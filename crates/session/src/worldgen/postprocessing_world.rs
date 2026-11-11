@@ -2375,22 +2375,22 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
             glam::IVec3::Z,
         ]
         .contains(&direction);
+        let dry_water_container = matches!(
+            old,
+            Cell::Slab {
+                waterlogged: false,
+                ..
+            } | Cell::Stairs {
+                waterlogged: false,
+                ..
+            } | Cell::FenceDry
+                | Cell::Ladder {
+                    waterlogged: false,
+                    ..
+                }
+        );
         ensure!(
-            (old == Cell::Air
-                || matches!(
-                    old,
-                    Cell::Slab {
-                        waterlogged: false,
-                        ..
-                    } | Cell::Stairs {
-                        waterlogged: false,
-                        ..
-                    } | Cell::FenceDry
-                        | Cell::Ladder {
-                            waterlogged: false,
-                            ..
-                        }
-                ) && fluid.source)
+            (old == Cell::Air || dry_water_container && fluid.source)
                 && pos == self.origin + direction
                 && fluid.kind == FluidKind::Water
                 && ((direction == glam::IVec3::NEG_Y
@@ -2398,13 +2398,7 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                     && fluid.falling
                     && fluid.amount == 8)
                     || (direction == glam::IVec3::NEG_Y
-                        && matches!(
-                            old,
-                            Cell::Ladder {
-                                waterlogged: false,
-                                ..
-                            }
-                        )
+                        && dry_water_container
                         && fluid.source
                         && !fluid.falling
                         && fluid.amount == 8)
@@ -6478,6 +6472,40 @@ mod tests {
                 world.set_block_id(7, 7, 8, water).unwrap();
                 world.set_block_id(9, 7, 8, water).unwrap();
             }
+            case if case.starts_with("down_container_") => {
+                let top = case.contains("_top_");
+                let state = if case.contains("slab_") {
+                    BlockState {
+                        name: "minecraft:stone_slab".into(),
+                        properties: BTreeMap::from([
+                            ("type".into(), if top { "top" } else { "bottom" }.into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]),
+                    }
+                } else if case.contains("stair_") {
+                    BlockState {
+                        name: "minecraft:oak_stairs".into(),
+                        properties: BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("half".into(), if top { "top" } else { "bottom" }.into()),
+                            ("shape".into(), "straight".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]),
+                    }
+                } else {
+                    BlockState {
+                        name: "minecraft:oak_fence".into(),
+                        properties: ["north", "east", "south", "west", "waterlogged"]
+                            .into_iter()
+                            .map(|key| (key.into(), "false".into()))
+                            .collect(),
+                    }
+                };
+                let id = world.intern_state(state);
+                world.set_block_id(8, 7, 8, id).unwrap();
+                world.set_block_id(7, 7, 8, water).unwrap();
+                world.set_block_id(9, 7, 8, water).unwrap();
+            }
             "ladder_break_unsupported" => {
                 let ladder = world.intern_state(BlockState {
                     name: "minecraft:ladder".into(),
@@ -6944,39 +6972,44 @@ mod tests {
         {
             stage.set_snow_tags(Some(snowy_test_tags(case.ends_with("_true"))));
         }
-        if matches!(
-            case,
-            "convert_on"
-                | "convert_off"
-                | "convert_bubble"
-                | "origin_source_on"
-                | "origin_source_off"
-                | "slab_bottom"
-                | "slab_top"
-                | "slab_bottom_off"
-                | "slab_oak"
-                | "stair_bottom"
-                | "stair_top"
-                | "stair_bottom_off"
-                | "fence_on"
-                | "fence_off"
-                | "fence_on_neighbor"
-                | "ladder_on"
-                | "ladder_off"
-                | "ladder_down_source"
-                | "ladder_down_source_off"
-        ) {
+        if case.starts_with("down_container_")
+            || matches!(
+                case,
+                "convert_on"
+                    | "convert_off"
+                    | "convert_bubble"
+                    | "origin_source_on"
+                    | "origin_source_off"
+                    | "slab_bottom"
+                    | "slab_top"
+                    | "slab_bottom_off"
+                    | "slab_oak"
+                    | "stair_bottom"
+                    | "stair_top"
+                    | "stair_bottom_off"
+                    | "fence_on"
+                    | "fence_off"
+                    | "fence_on_neighbor"
+                    | "ladder_on"
+                    | "ladder_off"
+                    | "ladder_down_source"
+                    | "ladder_down_source_off"
+            )
+        {
             stage
-                .set_water_source_conversion(!matches!(
-                    case,
-                    "convert_off"
-                        | "origin_source_off"
-                        | "slab_bottom_off"
-                        | "stair_bottom_off"
-                        | "fence_off"
-                        | "ladder_off"
-                        | "ladder_down_source_off"
-                ))
+                .set_water_source_conversion(
+                    !case.ends_with("_false")
+                        && !matches!(
+                            case,
+                            "convert_off"
+                                | "origin_source_off"
+                                | "slab_bottom_off"
+                                | "stair_bottom_off"
+                                | "fence_off"
+                                | "ladder_off"
+                                | "ladder_down_source_off"
+                        ),
+                )
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
@@ -7106,6 +7139,7 @@ mod tests {
         assert_eq!(
             result.water_source_conversion(),
             match case {
+                case if case.starts_with("down_container_") => Some(case.ends_with("_true")),
                 "convert_off"
                 | "origin_source_off"
                 | "slab_bottom_off"
@@ -7654,6 +7688,46 @@ mod tests {
             trace[0].contains("ladder destruction requires block drops"),
             "{trace:?}"
         );
+    }
+
+    #[test]
+    fn generated_water_flows_down_into_containers_only_as_source() {
+        for (kind, block) in [("slab_bottom", "stone_slab"), ("fence", "oak_fence")] {
+            for enabled in [true, false] {
+                let trace = water_spread_trace(&format!("down_container_{kind}_{enabled}"));
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == &format!("state 8,7,8 minecraft:{block} {enabled}")),
+                    "{kind}, source conversion {enabled}: {trace:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_water_downward_containers_match_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["down_containers"],
+        );
+        let mut expected = Vec::new();
+        for kind in [
+            "slab_bottom",
+            "slab_top",
+            "stair_bottom",
+            "stair_top",
+            "fence",
+        ] {
+            for enabled in [true, false] {
+                expected.extend(water_spread_trace(&format!(
+                    "down_container_{kind}_{enabled}"
+                )));
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

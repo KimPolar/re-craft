@@ -122,6 +122,11 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lichen"))scenarios.removeIf(s -> !s.startsWith("marked_lichen_"));
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
+        if(args.length>0 && args[0].equals("down_containers")){
+            scenarios.clear();
+            for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
+                for(var enabled:List.of(true,false))scenarios.add("down_container_"+kind+"_"+enabled);
+        }
         if(args.length>0 && args[0].equals("ladder")){
             scenarios.clear();scenarios.addAll(List.of("ladder_on","ladder_off","ladder_down_source","ladder_down_source_off","marked_ladder_dry","marked_ladder_wet","marked_ladder_side","marked_ladder_down","marked_ladder_back","marked_ladder_dry_back"));
             for(var facing:List.of("north","south","west","east")) for(boolean wet:new boolean[]{false,true})
@@ -141,7 +146,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             bind.invoke(Blocks.WATER.builtInRegistryHolder(),snowyWater && tagged?List.of(BlockTags.WASHED_AWAY_BY_FLUIDS,BlockTags.SNOW):List.of(BlockTags.WASHED_AWAY_BY_FLUIDS));
             bind.invoke(Blocks.OAK_FENCE.builtInRegistryHolder(),snowyFence && tagged?List.of(BlockTags.FENCES,BlockTags.WOODEN_FENCES,BlockTags.SNOW):List.of(BlockTags.FENCES,BlockTags.WOODEN_FENCES));
             pos=new BlockPos(scenario.startsWith("edge")?15:8,8,8);
-            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off")&&!scenario.equals("ladder_off")&&!scenario.equals("ladder_down_source_off"),null);
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off")&&!scenario.equals("ladder_off")&&!scenario.equals("ladder_down_source_off")&&!(scenario.startsWith("down_container_")&&scenario.endsWith("_false")),null);
             blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(snowyWater || snowyFence) {
                 var parts=scenario.split("_");
@@ -186,6 +191,14 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             }
             if(scenario.equals("ladder_down_source")||scenario.equals("ladder_down_source_off")) {
                 blocks.put(pos.below(),Blocks.LADDER.defaultBlockState().setValue(LadderBlock.FACING,Direction.NORTH));
+                blocks.put(pos.below().west(),Blocks.WATER.defaultBlockState());
+                blocks.put(pos.below().east(),Blocks.WATER.defaultBlockState());
+            }
+            if(scenario.startsWith("down_container_")) {
+                var state=scenario.contains("slab_")?Blocks.STONE_SLAB.defaultBlockState().setValue(BlockStateProperties.SLAB_TYPE,scenario.contains("_top_")?SlabType.TOP:SlabType.BOTTOM)
+                    :scenario.contains("stair_")?Blocks.OAK_STAIRS.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING,Direction.NORTH).setValue(BlockStateProperties.HALF,scenario.contains("_top_")?Half.TOP:Half.BOTTOM)
+                    :Blocks.OAK_FENCE.defaultBlockState();
+                blocks.put(pos.below(),state);
                 blocks.put(pos.below().west(),Blocks.WATER.defaultBlockState());
                 blocks.put(pos.below().east(),Blocks.WATER.defaultBlockState());
             }

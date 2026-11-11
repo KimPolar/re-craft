@@ -218,6 +218,25 @@ public class JigsawChestOracle {
                 }
             }
         }
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            var block=BuiltInRegistries.BLOCK.getValue(id);
+            if(!(block instanceof net.minecraft.world.level.block.CarpetBlock))continue;
+            var state=block.defaultBlockState();
+            var shape=state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO).toAabbs();
+            if(block.getStateDefinition().getPossibleStates().size()!=1 || shape.size()!=1
+                || !shape.equals(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO).toAabbs())
+                || state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                || state.getPostProcessPos(null,BlockPos.ZERO)!=null || state.useShapeForLightOcclusion()
+                || !state.getFluidState().isEmpty() || state.getLightEmission()!=0 || state.getLightDampening()!=0
+                || LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state))throw new AssertionError(state);
+            var box=shape.get(0);
+            for(var mirror:Mirror.values())for(var rotation:Rotation.values()) {
+                if(state.mirror(mirror).rotate(rotation)!=state)throw new AssertionError("carpet changed under transform");
+                out.printf("CARPET\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d%n",id.getPath(),mirror.name(),rotation.name(),
+                    Math.round(box.minX*16),Math.round(box.minY*16),Math.round(box.minZ*16),
+                    Math.round(box.maxX*16),Math.round(box.maxY*16),Math.round(box.maxZ*16));
+            }
+        }
         String[] stones = {"stone", "deepslate", "cobbled_deepslate", "polished_deepslate", "deepslate_bricks",
             "cracked_deepslate_bricks", "deepslate_tiles", "cracked_deepslate_tiles", "chiseled_deepslate",
             "reinforced_deepslate", "basalt", "polished_basalt", "smooth_basalt",

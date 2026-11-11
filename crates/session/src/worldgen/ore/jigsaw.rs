@@ -73,6 +73,10 @@ pub(super) fn jigsaw_candle(state: &BlockState) -> bool {
     native_world::collision::candle_state(state).is_some()
 }
 
+pub(super) fn jigsaw_carpet(state: &BlockState) -> bool {
+    native_world::collision::simple_carpet(state)
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::wall::Wall::from_state(state).is_some() {
         return Ok(false);
@@ -80,7 +84,8 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if jigsaw_wood(state) {
         return Ok(true);
     }
-    if jigsaw_torch(state) || jigsaw_lantern(state) || jigsaw_candle(state) {
+    if jigsaw_torch(state) || jigsaw_lantern(state) || jigsaw_candle(state) || jigsaw_carpet(state)
+    {
         return Ok(false);
     }
     if native_world::collision::full_glass(state) {
@@ -307,7 +312,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state)
                 || jigsaw_lantern(state)
-                || jigsaw_candle(state);
+                || jigsaw_candle(state)
+                || jigsaw_carpet(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -1243,6 +1249,79 @@ mod tests {
             candles_checked += 1;
         }
         assert_eq!(candles_checked, 3264);
+        let mut carpets_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("CARPET\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [_, name, mirror, rotation, x0, y0, z0, x1, y1, z1] = fields.as_slice() else {
+                bail!("invalid Java carpet result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            assert!(
+                registry.is_canonical_state(&state.name, &state.properties),
+                "{line}"
+            );
+            assert_eq!(registry.has_block_entity(&state.name), Some(false));
+            assert!(jigsaw_carpet(&state));
+            assert!(!jigsaw_static_full(&state)?);
+            assert_eq!(
+                registry.transform_template_state(
+                    &state.name,
+                    &state.properties,
+                    mirror,
+                    rotation
+                )?,
+                state.properties
+            );
+            let boxes =
+                native_world::collision::block_shape(&state).context("carpet shape missing")?;
+            assert_eq!(boxes.len(), 1);
+            let b = boxes[0];
+            assert_eq!(
+                [
+                    b.min.x * 16.0,
+                    b.min.y * 16.0,
+                    b.min.z * 16.0,
+                    b.max.x * 16.0,
+                    b.max.y * 16.0,
+                    b.max.z * 16.0
+                ],
+                [
+                    x0.parse::<f32>()?,
+                    y0.parse::<f32>()?,
+                    z0.parse::<f32>()?,
+                    x1.parse::<f32>()?,
+                    y1.parse::<f32>()?,
+                    z1.parse::<f32>()?
+                ],
+                "{line}"
+            );
+            let air = BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            };
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&air, &state),
+                Some(true)
+            );
+            carpets_checked += 1;
+        }
+        assert_eq!(carpets_checked, 204);
         let mut liquids_checked = 0;
         for line in output
             .lines()
@@ -3045,36 +3124,14 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
-    fn installed_ancient_city_entrance_matches_java_chunk_placement() -> Result<()> {
+    fn installed_ancient_city_templates_match_java_chunk_placement() -> Result<()> {
         let game =
             native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
         let mut resources = native_resources::packs::ResourceStack::open(&game)?;
         let blocks = resources.vanilla_block_ids()?;
         let registry = resources.vanilla_generated_block_registry()?;
         let motion = HeightmapTags::load(&mut resources, &blocks)?;
-        let holder = HolderValue::Reference(ResourceId::parse(
-            "minecraft:ancient_city_generic_degradation",
-        )?);
-        let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
-            PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
-        ));
         let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
-        let mut piece = Piece {
-            element: PoolElement::Single {
-                legacy: false,
-                location: ResourceId::parse(
-                    "minecraft:ancient_city/city/entrance/entrance_connector",
-                )?,
-                processors: holder,
-                projection: Projection::Rigid,
-                override_liquid_settings: None,
-            },
-            origin: [0, 0, 0],
-            rotation: Rotation::None,
-            bounds: clip,
-            ground_level_delta: 0,
-            junctions: vec![],
-        };
         let java = std::env::var_os("MINECRAFT_JAVA_HOME")
             .or_else(|| std::env::var_os("JAVA_HOME"))
             .map(std::path::PathBuf::from)
@@ -3115,19 +3172,79 @@ mod tests {
         );
         let mut saw_candle = false;
         let mut saw_soul_lantern = false;
-        for (origin, rotation, java_rotation) in [
-            ([0, 0, 0], Rotation::None, "NONE"),
-            ([0, 0, -16], Rotation::None, "NONE"),
-            ([16, 0, 0], Rotation::Clockwise90, "CLOCKWISE_90"),
-            ([16, 0, 16], Rotation::Clockwise180, "CLOCKWISE_180"),
+        let mut saw_carpet = false;
+        let entrance = "city/entrance/entrance_connector";
+        let wall = "walls/ruined_corner_wall_2";
+        for (template, processor, origin, rotation, java_rotation) in [
             (
+                entrance,
+                "ancient_city_generic_degradation",
+                [0, 0, 0],
+                Rotation::None,
+                "NONE",
+            ),
+            (
+                entrance,
+                "ancient_city_generic_degradation",
+                [0, 0, -16],
+                Rotation::None,
+                "NONE",
+            ),
+            (
+                entrance,
+                "ancient_city_generic_degradation",
+                [16, 0, 0],
+                Rotation::Clockwise90,
+                "CLOCKWISE_90",
+            ),
+            (
+                entrance,
+                "ancient_city_generic_degradation",
+                [16, 0, 16],
+                Rotation::Clockwise180,
+                "CLOCKWISE_180",
+            ),
+            (
+                entrance,
+                "ancient_city_generic_degradation",
                 [0, 0, 16],
                 Rotation::Counterclockwise90,
                 "COUNTERCLOCKWISE_90",
             ),
+            (
+                wall,
+                "ancient_city_walls_degradation",
+                [0, 0, 0],
+                Rotation::None,
+                "NONE",
+            ),
+            (
+                wall,
+                "ancient_city_walls_degradation",
+                [16, 0, 0],
+                Rotation::Clockwise90,
+                "CLOCKWISE_90",
+            ),
         ] {
-            piece.origin = origin;
-            piece.rotation = rotation;
+            let holder =
+                HolderValue::Reference(ResourceId::parse(&format!("minecraft:{processor}"))?);
+            let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
+                PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
+            ));
+            let piece = Piece {
+                element: PoolElement::Single {
+                    legacy: false,
+                    location: ResourceId::parse(&format!("minecraft:ancient_city/{template}"))?,
+                    processors: holder,
+                    projection: Projection::Rigid,
+                    override_liquid_settings: None,
+                },
+                origin,
+                rotation,
+                bounds: clip,
+                ground_level_delta: 0,
+                junctions: vec![],
+            };
             let prepared = PreparedTemplatePiece::load(&piece, &processors, &mut resources)?;
             let output = std::process::Command::new(java.join("java.exe"))
                 .arg("-cp")
@@ -3137,6 +3254,8 @@ mod tests {
                 .arg(origin[0].to_string())
                 .arg(origin[2].to_string())
                 .arg(java_rotation)
+                .arg(template)
+                .arg(processor)
                 .output()?;
             ensure!(
                 output.status.success(),
@@ -3186,10 +3305,11 @@ mod tests {
             for (pos, expected) in &expected {
                 saw_candle |= expected.name == "minecraft:candle";
                 saw_soul_lantern |= expected.name == "minecraft:soul_lantern";
+                saw_carpet |= expected.name == "minecraft:light_blue_carpet";
                 assert_eq!(
                     world.block(pos[0], pos[1], pos[2]),
                     Some(expected),
-                    "entrance block at {pos:?}, origin {origin:?}, rotation {rotation:?}"
+                    "template {template} block at {pos:?}, origin {origin:?}, rotation {rotation:?}"
                 );
             }
             assert_eq!(Some(random.next_long()), expected_random);
@@ -3200,8 +3320,8 @@ mod tests {
             }))));
         }
         assert!(
-            saw_candle && saw_soul_lantern,
-            "expected entrance light sources were not exercised"
+            saw_candle && saw_soul_lantern && saw_carpet,
+            "expected structure blocks were not exercised"
         );
         Ok(())
     }

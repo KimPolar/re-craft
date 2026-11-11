@@ -136,6 +136,15 @@ fn dye_color(name: &str) -> bool {
     )
 }
 
+/// Validate a stateless vanilla wool or moss carpet.
+pub fn simple_carpet(state: &BlockState) -> bool {
+    let Some(id) = state.name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    state.properties.is_empty()
+        && (id == "moss_carpet" || id.strip_suffix("_carpet").is_some_and(dye_color))
+}
+
 /// Validate the 17 built-in candle blocks and return count, lit, waterlogged.
 pub fn candle_state(state: &BlockState) -> Option<(u8, bool, bool)> {
     let id = state.name.strip_prefix("minecraft:")?;
@@ -497,6 +506,9 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
     if id == "snow" {
         let layers = snow_layers(state)?;
         return Some(direction == IVec3::NEG_Y || layers == 8);
+    }
+    if simple_carpet(state) {
+        return Some(direction == IVec3::NEG_Y);
     }
     if matches!(id, "air" | "cave_air" | "void_air") {
         return Some(false);
@@ -921,6 +933,9 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if crop_outline_height(state).is_some() {
         return Some(EMPTY.to_vec());
+    }
+    if simple_carpet(state) {
+        return Some(vec![pixel_box(0.0, 0.0, 0.0, 16.0, 1.0, 16.0)]);
     }
     if let Some((count, _, _)) = candle_state(state) {
         let bounds = match count {
@@ -1986,6 +2001,39 @@ pub fn unknown_barrier() -> &'static [Aabb] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn vanilla_carpets_have_thin_collision_and_validate_identity() {
+        for name in [
+            "minecraft:blue_carpet",
+            "minecraft:light_blue_carpet",
+            "minecraft:moss_carpet",
+        ] {
+            let state = BlockState {
+                name: name.into(),
+                properties: BTreeMap::new(),
+            };
+            let expected = Some(vec![pixel_box(0.0, 0.0, 0.0, 16.0, 1.0, 16.0)]);
+            assert_eq!(block_shape(&state), expected);
+            assert_eq!(block_outline(&state), expected);
+            assert_eq!(button_support_face(&state, IVec3::NEG_Y), Some(true));
+            assert_eq!(button_support_face(&state, IVec3::Y), Some(false));
+        }
+        for name in [
+            "minecraft:pale_moss_carpet",
+            "minecraft:invented_carpet",
+            "other:blue_carpet",
+        ] {
+            assert!(!simple_carpet(&BlockState {
+                name: name.into(),
+                properties: BTreeMap::new()
+            }));
+        }
+        assert!(!simple_carpet(&BlockState {
+            name: "minecraft:blue_carpet".into(),
+            properties: BTreeMap::from([("invalid".into(), "true".into())]),
+        }));
+    }
 
     #[test]
     fn candles_validate_color_count_and_collision_shape() {

@@ -753,6 +753,7 @@ impl GeneratedBlockRegistry {
                     )),
                     "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
                     "WOOL" => Some(("wool", BASE)),
+                    "CARPET" => Some(("carpet", "net/minecraft/world/level/block/WoolCarpetBlock")),
                     "DYED_CANDLE" => {
                         Some(("candle", "net/minecraft/world/level/block/CandleBlock"))
                     }
@@ -885,6 +886,8 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
                 "net/minecraft/world/level/block/LanternBlock" => Some(StateSchema::Lantern),
                 "net/minecraft/world/level/block/CandleBlock" => Some(StateSchema::Candle),
+                "net/minecraft/world/level/block/CarpetBlock"
+                | "net/minecraft/world/level/block/WoolCarpetBlock" => Some(StateSchema::Stateless),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock"

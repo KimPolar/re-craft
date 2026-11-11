@@ -46,7 +46,10 @@ public class AncientCityEntranceOracle {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         try (var jar=new ZipFile(args[0])) {
             var template=new StructureTemplate();
-            var entry=jar.getEntry("data/minecraft/structure/ancient_city/city/entrance/entrance_connector.nbt");
+            var templateName=args.length>4 ? args[4] : "city/entrance/entrance_connector";
+            var processorName=args.length>5 ? args[5] : "ancient_city_generic_degradation";
+            var entry=jar.getEntry("data/minecraft/structure/ancient_city/"+templateName+".nbt");
+            if(entry==null)throw new AssertionError("missing template " + templateName);
             try(var input=jar.getInputStream(entry)) {
                 var nbt=NbtIo.readCompressed(input,NbtAccounter.unlimitedHeap());
                 if(!nbt.getListOrEmpty("entities").isEmpty())throw new AssertionError("template entities need comparison");
@@ -67,7 +70,7 @@ public class AncientCityEntranceOracle {
                     case "getBlockEntity" -> null;
                     default -> throw new UnsupportedOperationException(method.toString());
                 });
-            var config=json(jar,"data/minecraft/worldgen/processor_list/ancient_city_generic_degradation.json").getAsJsonArray("processors");
+            var config=json(jar,"data/minecraft/worldgen/processor_list/"+processorName+".json").getAsJsonArray("processors");
             if(config.size()!=3)throw new AssertionError("unexpected processor count");
             var rot=config.get(0).getAsJsonObject();
             var rules=config.get(1).getAsJsonObject();

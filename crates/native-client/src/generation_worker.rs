@@ -756,6 +756,36 @@ impl GenerationReady {
                 .context("generated session requires light-complete targets")?,
         );
         ensure!(!targets.is_empty(), "generated session has no targets");
+        let generated_drops = self
+            .postprocessed
+            .as_ref()
+            .and_then(|processed| processed.region.block_drops());
+        if let Some(drops) = generated_drops {
+            let settings = self
+                .level_settings
+                .as_ref()
+                .context("generated drops require frozen level settings")?;
+            ensure!(
+                settings.session.seed == drops.world_seed()
+                    && settings.game_rules.block_drops == drops.block_drops_enabled(),
+                "generated drop rules or seed differ from the level"
+            );
+            ensure!(
+                drops.item_chunks().all(|pos| targets.contains(&pos)),
+                "generated drop entity chunk is not loaded"
+            );
+            if let Some(bonus) = self
+                .postprocessed
+                .as_ref()
+                .and_then(|processed| processed.initial_bonus_chest.as_ref())
+            {
+                ensure!(
+                    drops.operations() == 0
+                        && bonus.level_random.state() == drops.level_random().state(),
+                    "bonus chest and generated drop random streams differ"
+                );
+            }
+        }
         ensure!(
             self.batch.is_complete(),
             "generated session has pending generation work"
@@ -875,6 +905,14 @@ impl GenerationReady {
             }
             Arc::make_mut(chunk).block_light_correct = true;
         }
+        let generated_entities = match generated_drops {
+            Some(drops) if drops.item_chunks().next().is_some() => Some(
+                self.batch.postprocessed_complete_entity_records(
+                    &self.postprocessed.as_ref().expect("drop source exists").region,
+                )?,
+            ),
+            _ => None,
+        };
         for &pos in targets.iter() {
             let stage = self.batch.schedule().completed(pos);
             let payload = generated_session_block_entities(stage, || {
@@ -972,7 +1010,16 @@ impl GenerationReady {
                 .completed(pos)
                 .is_some_and(|stage| stage >= GenerationStage::Spawn)
             {
-                if let Some(records) = self.batch.complete_generated_entity_records(pos)? {
+                let records = match &generated_entities {
+                    Some(records) => Some(
+                        records
+                            .get(&pos)
+                            .context("generated entity chunk is missing")?
+                            .as_slice(),
+                    ),
+                    None => self.batch.complete_generated_entity_records(pos)?,
+                };
+                if let Some(records) = records {
                     let data =
                         native_session::loaded::SavedEntityData::from_generated(pos, records)?;
                     session.set_initial_entity_chunk(pos, data)?;
@@ -1009,10 +1056,12 @@ impl GenerationReady {
             session.set_game_mode(settings.mode);
             session.set_game_master_permission(settings.allow_commands);
             session.set_world_seed(Some(settings.seed));
-            session.set_random_sequences(
-                settings.seed,
-                native_persistence::random_sequences::RandomSequences::read(None)?,
-            )?;
+            if generated_drops.is_none() {
+                session.set_random_sequences(
+                    settings.seed,
+                    native_persistence::random_sequences::RandomSequences::read(None)?,
+                )?;
+            }
             session.set_survival_rules(native_session::survival::SurvivalRules {
                 difficulty: settings.difficulty,
                 natural_health_regeneration: rules.natural_health_regeneration,
@@ -1026,6 +1075,9 @@ impl GenerationReady {
             });
             session.set_block_drops(rules.block_drops);
             session.set_entity_drops(rules.entity_drops);
+            if let Some(drops) = generated_drops {
+                session.install_initial_generated_drops(drops)?;
+            }
             session.set_source_conversion(
                 rules.water_source_conversion,
                 rules.lava_source_conversion,
@@ -7840,6 +7892,7 @@ mod tests {
             } else {
                 None
             };
+            let game_for_drop_test = game.clone();
             let game = game.clone();
             let world = world.clone();
             let prepare_inputs =
@@ -8008,6 +8061,59 @@ mod tests {
                     on_ground: false,
                     pose: native_session::PlayerPose::Standing,
                 };
+                if !spawn_mobs {
+                    let previous = ready.postprocessed.take().context("postprocessing missing")?;
+                    let converted = previous.region.ticks().registration_order().to_vec();
+                    let mut resources =
+                        native_resources::packs::ResourceStack::open(&game_for_drop_test)?;
+                    let loot = Arc::new(native_resources::loot::BlockLootTables::load(
+                        &mut resources,
+                    )?);
+                    for (seed, enabled, valid) in
+                        [(42, true, true), (43, true, false), (42, false, false)]
+                    {
+                        let mut stage = ready.batch.begin_generated_postprocessing_with_neighbors(
+                            targets.iter().copied(),
+                            converted.iter().copied(),
+                            0,
+                            0,
+                        )?;
+                        stage.set_water_source_conversion(false)?;
+                        stage.set_block_drops(
+                            native_session::worldgen::postprocessing_drops::GeneratedBlockDrops::new(
+                                Arc::clone(&loot),
+                                seed,
+                                native_persistence::random_sequences::RandomSequences::read(None)?,
+                                native_core::random::LegacyRandom::new(9182),
+                                native_core::random::XoroshiroRandom::new(77),
+                                enabled,
+                            ),
+                        )?;
+                        for &pos in &targets {
+                            while !stage.poll(pos, 256)? {}
+                        }
+                        let region = stage.finish()?;
+                        let mesh = MeshJob::for_postprocessed(
+                            &ready.batch,
+                            &region,
+                            targets.clone(),
+                            previous.mesh.as_ref().unwrap().revision,
+                            ready.mesh.biome_blend,
+                            ready.mesh.origin,
+                        )?;
+                        ready.postprocessed = Some(PostprocessedGeneration {
+                            activated_ticks: region.ticks().activated_snapshot(),
+                            sealed_world: Arc::clone(&region.world),
+                            sealed_mesh: Some(mesh.clone()),
+                            mesh: Some(mesh),
+                            region,
+                            chunks: BTreeMap::new(),
+                            initial_bonus_chest: None,
+                        });
+                        assert_eq!(ready.start_session_inner(player).is_ok(), valid);
+                    }
+                    ready.postprocessed = Some(previous);
+                }
                 let session = ready.start_session_with_spawn_heightmaps(
                     player,
                     Arc::clone(collision_height_tags.as_ref().unwrap()),

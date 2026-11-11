@@ -3044,6 +3044,169 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_ancient_city_entrance_matches_java_chunk_placement() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        let holder = HolderValue::Reference(ResourceId::parse(
+            "minecraft:ancient_city_generic_degradation",
+        )?);
+        let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
+            PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
+        ));
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let mut piece = Piece {
+            element: PoolElement::Single {
+                legacy: false,
+                location: ResourceId::parse(
+                    "minecraft:ancient_city/city/entrance/entrance_connector",
+                )?,
+                processors: holder,
+                projection: Projection::Rigid,
+                override_liquid_settings: None,
+            },
+            origin: [0, 0, 0],
+            rotation: Rotation::None,
+            bounds: clip,
+            ground_level_delta: 0,
+            junctions: vec![],
+        };
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = temp.path().join("AncientCityEntranceOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/AncientCityEntranceOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut saw_candle = false;
+        let mut saw_soul_lantern = false;
+        for (origin, rotation, java_rotation) in [
+            ([0, 0, 0], Rotation::None, "NONE"),
+            ([0, 0, -16], Rotation::None, "NONE"),
+            ([16, 0, 0], Rotation::Clockwise90, "CLOCKWISE_90"),
+            ([16, 0, 16], Rotation::Clockwise180, "CLOCKWISE_180"),
+            (
+                [0, 0, 16],
+                Rotation::Counterclockwise90,
+                "COUNTERCLOCKWISE_90",
+            ),
+        ] {
+            piece.origin = origin;
+            piece.rotation = rotation;
+            let prepared = PreparedTemplatePiece::load(&piece, &processors, &mut resources)?;
+            let output = std::process::Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("AncientCityEntranceOracle")
+                .arg(version.join("26.3.jar"))
+                .arg(origin[0].to_string())
+                .arg(origin[2].to_string())
+                .arg(java_rotation)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "Java entrance oracle failed: {}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let mut expected = BTreeMap::new();
+            let mut expected_random = None;
+            for line in std::str::from_utf8(&output.stdout)?.lines() {
+                let fields: Vec<_> = line.split('\t').collect();
+                match fields.as_slice() {
+                    ["BLOCK", x, y, z, id, properties] => {
+                        let pos = [x.parse::<i32>()?, y.parse::<i32>()?, z.parse::<i32>()?];
+                        let state = BlockState {
+                            name: (*id).into(),
+                            properties: serde_json::from_str(properties)?,
+                        };
+                        ensure!(
+                            expected.insert(pos, state).is_none(),
+                            "duplicate Java block"
+                        );
+                    }
+                    ["RANDOM", value] => {
+                        ensure!(
+                            expected_random.replace(value.parse::<i64>()?).is_none(),
+                            "duplicate Java random"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            ensure!(expected.len() == 4096, "incomplete Java entrance output");
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut random = DecorationRandom::new(42);
+            assert!(region.place_rigid_jigsaw_piece(
+                &prepared,
+                &registry,
+                clip,
+                LiquidSettings::IgnoreWaterlogging,
+                &mut random
+            )?);
+            region.finish()?;
+            let world = terrain.snapshot();
+            for (pos, expected) in &expected {
+                saw_candle |= expected.name == "minecraft:candle";
+                saw_soul_lantern |= expected.name == "minecraft:soul_lantern";
+                assert_eq!(
+                    world.block(pos[0], pos[1], pos[2]),
+                    Some(expected),
+                    "entrance block at {pos:?}, origin {origin:?}, rotation {rotation:?}"
+                );
+            }
+            assert_eq!(Some(random.next_long()), expected_random);
+            assert!((0..16).any(|y| (0..16).any(|z| (0..16).any(|x| {
+                world
+                    .block(x, y, z)
+                    .is_some_and(|state| state.name == "minecraft:deepslate_tiles")
+            }))));
+        }
+        assert!(
+            saw_candle && saw_soul_lantern,
+            "expected entrance light sources were not exercised"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn jigsaw_entities_outside_clip_do_not_block_placement() -> Result<()> {
         let game =

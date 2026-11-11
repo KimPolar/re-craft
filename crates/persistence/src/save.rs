@@ -196,11 +196,53 @@ pub struct FreshWorldDraft {
 }
 
 /// A private, automatically removed staging tree. It is not a published world.
+#[derive(Debug)]
 pub struct FreshWorldStage {
     _directory: tempfile::TempDir,
     root: PathBuf,
     manifest: BTreeMap<PathBuf, Option<[u8; 32]>>,
     enabled_file_packs: Vec<String>,
+}
+
+/// A pre-copy failure retains the stage for retry. Once publication has begun,
+/// both paths are preserved for the existing interrupted-creation recovery.
+#[derive(Debug)]
+pub enum FreshWorldPublishError {
+    Retryable {
+        error: anyhow::Error,
+        stage: FreshWorldStage,
+    },
+    RecoveryRequired {
+        error: anyhow::Error,
+        staging: PathBuf,
+        destination: PathBuf,
+    },
+}
+
+impl FreshWorldPublishError {
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::Retryable { error, .. } | Self::RecoveryRequired { error, .. } => error,
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Retryable { error, .. } | Self::RecoveryRequired { error, .. } => error,
+        }
+    }
+}
+
+impl std::fmt::Display for FreshWorldPublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error())
+    }
+}
+
+impl std::error::Error for FreshWorldPublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error().as_ref())
+    }
 }
 
 impl FreshWorldStage {
@@ -272,41 +314,73 @@ impl FreshWorldStage {
         name: &str,
         default_name: &str,
     ) -> Result<PublishedFreshWorld> {
+        self.publish_recoverable(saves, name, default_name)
+            .map_err(FreshWorldPublishError::into_error)
+    }
+
+    /// Return the original stage if validation or folder reservation fails.
+    /// A failure after reservation preserves paths for explicit recovery.
+    /// As with `publish`, the caller must establish generation completeness.
+    pub fn publish_recoverable(
+        self,
+        saves: &Path,
+        name: &str,
+        default_name: &str,
+    ) -> std::result::Result<PublishedFreshWorld, FreshWorldPublishError> {
         #[cfg(not(windows))]
         {
-            let _ = (self, saves, name, default_name);
-            anyhow::bail!("world writing is currently supported only on Windows");
+            let _ = (saves, name, default_name);
+            Err(FreshWorldPublishError::Retryable {
+                error: anyhow::anyhow!("world writing is currently supported only on Windows"),
+                stage: self,
+            })
         }
         #[cfg(windows)]
         {
-            self.verify_ready()?;
-            let saves = saves
-                .canonicalize()
-                .context("cannot resolve saves directory")?;
-            ensure!(saves.is_dir(), "saves path is not a directory");
-            let staging = self._directory.path().canonicalize()?;
-            ensure!(
-                staging.parent() == Some(saves.as_path()),
-                "world must be staged inside the destination saves directory"
-            );
-            let root = self.root.canonicalize()?;
-            ensure!(
-                root.parent() == Some(staging.as_path()),
-                "staged world moved outside its staging directory"
-            );
-            let reserved = crate::world_creation::reserve_world_folder(&saves, name, default_name)?;
+            let preflight = (|| -> Result<_> {
+                self.verify_ready()?;
+                let saves = saves
+                    .canonicalize()
+                    .context("cannot resolve saves directory")?;
+                ensure!(saves.is_dir(), "saves path is not a directory");
+                let staging = self._directory.path().canonicalize()?;
+                ensure!(
+                    staging.parent() == Some(saves.as_path()),
+                    "world must be staged inside the destination saves directory"
+                );
+                let root = self.root.canonicalize()?;
+                ensure!(
+                    root.parent() == Some(staging.as_path()),
+                    "staged world moved outside its staging directory"
+                );
+                Ok((saves, staging, root))
+            })();
+            let (saves, staging, root) = match preflight {
+                Ok(value) => value,
+                Err(error) => return Err(FreshWorldPublishError::Retryable { error, stage: self }),
+            };
+            let reserved =
+                match crate::world_creation::reserve_world_folder(&saves, name, default_name) {
+                    Ok(reserved) => reserved,
+                    Err(error) => {
+                        return Err(FreshWorldPublishError::Retryable { error, stage: self });
+                    }
+                };
             let result = write_fresh_creation_journal(&staging, &reserved.name, &self.manifest)
                 .and_then(|()| {
                     install_fresh_world(&root, &staging, &reserved.path, &self.manifest)
                 });
             if let Err(error) = result {
                 let preserved = self._directory.keep();
-                return Err(error).with_context(|| {
-                    format!(
+                let error = error.context(format!(
                         "new world was not published; incomplete files remain at {}; staging files remain at {}",
                         reserved.path.display(),
                         preserved.display()
-                    )
+                    ));
+                return Err(FreshWorldPublishError::RecoveryRequired {
+                    error,
+                    staging: preserved,
+                    destination: reserved.path.clone(),
                 });
             }
             Ok(PublishedFreshWorld {
@@ -5769,6 +5843,64 @@ mod tests {
         assert!(stage.publish(other.path(), "World", "New World").is_err());
         assert!(!other.path().join("World").exists());
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn recoverable_publication_preserves_stage_until_preflight_succeeds() {
+        let saves = test_world();
+        let other = test_world();
+        let stage = publishable_stage(saves.path());
+        let path = stage.path().to_owned();
+        let stage = match stage.publish_recoverable(other.path(), "World", "New World") {
+            Err(FreshWorldPublishError::Retryable { error, stage }) => {
+                assert!(format!("{error:#}").contains("staged inside"));
+                stage
+            }
+            _ => panic!("wrong destination must retain the stage"),
+        };
+        assert!(path.join("level.dat").is_file());
+        assert!(!other.path().join("World").exists());
+        let level = fs::read(path.join("level.dat")).unwrap();
+        fs::write(path.join("level.dat"), b"changed").unwrap();
+        let stage = match stage.publish_recoverable(saves.path(), "World", "New World") {
+            Err(FreshWorldPublishError::Retryable { error, stage }) => {
+                assert!(format!("{error:#}").contains("staged world changed"));
+                stage
+            }
+            _ => panic!("modified stage must be retained and rejected"),
+        };
+        assert!(!saves.path().join("World").exists());
+        fs::write(path.join("level.dat"), level).unwrap();
+        let published = stage
+            .publish_recoverable(saves.path(), "World", "New World")
+            .unwrap();
+        assert!(published.path.join("level.dat").is_file());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn recoverable_publication_reports_paths_after_copy_begins() {
+        let saves = test_world();
+        let stage = publishable_stage(saves.path());
+        let staging = stage._directory.path().to_owned();
+        fs::write(staging.join(FRESH_CREATION_JOURNAL), b"existing").unwrap();
+        match stage.publish_recoverable(saves.path(), "World", "New World") {
+            Err(FreshWorldPublishError::RecoveryRequired {
+                error,
+                staging: retained,
+                destination,
+            }) => {
+                assert!(format!("{error:#}").contains("staging files remain"));
+                assert_eq!(retained, staging);
+                assert_eq!(
+                    destination,
+                    saves.path().canonicalize().unwrap().join("World")
+                );
+                assert!(retained.join("world/level.dat").is_file());
+                assert!(!destination.join("level.dat").exists());
+            }
+            _ => panic!("partially published world must require recovery"),
+        }
     }
 
     #[test]

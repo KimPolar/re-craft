@@ -134,6 +134,22 @@ fn random_stairs(name: &str, random: &mut LegacyRandom) -> BlockState {
 
 fn copy_stairs(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
+    // Java copies properties by identity. If there are no matching names,
+    // none can be shared; otherwise unknown property identities stay guarded.
+    if ["facing", "half", "shape", "waterlogged"]
+        .into_iter()
+        .all(|name| !p.contains_key(name))
+    {
+        return Ok(BlockState {
+            name: "minecraft:mossy_stone_brick_stairs".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("half".into(), "bottom".into()),
+                ("shape".into(), "straight".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        });
+    }
     ensure!(
         p.len() == 4
             && matches!(
@@ -158,6 +174,12 @@ fn copy_stairs(source: &BlockState) -> Result<BlockState> {
 }
 fn copy_slab(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
+    if ["type", "waterlogged"]
+        .into_iter()
+        .all(|name| !p.contains_key(name))
+    {
+        return Ok(slab("mossy_stone_brick_slab"));
+    }
     ensure!(
         p.len() == 2
             && matches!(
@@ -177,6 +199,22 @@ fn copy_slab(source: &BlockState) -> Result<BlockState> {
 }
 fn copy_wall(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
+    if ["north", "east", "south", "west", "up", "waterlogged"]
+        .into_iter()
+        .all(|name| !p.contains_key(name))
+    {
+        return Ok(BlockState {
+            name: "minecraft:mossy_stone_brick_wall".into(),
+            properties: BTreeMap::from([
+                ("north".into(), "none".into()),
+                ("east".into(), "none".into()),
+                ("south".into(), "none".into()),
+                ("west".into(), "none".into()),
+                ("up".into(), "true".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        });
+    }
     ensure!(
         p.len() == 6
             && ["north", "east", "south", "west"]
@@ -209,13 +247,16 @@ mod tests {
         );
         let state = BlockState {
             name: "example:custom".into(),
-            properties: BTreeMap::new(),
+            properties: BTreeMap::from([("type".into(), "unknown".into())]),
         };
         assert!(
             tags.process(&state, 1.0, &mut LegacyRandom::new(0))
                 .is_err()
         );
-        assert!(state.properties.is_empty());
+        assert_eq!(
+            state.properties.get("type").map(String::as_str),
+            Some("unknown")
+        );
         assert!(
             tags.process(&state, f32::NAN, &mut LegacyRandom::new(0))
                 .is_err()

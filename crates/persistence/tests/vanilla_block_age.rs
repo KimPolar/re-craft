@@ -5,7 +5,11 @@ use native_persistence::{
 use native_resources::{packs::ResourceStack, structure_pool::HolderValue};
 use native_world::loaded::BlockState;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    process::Command,
+};
 
 fn parse_state(value: &str) -> Result<BlockState> {
     let (name, properties) = value.split_once('|').context("state separator missing")?;
@@ -114,5 +118,109 @@ fn block_age_processor_matches_java() -> Result<()> {
         count += 1;
     }
     assert_eq!(count, 26_052, "unexpected Java case count");
+    let mut tagged_count = 0;
+    for line in text.lines().filter(|line| line.starts_with("B\t")) {
+        let fields: Vec<_> = line.split('\t').collect();
+        ensure!(fields.len() == 8, "invalid Java tagged-block output");
+        let category: usize = fields[1].parse()?;
+        let mode: usize = fields[2].parse()?;
+        let x = fields[3].parse()?;
+        let y = fields[4].parse()?;
+        let z = fields[5].parse()?;
+        let state = parse_state(fields[6])?;
+        let member = BTreeSet::from([state.name.clone()]);
+        let empty = BTreeSet::new();
+        let tags = match category {
+            0 => {
+                native_persistence::structure_block_age::AgeTags::new(member, empty.clone(), empty)
+            }
+            1 => {
+                native_persistence::structure_block_age::AgeTags::new(empty.clone(), member, empty)
+            }
+            2 => {
+                native_persistence::structure_block_age::AgeTags::new(empty.clone(), empty, member)
+            }
+            _ => anyhow::bail!("invalid category"),
+        };
+        let mut random = native_core::random::LegacyRandom::new(
+            native_resources::blockstates::positional_seed(x, y, z),
+        );
+        let actual = tags.process(&state, [0.0_f32, 0.2, 0.8, 1.0][mode], &mut random)?;
+        assert_eq!(actual, parse_state(fields[7])?, "{line}");
+        tagged_count += 1;
+    }
+    assert_eq!(tagged_count, 3_588, "unexpected tagged-block case count");
+
+    // Exercise the same states through the real data-pack tag loader and the
+    // processor list used by structure generation.
+    let world = temp.path().join("tagged-world");
+    let pack = world.join("datapacks/extra-aging");
+    let tags_dir = pack.join("data/minecraft/tags/block");
+    std::fs::create_dir_all(&tags_dir)?;
+    std::fs::write(
+        pack.join("pack.mcmeta"),
+        br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+    )?;
+    for (name, value) in [
+        ("stairs", "minecraft:dirt"),
+        ("slabs", "minecraft:oak_log"),
+        ("walls", "minecraft:redstone_ore"),
+    ] {
+        std::fs::write(
+            tags_dir.join(format!("{name}.json")),
+            serde_json::to_vec(&json!({"values":[value]}))?,
+        )?;
+    }
+    let selection = native_resources::datapacks::DataPackSettings {
+        enabled: vec!["vanilla".into(), "file/extra-aging".into()],
+        disabled: vec![],
+        enabled_features: vec!["minecraft:vanilla".into()],
+    };
+    ensure!(
+        resources
+            .configure_world_data(&world, &selection)?
+            .is_empty(),
+        "pack warnings"
+    );
+    let mut processors = Vec::new();
+    for mossiness in [0.0_f32, 0.2, 0.8, 1.0] {
+        processors.push(PreparedProcessors::load(
+            &HolderValue::Inline(json!({"processors":[{"processor_type":"minecraft:block_age","mossiness":mossiness}]})),
+            &mut resources,
+            &blocks,
+            &registry,
+        )?);
+    }
+    let mut loaded_count = 0;
+    for line in text.lines().filter(|line| line.starts_with("B\t")) {
+        let fields: Vec<_> = line.split('\t').collect();
+        let category: usize = fields[1].parse()?;
+        let state = parse_state(fields[6])?;
+        if state.name
+            != [
+                "minecraft:dirt",
+                "minecraft:oak_log",
+                "minecraft:redstone_ore",
+            ][category]
+        {
+            continue;
+        }
+        let mode: usize = fields[2].parse()?;
+        let position = [fields[3].parse()?, fields[4].parse()?, fields[5].parse()?];
+        let result = processors[mode]
+            .process(
+                PlacementBlock {
+                    position,
+                    state,
+                    nbt: Some(marker.clone()),
+                },
+                &mut |_| anyhow::bail!("age processor requested world state"),
+            )?
+            .context("age processor unexpectedly removed block")?;
+        assert_eq!(result.state, parse_state(fields[7])?, "{line}");
+        assert_eq!(result.nbt, Some(marker.clone()));
+        loaded_count += 1;
+    }
+    assert_eq!(loaded_count, 312);
     Ok(())
 }

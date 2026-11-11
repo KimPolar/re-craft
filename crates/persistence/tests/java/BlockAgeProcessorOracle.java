@@ -44,5 +44,21 @@ public class BlockAgeProcessorOracle {
                     out.printf("A\t%d\t%d\t%d\t%d\t%s\t%s%n", m, pos.getX(), pos.getY(), pos.getZ(), key(state), key(result.state()));
                 }
         }
+        // Simulate data packs that add ordinary blocks to each aging tag.
+        var tagged = List.of(Blocks.DIRT, Blocks.NETHERRACK, Blocks.OAK_LOG, Blocks.REDSTONE_ORE, Blocks.WATER);
+        var tags = List.of(BlockTags.STAIRS, BlockTags.SLABS, BlockTags.WALLS);
+        for (int category = 0; category < tags.size(); category++) {
+            for (var block : tagged) bind.invoke(block.builtInRegistryHolder(), List.of(tags.get(category)));
+            for (int m = 0; m < mossiness.length; m++) {
+                var processor = new BlockAgeProcessor(mossiness[m]);
+                for (var block : tagged) for (var state : block.getStateDefinition().getPossibleStates())
+                    for (int i = 0; i < 13; i++) {
+                        var pos = new BlockPos(i * 17 - 95, i * 29 - 64, 113 - i * 23);
+                        var info = new StructureBlockInfo(pos, state, null);
+                        var result = processor.processBlock(null, pos, pos, pos, info, new StructurePlaceSettings());
+                        out.printf("B\t%d\t%d\t%d\t%d\t%d\t%s\t%s%n", category, m, pos.getX(), pos.getY(), pos.getZ(), key(state), key(result.state()));
+                    }
+            }
+        }
     }
 }

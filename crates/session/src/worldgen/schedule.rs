@@ -558,12 +558,17 @@ fn ruin_structures_with_piece(
                 .ruined_portal_starts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let shipwreck = structures
+                .shipwreck_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
                 usize::from(simple.is_some())
                     + usize::from(ocean.is_some())
                     + usize::from(mine.is_some())
                     + usize::from(jigsaw.is_some())
                     + usize::from(portal.is_some())
+                    + usize::from(shipwreck.is_some())
                     == 1,
                 "ruin spawn referenced structure is missing or ambiguous"
             );
@@ -573,6 +578,7 @@ fn ruin_structures_with_piece(
                 .or_else(|| mine.map(|start| start.chunk))
                 .or_else(|| jigsaw.map(|start| start.chunk))
                 .or_else(|| portal.map(|start| start.chunk))
+                .or_else(|| shipwreck.map(|start| start.chunk))
                 .context("ruin structure missing")?;
             ensure!(
                 actual_chunk == [source.x, source.z],
@@ -601,6 +607,8 @@ fn ruin_structures_with_piece(
                     .any(|piece| contains(&piece.piece.bounds))
             } else if let Some(start) = portal {
                 contains(&start.piece.bounds)
+            } else if let Some(start) = shipwreck {
+                contains(&start.bounds)
             } else {
                 jigsaw
                     .expect("one start was validated")
@@ -610,7 +618,6 @@ fn ruin_structures_with_piece(
             };
             if inside {
                 matching.insert(id.clone());
-                break;
             }
         }
     }
@@ -1021,7 +1028,6 @@ pub(super) fn native_cat_condition(
             .and_then(serde_json::Value::as_str)
             .context("cat condition type missing")?,
     )?;
-    let mut matching = BTreeSet::new();
     let is_biome = kind.namespace == "minecraft" && kind.path == "biome";
     let is_structure = kind.namespace == "minecraft" && kind.path == "structure";
     let is_moon = kind.namespace == "minecraft" && kind.path == "moon_brightness";
@@ -1030,98 +1036,17 @@ pub(super) fn native_cat_condition(
     } else {
         None
     };
-    if is_structure {
-        let chunk = ChunkPos {
-            x: pos[0].div_euclid(16),
-            z: pos[2].div_euclid(16),
-        };
-        let references = all_structures
-            .references
-            .get(&chunk)
-            .context("cat spawn chunk structure references unavailable")?;
-        for (id, sources) in references.membership() {
-            for &packed in sources {
-                let bits = packed as u64;
-                let source = ChunkPos {
-                    x: bits as u32 as i32,
-                    z: (bits >> 32) as u32 as i32,
-                };
-                let candidate = (id.clone(), source);
-                let simple = all_structures
-                    .starts
-                    .get(&source)
-                    .and_then(|starts| starts.get(id));
-                let ocean = all_structures
-                    .ocean_starts
-                    .get(&source)
-                    .and_then(|starts| starts.get(id));
-                let mine = all_structures
-                    .mineshafts
-                    .get(&source)
-                    .and_then(|starts| starts.get(id));
-                let jigsaw = all_structures
-                    .jigsaw_starts
-                    .get(&source)
-                    .and_then(|starts| starts.get(id));
-                let portal = all_structures
-                    .ruined_portal_starts
-                    .get(&source)
-                    .and_then(|starts| starts.get(id));
-                ensure!(
-                    usize::from(simple.is_some())
-                        + usize::from(ocean.is_some())
-                        + usize::from(mine.is_some())
-                        + usize::from(jigsaw.is_some())
-                        + usize::from(portal.is_some())
-                        == 1,
-                    "cat spawn referenced structure is missing or ambiguous"
-                );
-                let start_chunk = simple
-                    .map(|start| start.chunk)
-                    .or_else(|| ocean.map(|start| start.chunk))
-                    .or_else(|| mine.map(|start| start.chunk))
-                    .or_else(|| jigsaw.map(|start| start.chunk))
-                    .or_else(|| portal.map(|start| start.chunk))
-                    .context("cat spawn referenced structure is missing")?;
-                ensure!(
-                    start_chunk == [source.x, source.z],
-                    "cat spawn structure source differs"
-                );
-                let contains = |piece: &native_core::beardifier::BoundingBox| {
-                    (0..3).all(|axis| (piece.min[axis]..=piece.max[axis]).contains(&pos[axis]))
-                };
-                let mut matching_revisions = revisions
-                    .iter()
-                    .filter(|(revision, _)| revision == &candidate)
-                    .peekable();
-                let inside = if &candidate == key {
-                    contains(&bounds)
-                } else if matching_revisions.peek().is_some() {
-                    matching_revisions.any(|(_, piece)| contains(piece))
-                } else if let Some(start) = simple {
-                    contains(&start.bounds)
-                } else if let Some(start) = ocean {
-                    start.pieces.iter().any(|piece| contains(&piece.bounds))
-                } else if let Some(start) = mine {
-                    start
-                        .pieces
-                        .iter()
-                        .any(|piece| contains(&piece.piece.bounds))
-                } else if let Some(start) = portal {
-                    contains(&start.piece.bounds)
-                } else {
-                    jigsaw
-                        .expect("one start was validated")
-                        .pieces
-                        .iter()
-                        .any(|piece| contains(&piece.bounds))
-                };
-                if inside {
-                    matching.insert(id.clone());
-                }
-            }
-        }
-    }
+    let matching = if is_structure {
+        Some(ruin_structures_with_piece(
+            all_structures,
+            pos,
+            key,
+            revisions,
+            &[bounds],
+        )?)
+    } else {
+        None
+    };
     let moon_phase = if is_moon {
         let phase = moon_phase_at(pos, biomes)?;
         ensure!(phase < 8, "invalid moon phase at cat spawn");
@@ -1134,7 +1059,7 @@ pub(super) fn native_cat_condition(
         &CatSpawnContext {
             biome,
             moon_phase,
-            structures_with_piece: is_structure.then_some(&matching),
+            structures_with_piece: matching.as_ref(),
         },
     )
 }
@@ -2046,6 +1971,189 @@ impl GenerationSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cat_and_drowned_structure_conditions_include_shipwrecks_and_revisions() -> Result<()> {
+        use super::super::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            cat_variants::CatSpawnVariants,
+            packs::{ResourceId, ResourceProvider},
+            shipwreck::Piece,
+            structure_transform::Rotation,
+        };
+        use std::sync::Arc;
+
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/cat_variant/black.json").then(||
+                    br#"{"spawn_conditions":[{"priority":1,"condition":{"type":"minecraft:structure","structures":"example:wreck"}}]}"#.to_vec()))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                match folder {
+                    "cat_variant" | "cat_sound_variant" => {
+                        Ok(vec![ResourceId::parse("minecraft:black")?])
+                    }
+                    "worldgen/structure" => Ok(vec![ResourceId::parse("example:wreck")?]),
+                    _ => anyhow::bail!("unexpected registry {folder}"),
+                }
+            }
+        }
+        let variants = CatSpawnVariants::load_active(&mut Data)?;
+        let conditions = variants.prepare_world_conditions(&mut Data)?;
+        let selector =
+            serde_json::json!({"type":"minecraft:structure","structures":"example:wreck"});
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:wreck")?;
+        let piece = Piece {
+            template: "minecraft:shipwreck/with_mast".into(),
+            position: [0, 8, 0],
+            rotation: Rotation::None,
+            beached: false,
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [3, 3, 3],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let start = super::super::shipwreck::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            bounds: piece.bounds(template.size)?,
+            piece,
+            template,
+            height_adjusted: true,
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let mut stages = super::super::structure_batch::PreparedStructureStages::default();
+        stages.starts.insert(source, BTreeMap::new());
+        stages
+            .shipwreck_starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        stages.references.insert(
+            source,
+            collect_ordered_structure_references(source, |pos| {
+                Ok(if pos == source {
+                    vec![bounds.clone()]
+                } else {
+                    vec![]
+                })
+            })?,
+        );
+        let other = (ResourceId::parse("example:hut")?, source);
+        let hut_bounds = BoundingBox::new([10, 8, 10], [12, 10, 12]).unwrap();
+        let biomes = super::super::BiomeNeighborhood::new(42, 0, 16)?;
+        let revised = [(
+            (id.clone(), source),
+            BoundingBox::new([5, 8, 0], [6, 10, 2]).unwrap(),
+        )];
+        for (pos, revisions, expected) in [
+            ([1, 9, 1], &[][..], true),
+            ([4, 9, 1], &[][..], false),
+            ([1, 9, 1], &revised[..], false),
+            ([5, 9, 1], &revised[..], true),
+        ] {
+            assert_eq!(
+                ruin_structures_with_piece(&stages, pos, &other, revisions, &[hut_bounds])?
+                    .contains(&id),
+                expected
+            );
+            assert_eq!(
+                native_cat_condition(
+                    &conditions,
+                    &|_, _| Ok(0),
+                    &stages,
+                    &biomes,
+                    &other,
+                    pos,
+                    &selector,
+                    hut_bounds,
+                    revisions
+                )?,
+                expected
+            );
+        }
+        stages
+            .shipwreck_starts
+            .get_mut(&source)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .chunk = [1, 0];
+        assert!(
+            ruin_structures_with_piece(&stages, [1, 9, 1], &other, &[], &[hut_bounds]).is_err()
+        );
+        assert!(
+            native_cat_condition(
+                &conditions,
+                &|_, _| Ok(0),
+                &stages,
+                &biomes,
+                &other,
+                [1, 9, 1],
+                &selector,
+                hut_bounds,
+                &[]
+            )
+            .is_err()
+        );
+        stages
+            .shipwreck_starts
+            .get_mut(&source)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .chunk = [0, 0];
+        stages.starts.get_mut(&source).unwrap().insert(
+            id.clone(),
+            native_resources::structure_start::SimpleStructureStart {
+                kind: native_resources::structure_start::SimpleStructureKind::SwampHut,
+                chunk: [0, 0],
+                generation_point: [1, 9, 1],
+                orientation: None,
+                bounds: hut_bounds,
+                terrain_adjustment: TerrainAdjustment::None,
+            },
+        );
+        assert!(
+            ruin_structures_with_piece(&stages, [1, 9, 1], &other, &[], &[hut_bounds]).is_err()
+        );
+        stages.starts.get_mut(&source).unwrap().clear();
+        stages.shipwreck_starts.clear();
+        assert!(
+            ruin_structures_with_piece(&stages, [1, 9, 1], &other, &[], &[hut_bounds]).is_err()
+        );
+        assert!(
+            native_cat_condition(
+                &conditions,
+                &|_, _| Ok(0),
+                &stages,
+                &biomes,
+                &other,
+                [1, 9, 1],
+                &selector,
+                hut_bounds,
+                &[]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn ruin_variant_lookup_checks_jigsaw_piece_bounds() -> Result<()> {

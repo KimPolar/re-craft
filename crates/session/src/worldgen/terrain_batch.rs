@@ -3452,7 +3452,7 @@ impl FreshTerrainBatch {
 
     /// Prove that recorded destruction events could not reach a block or
     /// entity listener. Every section-column in Java's notification radius
-    /// must be converted, present and have complete empty entity coverage.
+    /// must be converted, present and have complete listener-free entity coverage.
     pub fn certify_inert_destroy_events(
         &self,
         processed: &super::PostprocessedGeneratedRegion,
@@ -3465,7 +3465,7 @@ impl FreshTerrainBatch {
         drops.certify_inert_events(|pos| {
             Ok(self
                 .complete_generated_entity_records_in_complete_batch(pos)?
-                .is_some_and(<[_]>::is_empty))
+                .is_some_and(super::postprocessing_drops::entities_without_listeners))
         })
     }
 

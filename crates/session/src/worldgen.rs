@@ -7046,8 +7046,29 @@ mod tests {
             .step(&mut data, &mut classify, &mut resolve)?
             .is_some()
         {}
+        let cow = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:cow".into())),
+            ("UUID".into(), Tag::IntArray(vec![21, 22, 23, 24])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: vec![Tag::Double(1.5), Tag::Double(16.0), Tag::Double(1.5)],
+                },
+            ),
+        ]);
         for &pos in &converted {
-            batch.request_spawn_without_mobs(pos, false)?;
+            if pos == center {
+                batch.publish_completed_spawn(
+                    pos,
+                    &[GeneratedEntityAddition {
+                        block_position: [1, 16, 1],
+                        record: GeneratedEntityRecord::Saved(cow.clone()),
+                    }],
+                )?;
+            } else {
+                batch.request_spawn_without_mobs(pos, false)?;
+            }
             while batch
                 .step(&mut data, &mut classify, &mut resolve)?
                 .is_some()
@@ -7168,13 +7189,12 @@ mod tests {
             reader.random_sequences()?.source(),
             Some(&drops.random_sequences().draft()?)
         );
-        assert_eq!(
-            reader
-                .read_entity_chunk(0, 0)?
-                .context("entity chunk missing")?
-                .entities(),
-            drops.records(center)
-        );
+        let entities = reader
+            .read_entity_chunk(0, 0)?
+            .context("entity chunk missing")?;
+        assert_eq!(entities.entities().len(), 2);
+        assert_eq!(&entities.entities()[0], &cow);
+        assert_eq!(&entities.entities()[1..], drops.records(center));
         assert!(reader.read_chunk(0, 0)?.is_some());
         Ok(())
     }

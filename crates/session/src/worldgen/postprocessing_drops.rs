@@ -76,6 +76,53 @@ pub struct InertGeneratedDestroyEvents {
     events: Arc<Vec<GeneratedBlockDestroyEvent>>,
 }
 
+/// These vanilla entity classes inherit Entity's no-op dynamic listener
+/// registration in 26.3. Unknown IDs and passenger trees remain unverified.
+pub(super) fn entities_without_listeners(records: &[Tag]) -> bool {
+    records.iter().all(|record| {
+        let Tag::Compound(fields) = record else {
+            return false;
+        };
+        let mut ids = fields.iter().filter(|(name, _)| name.matches("id"));
+        let Some((_, Tag::String(id))) = ids.next() else {
+            return false;
+        };
+        if ids.next().is_some()
+            || ![
+                "minecraft:chicken",
+                "minecraft:cow",
+                "minecraft:pig",
+                "minecraft:sheep",
+                "minecraft:item",
+            ]
+            .iter()
+            .any(|name| id.matches(name))
+        {
+            return false;
+        }
+        let mut passengers = fields.iter().filter(|(name, _)| name.matches("Passengers"));
+        match passengers.next() {
+            None => true,
+            Some((
+                _,
+                Tag::List {
+                    element_type,
+                    values,
+                },
+            )) => {
+                passengers.next().is_none()
+                    && values.is_empty()
+                    && matches!(
+                        element_type,
+                        native_persistence::nbt::TagType::End
+                            | native_persistence::nbt::TagType::Compound
+                    )
+            }
+            _ => false,
+        }
+    })
+}
+
 /// A forkable checkpoint of one level's loot, item and level random streams.
 /// The caller supplies the same initial random streams and rules used by the
 /// level; no random state is inferred from the terrain seed.
@@ -257,7 +304,7 @@ impl GeneratedBlockDrops {
 
     pub(crate) fn certify_inert_events(
         &self,
-        mut complete_empty_source: impl FnMut(ChunkPos) -> Result<bool>,
+        mut complete_inert_source: impl FnMut(ChunkPos) -> Result<bool>,
     ) -> Result<InertGeneratedDestroyEvents> {
         ensure!(
             !self.destroy_events.is_empty(),
@@ -291,13 +338,13 @@ impl GeneratedBlockDrops {
                             .entities
                             .get(&chunk)
                             .and_then(Option::as_ref)
-                            .is_some_and(|records| records.is_empty()),
+                            .is_some_and(|records| entities_without_listeners(records)),
                         "event entity listeners are not known to be absent"
                     );
                     if checked.insert(chunk) {
                         ensure!(
-                            complete_empty_source(chunk)?,
-                            "event entity coverage is incomplete or nonempty"
+                            complete_inert_source(chunk)?,
+                            "event entity coverage is incomplete or may contain listeners"
                         );
                     }
                 }
@@ -488,6 +535,132 @@ mod tests {
     }
 
     #[test]
+    fn listener_free_entities_require_known_ids_and_no_passengers() {
+        use native_persistence::nbt::TagType;
+        let entity = |id: &str| Tag::Compound(vec![("id".into(), Tag::String(id.into()))]);
+        for id in [
+            "minecraft:chicken",
+            "minecraft:cow",
+            "minecraft:pig",
+            "minecraft:sheep",
+            "minecraft:item",
+        ] {
+            assert!(entities_without_listeners(&[entity(id)]), "{id}");
+        }
+        assert!(entities_without_listeners(&[]));
+        assert!(!entities_without_listeners(&[entity("minecraft:warden")]));
+        assert!(!entities_without_listeners(&[entity("example:cow")]));
+        assert!(!entities_without_listeners(&[Tag::Compound(vec![])]));
+        assert!(!entities_without_listeners(&[Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:cow".into())),
+            ("id".into(), Tag::String("minecraft:warden".into())),
+        ])]));
+        for (kind, values, expected) in [
+            (TagType::End, vec![], true),
+            (TagType::Compound, vec![], true),
+            (TagType::Compound, vec![entity("minecraft:warden")], false),
+            (TagType::Int, vec![], false),
+        ] {
+            let record = Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:cow".into())),
+                (
+                    "Passengers".into(),
+                    Tag::List {
+                        element_type: kind,
+                        values,
+                    },
+                ),
+            ]);
+            assert_eq!(entities_without_listeners(&[record]), expected);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn listener_free_entity_classes_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("GeneratedEntityListenerOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/GeneratedEntityListenerOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let checked = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedEntityListenerOracle")
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java listener check failed: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let disassembled = Command::new(java.join("javap.exe"))
+            .arg("-c")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("net.minecraft.world.entity.Entity")
+            .output()?;
+        ensure!(
+            disassembled.status.success(),
+            "javap failed: {}",
+            String::from_utf8_lossy(&disassembled.stderr)
+        );
+        let text = String::from_utf8(disassembled.stdout)?;
+        let method = text
+            .split("public void updateDynamicGameEventListener(")
+            .nth(1)
+            .context("base listener method missing")?;
+        let code = method
+            .lines()
+            .take_while(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        ensure!(
+            code.lines()
+                .filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                == ["0: return"],
+            "base entity listener registration is not a no-op: {code}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn inert_destroy_proof_requires_complete_empty_radius_and_tracks_sequence() {
         use native_world::loaded::Chunk;
         let chunks: Vec<_> = (-1..=1)
@@ -530,6 +703,25 @@ mod tests {
         let event = &mut Arc::make_mut(&mut unknown.destroy_events)[0];
         Arc::make_mut(&mut event.entities).insert(chunks[0], None);
         assert!(unknown.certify_inert_events(|_| Ok(true)).is_err());
+        let mut passive = drops.clone();
+        let event = &mut Arc::make_mut(&mut passive.destroy_events)[0];
+        Arc::make_mut(&mut event.entities).insert(
+            chunks[0],
+            Some(Arc::new(vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:cow".into()),
+            )])])),
+        );
+        assert!(passive.certify_inert_events(|_| Ok(true)).is_ok());
+        let event = &mut Arc::make_mut(&mut passive.destroy_events)[0];
+        Arc::make_mut(&mut event.entities).insert(
+            chunks[0],
+            Some(Arc::new(vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:warden".into()),
+            )])])),
+        );
+        assert!(passive.certify_inert_events(|_| Ok(true)).is_err());
         let mut listener = drops.clone();
         let event = &mut Arc::make_mut(&mut listener.destroy_events)[0];
         Arc::make_mut(&mut event.block_entities)

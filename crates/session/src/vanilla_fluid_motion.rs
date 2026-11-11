@@ -41,20 +41,22 @@ public class FluidMotionOracle {
         @Override public void playSound(Entity source, BlockPos pos, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource category, float volume, float pitch) { }
     }
     static class TestPlayer extends Player {
-        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress,slowFalling,noGravity,dolphins; float yaw; double look,depth,wall,ceiling,bounce,gravity,waterEfficiency; int delay; AttributeInstance speed; MobEffectInstance jumpBoost,levitation;
+        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress,slowFalling,noGravity,dolphins,climbing,air,sneak; float yaw; double look,depth,wall,ceiling,bounce,gravity,waterEfficiency; int delay; AttributeInstance speed; MobEffectInstance jumpBoost,levitation;
         TestPlayer(){super(null,null);}
         void setup(TestLevel level,Vec3 pos,Vec3 velocity,boolean grounded,double wallX) throws Exception {setLevel(level);p=pos;v=velocity;ground=grounded;wall=wallX;delay=0;positionField.set(this,p);}
         @Override public GameType gameMode(){return GameType.SURVIVAL;}
         @Override public boolean onGround(){return ground;}
         @Override public boolean isInWater(){return water;}
-        @Override public boolean isInLava(){return !water;}
+        @Override public boolean isInLava(){return !water && !air;}
         @Override public boolean isSwimming(){return swim;}
+        @Override public boolean isFallFlying(){return false;}
         @Override public boolean isPassenger(){return false;}
         @Override public boolean isVehicle(){return false;}
         @Override public boolean isSprinting(){return sprint;}
         @Override public boolean isAffectedByFluids(){return true;}
-        @Override protected boolean shouldTravelInFluid(FluidState state){return true;}
-        @Override public boolean onClimbable(){return false;}
+        @Override protected boolean shouldTravelInFluid(FluidState state){return !air;}
+        @Override public boolean onClimbable(){return climbing;}
+        @Override public boolean isSuppressingSlidingDownLadder(){return sneak;}
         @Override public boolean hasEffect(Holder<MobEffect> effect){return (effect==MobEffects.JUMP_BOOST && jumpBoost!=null)||(effect==MobEffects.SLOW_FALLING && slowFalling)||(effect==MobEffects.LEVITATION && levitation!=null)||(effect==MobEffects.DOLPHINS_GRACE && dolphins);}
         @Override public double getFluidHeight(TagKey<Fluid> tag){return depth;}
         @Override public boolean isFree(double x,double y,double z){return free;}
@@ -105,12 +107,12 @@ public class FluidMotionOracle {
         Field jumping=LivingEntity.class.getDeclaredField("jumping");jumping.setAccessible(true);
         JsonArray scenarios=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray(), results=new JsonArray();
         for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());int boost=s.has("boost")?s.get("boost").getAsInt():-1;entity.jumpBoost=boost<0?null:new MobEffectInstance(MobEffects.JUMP_BOOST,1000,boost);int levitation=s.has("levitation")?s.get("levitation").getAsInt():-1;entity.levitation=levitation<0?null:new MobEffectInstance(MobEffects.LEVITATION,1000,levitation);entity.slowFalling=s.has("slow_falling")&&s.get("slow_falling").getAsBoolean();entity.gravity=s.has("gravity")?s.get("gravity").getAsDouble():0.08;entity.noGravity=s.has("no_gravity")&&s.get("no_gravity").getAsBoolean();entity.waterEfficiency=s.has("water_efficiency")?s.get("water_efficiency").getAsDouble():0.0;entity.dolphins=s.has("dolphins")&&s.get("dolphins").getAsBoolean();entity.speed.setBaseValue(s.has("movement_speed")?s.get("movement_speed").getAsDouble():(double)0.1f);entity.bounce=s.has("bounce")?s.get("bounce").getAsDouble():0;entity.suppress=s.has("suppress")&&s.get("suppress").getAsBoolean();entity.ceiling=s.has("ceiling")?s.get("ceiling").getAsDouble():10000;int block=s.has("block")?s.get("block").getAsInt():0;level.floor=(block==1?Blocks.SLIME_BLOCK:block==2?net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")):block==3?Blocks.SHELF_MUSHROOM:Blocks.STONE).defaultBlockState();JsonArray ticks=new JsonArray();
-          for(var raw:s.getAsJsonArray("inputs")){var i=raw.getAsJsonObject();entity.water=i.get("water").getAsBoolean();entity.swim=i.get("swim").getAsBoolean();entity.sprint=i.get("sprint").getAsBoolean();entity.look=i.get("look").getAsDouble();entity.depth=i.get("depth").getAsDouble();entity.free=i.get("free").getAsBoolean();entity.yaw=i.get("yaw").getAsFloat();level.above=i.get("above").getAsBoolean();
+          for(var raw:s.getAsJsonArray("inputs")){var i=raw.getAsJsonObject();entity.water=i.get("water").getAsBoolean();entity.swim=i.get("swim").getAsBoolean();entity.sprint=i.get("sprint").getAsBoolean();entity.look=i.get("look").getAsDouble();entity.depth=i.get("depth").getAsDouble();entity.free=i.get("free").getAsBoolean();entity.yaw=i.get("yaw").getAsFloat();entity.climbing=i.has("climb")&&i.get("climb").getAsBoolean();entity.air=i.has("air")&&i.get("air").getAsBoolean();entity.sneak=i.has("sneak")&&i.get("sneak").getAsBoolean();level.above=i.get("above").getAsBoolean();
             entity.speed.removeModifier(modifier.id());if(entity.sprint)entity.speed.addTransientModifier(modifier);entity.setSpeed((float)entity.speed.getValue());
             if(entity.water&&i.get("descend").getAsBoolean())entity.down();
             if(entity.delay>0)entity.delay--; double x=entity.v.x,y=entity.v.y,z=entity.v.z;if(x*x+z*z<9.0e-6){x=0;z=0;}if(Math.abs(y)<0.003)y=0;entity.v=new Vec3(x,y,z);
             boolean jump=i.get("jump").getAsBoolean();jumping.setBoolean(entity,jump);
-            if(jump){if(entity.depth>0.0&&(!entity.ground||entity.depth>0.4))entity.up();else if(entity.ground&&entity.delay==0){entity.jumpFromGround();entity.delay=10;}}else entity.delay=0;
+            if(jump){if(!entity.air&&entity.depth>0.0&&(!entity.ground||entity.depth>0.4))entity.up();else if(entity.ground&&entity.delay==0){entity.jumpFromGround();entity.delay=10;}}else entity.delay=0;
             Vec2 key=new Vec2(-i.get("right").getAsFloat(),i.get("forward").getAsFloat()).normalized().scale(0.98f);if(i.get("slow").getAsBoolean())key=key.scale(0.3f);
             Vec2 modified=(Vec2)square.invoke(null,key);entity.travel(new Vec3(modified.x,0,modified.y));
             JsonObject out=new JsonObject();out.add("position",vec(entity.p));out.add("velocity",vec(entity.v));out.addProperty("ground",entity.ground);out.addProperty("delay",entity.delay);ticks.add(out);
@@ -212,6 +214,28 @@ fn water_and_lava_motion_match_vanilla_player() {
             }
         }
     }
+    for climbing in [false, true] {
+        for sneak in [false, true] {
+            for jump in [false, true] {
+                for wall in [0.31, 2.75] {
+                    for y in [-0.4, -0.02, 0.0, 0.25] {
+                        let input = json!({"forward":0.0,"right":1.0,"yaw":0.0,"jump":jump,"sprint":false,"slow":sneak,"water":false,"swim":false,"descend":false,"look":0.0,"depth":0.0,"free":false,"above":false,"climb":climbing,"air":true,"sneak":sneak});
+                        scenarios.push(json!({"position":[0.0,1.0,0.0],"velocity":[0.2,y,0.0],"ground":false,"wall":wall,"inputs":[input]}));
+                    }
+                }
+            }
+        }
+    }
+    for water in [false, true] {
+        for climbing in [false, true] {
+            for free in [false, true] {
+                for jump in [false, true] {
+                    let input = json!({"forward":0.0,"right":1.0,"yaw":0.0,"jump":jump,"sprint":false,"slow":false,"water":water,"swim":false,"descend":false,"look":0.0,"depth":1.0,"free":free,"above":true,"climb":climbing});
+                    scenarios.push(json!({"position":[0.0,1.0,0.0],"velocity":[0.15,-0.1,0.0],"ground":false,"wall":0.31,"inputs":[input]}));
+                }
+            }
+        }
+    }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("FluidMotionOracle.java");
     let input = temp.path().join("input.json");
@@ -233,8 +257,14 @@ fn water_and_lava_motion_match_vanilla_player() {
         .arg(&input)
         .arg(&output));
     let expected: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(expected.len(), scenarios.len());
     let mut errors = Vec::new();
     for (s, (scenario, results)) in scenarios.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            scenario["inputs"].as_array().unwrap().len(),
+            results.as_array().unwrap().len(),
+            "scenario {s}"
+        );
         let mut state = MotionState {
             position: vec3(&scenario["position"]),
             velocity: vec3(&scenario["velocity"]),
@@ -295,74 +325,104 @@ fn water_and_lava_motion_match_vanilla_player() {
             } else {
                 scenario["gravity"].as_f64().unwrap_or(0.08)
             };
-            state.tick_fluid_with_restitution(
-                command,
-                fluid,
-                crate::physics::WaterMovement {
-                    efficiency: scenario["water_efficiency"].as_f64().unwrap_or(0.0) as f32,
-                    movement_speed: (scenario["movement_speed"]
-                        .as_f64()
-                        .unwrap_or(f64::from(0.1_f32))
-                        * if command.sprinting {
-                            1.0 + f64::from(0.3_f32)
+            let movement_speed = (scenario["movement_speed"]
+                .as_f64()
+                .unwrap_or(f64::from(0.1_f32))
+                * if command.sprinting {
+                    1.0 + f64::from(0.3_f32)
+                } else {
+                    1.0
+                }) as f32;
+            let jump_power = crate::physics::jump_power(
+                0.42,
+                1.0,
+                scenario["boost"]
+                    .as_i64()
+                    .and_then(|v| u8::try_from(v).ok()),
+            );
+            let resolve = |position: DVec3, requested: DVec3, _| {
+                let mut actual = requested;
+                if actual.y < 0.0 && position.y + actual.y < 0.0 {
+                    actual.y = -position.y;
+                }
+                let ceiling = scenario["ceiling"].as_f64().unwrap_or(10000.0);
+                if actual.y > 0.0 && position.y + actual.y > ceiling {
+                    actual.y = (ceiling - position.y).max(0.0);
+                }
+                let wall = scenario["wall"].as_f64().unwrap();
+                if actual.x > 0.0 && position.x + f64::from(0.3_f32) + actual.x > wall {
+                    actual.x = (wall - position.x - f64::from(0.3_f32)).max(0.0);
+                }
+                (requested, actual)
+            };
+            let restitution = |_, requested: DVec3, actual: DVec3| {
+                let y = if requested.y < 0.0 {
+                    crate::items::vertical_restitution(
+                        requested.y,
+                        actual.y,
+                        block_bounce,
+                        if slow_falling && requested.y <= 0.0 {
+                            gravity.min(0.01)
                         } else {
-                            1.0
-                        }) as f32,
-                    dolphins_grace: scenario["dolphins"].as_bool().unwrap_or(false),
-                },
-                crate::physics::jump_power(
-                    0.42,
-                    1.0,
-                    scenario["boost"]
+                            gravity
+                        },
+                    )
+                } else {
+                    crate::items::collision_restitution(
+                        requested.y,
+                        actual.y,
+                        entity_bounce,
+                        if slow_falling && requested.y <= 0.0 {
+                            gravity.min(0.01)
+                        } else {
+                            gravity
+                        },
+                    )
+                };
+                (entity_bounce, y)
+            };
+            let climbable = |_| {
+                input["climb"]
+                    .as_bool()
+                    .filter(|value| *value)
+                    .map(|_| false)
+            };
+            if input["air"].as_bool().unwrap_or(false) {
+                state.tick_resolved_with_restitution(
+                    command,
+                    0.6,
+                    movement_speed,
+                    jump_power,
+                    gravity,
+                    slow_falling,
+                    scenario["levitation"]
                         .as_i64()
                         .and_then(|v| u8::try_from(v).ok()),
-                ),
-                gravity,
-                slow_falling,
-                |position, requested, _| {
-                    let mut actual = requested;
-                    if actual.y < 0.0 && position.y + actual.y < 0.0 {
-                        actual.y = -position.y;
-                    }
-                    let ceiling = scenario["ceiling"].as_f64().unwrap_or(10000.0);
-                    if actual.y > 0.0 && position.y + actual.y > ceiling {
-                        actual.y = (ceiling - position.y).max(0.0);
-                    }
-                    let wall = scenario["wall"].as_f64().unwrap();
-                    if actual.x > 0.0 && position.x + f64::from(0.3_f32) + actual.x > wall {
-                        actual.x = (wall - position.x - f64::from(0.3_f32)).max(0.0);
-                    }
-                    (requested, actual)
-                },
-                |_, _| b("free"),
-                |_, requested, actual| {
-                    let y = if requested.y < 0.0 {
-                        crate::items::vertical_restitution(
-                            requested.y,
-                            actual.y,
-                            block_bounce,
-                            if slow_falling && requested.y <= 0.0 {
-                                gravity.min(0.01)
-                            } else {
-                                gravity
-                            },
-                        )
-                    } else {
-                        crate::items::collision_restitution(
-                            requested.y,
-                            actual.y,
-                            entity_bounce,
-                            if slow_falling && requested.y <= 0.0 {
-                                gravity.min(0.01)
-                            } else {
-                                gravity
-                            },
-                        )
-                    };
-                    (entity_bounce, y)
-                },
-                |_, _, _| 1.0,
-            );
+                    resolve,
+                    restitution,
+                    |_, _, _| 1.0,
+                    input["sneak"].as_bool().unwrap_or(false),
+                    climbable,
+                );
+            } else {
+                state.tick_fluid_with_restitution(
+                    command,
+                    fluid,
+                    crate::physics::WaterMovement {
+                        efficiency: scenario["water_efficiency"].as_f64().unwrap_or(0.0) as f32,
+                        movement_speed,
+                        dolphins_grace: scenario["dolphins"].as_bool().unwrap_or(false),
+                    },
+                    jump_power,
+                    gravity,
+                    slow_falling,
+                    resolve,
+                    |_, _| b("free"),
+                    restitution,
+                    |_, _, _| 1.0,
+                    climbable,
+                );
+            }
             if ((state.position - vec3(&result["position"]))
                 .abs()
                 .max_element()
@@ -383,11 +443,14 @@ fn water_and_lava_motion_match_vanilla_player() {
     }
     assert!(
         errors.is_empty(),
-        "fluid motion mismatch:\n{}",
+        "player movement mismatch:\n{}",
         errors.join("\n")
     );
     println!(
-        "Compared {} fluid movement ticks with Minecraft 26.3",
-        64 * 80 + 2 * 3 * 4 * 2 * 3 * 3
+        "Compared {} player movement ticks with Minecraft 26.3",
+        scenarios
+            .iter()
+            .map(|scenario| scenario["inputs"].as_array().unwrap().len())
+            .sum::<usize>()
     );
 }

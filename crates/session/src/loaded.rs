@@ -21219,6 +21219,28 @@ impl LoadedSession {
         }
         let flying = self.flight.flying;
         let player_height = self.player.height();
+        let world = &self.world;
+        let origin = self.origin;
+        let bounds = self.bounds;
+        let air = self.states[0];
+        let climbable_tag = self.movement_climbable.as_deref();
+        let climbable = |position: DVec3| {
+            climbable_at(
+                world,
+                origin,
+                bounds,
+                air,
+                climbable_tag,
+                position.floor().as_ivec3(),
+            )
+        };
+        if !flying
+            && !in_water
+            && contacts.lava.depth <= 0.0
+            && climbable(self.motion.position).is_some()
+        {
+            self.fall_distance = 0.0;
+        }
         let fall_distance = self.fall_distance;
         let sneak = self.sneak;
         let requested_movement = std::cell::Cell::new(DVec3::ZERO);
@@ -21264,10 +21286,6 @@ impl LoadedSession {
         }
         let before_move = self.motion.position;
         let collision_support = std::cell::Cell::new(None);
-        let world = &self.world;
-        let origin = self.origin;
-        let bounds = self.bounds;
-        let air = self.states[0];
         let no_previous_support = self.ground_without_support;
         let suppressed = &self.bounce_suppression_tag;
         let entity_bounce = if sneak {
@@ -21534,6 +21552,7 @@ impl LoadedSession {
                 },
                 restitution,
                 block_speed,
+                climbable,
             )
         } else {
             self.motion.tick_resolved_with_restitution(
@@ -21547,6 +21566,8 @@ impl LoadedSession {
                 resolve,
                 restitution,
                 block_speed,
+                sneak,
+                climbable,
             )
         };
         self.player_known_movement = self
@@ -23809,6 +23830,40 @@ fn redstone_lamp_lit(state: &BlockState) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+/// Return whether a climbable block is scaffolding, at the player's feet.
+fn climbable_at(
+    world: &World,
+    origin: IVec3,
+    bounds: BuildBounds,
+    air: BlockStateId,
+    tag: Option<&BTreeSet<String>>,
+    pos: IVec3,
+) -> Option<bool> {
+    let Cell::State(id) = cell(world, origin, bounds, pos, air) else {
+        return None;
+    };
+    let state = world.state(id)?;
+    if tag?.contains(&state.name) {
+        return Some(state.name == "minecraft:scaffolding");
+    }
+    if native_world::collision::trapdoor_state(state).is_some_and(|(open, _)| open) {
+        let below = IVec3::new(pos.x, pos.y.checked_sub(1)?, pos.z);
+        let Cell::State(id) = cell(world, origin, bounds, below, air) else {
+            return None;
+        };
+        let below = world.state(id)?;
+        if let Some((facing, _)) = native_world::collision::ladder_state(below)
+            && state
+                .properties
+                .get("facing")
+                .is_some_and(|value| value == facing)
+        {
+            return Some(false);
+        }
+    }
+    None
 }
 
 fn cell(
@@ -26219,6 +26274,87 @@ pub(crate) mod tests {
             pose: PlayerPose::Standing,
         };
         (world, origin, player)
+    }
+
+    #[test]
+    fn climbable_tag_and_open_trapdoor_above_ladder_control_detection() {
+        let (mut world, origin, _) = fixture();
+        let bounds = BuildBounds {
+            min_y: 0,
+            max_y: 32,
+        };
+        let air = world.intern_state(state("minecraft:air", &[]));
+        let at = IVec3::new(8, 3, 8);
+        let tag = BTreeSet::from(["minecraft:ladder".to_owned()]);
+        let ladder = world.intern_state(state(
+            "minecraft:ladder",
+            &[("facing", "north"), ("waterlogged", "false")],
+        ));
+        let below = origin + at - IVec3::Y;
+        world
+            .set_block_id(below.x, below.y, below.z, ladder)
+            .unwrap();
+        assert_eq!(
+            climbable_at(&world, origin, bounds, air, Some(&tag), at - IVec3::Y),
+            Some(false)
+        );
+        assert_eq!(
+            climbable_at(
+                &world,
+                origin,
+                bounds,
+                air,
+                Some(&BTreeSet::new()),
+                at - IVec3::Y
+            ),
+            None
+        );
+        for (facing, open, expected) in [
+            ("north", "true", Some(false)),
+            ("east", "true", None),
+            ("north", "false", None),
+        ] {
+            let trapdoor = world.intern_state(state(
+                "minecraft:oak_trapdoor",
+                &[
+                    ("facing", facing),
+                    ("half", "bottom"),
+                    ("open", open),
+                    ("powered", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            let absolute = origin + at;
+            world
+                .set_block_id(absolute.x, absolute.y, absolute.z, trapdoor)
+                .unwrap();
+            assert_eq!(
+                climbable_at(&world, origin, bounds, air, Some(&tag), at),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_climbs_tagged_ladder_and_resets_fall_distance() {
+        let mut session = session();
+        let ladder = session.intern_block(state(
+            "minecraft:ladder",
+            &[("facing", "north"), ("waterlogged", "false")],
+        ));
+        assert!(session.set(IVec3::new(8, 2, 8), ladder));
+        session
+            .set_movement_climbable_tag(Arc::new(BTreeSet::from(["minecraft:ladder".to_owned()])));
+        session.motion.position = DVec3::new(8.5, 2.4, 8.5);
+        session.player.position = session.motion.position.as_vec3();
+        session.motion.velocity = DVec3::new(0.0, -0.4, 0.0);
+        session.motion.on_ground = false;
+        session.fall_distance = 10.0;
+        session.movement.2 = true;
+        session.update(TICK);
+        assert!((session.motion.position.y - (2.4 - f64::from(0.15_f32))).abs() < 1e-7);
+        assert!((session.motion.velocity.y - (0.2 - 0.08) * f64::from(0.98_f32)).abs() < 1e-7);
+        assert!(session.fall_distance > 0.0 && session.fall_distance < 0.16);
     }
 
     fn session() -> LoadedSession {

@@ -69,6 +69,20 @@ fn effective_gravity(gravity: f64, slow_falling: bool, vertical_velocity: f64) -
     }
 }
 
+/// LivingEntity.handleOnClimbable limits motion after horizontal input is applied.
+fn climbable_velocity(velocity: DVec3, suppress_sliding: bool, scaffolding: bool) -> DVec3 {
+    let limit = f64::from(0.15_f32);
+    let mut y = velocity.y.max(-limit);
+    if y < 0.0 && suppress_sliding && !scaffolding {
+        y = 0.0;
+    }
+    DVec3::new(
+        velocity.x.clamp(-limit, limit),
+        y,
+        velocity.z.clamp(-limit, limit),
+    )
+}
+
 /// Vanilla block jump factors are independent of block state.
 pub fn block_jump_factor(block: &str) -> f32 {
     if block == "minecraft:honey_block" {
@@ -381,6 +395,8 @@ impl MotionState {
             collide,
             |_, _, _| (0.0, 0.0),
             |_, _, _| 1.0,
+            false,
+            |_| None,
         )
     }
 
@@ -396,6 +412,8 @@ impl MotionState {
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
         block_speed: impl FnOnce(DVec3, DVec3, bool) -> f32,
+        suppress_sliding: bool,
+        climbable: impl Fn(DVec3) -> Option<bool>,
     ) -> (bool, DVec3) {
         let radians = input.yaw_degrees * 0.017453292_f32;
         let sine = f64::from(java_sin(f64::from(radians), false));
@@ -444,6 +462,10 @@ impl MotionState {
         self.velocity.x += x * cosine - z * sine;
         self.velocity.z += z * cosine + x * sine;
 
+        if let Some(scaffolding) = climbable(self.position) {
+            self.velocity = climbable_velocity(self.velocity, suppress_sliding, scaffolding);
+        }
+
         let (requested, actual) = collide(self.position, self.velocity, self.on_ground);
         self.position += actual;
         let horizontal_epsilon = f64::from(1.0e-5_f32);
@@ -469,6 +491,9 @@ impl MotionState {
         let block_speed = f64::from(block_speed(self.position, actual, self.on_ground));
         self.velocity.x *= block_speed;
         self.velocity.z *= block_speed;
+        if (blocked_x || blocked_z || input.jump) && climbable(self.position).is_some() {
+            self.velocity.y = 0.2;
+        }
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         let vertical_drag = modified_friction(0.98, 1.0);
         self.velocity.x *= f64::from(horizontal_drag);
@@ -506,6 +531,7 @@ impl MotionState {
             can_jump_out,
             |_, _, _| (0.0, 0.0),
             |_, _, _| 1.0,
+            |_| None,
         )
     }
 
@@ -521,6 +547,7 @@ impl MotionState {
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
         block_speed: impl FnOnce(DVec3, DVec3, bool) -> f32,
+        climbable: impl Fn(DVec3) -> Option<bool>,
     ) -> (bool, DVec3) {
         if fluid.kind == FluidKind::Water && fluid.descend {
             self.velocity.y -= f64::from(0.04_f32);
@@ -606,6 +633,12 @@ impl MotionState {
         let block_speed = f64::from(block_speed(self.position, actual, self.on_ground));
         self.velocity.x *= block_speed;
         self.velocity.z *= block_speed;
+        if fluid.kind == FluidKind::Water
+            && (blocked_x || blocked_z)
+            && climbable(self.position).is_some()
+        {
+            self.velocity.y = 0.2;
+        }
         match fluid.kind {
             FluidKind::Water => {
                 self.velocity *= DVec3::new(
@@ -930,6 +963,109 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn climbable_velocity_limits_slide_and_keeps_scaffolding_descent() {
+        let velocity = DVec3::new(1.0, -1.0, -1.0);
+        let limit = f64::from(0.15_f32);
+        assert_eq!(
+            climbable_velocity(velocity, false, false),
+            DVec3::new(limit, -limit, -limit)
+        );
+        assert_eq!(
+            climbable_velocity(velocity, true, false),
+            DVec3::new(limit, 0.0, -limit)
+        );
+        assert_eq!(
+            climbable_velocity(velocity, true, true),
+            DVec3::new(limit, -limit, -limit)
+        );
+        assert_eq!(climbable_velocity(DVec3::Y, true, false).y, 1.0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn climbable_velocity_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ClimbableVelocityOracle.java");
+        let output = temp.path().join("climbing.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ClimbableVelocityOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ClimbableVelocityOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 648);
+        for row in rows {
+            let velocity = DVec3::new(
+                row["x"].as_f64().unwrap(),
+                row["y"].as_f64().unwrap(),
+                row["z"].as_f64().unwrap(),
+            );
+            let climbing = row["climbing"].as_bool().unwrap();
+            let actual = if climbing {
+                climbable_velocity(
+                    velocity,
+                    row["suppress"].as_bool().unwrap(),
+                    row["scaffolding"].as_bool().unwrap(),
+                )
+            } else {
+                velocity
+            };
+            for (value, field) in [(actual.x, "outX"), (actual.y, "outY"), (actual.z, "outZ")] {
+                assert_eq!(
+                    value.to_bits(),
+                    row[field].as_str().unwrap().parse::<u64>().unwrap(),
+                    "{row}"
+                );
+            }
+            assert_eq!(
+                row["fall"].as_f64().unwrap(),
+                if climbing { 0.0 } else { 23.5 },
+                "{row}"
+            );
         }
     }
 

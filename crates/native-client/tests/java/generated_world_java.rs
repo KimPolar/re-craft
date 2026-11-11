@@ -524,6 +524,8 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     }
     let player = reader.read_player()?.context("player data missing")?;
     let clocks = reader.world_clocks()?;
+    let game_rules = reader.fluid_game_rules()?;
+    assert_eq!(game_rules, native_persistence::world::FluidGameRules::default());
     drop(reader);
     let version = game.join("versions/26.3");
     let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
@@ -631,6 +633,7 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         native_persistence::world::WorldReader::open(transaction_world.path(), dimension.clone())?;
     assert_eq!(reader.read_player()?.as_ref(), Some(&player));
     assert_eq!(reader.world_clocks()?, clocks);
+    assert_eq!(reader.fluid_game_rules()?, game_rules);
     assert_eq!(reader.saved_world_seed()?, Some(seed));
     assert_eq!(
         saved_region_positions(&sidecars.join("entities"))?,

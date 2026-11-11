@@ -24,6 +24,8 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.chunk.storage.*;
 import net.minecraft.world.level.levelgen.WorldGenSettings;
+import net.minecraft.world.level.gamerules.GameRuleMap;
+import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.storage.PrimaryLevelData;
 import net.minecraft.world.entity.ai.village.poi.PoiSection;
 import net.minecraft.world.phys.Vec3;
@@ -187,6 +189,24 @@ public class GeneratedWorldJavaOracle {
         var decodedAgain = WorldGenSettings.CODEC.parse(ops, encoded).getOrThrow();
         if (!WorldGenSettings.CODEC.encodeStart(ops, decodedAgain).getOrThrow().equals(encoded))
             throw new AssertionError("world generation settings did not survive Java codec");
+
+        var rulesPath = world.resolve("data/minecraft/game_rules.dat");
+        var rulesFile = NbtIo.readCompressed(rulesPath, NbtAccounter.unlimitedHeap());
+        var originalRules = rulesFile.get("data");
+        var rules = GameRuleMap.CODEC.parse(NbtOps.INSTANCE, originalRules).getOrThrow();
+        if (rules.size() != 14 || !rules.get(GameRules.SPAWN_MOBS) ||
+            !rules.get(GameRules.ADVANCE_TIME) || !rules.get(GameRules.ADVANCE_WEATHER) ||
+            !rules.get(GameRules.WATER_SOURCE_CONVERSION) || rules.get(GameRules.LAVA_SOURCE_CONVERSION) ||
+            !rules.get(GameRules.BLOCK_DROPS) || !rules.get(GameRules.ENTITY_DROPS) ||
+            !rules.get(GameRules.NATURAL_HEALTH_REGENERATION) || !rules.get(GameRules.FALL_DAMAGE) ||
+            rules.get(GameRules.KEEP_INVENTORY) || rules.get(GameRules.IMMEDIATE_RESPAWN) ||
+            !rules.get(GameRules.SHOW_DEATH_MESSAGES) || rules.get(GameRules.RANDOM_TICK_SPEED) != 3 ||
+            rules.get(GameRules.RESPAWN_RADIUS) != 10)
+            throw new AssertionError("world game rules differ: " + rules);
+        var rewrittenRules = GameRuleMap.CODEC.encodeStart(NbtOps.INSTANCE, rules).getOrThrow();
+        if (!Objects.equals(originalRules, rewrittenRules)) throw new AssertionError("world game rules changed");
+        rulesFile.put("data", rewrittenRules);
+        NbtIo.writeCompressed(rulesFile, rulesPath);
 
         Path playerPath;
         try (var files = Files.list(world.resolve("players/data"))) {

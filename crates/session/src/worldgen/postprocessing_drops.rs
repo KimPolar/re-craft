@@ -76,6 +76,34 @@ pub struct InertGeneratedDestroyEvents {
     events: Arc<Vec<GeneratedBlockDestroyEvent>>,
 }
 
+/// Only accept materialized block entities whose matching vanilla block and
+/// block entity types have been checked for listener registration.
+fn block_entities_without_listeners(world: &World, chunk: ChunkPos, records: &[Tag]) -> bool {
+    records.iter().all(|record| {
+        let Tag::Compound(fields) = record else {
+            return false;
+        };
+        let unique = |name: &str| {
+            let mut values = fields.iter().filter(|(key, _)| key.matches(name));
+            let value = values.next().map(|(_, value)| value);
+            if values.next().is_none() { value } else { None }
+        };
+        let (Some(Tag::String(id)), Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))) =
+            (unique("id"), unique("x"), unique("y"), unique("z"))
+        else {
+            return false;
+        };
+        if x.div_euclid(16) != chunk.x || z.div_euclid(16) != chunk.z {
+            return false;
+        }
+        let Some(state) = world.block(*x, *y, *z) else {
+            return false;
+        };
+        (id.matches("minecraft:chest") && state.name == "minecraft:chest")
+            || (id.matches("minecraft:mob_spawner") && state.name == "minecraft:spawner")
+    })
+}
+
 /// These vanilla entity classes inherit Entity's no-op dynamic listener
 /// registration in 26.3. Unknown IDs and passenger trees remain unverified.
 pub(super) fn entities_without_listeners(records: &[Tag]) -> bool {
@@ -330,7 +358,9 @@ impl GeneratedBlockDrops {
                         "event listener chunk is unavailable"
                     );
                     ensure!(
-                        event.block_entities.get(&chunk).is_some_and(Vec::is_empty),
+                        event.block_entities.get(&chunk).is_some_and(|records| {
+                            block_entities_without_listeners(&event.world, chunk, records)
+                        }),
                         "event block listeners are not known to be absent"
                     );
                     ensure!(
@@ -575,6 +605,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn listener_free_block_entities_require_matching_blocks_and_unique_positions() {
+        use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
+        let chunk = ChunkPos { x: -1, z: 0 };
+        let mut world = World::new("minecraft:overworld");
+        let state = |name: &str| BlockState {
+            name: name.into(),
+            properties: BTreeMap::new(),
+        };
+        let chest = world.intern_state(state("minecraft:chest"));
+        let spawner = world.intern_state(state("minecraft:spawner"));
+        let mut blocks = Box::new([chest; BLOCK_COUNT]);
+        blocks[1] = spawner;
+        world.chunks.insert(
+            chunk,
+            Arc::new(Chunk {
+                position: chunk,
+                status: Some("minecraft:full".into()),
+                block_light_correct: true,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let record = |id: &str, x: i32| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("x".into(), Tag::Int(x)),
+                ("y".into(), Tag::Int(0)),
+                ("z".into(), Tag::Int(0)),
+            ])
+        };
+        assert!(block_entities_without_listeners(
+            &world,
+            chunk,
+            &[
+                record("minecraft:chest", -16),
+                record("minecraft:mob_spawner", -15),
+            ]
+        ));
+        assert!(!block_entities_without_listeners(
+            &world,
+            chunk,
+            &[record("minecraft:chest", -15)]
+        ));
+        assert!(!block_entities_without_listeners(
+            &world,
+            chunk,
+            &[record("minecraft:sculk_sensor", -16)]
+        ));
+        assert!(!block_entities_without_listeners(
+            &world,
+            chunk,
+            &[record("minecraft:chest", 0)]
+        ));
+        let Tag::Compound(mut fields) = record("minecraft:chest", -16) else {
+            unreachable!()
+        };
+        fields.push(("x".into(), Tag::Int(-16)));
+        assert!(!block_entities_without_listeners(
+            &world,
+            chunk,
+            &[Tag::Compound(fields)]
+        ));
+        assert!(!block_entities_without_listeners(
+            &World::new("minecraft:overworld"),
+            chunk,
+            &[record("minecraft:chest", -16)]
+        ));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
@@ -722,6 +829,35 @@ mod tests {
             )])])),
         );
         assert!(passive.certify_inert_events(|_| Ok(true)).is_err());
+        let mut with_chest = drops.clone();
+        let event = &mut Arc::make_mut(&mut with_chest.destroy_events)[0];
+        let world = Arc::make_mut(&mut event.world);
+        let chest = world.intern_state(BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::new(),
+        });
+        let center = ChunkPos { x: 0, z: 0 };
+        Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+            .sections
+            .insert(
+                0,
+                Arc::new(native_world::loaded::Section {
+                    blocks: Some(Box::new([chest; native_world::loaded::BLOCK_COUNT])),
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                }),
+            );
+        Arc::make_mut(&mut event.block_entities)
+            .get_mut(&center)
+            .unwrap()
+            .push(Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(0)),
+                ("y".into(), Tag::Int(0)),
+                ("z".into(), Tag::Int(0)),
+            ]));
+        assert!(with_chest.certify_inert_events(|_| Ok(true)).is_ok());
         let mut listener = drops.clone();
         let event = &mut Arc::make_mut(&mut listener.destroy_events)[0];
         Arc::make_mut(&mut event.block_entities)

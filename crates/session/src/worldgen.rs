@@ -7094,6 +7094,11 @@ mod tests {
         let drops = processed.block_drops().context("drop checkpoint missing")?;
         assert_eq!(drops.operations(), 1);
         assert_eq!(drops.destroy_events().len(), 1);
+        let block_entities = &drops.destroy_events()[0].block_entities()[&center];
+        assert_eq!(block_entities.len(), 1);
+        assert!(
+            matches!(block_entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:chest"))
+        );
         assert_eq!(drops.records(center).len(), 1);
         assert!(drops.random_sequences().is_dirty());
         let proof = batch.certify_inert_destroy_events(&processed)?;
@@ -7195,7 +7200,18 @@ mod tests {
         assert_eq!(entities.entities().len(), 2);
         assert_eq!(&entities.entities()[0], &cow);
         assert_eq!(&entities.entities()[1..], drops.records(center));
-        assert!(reader.read_chunk(0, 0)?.is_some());
+        let terrain = reader
+            .read_chunk(0, 0)?
+            .context("terrain chunk missing")?;
+        let Some(Tag::List { values, .. }) = terrain.document.value.get("block_entities") else {
+            anyhow::bail!("saved chest is missing")
+        };
+        let mut expected_chest = block_entities[0].clone();
+        let Tag::Compound(fields) = &mut expected_chest else {
+            unreachable!()
+        };
+        fields.push(("keepPacked".into(), Tag::Byte(0)));
+        assert_eq!(values, &[expected_chest]);
         Ok(())
     }
 

@@ -4589,6 +4589,27 @@ impl FreshTerrainBatch {
                 .set_block_id(x + dx, 8, z + 8, id)
                 .map_err(|error| anyhow::anyhow!("fixture block: {error:?}"))?;
         }
+        let chest_position = [x + 12, 8, z + 8];
+        let chest_state = BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        let chest_id = world.intern_state(chest_state.clone());
+        world
+            .set_block_id(chest_position[0], chest_position[1], chest_position[2], chest_id)
+            .map_err(|error| anyhow::anyhow!("fixture chest: {error:?}"))?;
+        Arc::make_mut(&mut terrain.generated_monster_entities).insert(
+            chest_position,
+            Some(super::GeneratedMonsterRoomEntity::EmptyChest(super::GeneratedEmptyChest {
+                position: chest_position,
+                state: chest_state,
+            })),
+        );
+        Arc::make_mut(terrain.generated_entity_order.entry(pos).or_default()).insert(chest_position);
         let marks = terrain
             .feature_postprocessing
             .entry(pos)

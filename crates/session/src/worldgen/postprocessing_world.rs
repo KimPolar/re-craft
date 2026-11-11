@@ -2067,7 +2067,12 @@ impl GeneratedBlockView<'_> {
         self.block_drops
             .as_mut()
             .context("ladder destruction requires block drops")?
-            .record_destroy_event(pos, state);
+            .record_destroy_event(
+                pos,
+                state,
+                Arc::clone(self.world),
+                self.ticks.registration_order(),
+            );
         Ok(())
     }
 
@@ -7408,14 +7413,19 @@ mod tests {
         if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
             let drops = result.block_drops().unwrap();
             assert_eq!(drops.operations(), 1);
+            let [event] = drops.destroy_events() else {
+                panic!("unexpected destroy events")
+            };
+            assert_eq!(event.position, [10, 8, 8]);
+            assert_eq!(event.state, source.block(10, 8, 8).unwrap().clone());
+            assert_eq!(event.registered_chunks(), &[chunk]);
             assert_eq!(
-                drops.destroy_events(),
-                &[
-                    super::super::postprocessing_drops::GeneratedBlockDestroyEvent {
-                        position: [10, 8, 8],
-                        state: source.block(10, 8, 8).unwrap().clone(),
-                    }
-                ]
+                event.world().block(10, 8, 8).unwrap().name,
+                if case.contains("_wet_") {
+                    "minecraft:water"
+                } else {
+                    "minecraft:air"
+                }
             );
             let (mut fresh, _, _) = fixture(false);
             assert!(fresh.set_block_drops(drops.clone()).is_err());

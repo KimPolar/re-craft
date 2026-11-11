@@ -27004,7 +27004,12 @@ pub(crate) mod tests {
             )
             .unwrap();
         let mut pending = drops.clone();
-        pending.record_destroy_event((session.origin + IVec3::new(6, 2, 6)).to_array(), &ladder);
+        pending.record_destroy_event(
+            (session.origin + IVec3::new(6, 2, 6)).to_array(),
+            &ladder,
+            Arc::clone(&session.world),
+            &[chunk],
+        );
         let previous_level = session.level_random.state();
         let error = session
             .install_initial_generated_drops(&pending)
@@ -27102,6 +27107,8 @@ pub(crate) mod tests {
                 "minecraft:ladder",
                 &[("facing", "east"), ("waterlogged", "false")],
             ),
+            Arc::clone(&session.world),
+            &[],
         );
         assert!(session.install_initial_generated_drops(&pending).is_err());
         assert!(!session.generated_drops_installed);

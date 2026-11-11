@@ -13,14 +13,39 @@ use glam::IVec3;
 use native_core::random::{LegacyRandom, XoroshiroRandom};
 use native_persistence::{nbt::Tag, random_sequences::RandomSequences};
 use native_resources::loot::BlockLootTables;
-use native_world::loaded::{BlockState, ChunkPos};
+use native_world::loaded::{BlockState, ChunkPos, World};
 
 /// A successful Level.destroyBlock game event, in callback completion order.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GeneratedBlockDestroyEvent {
     pub position: [i32; 3],
     pub state: BlockState,
+    world: Arc<World>,
+    registered_chunks: Arc<[ChunkPos]>,
 }
+
+impl GeneratedBlockDestroyEvent {
+    /// Block geometry at emission time; listener registration is separate.
+    pub fn world(&self) -> &Arc<World> {
+        &self.world
+    }
+
+    /// Converted tick containers registered at emission, in their original order.
+    /// This does not establish which listeners were active.
+    pub fn registered_chunks(&self) -> &[ChunkPos] {
+        &self.registered_chunks
+    }
+}
+
+impl PartialEq for GeneratedBlockDestroyEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position
+            && self.state == other.state
+            && self.registered_chunks == other.registered_chunks
+            && Arc::ptr_eq(&self.world, &other.world)
+    }
+}
+impl Eq for GeneratedBlockDestroyEvent {}
 
 /// A forkable checkpoint of one level's loot, item and level random streams.
 /// The caller supplies the same initial random streams and rules used by the
@@ -196,10 +221,24 @@ impl GeneratedBlockDrops {
         &self.destroy_events
     }
 
-    pub(crate) fn record_destroy_event(&mut self, position: [i32; 3], state: &BlockState) {
+    pub(crate) fn record_destroy_event(
+        &mut self,
+        position: [i32; 3],
+        state: &BlockState,
+        world: Arc<World>,
+        registered_chunks: &[ChunkPos],
+    ) {
+        let registered_chunks = self
+            .destroy_events
+            .last()
+            .filter(|event| event.registered_chunks.as_ref() == registered_chunks)
+            .map(|event| Arc::clone(&event.registered_chunks))
+            .unwrap_or_else(|| registered_chunks.into());
         Arc::make_mut(&mut self.destroy_events).push(GeneratedBlockDestroyEvent {
             position,
             state: state.clone(),
+            world,
+            registered_chunks,
         });
     }
 
@@ -330,6 +369,34 @@ mod tests {
                 ("waterlogged".into(), "true".into()),
             ]),
         }
+    }
+
+    #[test]
+    fn destroy_event_retains_emission_world_and_registered_chunk_order() {
+        let mut drops = fixture(true);
+        let chunk = ChunkPos { x: -1, z: 0 };
+        let mut world = Arc::new(World::new("minecraft:overworld"));
+        let mut registered = vec![chunk];
+        drops.record_destroy_event([-1, 5, 0], &ladder(), Arc::clone(&world), &registered);
+        let earlier = drops.clone();
+        Arc::make_mut(&mut world).dimension = "example:later".into();
+        registered.push(ChunkPos { x: 0, z: 0 });
+        drops.record_destroy_event([0, 5, 0], &ladder(), world, &registered);
+        let world = Arc::clone(drops.destroy_events()[1].world());
+        drops.record_destroy_event([1, 5, 0], &ladder(), world, &registered);
+        assert_eq!(earlier.destroy_events().len(), 1);
+        assert_eq!(
+            earlier.destroy_events()[0].world().dimension,
+            "minecraft:overworld"
+        );
+        assert_eq!(earlier.destroy_events()[0].registered_chunks(), &[chunk]);
+        assert_eq!(drops.destroy_events().len(), 3);
+        assert_eq!(drops.destroy_events()[1].world().dimension, "example:later");
+        assert_eq!(drops.destroy_events()[1].registered_chunks(), registered);
+        assert!(Arc::ptr_eq(
+            &drops.destroy_events()[1].registered_chunks,
+            &drops.destroy_events()[2].registered_chunks,
+        ));
     }
 
     #[test]

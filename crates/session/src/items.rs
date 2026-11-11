@@ -670,6 +670,43 @@ impl Default for ItemEntities {
     }
 }
 
+/// Prepare generated item records using explicit level and entity RNG streams.
+/// The caller must combine them with the destination chunk's complete entity
+/// records and coordinate UUIDs and subsequent random-stream use.
+pub(crate) fn prepare_generated_block_drops(
+    position: IVec3,
+    drops: Vec<Drop>,
+    enabled: bool,
+    level_random: &mut LegacyRandom,
+    entity_seeder: &mut native_core::random::XoroshiroRandom,
+) -> anyhow::Result<Vec<Tag>> {
+    let mut staged_level = level_random.clone();
+    let mut items = ItemEntities {
+        entity_seeder: Some(entity_seeder.clone()),
+        entity_seed_checked: true,
+        ..ItemEntities::default()
+    };
+    items.drop_block_resources(position, drops, None, enabled, &mut staged_level);
+    let chunk = native_world::loaded::ChunkPos {
+        x: position.x.div_euclid(16),
+        z: position.z.div_euclid(16),
+    };
+    let drafts = items.draft_created_items_in_chunk(chunk)?;
+    anyhow::ensure!(
+        drafts.len() == items.entities.len(),
+        "generated item position is outside its destination chunk"
+    );
+    let records = drafts
+        .into_iter()
+        .map(|draft| draft.document().value.clone())
+        .collect();
+    *level_random = staged_level;
+    *entity_seeder = items
+        .entity_seeder
+        .expect("explicitly seeded item entities");
+    Ok(records)
+}
+
 impl ItemEntities {
     fn ensure_rain_resolved(&self) -> anyhow::Result<()> {
         anyhow::ensure!(

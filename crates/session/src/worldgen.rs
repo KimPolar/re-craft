@@ -59,6 +59,7 @@ mod mob_spawner;
 pub mod ocean_ruin;
 mod ore;
 pub mod postprocessing;
+pub mod postprocessing_drops;
 mod postprocessing_world;
 pub(crate) use postprocessing_world::fence_connection;
 pub mod ruined_portal;

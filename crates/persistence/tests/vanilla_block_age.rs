@@ -199,6 +199,34 @@ fn block_age_processor_matches_java() -> Result<()> {
     );
     assert!(waterlogged_replacements.into_iter().all(|count| count > 0));
 
+    let mut mixed_count = [0_usize; 3];
+    for line in text.lines().filter(|line| line.starts_with("D\t")) {
+        let fields: Vec<_> = line.split('\t').collect();
+        ensure!(fields.len() == 8, "invalid mixed-property output");
+        let category: usize = fields[1].parse()?;
+        let mode: usize = fields[2].parse()?;
+        let position = [fields[3].parse()?, fields[4].parse()?, fields[5].parse()?];
+        let state = parse_state(fields[6])?;
+        let member = BTreeSet::from([state.name.clone()]);
+        let empty = BTreeSet::new();
+        let tags = match category {
+            1 => {
+                native_persistence::structure_block_age::AgeTags::new(empty.clone(), member, empty)
+            }
+            2 => {
+                native_persistence::structure_block_age::AgeTags::new(empty.clone(), empty, member)
+            }
+            _ => anyhow::bail!("invalid category"),
+        };
+        let mut random = native_core::random::LegacyRandom::new(
+            native_resources::blockstates::positional_seed(position[0], position[1], position[2]),
+        );
+        let actual = tags.process(&state, [0.0_f32, 0.2, 0.8, 1.0][mode], &mut random)?;
+        assert_eq!(actual, parse_state(fields[7])?, "{line}");
+        mixed_count[category] += 1;
+    }
+    assert!(mixed_count[1] > 1_000 && mixed_count[2] > 1_000);
+
     // Exercise the same states through the real data-pack tag loader and the
     // processor list used by structure generation.
     let world = temp.path().join("tagged-world");
@@ -210,11 +238,25 @@ fn block_age_processor_matches_java() -> Result<()> {
         br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
     )?;
     for (name, values) in [
-        ("stairs", ["minecraft:dirt", "minecraft:iron_chain"]),
-        ("slabs", ["minecraft:oak_log", "minecraft:barrier"]),
+        (
+            "stairs",
+            [
+                "minecraft:dirt",
+                "minecraft:iron_chain",
+                "minecraft:netherrack",
+            ],
+        ),
+        (
+            "slabs",
+            ["minecraft:oak_log", "minecraft:barrier", "minecraft:chest"],
+        ),
         (
             "walls",
-            ["minecraft:redstone_ore", "minecraft:hanging_roots"],
+            [
+                "minecraft:redstone_ore",
+                "minecraft:hanging_roots",
+                "minecraft:oak_fence",
+            ],
         ),
     ] {
         std::fs::write(
@@ -304,5 +346,30 @@ fn block_age_processor_matches_java() -> Result<()> {
         loaded_waterlogged[category] += 1;
     }
     assert!(loaded_waterlogged.into_iter().all(|count| count > 0));
+    let mut loaded_mixed = [0_usize; 3];
+    for line in text.lines().filter(|line| line.starts_with("D\t")) {
+        let fields: Vec<_> = line.split('\t').collect();
+        let category: usize = fields[1].parse()?;
+        let state = parse_state(fields[6])?;
+        if state.name != ["", "minecraft:chest", "minecraft:oak_fence"][category] {
+            continue;
+        }
+        let mode: usize = fields[2].parse()?;
+        let position = [fields[3].parse()?, fields[4].parse()?, fields[5].parse()?];
+        let result = processors[mode]
+            .process(
+                PlacementBlock {
+                    position,
+                    state,
+                    nbt: Some(marker.clone()),
+                },
+                &mut |_| anyhow::bail!("age processor requested world state"),
+            )?
+            .context("age processor unexpectedly removed block")?;
+        assert_eq!(result.state, parse_state(fields[7])?, "{line}");
+        assert_eq!(result.nbt, Some(marker.clone()));
+        loaded_mixed[category] += 1;
+    }
+    assert!(loaded_mixed[1] > 0 && loaded_mixed[2] > 0);
     Ok(())
 }

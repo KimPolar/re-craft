@@ -191,7 +191,12 @@ fn copy_stairs(source: &BlockState) -> Result<BlockState> {
 }
 fn copy_slab(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
-    if ["type"].into_iter().all(|name| !p.contains_key(name)) {
+    // Chests and pistons also have a property called `type`, but it is a
+    // different Java property from the slab type. These values are disjoint.
+    if matches!(
+        p.get("type").map(String::as_str),
+        None | Some("single" | "left" | "right" | "normal" | "sticky")
+    ) {
         return copy_only_waterlogged(source, slab("mossy_stone_brick_slab"));
     }
     ensure!(
@@ -213,11 +218,15 @@ fn copy_slab(source: &BlockState) -> Result<BlockState> {
 }
 fn copy_wall(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
-    if ["north", "east", "south", "west", "up"]
-        .into_iter()
-        .all(|name| !p.contains_key(name))
-    {
-        return copy_only_waterlogged(
+    // Fence, vine, mushroom and multiface direction properties are boolean,
+    // unlike wall-side properties. Their `up` property is shared by walls.
+    if ["north", "east", "south", "west"].into_iter().all(|name| {
+        matches!(
+            p.get(name).map(String::as_str),
+            None | Some("true" | "false")
+        )
+    }) {
+        let mut target = copy_only_waterlogged(
             source,
             BlockState {
                 name: "minecraft:mossy_stone_brick_wall".into(),
@@ -230,7 +239,15 @@ fn copy_wall(source: &BlockState) -> Result<BlockState> {
                     ("waterlogged".into(), "false".into()),
                 ]),
             },
-        );
+        )?;
+        if let Some(value) = p.get("up") {
+            ensure!(
+                matches!(value.as_str(), "true" | "false"),
+                "invalid up state"
+            );
+            target.properties.insert("up".into(), value.clone());
+        }
+        return Ok(target);
     }
     ensure!(
         p.len() == 6
@@ -279,6 +296,32 @@ mod tests {
         assert!(copy_stairs(&invalid).is_err());
         assert!(copy_slab(&invalid).is_err());
         assert!(copy_wall(&invalid).is_err());
+    }
+
+    #[test]
+    fn tagged_fences_and_chests_keep_only_shared_properties() {
+        let vine = BlockState {
+            name: "minecraft:vine".into(),
+            properties: BTreeMap::from([
+                ("north".into(), "true".into()),
+                ("up".into(), "false".into()),
+            ]),
+        };
+        let result = copy_wall(&vine).unwrap();
+        assert_eq!(result.properties["north"], "none");
+        assert_eq!(result.properties["up"], "false");
+
+        let chest = BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("type".into(), "left".into()),
+                ("facing".into(), "north".into()),
+                ("waterlogged".into(), "true".into()),
+            ]),
+        };
+        let result = copy_slab(&chest).unwrap();
+        assert_eq!(result.properties["type"], "bottom");
+        assert_eq!(result.properties["waterlogged"], "true");
     }
 
     #[test]

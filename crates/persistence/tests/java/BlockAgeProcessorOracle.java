@@ -90,5 +90,42 @@ public class BlockAgeProcessorOracle {
                 }
             }
         }
+        // Vary every property value of each eligible registered block. Wall
+        // sides represented by booleans are distinct from wall-side enums.
+        for (var block : BuiltInRegistries.BLOCK) {
+            var states = new LinkedHashMap<String, BlockState>();
+            states.put("default", block.defaultBlockState());
+            for (var state : block.getStateDefinition().getPossibleStates())
+                state.getValues().forEach(entry ->
+                    states.putIfAbsent(entry.property().getName() + "=" + entry.valueName(), state));
+            for (int category = 1; category <= 2; category++) {
+                bind.invoke(block.builtInRegistryHolder(), List.of(tags.get(category)));
+                for (var state : states.values()) {
+                    var props = new HashMap<String, String>();
+                    state.getValues().forEach(e -> props.put(e.property().getName(), e.valueName()));
+                    if (category == 1 && props.containsKey("type")
+                            && !Set.of("single", "left", "right", "normal", "sticky").contains(props.get("type"))
+                            && !(props.size() == 2 && Set.of("top", "bottom", "double").contains(props.get("type"))
+                                && props.containsKey("waterlogged"))) continue;
+                    if (category == 2) {
+                        boolean boolSides = List.of("north", "east", "south", "west").stream()
+                                .allMatch(k -> !props.containsKey(k) || Set.of("true", "false").contains(props.get(k)));
+                        boolean wall = props.size() == 6 && props.containsKey("up") && props.containsKey("waterlogged")
+                                && List.of("north", "east", "south", "west").stream()
+                                    .allMatch(k -> Set.of("none", "low", "tall").contains(props.get(k)));
+                        if (!boolSides && !wall) continue;
+                    }
+                    for (int m = 0; m < mossiness.length; m++) {
+                        var processor = new BlockAgeProcessor(mossiness[m]);
+                        for (int i = 0; i < 4; i++) {
+                            var pos = new BlockPos(i * 17 - 95, i * 29 - 64, 113 - i * 23);
+                            var info = new StructureBlockInfo(pos, state, null);
+                            var result = processor.processBlock(null, pos, pos, pos, info, new StructurePlaceSettings());
+                            out.printf("D\t%d\t%d\t%d\t%d\t%d\t%s\t%s%n", category, m, pos.getX(), pos.getY(), pos.getZ(), key(state), key(result.state()));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -350,6 +350,28 @@ struct ItemEntity {
     _damage_state: ItemDamageState,
 }
 
+/// A generated item that has not yet entered the live session. Its runtime
+/// random stream and visual state cannot be reconstructed from entity NBT.
+#[derive(Clone)]
+pub struct GeneratedItem {
+    entity: ItemEntity,
+}
+
+impl GeneratedItem {
+    /// The immutable render snapshot and UUID assigned at creation.
+    pub fn item(&self) -> &DroppedItem {
+        &self.entity.item
+    }
+
+    pub fn uuid(&self) -> [i32; 4] {
+        self.entity
+            .created
+            .as_ref()
+            .and_then(|created| created.uuid)
+            .expect("prepared generated item has a validated UUID")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CreatedItemIdentity {
     uuid: Option<[i32; 4]>,
@@ -679,7 +701,7 @@ pub(crate) fn prepare_generated_block_drops(
     enabled: bool,
     level_random: &mut LegacyRandom,
     entity_seeder: &mut native_core::random::XoroshiroRandom,
-) -> anyhow::Result<Vec<Tag>> {
+) -> anyhow::Result<(Vec<Tag>, Vec<GeneratedItem>)> {
     let mut staged_level = level_random.clone();
     let mut items = ItemEntities {
         entity_seeder: Some(entity_seeder.clone()),
@@ -704,7 +726,14 @@ pub(crate) fn prepare_generated_block_drops(
     *entity_seeder = items
         .entity_seeder
         .expect("explicitly seeded item entities");
-    Ok(records)
+    Ok((
+        records,
+        items
+            .entities
+            .into_iter()
+            .map(|entity| GeneratedItem { entity })
+            .collect(),
+    ))
 }
 
 impl ItemEntities {
@@ -3113,6 +3142,44 @@ fn item_in_rain(position: DVec3, rain_at: impl FnMut(IVec3) -> Option<bool>) -> 
 mod tests {
     use super::*;
     use native_resources::packs::ResourceProvider;
+
+    #[test]
+    fn generated_item_keeps_its_original_runtime_random_and_visual_state() {
+        let mut seeder = native_core::random::XoroshiroRandom::new(77);
+        let mut expected_seeder = seeder.clone();
+        let (uuid, bob, yaw, mut random) = item_random_from_seed(expected_seeder.next_long());
+        let vx = random.next_double() * 0.2 - 0.1;
+        let vz = random.next_double() * 0.2 - 0.1;
+        let mut level = LegacyRandom::new(42);
+        let (records, items) = prepare_generated_block_drops(
+            IVec3::new(-1, 70, -17),
+            vec![Drop {
+                item: native_resources::packs::ResourceId::parse("minecraft:ladder").unwrap(),
+                count: 1,
+                copy_block_entity_custom_name: false,
+                copy_block_entity_components: Vec::new(),
+            }],
+            true,
+            &mut level,
+            &mut seeder,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.uuid(), uuid);
+        assert_eq!(item.item().bob_offset.to_bits(), bob.to_bits());
+        assert_eq!(
+            item.entity.created.as_ref().unwrap().yaw.to_bits(),
+            yaw.to_bits()
+        );
+        assert_eq!(item.entity.velocity, DVec3::new(vx, 0.2, vz));
+        assert_eq!(item.entity.random.clone().next_int(), random.next_int());
+        assert_eq!(seeder.state(), expected_seeder.state());
+        let saved = crate::saved_item::read(&records[0]).unwrap().unwrap();
+        assert_eq!(saved.uuid, Some(uuid));
+        assert_eq!(saved.position, item.item().position);
+    }
 
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]

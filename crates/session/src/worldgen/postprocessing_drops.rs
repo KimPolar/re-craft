@@ -27,6 +27,7 @@ pub struct GeneratedBlockDrops {
     entity_seeder: XoroshiroRandom,
     enabled: bool,
     records: Arc<BTreeMap<ChunkPos, Arc<Vec<Tag>>>>,
+    items: Arc<BTreeMap<ChunkPos, Arc<Vec<crate::items::GeneratedItem>>>>,
     uuids: Arc<BTreeSet<[i32; 4]>>,
     operations: u64,
 }
@@ -48,6 +49,7 @@ impl GeneratedBlockDrops {
             entity_seeder,
             enabled,
             records: Arc::new(BTreeMap::new()),
+            items: Arc::new(BTreeMap::new()),
             uuids: Arc::new(BTreeSet::new()),
             operations: 0,
         }
@@ -82,7 +84,7 @@ impl GeneratedBlockDrops {
                 None,
             )
         };
-        let records = crate::items::prepare_generated_block_drops(
+        let (records, items) = crate::items::prepare_generated_block_drops(
             pos,
             drops,
             self.enabled,
@@ -98,6 +100,16 @@ impl GeneratedBlockDrops {
                 "duplicate generated item UUID"
             );
         }
+        ensure!(
+            records.len() == items.len()
+                && records.iter().zip(&items).all(|(record, item)| {
+                    crate::saved_item::optional_uuid(record, "UUID")
+                        .ok()
+                        .flatten()
+                        == Some(item.uuid())
+                }),
+            "generated item records and runtime identities differ"
+        );
         if let Some((name, random)) = changed_sequence {
             Arc::make_mut(&mut self.sequences).set(&name, &random)?;
         }
@@ -108,6 +120,7 @@ impl GeneratedBlockDrops {
             };
             Arc::make_mut(Arc::make_mut(&mut self.records).entry(chunk).or_default())
                 .extend(records);
+            Arc::make_mut(Arc::make_mut(&mut self.items).entry(chunk).or_default()).extend(items);
             Arc::make_mut(&mut self.uuids).extend(ids);
         }
         self.level_random = level;
@@ -124,6 +137,11 @@ impl GeneratedBlockDrops {
 
     pub fn item_chunks(&self) -> impl Iterator<Item = ChunkPos> + '_ {
         self.records.keys().copied()
+    }
+
+    /// Runtime item state corresponding one-for-one to `records` in this chunk.
+    pub fn items(&self, chunk: ChunkPos) -> &[crate::items::GeneratedItem] {
+        self.items.get(&chunk).map_or(&[], |items| items.as_slice())
     }
 
     pub fn level_random(&self) -> &LegacyRandom {
@@ -291,12 +309,16 @@ mod tests {
         enabled.drop_block(pos, &ladder()).unwrap();
         disabled.drop_block(pos, &ladder()).unwrap();
         assert_eq!(enabled.records(chunk).len(), 1);
+        assert_eq!(enabled.items(chunk).len(), 1);
         assert!(disabled.records(chunk).is_empty());
+        assert!(disabled.items(chunk).is_empty());
         let saved = crate::saved_item::read(&enabled.records(chunk)[0])
             .unwrap()
             .unwrap();
         assert_eq!(saved.position.to_array(), expected_position);
         assert_eq!(saved.stack.id(), "minecraft:ladder");
+        assert_eq!(saved.uuid, Some(enabled.items(chunk)[0].uuid()));
+        assert_eq!(saved.position, enabled.items(chunk)[0].item().position);
         assert_eq!(
             enabled.level_random.clone().next_int(),
             expected_level.clone().next_int()
@@ -326,7 +348,9 @@ mod tests {
         let chunk = ChunkPos { x: 0, z: 0 };
         fork.drop_block(IVec3::new(1, 3, 1), &ladder()).unwrap();
         assert_eq!(fork.records(chunk).len(), 1);
+        assert_eq!(fork.items(chunk).len(), 1);
         assert!(original.records(chunk).is_empty());
+        assert!(original.items(chunk).is_empty());
         let original_level = original.level_random.clone().next_int();
         let original_sequence = original
             .sequences
@@ -357,6 +381,7 @@ mod tests {
         assert_eq!(original.entity_seeder.state(), original_entity);
         original.drop_block(IVec3::new(1, 3, 1), &ladder()).unwrap();
         assert_eq!(original.records(chunk), fork.records(chunk));
+        assert_eq!(original.items(chunk)[0].uuid(), fork.items(chunk)[0].uuid());
     }
 
     #[test]

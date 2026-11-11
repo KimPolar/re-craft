@@ -57,6 +57,10 @@ impl Display {
 }
 
 /// Restrict the two inverse passes to the indicator's physical pixels.
+pub fn origin(size: (u32, u32)) -> (i32, i32) {
+    (size.0 as i32 / 2 - 8, size.1 as i32 / 2 + 9)
+}
+
 pub fn scissor(
     size: (u32, u32),
     scale: u32,
@@ -79,27 +83,25 @@ pub fn scissor(
 
 /// Return separate layers: Java uses inverted blending for each sprite, so
 /// flattening them with ordinary alpha compositing would change their colors.
-pub fn crosshair_layers(
-    size: (u32, u32),
-    sprites: &HudSprites,
-    display: Display,
-) -> Option<(Canvas, Canvas)> {
+pub fn crosshair_layers(sprites: &HudSprites, display: Display) -> Option<(Canvas, Canvas)> {
     if display.mode != AttackIndicator::Crosshair {
         return None;
     }
     if display.full {
-        let mut background = Canvas::new(size.0, size.1);
-        let x = background.width / 2 - 8;
-        let y = background.height / 2 + 9;
+        let mut background = Canvas::new(16, 16);
         background.gui_sprite(
             &sprites.crosshair_attack_full.image,
-            Rect { x, y, w: 16, h: 16 },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+            },
             sprites.crosshair_attack_full.scaling,
         );
-        return Some((background, Canvas::new(size.0, size.1)));
+        return Some((background, Canvas::new(16, 16)));
     }
     layers(
-        size,
         &sprites.crosshair_attack_background,
         &sprites.crosshair_attack_progress,
         display,
@@ -178,16 +180,14 @@ fn hotbar_rect(width: i32, height: i32, main_hand_left: bool) -> Rect {
 }
 
 fn layers(
-    size: (u32, u32),
     background_sprite: &GuiSprite,
     progress_sprite: &GuiSprite,
     display: Display,
 ) -> Option<(Canvas, Canvas)> {
     let width = i32::from(display.width?);
-    let mut background = Canvas::new(size.0, size.1);
-    let mut progress = Canvas::new(size.0, size.1);
-    let x = background.width / 2 - 8;
-    let y = background.height / 2 + 9;
+    let mut background = Canvas::new(16, 16);
+    let mut progress = Canvas::new(16, 16);
+    let (x, y) = (0, 0);
     background.gui_sprite(
         &background_sprite.image,
         Rect { x, y, w: 16, h: 4 },
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_sprites_use_java_coordinates_and_clip_progress() {
+    fn separate_compact_sprites_clip_progress() {
         use crate::menu_assets::GuiSpriteScaling;
         let background = GuiSprite {
             image: image::RgbaImage::from_pixel(16, 4, image::Rgba([16, 32, 48, 255])),
@@ -525,18 +525,18 @@ mod tests {
             scaling: GuiSpriteScaling::Stretch,
         };
         let (bg, fg) = layers(
-            (321, 241),
             &background,
             &progress,
             crosshair(Some(0.5), GameMode::Survival),
         )
         .unwrap();
-        let at = |x: usize, y: usize| y * 321 + x;
-        assert_eq!(bg.pixels[at(152, 129)], 0xff102030);
-        assert_eq!(bg.pixels[at(168, 129)], 0);
-        assert_eq!(fg.pixels[at(159, 132)], 0xffff8040);
-        assert_eq!(fg.pixels[at(160, 132)], 0);
-        assert_eq!(fg.pixels[at(152, 133)], 0);
+        let at = |x: usize, y: usize| y * 16 + x;
+        assert_eq!((bg.width, bg.height), (16, 16));
+        assert_eq!(bg.pixels[at(0, 0)], 0xff102030);
+        assert_eq!(bg.pixels[at(0, 4)], 0);
+        assert_eq!(fg.pixels[at(7, 3)], 0xffff8040);
+        assert_eq!(fg.pixels[at(8, 3)], 0);
+        assert_eq!(fg.pixels[at(0, 4)], 0);
     }
 
     #[test]
@@ -587,19 +587,13 @@ mod tests {
                 attack_delay: 6.0,
             }),
         );
-        let (full, empty) = crosshair_layers((426, 240), &assets.hud, display).unwrap();
-        assert_eq!(full.pixels[(144 * 426 + 220) as usize], 0xff0c_2238);
-        assert_eq!(full.pixels[(145 * 426 + 220) as usize], 0);
+        let (full, empty) = crosshair_layers(&assets.hud, display).unwrap();
+        assert_eq!(full.pixels[15 * 16 + 15], 0xff0c_2238);
         assert!(empty.pixels.iter().all(|pixel| *pixel == 0));
-        let (background, progress) = crosshair_layers(
-            (426, 240),
-            &assets.hud,
-            crosshair(Some(0.5), GameMode::Survival),
-        )
-        .unwrap();
-        let (x, y) = (426 / 2 - 8, 240 / 2 + 9);
+        let (background, progress) =
+            crosshair_layers(&assets.hud, crosshair(Some(0.5), GameMode::Survival)).unwrap();
         for sx in 0..16 {
-            let index = ((y + 2) * 426 + x + sx) as usize;
+            let index = (2 * 16 + sx) as usize;
             assert_eq!(background.pixels[index], 0xff14_1e28);
             let expected = if sx < 8 {
                 0xff00_0000 | ((50 + (sx % 4) * 30) as u32) << 16 | 90 << 8 | 140

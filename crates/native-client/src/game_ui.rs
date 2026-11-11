@@ -2651,12 +2651,12 @@ impl GameUi {
                 canvas.height as u32,
             );
             if self.attack_indicator_upload != Some(indicator_key) {
-                let layers = crate::attack_hud::crosshair_layers(
+                let layers =
+                    crate::attack_hud::crosshair_layers(&self.assets.hud, self.attack_indicator);
+                renderer.update_attack_indicator(
+                    layers.as_ref(),
                     (canvas.width as u32, canvas.height as u32),
-                    &self.assets.hud,
-                    self.attack_indicator,
-                );
-                renderer.update_attack_indicator(layers.as_ref())?;
+                )?;
                 self.attack_indicator_upload = Some(indicator_key);
             }
             renderer.update_overlay(&canvas, self.paused || inventory.is_open())?;

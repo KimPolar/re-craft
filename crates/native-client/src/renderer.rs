@@ -252,6 +252,7 @@ pub struct Renderer {
     overlay_pipeline: wgpu::RenderPipeline,
     inverted_overlay_pipeline: wgpu::RenderPipeline,
     gui_scale: crate::gui_gpu::GuiScaleBinding,
+    attack_gui_scale: crate::gui_gpu::GuiScaleBinding,
     overlay_layout: wgpu::BindGroupLayout,
     overlay_sampler: wgpu::Sampler,
     overlay_texture: Option<wgpu::Texture>,
@@ -267,6 +268,7 @@ pub struct Renderer {
     attack_background: PreBlurOverlay,
     attack_progress: PreBlurOverlay,
     attack_indicator_visible: bool,
+    attack_viewport: (u32, u32),
     overlay_glint_started: Instant,
     overlay_glint_available: bool,
     overlay_bind_group: Option<wgpu::BindGroup>,
@@ -1332,6 +1334,8 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("game_overlay.wgsl").into()),
         });
         let gui_scale = crate::gui_gpu::GuiScaleBinding::new(&device);
+        let attack_gui_scale =
+            crate::gui_gpu::GuiScaleBinding::with_layout(&device, &gui_scale.layout);
         let overlay_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("GUI overlay layout"),
@@ -1485,6 +1489,7 @@ impl Renderer {
             overlay_pipeline,
             inverted_overlay_pipeline,
             gui_scale,
+            attack_gui_scale,
             overlay_layout,
             overlay_sampler,
             overlay_texture: None,
@@ -1500,6 +1505,7 @@ impl Renderer {
             attack_background: PreBlurOverlay::default(),
             attack_progress: PreBlurOverlay::default(),
             attack_indicator_visible: false,
+            attack_viewport: (0, 0),
             overlay_glint_started: Instant::now(),
             overlay_glint_available: glint_texture.is_some(),
             overlay_bind_group: None,
@@ -1796,6 +1802,11 @@ impl Renderer {
 
     pub fn set_gui_scale(&mut self, scale: u32) {
         self.gui_scale.set(&self.queue, scale);
+        self.attack_gui_scale.set_mapping(
+            &self.queue,
+            scale,
+            crate::attack_hud::origin(self.attack_viewport),
+        );
     }
 
     /// Reuse the overlay upload path for the HUD that precedes screen blur.
@@ -1819,8 +1830,18 @@ impl Renderer {
     }
 
     /// Upload the two inverse-blended indicator sprites independently.
-    pub fn update_attack_indicator(&mut self, layers: Option<&(Canvas, Canvas)>) -> Result<()> {
+    pub fn update_attack_indicator(
+        &mut self,
+        layers: Option<&(Canvas, Canvas)>,
+        viewport: (u32, u32),
+    ) -> Result<()> {
         self.attack_indicator_visible = layers.is_some();
+        self.attack_viewport = viewport;
+        self.attack_gui_scale.set_mapping(
+            &self.queue,
+            self.gui_scale.scale(),
+            crate::attack_hud::origin(viewport),
+        );
         let Some((background, progress)) = layers else {
             return Ok(());
         };
@@ -2616,7 +2637,7 @@ impl Renderer {
             && !self.hud_hidden
             && self.attack_indicator_visible
             && let Some((x, y, w, h)) = crate::attack_hud::scissor(
-                self.attack_background.size,
+                self.attack_viewport,
                 self.gui_scale.scale(),
                 (self.config.width, self.config.height),
             )
@@ -2647,7 +2668,7 @@ impl Renderer {
                 pass.set_pipeline(&self.inverted_overlay_pipeline);
                 pass.set_scissor_rect(x, y, w, h);
                 pass.set_bind_group(0, binding, &[]);
-                pass.set_bind_group(1, &self.gui_scale.bind_group, &[]);
+                pass.set_bind_group(1, &self.attack_gui_scale.bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
         }
@@ -3243,6 +3264,7 @@ mod tests {
                     }
                     Layer::Attack => {
                         pass.set_pipeline(&renderer.inverted_overlay_pipeline);
+                        pass.set_bind_group(1, &renderer.attack_gui_scale.bind_group, &[]);
                         for binding in [
                             &renderer.attack_background.binding,
                             &renderer.attack_progress.binding,
@@ -3471,8 +3493,8 @@ mod tests {
                     }
                 }
                 renderer.set_gui_scale(1);
-                let mut background = Canvas::new(64, 16);
-                let mut foreground = Canvas::new(64, 16);
+                let mut background = Canvas::new(16, 16);
+                let mut foreground = Canvas::new(16, 16);
                 background.fill(
                     Rect {
                         x: 0,
@@ -3492,8 +3514,11 @@ mod tests {
                     [255, 255, 255, 255],
                 );
                 renderer
-                    .update_attack_indicator(Some(&(background, foreground)))
+                    .update_attack_indicator(Some(&(background, foreground)), (64, 16))
                     .unwrap();
+                renderer
+                    .attack_gui_scale
+                    .set_mapping(&renderer.queue, 1, (0, 0));
                 let inverted = render(
                     &renderer,
                     super::glint_uniform(0, 0.5, 0.0, false),
@@ -3512,7 +3537,41 @@ mod tests {
                     pixel(10),
                     "one inversion must change the background"
                 );
-                renderer.update_attack_indicator(None).unwrap();
+                renderer
+                    .attack_gui_scale
+                    .set_mapping(&renderer.queue, 1, (8, 2));
+                let shifted = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, false),
+                    Layer::Attack,
+                );
+                let sample = |x: usize, y: usize| &shifted[y * 256 + x * 4..y * 256 + x * 4 + 4];
+                assert!(
+                    sample(0, 0)
+                        .iter()
+                        .zip(sample(8, 2))
+                        .all(|(a, b)| a.abs_diff(*b) <= 2)
+                );
+                assert_ne!(sample(0, 0), sample(14, 2));
+                assert_eq!(sample(0, 0), sample(14, 1));
+                renderer
+                    .attack_gui_scale
+                    .set_mapping(&renderer.queue, 3, (4, 1));
+                let scaled = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, false),
+                    Layer::Attack,
+                );
+                let sample = |x: usize, y: usize| &scaled[y * 256 + x * 4..y * 256 + x * 4 + 4];
+                assert!(
+                    sample(0, 0)
+                        .iter()
+                        .zip(sample(12, 3))
+                        .all(|(a, b)| a.abs_diff(*b) <= 2)
+                );
+                assert_ne!(sample(0, 0), sample(30, 3));
+                assert_eq!(sample(0, 0), sample(11, 3));
+                renderer.update_attack_indicator(None, (64, 16)).unwrap();
                 assert!(!renderer.attack_indicator_visible);
                 event_loop.exit();
             }

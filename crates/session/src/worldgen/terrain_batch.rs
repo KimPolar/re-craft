@@ -4258,6 +4258,26 @@ impl FreshTerrainBatch {
         timestamp: u32,
     ) -> Result<PreparedStructureRegions> {
         processed.ensure_drops_integrated_for_save()?;
+        self.prepare_converted_structure_region_drafts_inner(processed, timestamp)
+    }
+
+    /// Intermediate regions for a pass whose destroy events were proven inert.
+    /// The caller must also carry the matching random sequences into the world.
+    pub fn prepare_converted_structure_region_drafts_with_inert_events(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        timestamp: u32,
+        proof: &super::postprocessing_drops::InertGeneratedDestroyEvents,
+    ) -> Result<PreparedStructureRegions> {
+        processed.ensure_inert_drops_for_region_draft(proof)?;
+        self.prepare_converted_structure_region_drafts_inner(processed, timestamp)
+    }
+
+    fn prepare_converted_structure_region_drafts_inner(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        timestamp: u32,
+    ) -> Result<PreparedStructureRegions> {
         ensure!(
             self.structures.is_some(),
             "structure generation is disabled"
@@ -4326,6 +4346,36 @@ impl FreshTerrainBatch {
         >,
     > {
         processed.ensure_drops_integrated_for_save()?;
+        self.converted_region_drafts_inner(processed, timestamp)
+    }
+
+    /// Intermediate regions for a pass with a matching inert-event proof.
+    /// Random sequences and other world data must still be staged together.
+    pub fn converted_region_drafts_with_inert_events(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        timestamp: u32,
+        proof: &super::postprocessing_drops::InertGeneratedDestroyEvents,
+    ) -> Result<
+        BTreeMap<
+            (native_persistence::save::FreshRegionKind, i32, i32),
+            native_persistence::save::FreshRegionDraft,
+        >,
+    > {
+        processed.ensure_inert_drops_for_region_draft(proof)?;
+        self.converted_region_drafts_inner(processed, timestamp)
+    }
+
+    fn converted_region_drafts_inner(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        timestamp: u32,
+    ) -> Result<
+        BTreeMap<
+            (native_persistence::save::FreshRegionKind, i32, i32),
+            native_persistence::save::FreshRegionDraft,
+        >,
+    > {
         ensure!(
             self.structures.is_none(),
             "structure world persistence is not yet supported"

@@ -9579,6 +9579,90 @@ mod tests {
                             .prepare_structure_region_drafts(&with_drop, [target], 1)
                             .is_err()
                     );
+                    // Exercise region assembly with a matching inert-event proof.
+                    // The synthetic proof isolates this storage test from the
+                    // separate generation-batch listener-coverage proof.
+                    let position = glam::IVec3::new(target.x * 16 + 8, 8, target.z * 16 + 8);
+                    let mut drops = test_generated_drops(position, true);
+                    let neighbors: Vec<_> = (-1..=1)
+                        .flat_map(|dx| {
+                            (-1..=1).map(move |dz| ChunkPos {
+                                x: target.x + dx,
+                                z: target.z + dz,
+                            })
+                        })
+                        .collect();
+                    let mut event_world = (*processed.world).clone();
+                    for &pos in &neighbors {
+                        event_world.chunks.entry(pos).or_insert_with(|| {
+                            Arc::new(native_world::loaded::Chunk {
+                                position: pos,
+                                status: Some("minecraft:full".into()),
+                                block_light_correct: true,
+                                sections: BTreeMap::new(),
+                            })
+                        });
+                    }
+                    let blocks = neighbors
+                        .iter()
+                        .copied()
+                        .map(|pos| (pos, Vec::new()))
+                        .collect();
+                    let entities = neighbors
+                        .iter()
+                        .copied()
+                        .map(|pos| (pos, Some(Arc::new(Vec::new()))))
+                        .collect();
+                    drops.record_destroy_event(
+                        position.to_array(),
+                        &native_world::loaded::BlockState {
+                            name: "minecraft:ladder".into(),
+                            properties: BTreeMap::new(),
+                        },
+                        Arc::new(event_world),
+                        &neighbors,
+                        blocks,
+                        entities,
+                    );
+                    let proof = drops.certify_inert_events(|_| Ok(true))?;
+                    with_drop.set_block_drops_for_test(drops);
+                    let expected_entity_chunk = batch
+                        .postprocessed_chunk_drafts(&with_drop, [target])?
+                        .remove(&target)
+                        .unwrap()
+                        .entity_chunk
+                        .unwrap();
+                    let verified = batch
+                        .prepare_converted_structure_region_drafts_with_inert_events(
+                            &with_drop, 1, &proof,
+                        )?;
+                    let verified_key = (
+                        native_persistence::save::FreshRegionKind::Entities,
+                        target.x.div_euclid(32),
+                        target.z.div_euclid(32),
+                    );
+                    let verified_dir = tempfile::tempdir()?;
+                    let verified_path = verified_dir
+                        .path()
+                        .join(format!("r.{}.{}.mca", verified_key.1, verified_key.2));
+                    let mut verified_file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&verified_path)?;
+                    assert!(
+                        verified.regions[&verified_key]
+                            .write_staged(&mut verified_file)?
+                            .is_empty()
+                    );
+                    drop(verified_file);
+                    let saved = native_persistence::anvil::RegionReader::open(&verified_path)?
+                        .read_chunk(target.x, target.z)?
+                        .context("verified entity chunk missing")?;
+                    assert_eq!(
+                        canonical_nbt(saved.value),
+                        canonical_nbt(expected_entity_chunk.value)
+                    );
                     let prepared =
                         batch.prepare_structure_region_drafts(&processed, [target], 1)?;
                     let key = (

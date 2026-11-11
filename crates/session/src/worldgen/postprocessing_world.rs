@@ -345,6 +345,21 @@ impl PostprocessedGeneratedRegion {
         );
         Ok(())
     }
+
+    pub(super) fn ensure_inert_drops_for_region_draft(
+        &self,
+        proof: &super::postprocessing_drops::InertGeneratedDestroyEvents,
+    ) -> Result<()> {
+        let drops = self
+            .block_drops
+            .as_ref()
+            .context("block drop checkpoint is missing")?;
+        ensure!(
+            drops.verify_inert_proof(proof),
+            "generated destroy event proof does not match"
+        );
+        Ok(())
+    }
 }
 
 /// Apply one explicitly chosen light-engine drain to a complete input
@@ -3336,6 +3351,83 @@ mod tests {
     use native_core::postprocessing::PostProcessing;
     use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn inert_region_proof_is_bound_to_the_exact_drop_checkpoint() {
+        use native_core::random::{LegacyRandom, XoroshiroRandom};
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/ladder.json").then(||
+                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder"}]}]}"#.to_vec()))
+            }
+        }
+        let mut drops = super::super::postprocessing_drops::GeneratedBlockDrops::new(
+            Arc::new(native_resources::loot::BlockLootTables::load(&mut Loot).unwrap()),
+            42,
+            native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+            LegacyRandom::new(1),
+            XoroshiroRandom::new(2),
+            true,
+        );
+        let ladder = BlockState {
+            name: "minecraft:ladder".into(),
+            properties: BTreeMap::new(),
+        };
+        drops
+            .drop_block(glam::IVec3::new(1, 5, 1), &ladder)
+            .unwrap();
+        let chunks: Vec<_> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| ChunkPos { x, z }))
+            .collect();
+        let mut world = World::new("minecraft:overworld");
+        for &pos in &chunks {
+            world.chunks.insert(
+                pos,
+                Arc::new(Chunk {
+                    position: pos,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: true,
+                    sections: BTreeMap::new(),
+                }),
+            );
+        }
+        let blocks = chunks
+            .iter()
+            .copied()
+            .map(|pos| (pos, Vec::new()))
+            .collect();
+        let entities = chunks
+            .iter()
+            .copied()
+            .map(|pos| (pos, Some(Arc::new(Vec::new()))))
+            .collect();
+        drops.record_destroy_event(
+            [1, 5, 1],
+            &ladder,
+            Arc::new(world),
+            &chunks,
+            blocks,
+            entities,
+        );
+        let proof = drops.certify_inert_events(|_| Ok(true)).unwrap();
+        let (mut stage, _, chunk) = fixture(false);
+        while !stage.poll(chunk, 10).unwrap() {}
+        let mut result = stage.finish().unwrap();
+        assert!(result.ensure_inert_drops_for_region_draft(&proof).is_err());
+        result.set_block_drops_for_test(drops.clone());
+        assert!(result.ensure_drops_integrated_for_save().is_err());
+        result.ensure_inert_drops_for_region_draft(&proof).unwrap();
+        drops
+            .drop_block(glam::IVec3::new(2, 5, 1), &ladder)
+            .unwrap();
+        result.set_block_drops_for_test(drops);
+        assert!(result.ensure_inert_drops_for_region_draft(&proof).is_err());
+    }
 
     #[test]
     fn destroy_event_captures_only_materialized_entities_in_dispatch_sections() {

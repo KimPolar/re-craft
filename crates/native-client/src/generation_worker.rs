@@ -321,14 +321,39 @@ impl GenerationReady {
             .region
             .water_source_conversion()
             .context("postprocessed water conversion rule is missing")?;
+        let drop_sequences = processed
+            .region
+            .block_drops()
+            .map(|drops| drops.random_sequences().clone())
+            .filter(|sequences| sequences.is_dirty());
+        let inert_events = match processed.region.block_drops() {
+            Some(drops) if drops.operations() != 0 => {
+                Some(self.batch.certify_inert_destroy_events(&processed.region)?)
+            }
+            _ => None,
+        };
         ensure!(self.mesh.targets.is_some(), "generated targets are missing");
-        let regions = if structures {
-            self.batch
+        let regions = match (structures, &inert_events) {
+            (true, Some(proof)) => self
+                .batch
+                .prepare_converted_structure_region_drafts_with_inert_events(
+                    &processed.region,
+                    region_timestamp,
+                    proof,
+                )?
+                .regions,
+            (true, None) => self
+                .batch
                 .prepare_converted_structure_region_drafts(&processed.region, region_timestamp)?
-                .regions
-        } else {
-            self.batch
-                .converted_region_drafts(&processed.region, region_timestamp)?
+                .regions,
+            (false, Some(proof)) => self.batch.converted_region_drafts_with_inert_events(
+                &processed.region,
+                region_timestamp,
+                proof,
+            )?,
+            (false, None) => self
+                .batch
+                .converted_region_drafts(&processed.region, region_timestamp)?,
         };
         progress(InitialWorldStageProgress::Preparing)?;
         // Reject incomplete regions before constructing the initial session.
@@ -387,6 +412,9 @@ impl GenerationReady {
             "game rules differ from the initial generation state"
         );
         draft.set_game_rules(rules)?;
+        if let Some(sequences) = &drop_sequences {
+            draft.set_random_sequences(sequences)?;
+        }
         let dimension = DimensionId::parse(&self.mesh.world.dimension)?;
         for ((_, _, _), region) in regions {
             draft.add_region(dimension.clone(), region)?;

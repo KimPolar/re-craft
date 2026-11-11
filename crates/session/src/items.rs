@@ -370,6 +370,11 @@ impl GeneratedItem {
             .and_then(|created| created.uuid)
             .expect("prepared generated item has a validated UUID")
     }
+
+    #[cfg(test)]
+    pub(crate) fn debug_next_random(&self) -> i32 {
+        self.entity.random.clone().next_int()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -737,6 +742,73 @@ pub(crate) fn prepare_generated_block_drops(
 }
 
 impl ItemEntities {
+    #[cfg(test)]
+    pub(crate) fn debug_saved_item_random(&self, uuid: [i32; 4]) -> Option<i32> {
+        self.entities.iter().find_map(|item| {
+            let source = item._saved_source.as_ref()?;
+            (crate::saved_item::optional_uuid(source, "UUID")
+                .ok()
+                .flatten()
+                == Some(uuid))
+            .then(|| item.random.clone().next_int())
+        })
+    }
+    /// Validate the exact serialized source before treating a generated item
+    /// as an entity already present in an initial entity-chunk snapshot.
+    pub(crate) fn prepare_generated_saved_item(
+        item: &GeneratedItem,
+        record: &Tag,
+    ) -> anyhow::Result<GeneratedItem> {
+        use anyhow::{Context, ensure};
+        let pos =
+            created_chunk(item.entity.item.position).context("invalid generated item position")?;
+        let mut temporary = ItemEntities::default();
+        temporary.entities.push(item.entity.clone());
+        let drafts = temporary.draft_created_items_in_chunk(pos)?;
+        ensure!(
+            drafts.len() == 1 && &drafts[0].document().value == record,
+            "generated item differs from its entity record"
+        );
+        let mut entity = item.entity.clone();
+        entity.saved_fall_distance = Some(
+            entity
+                .created
+                .as_ref()
+                .context("missing generated identity")?
+                .fall_distance,
+        );
+        entity.created = None;
+        entity._saved_source = Some(Arc::new(record.clone()));
+        Ok(GeneratedItem { entity })
+    }
+
+    pub(crate) fn install_generated_saved_item(&mut self, mut item: GeneratedItem) {
+        item.entity.id = self.next_id;
+        item.entity.section_sequence = self.next_section_sequence;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
+        self.entities.push(item.entity);
+    }
+
+    pub(crate) fn set_generated_entity_seeder(
+        &mut self,
+        seeder: native_core::random::XoroshiroRandom,
+    ) {
+        self.entity_seed_checked = true;
+        self.entity_seeder = Some(seeder);
+    }
+
+    pub(crate) fn empty_for_generated_install(&self) -> bool {
+        self.entities.is_empty()
+            && self.removed_saved.is_empty()
+            && self.removed_created.is_empty()
+            && self.created_pickups.is_empty()
+            && self.saved_merges.is_empty()
+            && !self.entity_seed_checked
+            && self.next_id == 0
+            && self.next_section_sequence == 0
+    }
+
     fn ensure_rain_resolved(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.unresolved_rain_effect,

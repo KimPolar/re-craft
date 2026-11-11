@@ -724,6 +724,7 @@ pub struct LoadedSession {
     game_time: i64,
     initial_game_time_set: bool,
     generated_ticks_installed: bool,
+    generated_drops_installed: bool,
     level_time_source: Option<Arc<native_persistence::nbt::NamedTag>>,
     biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
     generator_sea_level: Option<i32>,
@@ -7069,6 +7070,7 @@ impl LoadedSession {
             game_time: 0,
             initial_game_time_set: false,
             generated_ticks_installed: false,
+            generated_drops_installed: false,
             level_time_source: None,
             biome_climates: None,
             generator_sea_level: None,
@@ -7992,12 +7994,166 @@ impl LoadedSession {
             "entity chunks must be set before the first tick"
         );
         anyhow::ensure!(
+            !self.generated_drops_installed || !self.item_chunks_seen.contains(&pos),
+            "cannot replace an entity chunk after generated items were installed"
+        );
+        anyhow::ensure!(
             self.world.chunks.contains_key(&pos),
             "entity chunk has no loaded block chunk"
         );
         validate_entity_chunk(pos, &entities)?;
         self.entity_chunks.insert(pos, entities);
         self.entity_collision_cache.insert(pos, OnceLock::new());
+        Ok(())
+    }
+
+    /// Install a completed generation drop checkpoint before the first tick.
+    /// Entity chunks must already contain the corresponding merged records.
+    /// This preserves the live item RNG instead of constructing items from NBT.
+    pub fn install_initial_generated_drops(
+        &mut self,
+        drops: &crate::worldgen::postprocessing_drops::GeneratedBlockDrops,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO && !self.generated_drops_installed,
+            "generated drops must be installed once before the first tick"
+        );
+        ensure!(
+            self.random_sequences.is_none()
+                && self.item_chunks_seen.is_empty()
+                && self.saved_item_uuids.is_empty()
+                && self.dropped_items.empty_for_generated_install(),
+            "session items or random sequences were already initialized"
+        );
+        ensure!(
+            self.world_seed
+                .is_none_or(|seed| seed == drops.world_seed()),
+            "generated drop world seed differs from the session"
+        );
+        ensure!(
+            self.block_drops == drops.block_drops_enabled(),
+            "generated drop rule differs from the session"
+        );
+
+        let mut prepared = Vec::new();
+        let mut saved_items = Vec::new();
+        let mut activated_chunks = BTreeSet::new();
+        let mut saved_uuids = BTreeMap::new();
+        if drops.item_chunks().next().is_some() {
+            let chunks: BTreeSet<_> = self
+                .world
+                .chunks
+                .keys()
+                .copied()
+                .chain(self.entity_chunks.keys().copied())
+                .collect();
+            let mut original = BTreeMap::new();
+            let mut current = BTreeMap::new();
+            for &pos in &chunks {
+                let records = match self.entity_chunks.get(&pos) {
+                    Some(SavedEntityData::Empty) => Vec::new(),
+                    Some(SavedEntityData::Present(chunk)) => chunk.entities().to_vec(),
+                    _ => anyhow::bail!("entity chunk {}, {} is unavailable", pos.x, pos.z),
+                };
+                let additions = drops.records(pos);
+                let base_count = records
+                    .len()
+                    .checked_sub(additions.len())
+                    .context("generated item record is absent from its entity chunk")?;
+                ensure!(
+                    &records[base_count..] == additions,
+                    "generated item records are missing or out of order"
+                );
+                let base = records[..base_count].to_vec();
+                current.insert(pos, Arc::new(records));
+                original.insert(pos, Arc::new(base));
+            }
+            let merged = drops.merge_complete_entities(&original)?;
+            ensure!(
+                merged == current,
+                "entity chunks differ from the merged generated records"
+            );
+
+            let mut records_by_uuid = HashMap::new();
+            for pos in drops.item_chunks() {
+                for record in drops.records(pos) {
+                    let uuid = crate::saved_item::optional_uuid(record, "UUID")?
+                        .context("generated item UUID is missing")?;
+                    ensure!(
+                        records_by_uuid.insert(uuid, (pos, record)).is_none(),
+                        "duplicate generated item UUID"
+                    );
+                }
+            }
+            let generated: BTreeSet<_> = drops
+                .items_in_spawn_order()
+                .map(|(_, item)| item.uuid())
+                .collect();
+            ensure!(
+                generated.len() == records_by_uuid.len(),
+                "generated item records are incomplete"
+            );
+            ensure!(
+                self.player_uuid
+                    .is_none_or(|uuid| !generated.contains(&uuid)),
+                "generated item UUID conflicts with the player"
+            );
+            for &pos in self.world.chunks.keys() {
+                let items = self
+                    .saved_items_in_chunk(pos)?
+                    .context("initial item chunk is unavailable")?;
+                for item in items {
+                    let uuid = item.uuid.context("initial item UUID is unavailable")?;
+                    ensure!(
+                        saved_uuids.insert(uuid, pos).is_none(),
+                        "duplicate initial item UUID"
+                    );
+                    if !generated.contains(&uuid) {
+                        saved_items.push(item);
+                    }
+                }
+                activated_chunks.insert(pos);
+            }
+            for (pos, item) in drops.items_in_spawn_order() {
+                ensure!(
+                    self.world.chunks.contains_key(&pos),
+                    "generated item chunk is not loaded"
+                );
+                let (record_pos, record) = records_by_uuid
+                    .get(&item.uuid())
+                    .context("generated item record is missing")?;
+                ensure!(
+                    *record_pos == pos,
+                    "generated item record belongs to another chunk"
+                );
+                prepared.push(crate::items::ItemEntities::prepare_generated_saved_item(
+                    item, record,
+                )?);
+            }
+            ensure!(
+                prepared.len() == generated.len(),
+                "generated item order is incomplete"
+            );
+        }
+
+        for item in saved_items {
+            self.dropped_items.spawn_saved(item);
+        }
+        for item in prepared {
+            self.dropped_items.install_generated_saved_item(item);
+        }
+        self.dropped_items
+            .set_generated_entity_seeder(drops.entity_seeder().clone());
+        self.saved_item_uuids = saved_uuids;
+        self.item_chunks_seen = activated_chunks;
+        self.world_seed = Some(drops.world_seed());
+        self.level_random = drops.level_random().clone();
+        self.random_sequences = Some(SessionRandomSequences {
+            world_seed: drops.world_seed(),
+            data: drops.random_sequences().clone(),
+        });
+        self.generated_drops_installed = true;
         Ok(())
     }
 
@@ -26782,6 +26938,161 @@ pub(crate) mod tests {
             }
         }
         Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    #[test]
+    fn generated_drops_install_live_items_without_reloading_or_losing_randomness() {
+        use crate::worldgen::postprocessing_drops::GeneratedBlockDrops;
+        use native_core::random::{LegacyRandom, XoroshiroRandom};
+        use native_persistence::random_sequences::RandomSequences;
+
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        let make_drops = |seed| {
+            GeneratedBlockDrops::new(
+                test_ladder_loot(),
+                42,
+                RandomSequences::read(None).unwrap(),
+                LegacyRandom::new(seed),
+                XoroshiroRandom::new(seed),
+                true,
+            )
+        };
+        let ladder = state(
+            "minecraft:ladder",
+            &[("facing", "east"), ("waterlogged", "false")],
+        );
+        let mut base = make_drops(5);
+        base.drop_block(session.origin + IVec3::new(4, 2, 4), &ladder)
+            .unwrap();
+        let mut drops = make_drops(77);
+        drops
+            .drop_block(session.origin + IVec3::new(6, 2, 6), &ladder)
+            .unwrap();
+        drops
+            .drop_block(session.origin + IVec3::new(7, 2, 6), &ladder)
+            .unwrap();
+        let expected: Vec<_> = drops
+            .items_in_spawn_order()
+            .map(|(_, item)| (item.uuid(), item.debug_next_random(), item.item().position))
+            .collect();
+        let original = BTreeMap::from([(chunk, Arc::new(base.records(chunk).to_vec()))]);
+        let merged = drops.merge_complete_entities(&original).unwrap();
+        let records = merged[&chunk].as_slice();
+        let mut before_level = session.level_random.clone();
+        assert!(session.install_initial_generated_drops(&drops).is_err());
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert!(session.random_sequences.is_none());
+        assert_eq!(
+            session.level_random.clone().next_int(),
+            before_level.next_int()
+        );
+        session
+            .set_initial_entity_chunk(chunk, SavedEntityData::Empty)
+            .unwrap();
+        assert!(session.install_initial_generated_drops(&drops).is_err());
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert!(session.random_sequences.is_none());
+        session
+            .set_initial_entity_chunk(
+                chunk,
+                SavedEntityData::from_generated(chunk, records).unwrap(),
+            )
+            .unwrap();
+        session.install_initial_generated_drops(&drops).unwrap();
+        assert!(session.install_initial_generated_drops(&drops).is_err());
+        assert!(
+            session
+                .set_initial_entity_chunk(chunk, SavedEntityData::Empty)
+                .is_err()
+        );
+        let items = session.dropped_items.snapshot();
+        assert_eq!(items.len(), 3);
+        for (index, (uuid, random, position)) in expected.iter().enumerate() {
+            assert_eq!(items[index + 1].position, *position);
+            assert_eq!(
+                session.dropped_items.debug_saved_item_random(*uuid),
+                Some(*random)
+            );
+        }
+        assert_eq!(
+            session.level_random.clone().next_int(),
+            drops.level_random().clone().next_int()
+        );
+        assert_eq!(
+            session
+                .random_sequences
+                .as_ref()
+                .unwrap()
+                .data
+                .draft()
+                .unwrap(),
+            drops.random_sequences().draft().unwrap()
+        );
+        session.activate_saved_items();
+        assert_eq!(session.dropped_items.snapshot().len(), 3);
+        for (uuid, random, _) in expected {
+            assert_eq!(
+                session.dropped_items.debug_saved_item_random(uuid),
+                Some(random)
+            );
+        }
+    }
+
+    #[test]
+    fn generated_disabled_drops_install_rng_without_entity_chunks() {
+        use crate::worldgen::postprocessing_drops::GeneratedBlockDrops;
+        use native_core::random::{LegacyRandom, XoroshiroRandom};
+        use native_persistence::random_sequences::RandomSequences;
+        use native_resources::packs::ResourceProvider;
+        struct NamedLoot;
+        impl ResourceProvider for NamedLoot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/ladder.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:ladder","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder","condition":{"type":"minecraft:random_chance","chance":1.0}}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        session.set_block_drops(false);
+        let mut drops = GeneratedBlockDrops::new(
+            Arc::new(BlockLootTables::load(&mut NamedLoot).unwrap()),
+            42,
+            RandomSequences::read(None).unwrap(),
+            LegacyRandom::new(17),
+            XoroshiroRandom::new(23),
+            false,
+        );
+        drops
+            .drop_block(
+                session.origin + IVec3::new(6, 2, 6),
+                &state(
+                    "minecraft:ladder",
+                    &[("facing", "east"), ("waterlogged", "false")],
+                ),
+            )
+            .unwrap();
+        assert_eq!(drops.operations(), 1);
+        assert!(drops.random_sequences().is_dirty());
+        assert_eq!(drops.items_in_spawn_order().count(), 0);
+        session.install_initial_generated_drops(&drops).unwrap();
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert_eq!(
+            session.level_random.clone().next_int(),
+            drops.level_random().clone().next_int()
+        );
+        assert_eq!(
+            session
+                .random_sequences
+                .as_ref()
+                .unwrap()
+                .data
+                .draft()
+                .unwrap(),
+            drops.random_sequences().draft().unwrap()
+        );
+        assert!(session.item_chunks_seen.is_empty());
     }
 
     #[test]

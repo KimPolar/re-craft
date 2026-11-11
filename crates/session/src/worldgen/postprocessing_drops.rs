@@ -28,6 +28,7 @@ pub struct GeneratedBlockDrops {
     enabled: bool,
     records: Arc<BTreeMap<ChunkPos, Arc<Vec<Tag>>>>,
     items: Arc<BTreeMap<ChunkPos, Arc<Vec<crate::items::GeneratedItem>>>>,
+    item_order: Arc<Vec<(ChunkPos, usize)>>,
     uuids: Arc<BTreeSet<[i32; 4]>>,
     operations: u64,
 }
@@ -50,6 +51,7 @@ impl GeneratedBlockDrops {
             enabled,
             records: Arc::new(BTreeMap::new()),
             items: Arc::new(BTreeMap::new()),
+            item_order: Arc::new(Vec::new()),
             uuids: Arc::new(BTreeSet::new()),
             operations: 0,
         }
@@ -110,14 +112,19 @@ impl GeneratedBlockDrops {
                 }),
             "generated item records and runtime identities differ"
         );
+        let chunk = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        let start = self.items.get(&chunk).map_or(0, |items| items.len());
+        let end = start
+            .checked_add(items.len())
+            .context("generated item count overflow")?;
         if let Some((name, random)) = changed_sequence {
             Arc::make_mut(&mut self.sequences).set(&name, &random)?;
         }
         if !records.is_empty() {
-            let chunk = ChunkPos {
-                x: pos.x.div_euclid(16),
-                z: pos.z.div_euclid(16),
-            };
+            Arc::make_mut(&mut self.item_order).extend((start..end).map(|index| (chunk, index)));
             Arc::make_mut(Arc::make_mut(&mut self.records).entry(chunk).or_default())
                 .extend(records);
             Arc::make_mut(Arc::make_mut(&mut self.items).entry(chunk).or_default()).extend(items);
@@ -142,6 +149,15 @@ impl GeneratedBlockDrops {
     /// Runtime item state corresponding one-for-one to `records` in this chunk.
     pub fn items(&self, chunk: ChunkPos) -> &[crate::items::GeneratedItem] {
         self.items.get(&chunk).map_or(&[], |items| items.as_slice())
+    }
+
+    /// Items across all chunks in the order they were created.
+    pub fn items_in_spawn_order(
+        &self,
+    ) -> impl Iterator<Item = (ChunkPos, &crate::items::GeneratedItem)> + '_ {
+        self.item_order
+            .iter()
+            .map(|&(chunk, index)| (chunk, &self.items[&chunk][index]))
     }
 
     pub fn level_random(&self) -> &LegacyRandom {
@@ -407,6 +423,44 @@ mod tests {
         );
         assert!(!generated.sequences.is_dirty());
         assert_eq!(generated.records(ChunkPos { x: 0, z: 0 }).len(), 1);
+    }
+
+    #[test]
+    fn generated_items_preserve_creation_order_across_chunks_and_forks() {
+        let mut drops = fixture(true);
+        let positions = [
+            IVec3::new(17, 5, 0),
+            IVec3::new(-1, 5, 0),
+            IVec3::new(18, 5, 0),
+        ];
+        for pos in positions {
+            drops.drop_block(pos, &ladder()).unwrap();
+        }
+        let snapshot = drops.clone();
+        let expected = [
+            ChunkPos { x: 1, z: 0 },
+            ChunkPos { x: -1, z: 0 },
+            ChunkPos { x: 1, z: 0 },
+        ];
+        assert_eq!(
+            drops
+                .items_in_spawn_order()
+                .map(|(chunk, _)| chunk)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let ids: Vec<_> = drops
+            .items_in_spawn_order()
+            .map(|(_, item)| item.uuid())
+            .collect();
+        drops.drop_block(IVec3::new(0, 5, 0), &ladder()).unwrap();
+        assert_eq!(
+            snapshot
+                .items_in_spawn_order()
+                .map(|(_, item)| item.uuid())
+                .collect::<Vec<_>>(),
+            ids
+        );
     }
 
     #[test]

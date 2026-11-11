@@ -19781,6 +19781,14 @@ impl LoadedSession {
         if native_world::collision::fence_waterlogged(state) == Some(false) {
             return fluid_sim::Cell::FenceDry;
         }
+        if let Some((_, waterlogged)) = native_world::collision::ladder_state(state)
+            && let Some(support) = ladder_support_direction(state)
+        {
+            return fluid_sim::Cell::Ladder {
+                facing: -support,
+                waterlogged,
+            };
+        }
         if matches!(
             state.name.as_str(),
             "minecraft:chest" | "minecraft:trapped_chest"
@@ -19907,7 +19915,8 @@ impl LoadedSession {
             fluid_sim::ChangedBlock::WaterloggedSlab { .. }
             | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
             | fluid_sim::ChangedBlock::WaterloggedChest
-            | fluid_sim::ChangedBlock::WaterloggedFence => {
+            | fluid_sim::ChangedBlock::WaterloggedFence
+            | fluid_sim::ChangedBlock::WaterloggedLadder { .. } => {
                 let expected = match change.block {
                     fluid_sim::ChangedBlock::WaterloggedSlab { top } => fluid_sim::Cell::Slab {
                         top,
@@ -19923,6 +19932,12 @@ impl LoadedSession {
                         fluid_sim::Cell::Chest { waterlogged: false }
                     }
                     fluid_sim::ChangedBlock::WaterloggedFence => fluid_sim::Cell::FenceDry,
+                    fluid_sim::ChangedBlock::WaterloggedLadder { facing } => {
+                        fluid_sim::Cell::Ladder {
+                            facing,
+                            waterlogged: false,
+                        }
+                    }
                     _ => unreachable!(),
                 };
                 if self.simulation_cell(change.position) != expected {
@@ -19993,6 +20008,7 @@ impl LoadedSession {
                     | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
                     | fluid_sim::ChangedBlock::WaterloggedChest
                     | fluid_sim::ChangedBlock::WaterloggedFence
+                    | fluid_sim::ChangedBlock::WaterloggedLadder { .. }
             ) && let Some(water) = self.simulated_fluid(id)
             {
                 self.schedule_fluid(change.position, water, settings.delay(water.kind));
@@ -22959,10 +22975,17 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             FluidCell::FenceDry if fluid.kind == FluidKind::Water && fluid.source => {
                 ChangedBlock::WaterloggedFence
             }
+            FluidCell::Ladder {
+                facing,
+                waterlogged: false,
+            } if fluid.kind == FluidKind::Water && fluid.source => {
+                ChangedBlock::WaterloggedLadder { facing }
+            }
             FluidCell::Slab { .. }
             | FluidCell::Stairs { .. }
             | FluidCell::Chest { .. }
-            | FluidCell::FenceDry => {
+            | FluidCell::FenceDry
+            | FluidCell::Ladder { .. } => {
                 return Ok(());
             }
             _ => ChangedBlock::Fluid(fluid),
@@ -69652,6 +69675,109 @@ pub(crate) mod tests {
                     && key.kind == FluidKind::Water
                     && key.source));
             }
+        }
+    }
+
+    #[test]
+    fn source_conversion_waterlogs_ladders_only_through_open_faces() {
+        for (facing, vector) in [
+            ("north", IVec3::NEG_Z),
+            ("south", IVec3::Z),
+            ("west", IVec3::NEG_X),
+            ("east", IVec3::X),
+        ] {
+            for conversion in [false, true] {
+                let mut session = session();
+                session.set_source_conversion(conversion, false);
+                let pos = IVec3::new(8, 3, 8);
+                let water = FluidState {
+                    kind: FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                };
+                let water_id = session.intern_liquid(water);
+                let ladder = session.intern_block(state(
+                    "minecraft:ladder",
+                    &[("facing", facing), ("waterlogged", "false")],
+                ));
+                assert!(session.set_with_notify(pos, water_id, false));
+                assert!(session.set_with_notify(pos + IVec3::X * 2, water_id, false));
+                assert!(session.set_with_notify(pos + IVec3::X, ladder, false));
+                for offset in [
+                    IVec3::NEG_Y,
+                    IVec3::X + IVec3::NEG_Y,
+                    IVec3::NEG_X,
+                    IVec3::NEG_Z,
+                    IVec3::Z,
+                ] {
+                    assert!(session.set_with_notify(pos + offset, session.states[3], false));
+                }
+                session.fluid_ticks.clear();
+                session.fluid_pending.clear();
+                session.schedule_fluid(pos, water, 0);
+                session.advance_fluid_ticks();
+                let expected_wet = conversion && vector.x == 0;
+                assert_eq!(
+                    session.simulation_cell(pos + IVec3::X),
+                    fluid_sim::Cell::Ladder {
+                        facing: vector,
+                        waterlogged: expected_wet
+                    },
+                    "{facing} {conversion}"
+                );
+                if expected_wet {
+                    let absolute = session.origin + pos + IVec3::X;
+                    assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+                        && key.y == absolute.y
+                        && key.z == absolute.z
+                        && key.kind == FluidKind::Water
+                        && key.source));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contained_ladder_water_spreads_without_replacing_the_ladder() {
+        for (facing, vector) in [
+            ("north", IVec3::NEG_Z),
+            ("south", IVec3::Z),
+            ("west", IVec3::NEG_X),
+            ("east", IVec3::X),
+        ] {
+            let mut session = session();
+            let pos = IVec3::new(8, 3, 8);
+            let ladder = session.intern_block(state(
+                "minecraft:ladder",
+                &[("facing", facing), ("waterlogged", "true")],
+            ));
+            assert!(session.set_with_notify(pos, ladder, false));
+            for offset in [IVec3::NEG_Y, IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z] {
+                if offset != vector {
+                    assert!(session.set_with_notify(pos + offset, session.states[3], false));
+                }
+            }
+            let water = FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            session.schedule_fluid(pos, water, 0);
+            session.advance_fluid_ticks();
+            assert_eq!(
+                session.simulation_cell(pos),
+                fluid_sim::Cell::Ladder {
+                    facing: vector,
+                    waterlogged: true
+                }
+            );
+            assert!(
+                matches!(session.simulation_cell(pos + vector), fluid_sim::Cell::Fluid(fluid) if fluid.kind == FluidKind::Water && fluid.amount == 7 && !fluid.source)
+            );
         }
     }
 

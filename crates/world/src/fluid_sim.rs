@@ -1,4 +1,4 @@
-//! Scheduled fluid spread for air, full blocks, liquids, slabs, stairs, chests and wet fences.
+//! Scheduled fluid spread for supported blocks and waterlogged containers.
 //!
 //! Other blocks are barriers until their fluid occupancy and side shapes are
 //! available. Wet copper grates block flow but count in source checks. The
@@ -25,6 +25,11 @@ pub enum Cell {
     OpenWater(FluidState),
     /// A dry fence may accept a newly formed water source.
     FenceDry,
+    /// A ladder's facing determines its full collision face.
+    Ladder {
+        facing: IVec3,
+        waterlogged: bool,
+    },
     /// A half slab, optionally holding source water.
     Slab {
         top: bool,
@@ -138,6 +143,7 @@ pub enum ChangedBlock {
     WaterloggedStairs { voxels: u8 },
     WaterloggedChest,
     WaterloggedFence,
+    WaterloggedLadder { facing: IVec3 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +229,7 @@ fn source(cell: Cell, kind: FluidKind) -> bool {
         || matches!(cell, Cell::Slab { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Stairs { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Chest { waterlogged: true } if kind == FluidKind::Water)
+        || matches!(cell, Cell::Ladder { waterlogged: true, .. } if kind == FluidKind::Water)
 }
 
 fn fluid(cell: Cell) -> Option<FluidState> {
@@ -238,7 +245,10 @@ fn fluid(cell: Cell) -> Option<FluidState> {
         | Cell::Stairs {
             waterlogged: true, ..
         }
-        | Cell::Chest { waterlogged: true } => Some(flowing(FluidKind::Water, 8, false)),
+        | Cell::Chest { waterlogged: true }
+        | Cell::Ladder {
+            waterlogged: true, ..
+        } => Some(flowing(FluidKind::Water, 8, false)),
         _ => None,
     }
 }
@@ -254,6 +264,13 @@ fn face(cell: Cell, direction: IVec3) -> u8 {
         | Cell::OpenWater(_)
         | Cell::FenceDry
         | Cell::Chest { .. } => 0,
+        Cell::Ladder { facing, .. } => {
+            if direction == -facing {
+                15
+            } else {
+                0
+            }
+        }
         Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 15,
         Cell::Slab { top, .. } if direction == IVec3::Y => {
             if top {
@@ -390,9 +407,11 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
     match cell {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
-        Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::FenceDry => {
-            !source(cell, kind)
-        }
+        Cell::Slab { .. }
+        | Cell::Stairs { .. }
+        | Cell::Chest { .. }
+        | Cell::FenceDry
+        | Cell::Ladder { .. } => !source(cell, kind),
         Cell::Solid
         | Cell::GrateWater(_)
         | Cell::BubbleWater(_)
@@ -416,7 +435,10 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool 
         | Cell::Stairs {
             waterlogged: true, ..
         }
-        | Cell::Chest { waterlogged: true } => kind == FluidKind::Water,
+        | Cell::Chest { waterlogged: true }
+        | Cell::Ladder {
+            waterlogged: true, ..
+        } => kind == FluidKind::Water,
         _ => false,
     }
 }
@@ -435,9 +457,10 @@ fn can_replace(
         | Cell::Stairs {
             waterlogged: false, ..
         }
-        | Cell::Chest { waterlogged: false } => {
-            incoming.kind == FluidKind::Water && incoming.source
-        }
+        | Cell::Chest { waterlogged: false }
+        | Cell::Ladder {
+            waterlogged: false, ..
+        } => incoming.kind == FluidKind::Water && incoming.source,
         Cell::FenceDry => incoming.kind == FluidKind::Water && incoming.source,
         Cell::Fluid(state)
             if state.kind == FluidKind::Water && incoming.kind == FluidKind::Lava =>
@@ -476,7 +499,11 @@ fn slope_distance(
         let candidate = world(next);
         if matches!(
             candidate,
-            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::FenceDry
+            Cell::Slab { .. }
+                | Cell::Stairs { .. }
+                | Cell::Chest { .. }
+                | Cell::FenceDry
+                | Cell::Ladder { .. }
         ) || !can_search(candidate, kind)
             || !can_pass(current, candidate, direction)
         {
@@ -538,7 +565,11 @@ fn side_changes_from(
         };
         if matches!(
             cell,
-            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::FenceDry
+            Cell::Slab { .. }
+                | Cell::Stairs { .. }
+                | Cell::Chest { .. }
+                | Cell::FenceDry
+                | Cell::Ladder { .. }
         ) && !(new.kind == FluidKind::Water && new.source)
         {
             continue;
@@ -567,6 +598,7 @@ fn side_changes_from(
                         Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
                         Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
                         Cell::FenceDry => ChangedBlock::WaterloggedFence,
+                        Cell::Ladder { facing, .. } => ChangedBlock::WaterloggedLadder { facing },
                         _ => ChangedBlock::Fluid(new),
                     },
                 });
@@ -616,6 +648,7 @@ pub fn tick(
                     | Cell::BubbleWater(_)
                     | Cell::FenceWater(_)
                     | Cell::OpenWater(_)
+                    | Cell::Ladder { .. }
             ) {
                 original
             } else {
@@ -647,6 +680,8 @@ pub fn tick(
                 ChangedBlock::WaterloggedChest
             } else if let Cell::FenceDry = below {
                 ChangedBlock::WaterloggedFence
+            } else if let Cell::Ladder { facing, .. } = below {
+                ChangedBlock::WaterloggedLadder { facing }
             } else {
                 ChangedBlock::Fluid(next)
             };
@@ -675,6 +710,10 @@ pub fn tick(
                             ChangedBlock::WaterloggedFence => {
                                 Cell::FenceWater(flowing(FluidKind::Water, 8, false))
                             }
+                            ChangedBlock::WaterloggedLadder { facing } => Cell::Ladder {
+                                facing,
+                                waterlogged: true,
+                            },
                             _ => Cell::Solid,
                         }
                     } else {
@@ -899,7 +938,8 @@ pub fn tick_live<W: LiveFluidWorld>(
             ChangedBlock::WaterloggedSlab { .. }
             | ChangedBlock::WaterloggedStairs { .. }
             | ChangedBlock::WaterloggedChest
-            | ChangedBlock::WaterloggedFence => flowing(FluidKind::Water, 8, false),
+            | ChangedBlock::WaterloggedFence
+            | ChangedBlock::WaterloggedLadder { .. } => flowing(FluidKind::Water, 8, false),
             ChangedBlock::Air | ChangedBlock::Solid(_) => {
                 unreachable!("side planning only emits fluid")
             }
@@ -1100,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_faces_match_full_collision_shapes_for_stairs_and_slabs() {
+    fn compact_faces_match_supported_collision_shapes() {
         let mut shapes = Vec::new();
         for facing in ["north", "south", "west", "east"] {
             for half in ["bottom", "top"] {
@@ -1183,6 +1223,27 @@ mod tests {
             };
             shapes.push((
                 Cell::FenceWater(flowing(FluidKind::Water, 8, false)),
+                block_shape(&state).unwrap(),
+            ));
+        }
+        for (name, facing) in [
+            ("north", IVec3::NEG_Z),
+            ("south", IVec3::Z),
+            ("west", IVec3::NEG_X),
+            ("east", IVec3::X),
+        ] {
+            let state = BlockState {
+                name: "minecraft:ladder".into(),
+                properties: [("facing", name), ("waterlogged", "true")]
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
+            };
+            shapes.push((
+                Cell::Ladder {
+                    facing,
+                    waterlogged: true,
+                },
                 block_shape(&state).unwrap(),
             ));
         }

@@ -8035,6 +8035,10 @@ impl LoadedSession {
             self.block_drops == drops.block_drops_enabled(),
             "generated drop rule differs from the session"
         );
+        ensure!(
+            drops.destroy_events().is_empty(),
+            "generated block destroy events require listener integration"
+        );
 
         let mut prepared = Vec::new();
         let mut saved_items = Vec::new();
@@ -26999,6 +27003,21 @@ pub(crate) mod tests {
                 SavedEntityData::from_generated(chunk, records).unwrap(),
             )
             .unwrap();
+        let mut pending = drops.clone();
+        pending.record_destroy_event((session.origin + IVec3::new(6, 2, 6)).to_array(), &ladder);
+        let previous_level = session.level_random.state();
+        let error = session
+            .install_initial_generated_drops(&pending)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("destroy events require listener integration")
+        );
+        assert!(!session.generated_drops_installed);
+        assert!(session.random_sequences.is_none());
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert_eq!(session.level_random.state(), previous_level);
         session.install_initial_generated_drops(&drops).unwrap();
         assert!(session.install_initial_generated_drops(&drops).is_err());
         assert!(
@@ -27076,6 +27095,17 @@ pub(crate) mod tests {
         assert_eq!(drops.operations(), 1);
         assert!(drops.random_sequences().is_dirty());
         assert_eq!(drops.items_in_spawn_order().count(), 0);
+        let mut pending = drops.clone();
+        pending.record_destroy_event(
+            (session.origin + IVec3::new(6, 2, 6)).to_array(),
+            &state(
+                "minecraft:ladder",
+                &[("facing", "east"), ("waterlogged", "false")],
+            ),
+        );
+        assert!(session.install_initial_generated_drops(&pending).is_err());
+        assert!(!session.generated_drops_installed);
+        assert!(session.random_sequences.is_none());
         session.install_initial_generated_drops(&drops).unwrap();
         assert!(session.dropped_items.snapshot().is_empty());
         assert_eq!(

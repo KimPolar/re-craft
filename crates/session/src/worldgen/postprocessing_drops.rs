@@ -196,7 +196,7 @@ impl GeneratedBlockDrops {
         &self.destroy_events
     }
 
-    pub(super) fn record_destroy_event(&mut self, position: [i32; 3], state: &BlockState) {
+    pub(crate) fn record_destroy_event(&mut self, position: [i32; 3], state: &BlockState) {
         Arc::make_mut(&mut self.destroy_events).push(GeneratedBlockDestroyEvent {
             position,
             state: state.clone(),

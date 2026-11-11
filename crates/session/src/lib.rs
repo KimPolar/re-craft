@@ -2306,7 +2306,8 @@ impl LocalSession {
             eprintln!("player attack speed equipment: {error:#}");
         }
         self.first_person.item_use = self.food_use.visual_state();
-        self.first_person.tick(&self.inventory);
+        self.first_person
+            .tick_with_swap(&self.inventory, self.attack_charge.item_swap_scale(1.0));
         if self.death.is_none() {
             let effect = self.vitals.tick_food(self.survival_rules);
             if effect == survival::FoodEffect::Starve {

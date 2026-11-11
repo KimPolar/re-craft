@@ -1,5 +1,5 @@
 //! Client-side hand state advanced at the same fixed tick rate as the player.
-//! Item model swap rules and attack-speed modifiers are not yet resolved.
+//! Some item-model swap rules are not yet resolved.
 
 use std::sync::Arc;
 
@@ -335,7 +335,12 @@ impl FirstPersonState {
         }
     }
 
-    pub(crate) fn tick(&mut self, inventory: &PlayerInventory) {
+    #[cfg(test)]
+    fn tick(&mut self, inventory: &PlayerInventory) {
+        self.tick_with_swap(inventory, 1.0);
+    }
+
+    pub(crate) fn tick_with_swap(&mut self, inventory: &PlayerInventory, swap: f32) {
         self.swing.tick();
         if self.inventory_revision != Some(inventory.revision()) {
             self.main
@@ -343,7 +348,7 @@ impl FirstPersonState {
             self.off.set_held(inventory.slot(PlayerSlot::Offhand));
             self.inventory_revision = Some(inventory.revision());
         }
-        self.main.tick(1.0);
+        self.main.tick(swap * swap * swap);
         self.off.tick(1.0);
     }
 }
@@ -591,11 +596,12 @@ public class SwingOracle {
   }
   static class Player extends LocalPlayer {
     ItemStack main=ItemStack.EMPTY, off=ItemStack.EMPTY;
+    float swapScale;
     Player() { super(null,null,null,null,null,null,false,null,null); }
     public ItemStack getMainHandItem() { return main; }
     public ItemStack getOffhandItem() { return off; }
     public boolean isHandsBusy() { return false; }
-    public float getItemSwapScale(float partial) { return 1f; }
+    public float getItemSwapScale(float partial) { return swapScale; }
   }
   static class EffectPlayer extends Player {
     MobEffectInstance haste, conduit, fatigue;
@@ -614,6 +620,11 @@ public class SwingOracle {
   }
   static class ChargePlayer extends Player {
     double speed;
+    public double getAttributeValue(Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) { return speed; }
+  }
+  static class SwapPlayer extends LocalPlayer {
+    double speed;
+    SwapPlayer() { super(null,null,null,null,null,null,false,null,null); }
     public double getAttributeValue(Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) { return speed; }
   }
   static class AttackMode extends MultiPlayerGameMode {
@@ -665,6 +676,15 @@ public class SwingOracle {
     }
     var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
     var unsafe=(Unsafe)unsafeField.get(null);
+    var swapPlayer=(SwapPlayer)unsafe.allocateInstance(SwapPlayer.class);
+    var swapTicker=net.minecraft.world.entity.LivingEntity.class.getDeclaredField("itemSwapTicker"); swapTicker.setAccessible(true);
+    var swaps=new JsonArray();
+    for(double speed:new double[]{0,0.1,1,4,1024})
+    for(int ticks:new int[]{-1,0,1,4,19,20,21,100})
+    for(float partial:new float[]{0f,0.25f,1f}) {
+      swapPlayer.speed=speed; swapTicker.setInt(swapPlayer,ticks);
+      var row=new JsonArray(); row.add(speed); row.add(ticks); row.add(partial); row.add(swapPlayer.getItemSwapScale(partial)); swaps.add(row);
+    }
     var chargePlayer=(ChargePlayer)unsafe.allocateInstance(ChargePlayer.class);
     var ticker=net.minecraft.world.entity.LivingEntity.class.getDeclaredField("attackStrengthTicker"); ticker.setAccessible(true);
     var charges=new JsonArray();
@@ -754,7 +774,7 @@ public class SwingOracle {
     var player=(Player)unsafe.allocateInstance(Player.class);
     var game=(Game)unsafe.allocateInstance(Game.class);
     var minecraft=LocalPlayer.class.getDeclaredField("minecraft"); minecraft.setAccessible(true); minecraft.set(player,game);
-    player.main=ItemStack.EMPTY; player.off=ItemStack.EMPTY;
+    player.main=ItemStack.EMPTY; player.off=ItemStack.EMPTY; player.swapScale=1f;
     var stone=new ItemStack(Items.STONE,5); var dirt=new ItemStack(Items.DIRT,5);
     var equip=new FirstPersonHandsAndItems();
     var fields=new java.lang.reflect.Field[6];
@@ -784,7 +804,25 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes); result.add("charges",charges);
+    player.main=ItemStack.EMPTY; player.off=ItemStack.EMPTY;
+    var scaledEquip=new FirstPersonHandsAndItems(); var scaled=new JsonArray();
+    for(int tick=0;tick<24;tick++) {
+      if(tick==0) player.main=stone;
+      if(tick==12) player.main=dirt;
+      if(tick==15) player.off=stone;
+      player.swapScale=(tick%12)/11f;
+      scaledEquip.tick(player);
+      var row=new JsonArray(); row.add(player.swapScale);
+      for(var f:fields) {
+        if(f.getType()==ItemStack.class) {
+          var item=(ItemStack)f.get(scaledEquip);
+          row.add(item.isEmpty()?"":BuiltInRegistries.ITEM.getKey(item.getItem()).toString());
+          row.add(item.getCount());
+        } else row.add(f.getFloat(scaledEquip));
+      }
+      scaled.add(row);
+    }
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("scaledEquipment",scaled); result.add("swapScales",swaps); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes); result.add("charges",charges);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -1293,6 +1331,60 @@ public class SwingOracle {
                     assert!(
                         (actual - java).abs() < 1e-6,
                         "tick={tick} {actual} != {java}"
+                    );
+                }
+            }
+        }
+        for row in result["swapScales"].as_array().unwrap() {
+            let speed = row[0].as_f64().unwrap();
+            let ticks = row[1].as_i64().unwrap() as i32;
+            let partial = row[2].as_f64().unwrap() as f32;
+            let actual =
+                crate::combat::AttackCharge::for_swap_test(ticks, speed).item_swap_scale(partial);
+            let expected = row[3].as_f64().unwrap() as f32;
+            assert_eq!(
+                actual, expected,
+                "speed={speed} ticks={ticks} partial={partial}"
+            );
+        }
+        let mut inventory = PlayerInventory::default();
+        let mut hands = FirstPersonState::default();
+        for (tick, row) in result["scaledEquipment"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            match tick {
+                0 => {
+                    inventory.set_slot(PlayerSlot::Storage(0), Some(stack("minecraft:stone", 4)));
+                }
+                12 => {
+                    inventory.set_slot(PlayerSlot::Storage(0), Some(stack("minecraft:dirt", 5)));
+                }
+                15 => {
+                    inventory.set_slot(PlayerSlot::Offhand, Some(stack("minecraft:stone", 4)));
+                }
+                _ => {}
+            }
+            hands.tick_with_swap(&inventory, row[0].as_f64().unwrap() as f32);
+            for (hand, offset) in [(&hands.main, 1), (&hands.off, 5)] {
+                let item = hand.item.as_deref();
+                assert_eq!(
+                    item.map_or("", ItemStack::id),
+                    row[offset].as_str().unwrap(),
+                    "tick={tick}"
+                );
+                assert_eq!(
+                    u64::from(item.map_or(0, ItemStack::count)),
+                    row[offset + 1].as_u64().unwrap(),
+                    "tick={tick}"
+                );
+                for (actual, index) in [(hand.old_height, offset + 2), (hand.height, offset + 3)] {
+                    let expected = row[index].as_f64().unwrap() as f32;
+                    assert!(
+                        (actual - expected).abs() < 1e-6,
+                        "tick={tick} {actual} != {expected}"
                     );
                 }
             }

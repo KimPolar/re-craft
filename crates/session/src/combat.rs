@@ -75,6 +75,15 @@ impl AttackCharge {
             ..Self::default()
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_swap_test(ticks: i32, speed: f64) -> Self {
+        Self {
+            swap_ticks: ticks,
+            speed: Some(speed),
+            ..Self::default()
+        }
+    }
     pub(crate) fn restore(
         &mut self,
         attribute: SavedAttribute,
@@ -107,6 +116,14 @@ impl AttackCharge {
         };
         let delay = ((1.0 / speed) * 20.0) as f32;
         !((self.ticks as f32 / delay) < minimum)
+    }
+
+    /// Player.getItemSwapScale uses the same attack-speed delay, but its own
+    /// ticker: a piercing attack resets attack charge without resetting this.
+    pub(crate) fn item_swap_scale(&self, partial: f32) -> f32 {
+        let Some(speed) = self.speed else { return 1.0 };
+        let delay = ((1.0 / speed) * 20.0) as f32;
+        ((self.swap_ticks as f32 + partial) / delay).clamp(0.0, 1.0)
     }
 
     pub(crate) fn attacked(&mut self) {
@@ -208,6 +225,16 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn piercing_attack_preserves_swap_progress_but_miss_resets_it() {
+        let mut charge = AttackCharge::for_swap_test(2, 4.0);
+        let before = charge.item_swap_scale(1.0);
+        charge.attacked();
+        assert_eq!(charge.item_swap_scale(1.0), before);
+        charge.missed();
+        assert_eq!(charge.item_swap_scale(1.0), 0.2);
     }
 
     #[test]

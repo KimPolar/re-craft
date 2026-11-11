@@ -225,12 +225,6 @@ impl FreshWorldPublishError {
             Self::Retryable { error, .. } | Self::RecoveryRequired { error, .. } => error,
         }
     }
-
-    fn into_error(self) -> anyhow::Error {
-        match self {
-            Self::Retryable { error, .. } | Self::RecoveryRequired { error, .. } => error,
-        }
-    }
 }
 
 impl std::fmt::Display for FreshWorldPublishError {
@@ -307,15 +301,15 @@ impl FreshWorldStage {
 
     /// Reserve a Java-style folder and keep its session lock while copying.
     /// Install level.dat last, atomically and without replacing any file. The
-    /// caller must independently prove the world data is complete.
+    /// caller must independently prove the world data is complete. Validation
+    /// errors retain the stage in the returned error for an explicit retry.
     pub fn publish(
         self,
         saves: &Path,
         name: &str,
         default_name: &str,
-    ) -> Result<PublishedFreshWorld> {
+    ) -> std::result::Result<PublishedFreshWorld, FreshWorldPublishError> {
         self.publish_recoverable(saves, name, default_name)
-            .map_err(FreshWorldPublishError::into_error)
     }
 
     /// Return the original stage if validation or folder reservation fails.
@@ -5874,6 +5868,32 @@ mod tests {
         let published = stage
             .publish_recoverable(saves.path(), "World", "New World")
             .unwrap();
+        assert!(published.path.join("level.dat").is_file());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn ordinary_publish_error_retains_stage_across_error_context() {
+        let saves = test_world();
+        let other = test_world();
+        let stage = publishable_stage(saves.path());
+        let path = stage.path().to_owned();
+        let propagated = stage
+            .publish(other.path(), "World", "New World")
+            .context("creating world");
+        let error = match propagated {
+            Ok(_) => panic!("wrong destination must be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("creating world"));
+        let stage = match error.downcast::<FreshWorldPublishError>().unwrap() {
+            FreshWorldPublishError::Retryable { stage, .. } => stage,
+            FreshWorldPublishError::RecoveryRequired { .. } => {
+                panic!("validation failure must allow retry")
+            }
+        };
+        assert!(path.join("level.dat").is_file());
+        let published = stage.publish(saves.path(), "World", "New World").unwrap();
         assert!(published.path.join("level.dat").is_file());
         assert!(!path.exists());
     }

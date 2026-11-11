@@ -1773,7 +1773,9 @@ impl LocalSession {
                     let hand = self
                         .inventory
                         .slot(PlayerSlot::Storage(self.inventory.selected()));
-                    if let Some(position) =
+                    if inventory::has_piercing_weapon(hand) {
+                        self.mining.hold_without_start();
+                    } else if let Some(position) =
                         self.mining
                             .press(target, hand, self.game_mode == GameMode::Creative)
                     {
@@ -1900,6 +1902,10 @@ impl LocalSession {
         if self.mining.held()
             && !self.food_use.is_active()
             && self.game_mode.allows_basic_building()
+            && !inventory::has_piercing_weapon(
+                self.inventory
+                    .slot(PlayerSlot::Storage(self.inventory.selected())),
+            )
         {
             let target = self.mining_target();
             if target.is_some() {
@@ -5757,6 +5763,96 @@ mod tests {
             session.snapshot().world.demo().unwrap().block(target),
             Block::Air
         );
+    }
+
+    #[test]
+    fn piercing_attacks_do_not_mine_and_resume_after_switching_items() {
+        use crate::inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+
+        let target = IVec3::new(0, 4, 3);
+        for mode in [GameMode::Survival, GameMode::Creative] {
+            for id in [
+                "minecraft:wooden_spear",
+                "minecraft:stone_spear",
+                "minecraft:copper_spear",
+                "minecraft:iron_spear",
+                "minecraft:golden_spear",
+                "minecraft:diamond_spear",
+                "minecraft:netherite_spear",
+            ] {
+                let mut world = World::default();
+                world.set_block(IVec3::new(0, 2, 5), Block::Stone);
+                world.set_block(target, Block::Dirt);
+                let mut session = LocalSession::new(world);
+                session.set_game_mode(mode);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new(id.into(), 1, 1, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.update(TICK * 3);
+                session.submit_command(PlayerCommand::Break);
+                session.update(TICK);
+                assert_eq!(session.world.block(target), Block::Dirt, "{mode:?} {id}");
+                assert_eq!(
+                    session.snapshot().first_person.swing.kind(),
+                    Some(animation::SwingKind::Stab)
+                );
+                for _ in 0..32 {
+                    session.update(TICK);
+                }
+                assert_eq!(session.world.block(target), Block::Dirt, "{mode:?} {id}");
+                assert_eq!(
+                    session.snapshot().first_person.swing.hand(),
+                    None,
+                    "holding attack must not restart the swing"
+                );
+                session.submit_command(PlayerCommand::SelectSlot(1));
+                for _ in 0..40 {
+                    session.update(TICK);
+                }
+                assert_eq!(
+                    session.world.block(target),
+                    Block::Air,
+                    "held attack should resume with an empty hand"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spear_without_piercing_component_mines_like_an_empty_hand() {
+        use crate::inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+        let target = IVec3::new(0, 4, 3);
+        let mut world = World::default();
+        world.set_block(IVec3::new(0, 2, 5), Block::Stone);
+        world.set_block(target, Block::Dirt);
+        let mut session = LocalSession::new(world);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:iron_spear".into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "!minecraft:piercing_weapon".into(),
+                    Tag::Compound(vec![]),
+                )]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        session.update(TICK * 3);
+        session.submit_command(PlayerCommand::Break);
+        session.update(TICK);
+        assert_eq!(session.world.block(target), Block::Dirt);
+        for _ in 0..40 {
+            session.update(TICK);
+        }
+        assert_eq!(session.world.block(target), Block::Air);
     }
 
     #[test]

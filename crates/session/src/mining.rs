@@ -639,6 +639,7 @@ pub(crate) fn basic_hand(item: Option<&ItemStack>) -> bool {
         ordinary_return_supported(item)
             && item.components().get("minecraft:tool").is_none()
             && (matches!(ordinary_item_default_max(item.id()), Some(16 | 64))
+                || crate::inventory::is_vanilla_spear(item.id())
                 || item.components().get("!minecraft:tool").is_some())
     })
 }

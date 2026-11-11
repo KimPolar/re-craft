@@ -559,6 +559,8 @@ import net.minecraft.world.entity.LivingEntity.SwingState;
 import net.minecraft.world.entity.LivingEntity.SwingDescription;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.SwingAnimationType;
+import net.minecraft.world.item.component.PiercingWeapon;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
@@ -603,6 +605,16 @@ public class SwingOracle {
       return null;
     }
   }
+  static class AttackPlayer extends Player {
+    ItemStack held;
+    public ItemStack getItemInHand(InteractionHand hand) { return held; }
+    public boolean isUsingItem() { return false; }
+  }
+  static class AttackMode extends MultiPlayerGameMode {
+    int stops;
+    AttackMode() { super(null,null); }
+    public void stopDestroyBlock() { stops++; }
+  }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var registries=VanillaRegistries.createReloadableLookup(VanillaRegistries.createWorldLookup());
@@ -614,13 +626,15 @@ public class SwingOracle {
       var row=new JsonArray(); row.add(BuiltInRegistries.ITEM.getKey(item).toString());
       row.add(attack.type().getSerializedName()); row.add(attack.duration());
       row.add(interact.type().getSerializedName()); row.add(interact.duration());
-      row.add(stack.getMaxStackSize()); row.add(stack.getMaxDamage()); prototypes.add(row);
+      row.add(stack.getMaxStackSize()); row.add(stack.getMaxDamage()); row.add(stack.has(DataComponents.PIERCING_WEAPON)); prototypes.add(row);
       if(attack.type()==SwingAnimationType.STAB) {
         stack.remove(DataComponents.ATTACK_ANIMATION); var removed=stack.getAttackAnimation();
         stack.set(DataComponents.ATTACK_ANIMATION,new SwingAnimation(SwingAnimationType.NONE,11)); var overridden=stack.getAttackAnimation();
         var patch=new JsonArray(); patch.add(BuiltInRegistries.ITEM.getKey(item).toString());
         patch.add(removed.type().getSerializedName()); patch.add(removed.duration());
-        patch.add(overridden.type().getSerializedName()); patch.add(overridden.duration()); prototypePatches.add(patch);
+        patch.add(overridden.type().getSerializedName()); patch.add(overridden.duration());
+        stack.remove(DataComponents.PIERCING_WEAPON); patch.add(stack.has(DataComponents.PIERCING_WEAPON));
+        prototypePatches.add(patch);
       }
     }
     var current=SwingState.class.getDeclaredField("currentSwing"); current.setAccessible(true);
@@ -638,6 +652,20 @@ public class SwingOracle {
     }
     var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
     var unsafe=(Unsafe)unsafeField.get(null);
+    var attackPlayer=(AttackPlayer)unsafe.allocateInstance(AttackPlayer.class);
+    var attackMode=(AttackMode)unsafe.allocateInstance(AttackMode.class);
+    var attackGame=(Game)unsafe.allocateInstance(Game.class);
+    attackGame.player=attackPlayer; attackGame.gameMode=attackMode;
+    var continueAttack=Minecraft.class.getDeclaredMethod("continueAttack",boolean.class); continueAttack.setAccessible(true);
+    var routes=new JsonArray();
+    for(int variant=0;variant<4;variant++) {
+      var stack=new ItemStack(variant==0||variant==1?Items.IRON_SPEAR:Items.STONE,1);
+      if(variant==1) stack.remove(DataComponents.PIERCING_WEAPON);
+      if(variant==3) stack.set(DataComponents.PIERCING_WEAPON,new PiercingWeapon(false,false,java.util.Optional.empty(),java.util.Optional.empty()));
+      attackPlayer.held=stack; var row=new JsonArray(); row.add(stack.has(DataComponents.PIERCING_WEAPON));
+      for(boolean held:new boolean[]{false,true}) { attackMode.stops=0; continueAttack.invoke(attackGame,held); row.add(attackMode.stops); }
+      routes.add(row);
+    }
     var effectPlayer=(EffectPlayer)unsafe.allocateInstance(EffectPlayer.class);
     var duration=net.minecraft.world.entity.LivingEntity.class.getDeclaredMethod("getModifiedSwingDuration",SwingAnimation.class);
     duration.setAccessible(true);
@@ -732,7 +760,7 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -806,6 +834,11 @@ public class SwingOracle {
                     "{id} {component}"
                 );
             }
+            assert_eq!(
+                crate::inventory::has_piercing_weapon(Some(&stack)),
+                row[7].as_bool().unwrap(),
+                "{id} piercing prototype"
+            );
             if id.strip_prefix("minecraft:").is_some_and(|name| {
                 matches!(
                     name,
@@ -860,6 +893,52 @@ public class SwingOracle {
                     i64::from(actual.duration),
                     row[offset + 1].as_i64().unwrap(),
                     "{id} patch"
+                );
+            }
+            let removed = ItemStack::new(
+                id.into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "!minecraft:piercing_weapon".into(),
+                    Tag::Compound(vec![]),
+                )]),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::inventory::has_piercing_weapon(Some(&removed)),
+                row[5].as_bool().unwrap()
+            );
+        }
+        let routes = result["piercingRoutes"].as_array().unwrap();
+        let cases = [
+            ("minecraft:iron_spear", Tag::Compound(vec![])),
+            (
+                "minecraft:iron_spear",
+                Tag::Compound(vec![(
+                    "!minecraft:piercing_weapon".into(),
+                    Tag::Compound(vec![]),
+                )]),
+            ),
+            ("minecraft:stone", Tag::Compound(vec![])),
+            (
+                "minecraft:stone",
+                Tag::Compound(vec![(
+                    "minecraft:piercing_weapon".into(),
+                    Tag::Compound(vec![]),
+                )]),
+            ),
+        ];
+        assert_eq!(routes.len(), cases.len());
+        for ((id, components), row) in cases.into_iter().zip(routes) {
+            let stack = ItemStack::new(id.into(), 1, 1, components).unwrap();
+            let piercing = crate::inventory::has_piercing_weapon(Some(&stack));
+            assert_eq!(piercing, row[0].as_bool().unwrap(), "{id}");
+            for held in [1, 2] {
+                assert_eq!(
+                    i64::from(!piercing),
+                    row[held].as_i64().unwrap(),
+                    "{id} held={held}"
                 );
             }
         }

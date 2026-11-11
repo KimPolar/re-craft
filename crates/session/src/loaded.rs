@@ -20529,23 +20529,30 @@ impl LoadedSession {
                         self.fall.effects(),
                         &self.breathing_effects,
                     );
-                    let target = self.mining_target();
-                    if let Some(relative) =
-                        target.and_then(|target| subtract(target.position, self.origin))
-                    {
-                        self.set_redstone_ore_lit(relative, true);
-                    }
-                    let context = self.mining_context();
                     let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
                         self.inventory.selected(),
                     ));
-                    if let Some(position) = self.mining.press_with_context(
-                        target,
-                        hand,
-                        self.game_mode == GameMode::Creative,
-                        context,
-                    ) {
-                        self.finish_breaking(position);
+                    if crate::inventory::has_piercing_weapon(hand) {
+                        self.mining.hold_without_start();
+                    } else {
+                        let target = self.mining_target();
+                        if let Some(relative) =
+                            target.and_then(|target| subtract(target.position, self.origin))
+                        {
+                            self.set_redstone_ore_lit(relative, true);
+                        }
+                        let context = self.mining_context();
+                        let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+                            self.inventory.selected(),
+                        ));
+                        if let Some(position) = self.mining.press_with_context(
+                            target,
+                            hand,
+                            self.game_mode == GameMode::Creative,
+                            context,
+                        ) {
+                            self.finish_breaking(position);
+                        }
                     }
                 }
                 PlayerCommand::Break
@@ -20843,6 +20850,9 @@ impl LoadedSession {
         if self.mining.held()
             && !self.food_use.is_active()
             && self.game_mode.allows_basic_building()
+            && !crate::inventory::has_piercing_weapon(self.inventory.slot(
+                crate::inventory::PlayerSlot::Storage(self.inventory.selected()),
+            ))
         {
             let target = self.mining_target();
             if target.is_some() {
@@ -66519,6 +66529,37 @@ pub(crate) mod tests {
             session.random_block_position.next_section_offset(),
             expected.next_section_offset()
         );
+    }
+
+    #[test]
+    fn piercing_attack_does_not_mine_or_light_redstone_ore() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let relative = IVec3::new(8, 2, 6);
+        for mode in [GameMode::Survival, GameMode::Creative] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session.set_game_mode(mode);
+            let ore = session.intern_block(state("minecraft:redstone_ore", &[("lit", "false")]));
+            assert!(session.set(relative + IVec3::NEG_Y, session.states[3]));
+            assert!(session.set(relative, ore));
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:iron_spear".into(), 1, 1, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            session.update(TICK * 3);
+            session.submit_command(PlayerCommand::Break);
+            for _ in 0..30 {
+                session.update(TICK);
+            }
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]),
+                Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(false))
+            );
+            assert_eq!(session.snapshot().first_person.swing.hand(), None);
+        }
     }
 
     #[test]

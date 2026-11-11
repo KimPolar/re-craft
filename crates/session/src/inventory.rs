@@ -3101,6 +3101,34 @@ const STACKABLE_ITEMS: &[&str] = &[
     "chorus_fruit",
 ];
 
+pub(crate) fn is_vanilla_spear(id: &str) -> bool {
+    matches!(
+        id,
+        "minecraft:wooden_spear"
+            | "minecraft:stone_spear"
+            | "minecraft:copper_spear"
+            | "minecraft:iron_spear"
+            | "minecraft:golden_spear"
+            | "minecraft:diamond_spear"
+            | "minecraft:netherite_spear"
+    )
+}
+
+/// Java routes attack input by component presence, before targeting a block.
+pub(crate) fn has_piercing_weapon(item: Option<&ItemStack>) -> bool {
+    item.is_some_and(|item| {
+        if item.components().get("minecraft:piercing_weapon").is_some() {
+            true
+        } else {
+            is_vanilla_spear(item.id())
+                && item
+                    .components()
+                    .get("!minecraft:piercing_weapon")
+                    .is_none()
+        }
+    })
+}
+
 /// Vanilla defaults for ordinary items whose inventory behavior is implemented.
 /// This does not mean their use, placement, tools, or rendering are complete.
 pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
@@ -3355,6 +3383,11 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             1073741824
+        } else if name.matches("!minecraft:piercing_weapon") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            2147483648
         } else if name.matches("minecraft:dyed_color") {
             value.as_java_int()?;
             131072

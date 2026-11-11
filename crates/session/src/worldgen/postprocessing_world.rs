@@ -2058,7 +2058,17 @@ impl GeneratedBlockView<'_> {
                 properties: BTreeMap::new(),
             }
         };
-        self.apply_water_change_with_depth(glam::IVec3::from_array(pos), state, &replacement, depth)
+        self.apply_water_change_with_depth(
+            glam::IVec3::from_array(pos),
+            state,
+            &replacement,
+            depth,
+        )?;
+        self.block_drops
+            .as_mut()
+            .context("ladder destruction requires block drops")?
+            .record_destroy_event(pos, state);
+        Ok(())
     }
 
     /// A shape-update write has Java's flag 2: shape notifications, but no
@@ -6784,6 +6794,7 @@ mod tests {
             }
             "ladder_break_unsupported"
             | "ladder_break_failed_loot"
+            | "ladder_break_neighbor_failure_on"
             | "ladder_break_dry_on"
             | "ladder_break_dry_off"
             | "ladder_break_wet_on"
@@ -6797,6 +6808,13 @@ mod tests {
                 });
                 world.set_block_id(9, 8, 8, air).unwrap();
                 world.set_block_id(10, 8, 8, ladder).unwrap();
+                if case == "ladder_break_neighbor_failure_on" {
+                    let lava = world.intern_state(BlockState {
+                        name: "minecraft:lava".into(),
+                        properties: BTreeMap::from([("level".into(), "0".into())]),
+                    });
+                    world.set_block_id(11, 8, 8, lava).unwrap();
+                }
             }
             "marked_ladder_dry"
             | "marked_ladder_wet"
@@ -7322,9 +7340,20 @@ mod tests {
                 )
                 .unwrap();
         }
-        if case == "ladder_break_failed_loot" {
+        if matches!(
+            case,
+            "ladder_break_failed_loot" | "ladder_break_neighbor_failure_on"
+        ) {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let mut before_random = stage.block_drops.as_ref().unwrap().level_random().clone();
+            if case == "ladder_break_neighbor_failure_on" {
+                let mut probe = stage.clone();
+                assert!(probe.poll(chunk, 1).is_err());
+                let attempted = probe.block_drops.as_ref().unwrap();
+                assert_eq!(attempted.operations(), 1);
+                assert_eq!(attempted.records(chunk).len(), 1);
+                assert!(attempted.destroy_events().is_empty());
+            }
             assert!(stage.try_poll(chunk, 1).is_err());
             assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
             assert_eq!(stage.world.block(9, 8, 8).unwrap().name, "minecraft:air");
@@ -7334,6 +7363,7 @@ mod tests {
             );
             let drops = stage.block_drops.as_ref().unwrap();
             assert_eq!(drops.operations(), 0);
+            assert!(drops.destroy_events().is_empty());
             assert!(drops.records(chunk).is_empty());
             assert_eq!(
                 drops.level_random().clone().next_int(),
@@ -7378,6 +7408,15 @@ mod tests {
         if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
             let drops = result.block_drops().unwrap();
             assert_eq!(drops.operations(), 1);
+            assert_eq!(
+                drops.destroy_events(),
+                &[
+                    super::super::postprocessing_drops::GeneratedBlockDestroyEvent {
+                        position: [10, 8, 8],
+                        state: source.block(10, 8, 8).unwrap().clone(),
+                    }
+                ]
+            );
             let (mut fresh, _, _) = fixture(false);
             assert!(fresh.set_block_drops(drops.clone()).is_err());
             assert!(fresh.block_drops.is_none());
@@ -7393,6 +7432,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(resumed.block_drops.as_ref().unwrap().operations(), 1);
+            assert_eq!(
+                resumed.block_drops.as_ref().unwrap().destroy_events(),
+                drops.destroy_events()
+            );
             assert!(result.ensure_drops_integrated_for_save().is_err());
             let original = BTreeMap::from([(chunk, Arc::new(Vec::new()))]);
             let merged = result.merge_complete_entity_records(&original).unwrap();
@@ -8054,6 +8097,14 @@ mod tests {
     fn generated_ladder_drops_roll_back_failed_loot() {
         assert_eq!(
             water_spread_trace("ladder_break_failed_loot"),
+            ["rolled back"]
+        );
+    }
+
+    #[test]
+    fn generated_ladder_destroy_event_rolls_back_after_neighbor_failure() {
+        assert_eq!(
+            water_spread_trace("ladder_break_neighbor_failure_on"),
             ["rolled back"]
         );
     }

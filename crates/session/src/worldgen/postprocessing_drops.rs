@@ -15,6 +15,13 @@ use native_persistence::{nbt::Tag, random_sequences::RandomSequences};
 use native_resources::loot::BlockLootTables;
 use native_world::loaded::{BlockState, ChunkPos};
 
+/// A successful Level.destroyBlock game event, in callback completion order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedBlockDestroyEvent {
+    pub position: [i32; 3],
+    pub state: BlockState,
+}
+
 /// A forkable checkpoint of one level's loot, item and level random streams.
 /// The caller supplies the same initial random streams and rules used by the
 /// level; no random state is inferred from the terrain seed.
@@ -30,6 +37,7 @@ pub struct GeneratedBlockDrops {
     items: Arc<BTreeMap<ChunkPos, Arc<Vec<crate::items::GeneratedItem>>>>,
     item_order: Arc<Vec<(ChunkPos, usize)>>,
     uuids: Arc<BTreeSet<[i32; 4]>>,
+    destroy_events: Arc<Vec<GeneratedBlockDestroyEvent>>,
     operations: u64,
 }
 
@@ -53,6 +61,7 @@ impl GeneratedBlockDrops {
             items: Arc::new(BTreeMap::new()),
             item_order: Arc::new(Vec::new()),
             uuids: Arc::new(BTreeSet::new()),
+            destroy_events: Arc::new(Vec::new()),
             operations: 0,
         }
     }
@@ -180,6 +189,18 @@ impl GeneratedBlockDrops {
     }
     pub fn operations(&self) -> u64 {
         self.operations
+    }
+
+    /// Events have not yet been delivered to game-event listeners.
+    pub fn destroy_events(&self) -> &[GeneratedBlockDestroyEvent] {
+        &self.destroy_events
+    }
+
+    pub(super) fn record_destroy_event(&mut self, position: [i32; 3], state: &BlockState) {
+        Arc::make_mut(&mut self.destroy_events).push(GeneratedBlockDestroyEvent {
+            position,
+            state: state.clone(),
+        });
     }
 
     /// Append item records to a caller-supplied complete entity snapshot.

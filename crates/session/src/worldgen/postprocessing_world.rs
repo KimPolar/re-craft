@@ -1751,10 +1751,6 @@ impl GeneratedBlockView<'_> {
             let p = target + glam::IVec3::from_array(d);
             let state = self.read(p.to_array())?;
             ensure!(
-                d != [0, -1, 0] || !snowy_fluid_barrier(&state),
-                "water change needs snowy surface shape callback"
-            );
-            ensure!(
                 matches!(
                     self.fluid_cell(p),
                     Cell::Air
@@ -1832,7 +1828,14 @@ impl GeneratedBlockView<'_> {
                     self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
                 if updated != state {
                     self.write_postprocessed_state(p.to_array(), &state, &updated)?;
-                    self.update_fence_shape_neighbors(p.to_array(), &updated, 512)?;
+                    self.update_water_shape_neighbors(p.to_array(), &updated, 512)?;
+                }
+            } else if d == [0, -1, 0] && snowy_fluid_barrier(&state) {
+                let updated =
+                    self.update_shape(p.to_array(), &state, [0, 1, 0], target.to_array(), next)?;
+                if updated != state {
+                    self.write_postprocessed_state(p.to_array(), &state, &updated)?;
+                    self.update_water_shape_neighbors(p.to_array(), &updated, 512)?;
                 }
             } else if super::ore::valid_lichen(&state) {
                 let direction = [-d[0], -d[1], -d[2]];
@@ -1864,14 +1867,14 @@ impl GeneratedBlockView<'_> {
     /// A shape-update write has Java's flag 2: shape notifications, but no
     /// redstone neighbor notifications. Each nested write runs before the
     /// remaining shape callbacks of the enclosing update.
-    fn update_fence_shape_neighbors(
+    fn update_water_shape_neighbors(
         &mut self,
         pos: [i32; 3],
-        fence: &BlockState,
+        changed: &BlockState,
         depth: usize,
     ) -> Result<()> {
         use native_world::fluid_sim::Cell;
-        ensure!(depth > 0, "fence shape update depth exceeded");
+        ensure!(depth > 0, "water shape update depth exceeded");
         for d in [
             [-1, 0, 0],
             [1, 0, 0],
@@ -1886,10 +1889,6 @@ impl GeneratedBlockView<'_> {
                 pos[2].wrapping_add(d[2]),
             ];
             let state = self.read(neighbor)?;
-            ensure!(
-                d != [0, -1, 0] || !snowy_fluid_barrier(&state),
-                "fence change needs snowy surface shape callback"
-            );
             let cell = self.fluid_cell(glam::IVec3::from_array(neighbor));
             ensure!(
                 matches!(
@@ -1911,10 +1910,15 @@ impl GeneratedBlockView<'_> {
                     fluid.kind == native_world::fluid::FluidKind::Water,
                     "fence touches unsupported liquid"
                 );
-                self.schedule_water(neighbor, &state)?;
+                // LiquidBlock schedules a shape tick only when either the
+                // liquid or the changed neighbor contains source water.
+                if fluid.source || native_world::collision::fence_waterlogged(changed) == Some(true)
+                {
+                    self.schedule_water(neighbor, &state)?;
+                }
                 if fluid.source && d == [0, 1, 0] {
                     let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
-                    if tags.can_occupy_fluid("minecraft:water") && tags.enables(&fence.name) {
+                    if tags.can_occupy_fluid("minecraft:water") && tags.enables(&changed.name) {
                         ensure!(
                             self.ticks.schedule(
                                 TickRegistry::Block,
@@ -1929,10 +1933,16 @@ impl GeneratedBlockView<'_> {
                 }
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let next =
-                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, fence)?;
+                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
                 if next != state {
                     self.write_postprocessed_state(neighbor, &state, &next)?;
-                    self.update_fence_shape_neighbors(neighbor, &next, depth - 1)?;
+                    self.update_water_shape_neighbors(neighbor, &next, depth - 1)?;
+                }
+            } else if d == [0, -1, 0] && snowy_fluid_barrier(&state) {
+                let next = self.update_shape(neighbor, &state, [0, 1, 0], pos, changed)?;
+                if next != state {
+                    self.write_postprocessed_state(neighbor, &state, &next)?;
+                    self.update_water_shape_neighbors(neighbor, &next, depth - 1)?;
                 }
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
@@ -2921,7 +2931,7 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 if path == "data/minecraft/tags/block/snow.json" {
                     Ok(Some(if self.0 {
-                        br#"{"values":["minecraft:stone","minecraft:water","minecraft:snow"]}"#
+                        br#"{"values":["minecraft:stone","minecraft:water","minecraft:snow","minecraft:oak_fence"]}"#
                             .to_vec()
                     } else {
                         br#"{"values":[]}"#.to_vec()
@@ -2931,10 +2941,15 @@ mod tests {
                 }
             }
         }
-        let registry = ["minecraft:stone", "minecraft:water", "minecraft:snow"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let registry = [
+            "minecraft:stone",
+            "minecraft:water",
+            "minecraft:snow",
+            "minecraft:oak_fence",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         let ids = BTreeSet::from([ResourceId::parse("minecraft:snow").unwrap()]);
         Arc::new(OreBlockTags::load(&mut Tags(tagged), &registry, &ids).unwrap())
     }
@@ -6120,7 +6135,7 @@ mod tests {
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
                     return Ok(Some(
-                        br#"{"values":["minecraft:stone","minecraft:sulfur","minecraft:cinnabar","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab","minecraft:oak_stairs","minecraft:oak_fence"]}"#.to_vec(),
+                        br#"{"values":["minecraft:stone","minecraft:sulfur","minecraft:cinnabar","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab","minecraft:oak_stairs","minecraft:oak_fence","minecraft:grass_block","minecraft:podzol","minecraft:mycelium"]}"#.to_vec(),
                     ));
                 }
                 if path == "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" {
@@ -6177,6 +6192,44 @@ mod tests {
         }
         world.set_block_id(origin_x, 8, 8, water).unwrap();
         match case {
+            case if case.starts_with("snow_water_") || case.starts_with("snow_fence_") => {
+                let is_water = case.starts_with("snow_water_");
+                let suffix = case
+                    .strip_prefix(if is_water {
+                        "snow_water_"
+                    } else {
+                        "snow_fence_"
+                    })
+                    .unwrap();
+                let mut parts = suffix.rsplitn(3, '_');
+                let _tagged = parts.next().unwrap();
+                let initial = parts.next().unwrap();
+                let name = parts.next().unwrap();
+                let snowy = world.intern_state(BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::from([("snowy".into(), initial.into())]),
+                });
+                if is_water {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                    world.set_block_id(8, 6, 8, snowy).unwrap();
+                } else {
+                    let fence = world.intern_state(BlockState {
+                        name: "minecraft:oak_fence".into(),
+                        properties: ["north", "east", "south", "west", "waterlogged"]
+                            .into_iter()
+                            .map(|name| {
+                                (
+                                    name.into(),
+                                    (name == "east" || name == "waterlogged").to_string(),
+                                )
+                            })
+                            .collect(),
+                    });
+                    world.set_block_id(8, 8, 8, fence).unwrap();
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                    world.set_block_id(8, 7, 8, snowy).unwrap();
+                }
+            }
             "down" | "down_sand" | "down_wet_slab" => {
                 world.set_block_id(8, 7, 8, air).unwrap();
                 if case == "down_sand" {
@@ -6605,6 +6658,9 @@ mod tests {
             "oak_leaves",
             "oak_fence",
             "glow_lichen",
+            "grass_block",
+            "podzol",
+            "mycelium",
         ]
         .into_iter()
         .map(|name| format!("minecraft:{name}"))
@@ -6660,6 +6716,11 @@ mod tests {
                 "minecraft:flowing_lava".into(),
             ]))),
         );
+        if (case.starts_with("snow_water_") || case.starts_with("snow_fence_"))
+            && !case.ends_with("_missing")
+        {
+            stage.set_snow_tags(Some(snowy_test_tags(case.ends_with("_true"))));
+        }
         if matches!(
             case,
             "convert_on"
@@ -6690,6 +6751,13 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if case.ends_with("_missing") {
+            let error = stage.poll(chunk, 1).unwrap_err();
+            assert!(stage.finish().is_err());
+            assert_eq!(source.block(8, 7, 8).unwrap().name, "minecraft:air");
+            assert_eq!(source.block(8, 6, 8).unwrap().properties["snowy"], "true");
+            return vec![format!("{error:#}")];
+        }
         if case == "edge_deferred" {
             assert!(stage.select_initial_targets(BTreeSet::new()).is_err());
             assert!(
@@ -6869,6 +6937,18 @@ mod tests {
                 ));
             }
         }
+        if case.starts_with("snow_water_") || case.starts_with("snow_fence_") {
+            let y = if case.starts_with("snow_water_") {
+                6
+            } else {
+                7
+            };
+            let state = result.world.block(8, y, 8).unwrap();
+            trace.push(format!(
+                "snow 8,{y},8 {} {}",
+                state.name, state.properties["snowy"]
+            ));
+        }
         if case == "fence_on_neighbor" {
             let state = result.world.block(10, 8, 8).unwrap();
             trace.push(format!(
@@ -6943,6 +7023,48 @@ mod tests {
             &["edge_deferred"],
         );
         assert_eq!(actual, water_spread_trace("edge_deferred"));
+    }
+
+    #[test]
+    fn water_and_fence_updates_apply_snow_tags() {
+        for kind in ["water", "fence"] {
+            for name in ["grass_block", "podzol", "mycelium"] {
+                for initial in [false, true] {
+                    for tagged in [false, true] {
+                        let case = format!("snow_{kind}_{name}_{initial}_{tagged}");
+                        let trace = water_spread_trace(&case);
+                        let y = if kind == "water" { 6 } else { 7 };
+                        assert!(
+                            trace.contains(&format!("snow 8,{y},8 minecraft:{name} {tagged}")),
+                            "{case}: {trace:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn water_and_fence_snowy_updates_match_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["snow"],
+        );
+        let mut expected = Vec::new();
+        for kind in ["water", "fence"] {
+            for name in ["grass_block", "podzol", "mycelium"] {
+                for initial in [false, true] {
+                    for tagged in [false, true] {
+                        expected.extend(water_spread_trace(&format!(
+                            "snow_{kind}_{name}_{initial}_{tagged}"
+                        )));
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -7063,49 +7185,9 @@ mod tests {
     }
 
     #[test]
-    fn water_spread_rejects_unhandled_snowy_surface_callback() {
-        let (mut stage, _, chunk) = fixture(false);
-        let world = Arc::make_mut(&mut stage.world);
-        let stone = world.block_id(0, 0, 0).unwrap();
-        let air = world.intern_state(BlockState {
-            name: "minecraft:air".into(),
-            properties: BTreeMap::new(),
-        });
-        let water = world.intern_state(BlockState {
-            name: "minecraft:water".into(),
-            properties: BTreeMap::from([("level".into(), "0".into())]),
-        });
-        let grass = world.intern_state(BlockState {
-            name: "minecraft:grass_block".into(),
-            properties: BTreeMap::from([("snowy".into(), "true".into())]),
-        });
-        Arc::make_mut(
-            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
-                .sections
-                .get_mut(&0)
-                .unwrap(),
-        )
-        .blocks
-        .as_mut()
-        .unwrap()
-        .fill(stone);
-        world.set_block_id(8, 8, 8, water).unwrap();
-        world.set_block_id(8, 7, 8, air).unwrap();
-        world.set_block_id(8, 6, 8, grass).unwrap();
-        let source = Arc::clone(&stage.world);
-        stage.set_water_source_conversion(true).unwrap();
-        stage.set_fluid_tags(
-            Some(Arc::new(BTreeSet::from([
-                "minecraft:air".into(),
-                "minecraft:water".into(),
-            ]))),
-            Some(Arc::new(BTreeSet::from(["minecraft:lava".into()]))),
-        );
-        let error = stage.poll(chunk, 1).unwrap_err();
-        assert!(format!("{error:#}").contains("water change needs snowy surface shape callback"));
-        assert!(stage.finish().is_err());
-        assert_eq!(source.block(8, 7, 8).unwrap().name, "minecraft:air");
-        assert_eq!(source.block(8, 6, 8).unwrap().properties["snowy"], "true");
+    fn water_spread_rejects_missing_snowy_surface_tags() {
+        let trace = water_spread_trace("snow_water_grass_block_true_missing");
+        assert!(trace[0].contains("snow block tags unavailable"));
     }
 
     #[test]

@@ -172,6 +172,8 @@ pub struct GeneratedPostprocessing {
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
+    pub(super) entity_candidates:
+        BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
     block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
     bonus_chest_attempted: bool,
 }
@@ -236,6 +238,7 @@ pub struct PostprocessedGeneratedRegion {
     water_source_conversion: Option<bool>,
     block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
+    entity_candidates: BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
     block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
     bonus_chest_attempted: bool,
 }
@@ -466,6 +469,12 @@ impl GeneratedPostprocessing {
             .map(|pos| (pos, ConvertedBlockEntities::default()))
             .collect();
         let required = region.tasks.keys().copied().collect();
+        let entity_candidates = region
+            .tasks
+            .keys()
+            .copied()
+            .map(|pos| (pos, None))
+            .collect();
         Self {
             source: Arc::clone(&world),
             world,
@@ -495,6 +504,7 @@ impl GeneratedPostprocessing {
             heightmaps,
             heightmap_tags,
             block_entities,
+            entity_candidates,
             block_entity_edits: BTreeMap::new(),
             bonus_chest_attempted: false,
         }
@@ -510,6 +520,32 @@ impl GeneratedPostprocessing {
         );
         self.block_entities = entities;
         Ok(())
+    }
+
+    pub(super) fn set_entity_candidates(
+        &mut self,
+        candidates: BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
+    ) -> Result<()> {
+        ensure!(
+            candidates.keys().eq(self.region.tasks.keys())
+                && self.completed.is_empty()
+                && self.active.is_none()
+                && !self.failed,
+            "converted entity candidate chunks differ"
+        );
+        self.entity_candidates = candidates;
+        Ok(())
+    }
+
+    pub(super) fn set_registered_entity_candidates(
+        &mut self,
+        pos: ChunkPos,
+        candidates: Arc<Vec<native_persistence::nbt::Tag>>,
+    ) {
+        *self
+            .entity_candidates
+            .get_mut(&pos)
+            .expect("registered entity chunk") = Some(candidates);
     }
 
     pub(super) fn bind_batch_revision(&mut self, revision: u64) {
@@ -575,6 +611,7 @@ impl GeneratedPostprocessing {
         stage.light_reads = RefCell::new(completed.light_reads.clone());
         stage.light_checks = completed.light_checks.clone();
         stage.block_entities = completed.block_entities.clone();
+        stage.entity_candidates = completed.entity_candidates.clone();
         stage.block_entity_edits = completed.block_entity_edits.clone();
         stage.bonus_chest_attempted = completed.bonus_chest_attempted;
         Ok(stage)
@@ -622,6 +659,7 @@ impl GeneratedPostprocessing {
             self.required.insert(pos);
         }
         self.block_entities.insert(pos, entities);
+        self.entity_candidates.insert(pos, None);
         self.heightmaps.insert(pos, heightmaps);
         if let Some(light) = light {
             self.light = Some(light);
@@ -871,6 +909,7 @@ impl GeneratedPostprocessing {
             chunk: pos,
             block_entities: &mut entities,
             other_block_entities: &self.block_entities,
+            entity_candidates: &self.entity_candidates,
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             read_chunks: &self.read_chunks,
@@ -958,6 +997,7 @@ impl GeneratedPostprocessing {
             chunk: pos,
             block_entities: &mut entities,
             other_block_entities: &self.block_entities,
+            entity_candidates: &self.entity_candidates,
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             read_chunks: &self.read_chunks,
@@ -1027,6 +1067,7 @@ impl GeneratedPostprocessing {
             water_source_conversion: self.water_source_conversion,
             block_drops: self.block_drops,
             block_entities: self.block_entities,
+            entity_candidates: self.entity_candidates,
             block_entity_edits: self.block_entity_edits,
             bonus_chest_attempted: self.bonus_chest_attempted,
         })
@@ -1037,6 +1078,7 @@ struct GeneratedBlockView<'a> {
     chunk: ChunkPos,
     block_entities: &'a mut ConvertedBlockEntities,
     other_block_entities: &'a BTreeMap<ChunkPos, ConvertedBlockEntities>,
+    entity_candidates: &'a BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
     block_entity_edits: &'a mut BTreeMap<BlockPosition, (BlockState, BlockState)>,
     world: &'a mut Arc<World>,
     read_chunks: &'a RefCell<BTreeSet<ChunkPos>>,
@@ -2135,6 +2177,18 @@ impl GeneratedBlockView<'_> {
             self.block_entities,
             self.other_block_entities,
         )?;
+        let entities = block_entities
+            .keys()
+            .map(|&chunk| {
+                Ok((
+                    chunk,
+                    self.entity_candidates
+                        .get(&chunk)
+                        .context("event entity candidate chunk is missing")?
+                        .clone(),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         self.block_drops
             .as_mut()
             .context("ladder destruction requires block drops")?
@@ -2144,6 +2198,7 @@ impl GeneratedBlockView<'_> {
                 Arc::clone(self.world),
                 self.ticks.registration_order(),
                 block_entities,
+                entities,
             );
         Ok(())
     }
@@ -7561,6 +7616,14 @@ mod tests {
             assert_eq!(event.state, source.block(10, 8, 8).unwrap().clone());
             assert_eq!(event.registered_chunks(), &[chunk]);
             assert_eq!(event.block_entities().get(&chunk), Some(&Vec::new()));
+            assert_eq!(event.entities().get(&chunk), Some(&None));
+            assert_eq!(
+                event
+                    .generated_items()
+                    .get(&chunk)
+                    .map_or(0, |items| items.len()),
+                usize::from(case.ends_with("_on"))
+            );
             assert_eq!(
                 event.world().block(10, 8, 8).unwrap().name,
                 if case.contains("_wet_") {

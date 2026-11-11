@@ -6049,6 +6049,10 @@ mod tests {
         let mut generated = batch
             .begin_generated_postprocessing_with_neighbors([center], [center], 42, 10)
             .unwrap();
+        assert_eq!(
+            generated.entity_candidates[&center].as_deref().map(Vec::as_slice),
+            Some(batch.recorded_generated_entities(center).unwrap())
+        );
         while !generated.poll(center, 4).unwrap() {}
         let mut processed = generated.clone().finish().unwrap();
         assert!(Arc::ptr_eq(&original, &processed.world));

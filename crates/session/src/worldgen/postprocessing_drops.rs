@@ -23,6 +23,8 @@ pub struct GeneratedBlockDestroyEvent {
     world: Arc<World>,
     registered_chunks: Arc<[ChunkPos]>,
     block_entities: Arc<BTreeMap<ChunkPos, Vec<Tag>>>,
+    entities: Arc<BTreeMap<ChunkPos, Option<Arc<Vec<Tag>>>>>,
+    generated_items: Arc<BTreeMap<ChunkPos, Arc<Vec<Tag>>>>,
 }
 
 impl GeneratedBlockDestroyEvent {
@@ -42,6 +44,17 @@ impl GeneratedBlockDestroyEvent {
     pub fn block_entities(&self) -> &BTreeMap<ChunkPos, Vec<Tag>> {
         &self.block_entities
     }
+
+    /// Recorded protochunk entities at conversion. `None` means the source
+    /// was unavailable; `Some` does not by itself prove complete coverage.
+    pub fn entities(&self) -> &BTreeMap<ChunkPos, Option<Arc<Vec<Tag>>>> {
+        &self.entities
+    }
+
+    /// Items created by postprocessing before this event was emitted.
+    pub fn generated_items(&self) -> &BTreeMap<ChunkPos, Arc<Vec<Tag>>> {
+        &self.generated_items
+    }
 }
 
 impl PartialEq for GeneratedBlockDestroyEvent {
@@ -50,6 +63,8 @@ impl PartialEq for GeneratedBlockDestroyEvent {
             && self.state == other.state
             && self.registered_chunks == other.registered_chunks
             && self.block_entities == other.block_entities
+            && self.entities == other.entities
+            && self.generated_items == other.generated_items
             && Arc::ptr_eq(&self.world, &other.world)
     }
 }
@@ -236,7 +251,14 @@ impl GeneratedBlockDrops {
         world: Arc<World>,
         registered_chunks: &[ChunkPos],
         block_entities: BTreeMap<ChunkPos, Vec<Tag>>,
+        entities: BTreeMap<ChunkPos, Option<Arc<Vec<Tag>>>>,
     ) {
+        let generated_items: BTreeMap<_, _> = self
+            .records
+            .iter()
+            .filter(|(chunk, _)| block_entities.contains_key(chunk))
+            .map(|(&chunk, records)| (chunk, Arc::clone(records)))
+            .collect();
         let registered_chunks = self
             .destroy_events
             .last()
@@ -249,12 +271,26 @@ impl GeneratedBlockDrops {
             .filter(|event| event.block_entities.as_ref() == &block_entities)
             .map(|event| Arc::clone(&event.block_entities))
             .unwrap_or_else(|| Arc::new(block_entities));
+        let entities = self
+            .destroy_events
+            .last()
+            .filter(|event| event.entities.as_ref() == &entities)
+            .map(|event| Arc::clone(&event.entities))
+            .unwrap_or_else(|| Arc::new(entities));
+        let generated_items = self
+            .destroy_events
+            .last()
+            .filter(|event| event.generated_items.as_ref() == &generated_items)
+            .map(|event| Arc::clone(&event.generated_items))
+            .unwrap_or_else(|| Arc::new(generated_items));
         Arc::make_mut(&mut self.destroy_events).push(GeneratedBlockDestroyEvent {
             position,
             state: state.clone(),
             world,
             registered_chunks,
             block_entities,
+            entities,
+            generated_items,
         });
     }
 
@@ -388,6 +424,31 @@ mod tests {
     }
 
     #[test]
+    fn destroy_event_retains_only_items_and_entities_present_at_emission() {
+        let mut drops = fixture(true);
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let mut entities = Arc::new(vec![Tag::Int(1)]);
+        drops.drop_block(IVec3::new(1, 5, 1), &ladder()).unwrap();
+        drops.record_destroy_event(
+            [1, 5, 1],
+            &ladder(),
+            Arc::new(World::new("minecraft:overworld")),
+            &[chunk],
+            BTreeMap::from([(chunk, Vec::new())]),
+            BTreeMap::from([(chunk, Some(Arc::clone(&entities)))]),
+        );
+        drops.drop_block(IVec3::new(2, 5, 1), &ladder()).unwrap();
+        Arc::make_mut(&mut entities).push(Tag::Int(2));
+        let event = &drops.destroy_events()[0];
+        assert_eq!(event.generated_items()[&chunk].len(), 1);
+        assert_eq!(drops.records(chunk).len(), 2);
+        assert_eq!(
+            event.entities()[&chunk].as_deref(),
+            Some(&vec![Tag::Int(1)])
+        );
+    }
+
+    #[test]
     fn destroy_event_retains_emission_world_and_registered_chunk_order() {
         let mut drops = fixture(true);
         let chunk = ChunkPos { x: -1, z: 0 };
@@ -399,13 +460,28 @@ mod tests {
             Arc::clone(&world),
             &registered,
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         let earlier = drops.clone();
         Arc::make_mut(&mut world).dimension = "example:later".into();
         registered.push(ChunkPos { x: 0, z: 0 });
-        drops.record_destroy_event([0, 5, 0], &ladder(), world, &registered, BTreeMap::new());
+        drops.record_destroy_event(
+            [0, 5, 0],
+            &ladder(),
+            world,
+            &registered,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
         let world = Arc::clone(drops.destroy_events()[1].world());
-        drops.record_destroy_event([1, 5, 0], &ladder(), world, &registered, BTreeMap::new());
+        drops.record_destroy_event(
+            [1, 5, 0],
+            &ladder(),
+            world,
+            &registered,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
         assert_eq!(earlier.destroy_events().len(), 1);
         assert_eq!(
             earlier.destroy_events()[0].world().dimension,

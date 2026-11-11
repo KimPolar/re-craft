@@ -3112,6 +3112,24 @@ impl FreshTerrainBatch {
             Some(heightmap_tags),
         );
         stage.set_block_entities(block_entities)?;
+        stage.set_entity_candidates(
+            positions
+                .iter()
+                .copied()
+                .map(|pos| {
+                    (
+                        pos,
+                        Some(
+                            terrain
+                                .generated_entities
+                                .get(&pos)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    )
+                })
+                .collect(),
+        )?;
         stage.bind_batch_revision(self.schedule.revision());
         stage.set_leaf_tags(
             self.decoration
@@ -3220,6 +3238,11 @@ impl FreshTerrainBatch {
             terrain.generated_entity_order.get(&pos).map(Arc::as_ref),
             terrain.generated_pending_order.get(&pos).map(Arc::as_ref),
         )?;
+        let entity_candidates = terrain
+            .generated_entities
+            .get(&pos)
+            .cloned()
+            .unwrap_or_default();
         let (min_y, max_y) = self.build_bounds()?;
         let heightmaps = native_persistence::heightmap::FullHeightmaps::from_converted(
             native_persistence::heightmap::HeightBounds { min_y, max_y },
@@ -3233,10 +3256,14 @@ impl FreshTerrainBatch {
             None
         };
         if required {
-            stage.register_converted_chunk(pos, converted, entities, heightmaps, light)
+            stage.register_converted_chunk(pos, converted, entities, heightmaps, light)?;
         } else {
-            stage.register_converted_chunk_inner(pos, converted, entities, heightmaps, light, false)
+            stage.register_converted_chunk_inner(
+                pos, converted, entities, heightmaps, light, false,
+            )?;
         }
+        stage.set_registered_entity_candidates(pos, entity_candidates);
+        Ok(())
     }
 
     /// Reopen a completed pass against the same validated batch revision.

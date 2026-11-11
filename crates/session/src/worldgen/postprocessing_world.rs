@@ -164,6 +164,7 @@ pub struct GeneratedPostprocessing {
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
     water_source_conversion: Option<bool>,
+    block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     edits: Vec<BlockPosition>,
     read_chunks: RefCell<BTreeSet<ChunkPos>>,
     light_reads: RefCell<BTreeSet<ChunkPos>>,
@@ -233,6 +234,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) max_y: i32,
     pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     water_source_conversion: Option<bool>,
+    block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
     block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
     bonus_chest_attempted: bool,
@@ -302,6 +304,23 @@ impl PostprocessedGeneratedRegion {
     /// The explicit rule used for this pass, if supplied by its caller.
     pub fn water_source_conversion(&self) -> Option<bool> {
         self.water_source_conversion
+    }
+
+    /// Intermediate drop records and random streams from this pass. The
+    /// caller must merge these records into complete entity chunks and carry
+    /// both random streams into the live level before publishing it.
+    pub fn block_drops(&self) -> Option<&super::postprocessing_drops::GeneratedBlockDrops> {
+        self.block_drops.as_ref()
+    }
+
+    pub(super) fn ensure_drops_integrated_for_save(&self) -> Result<()> {
+        ensure!(
+            self.block_drops
+                .as_ref()
+                .is_none_or(|drops| drops.operations() == 0),
+            "postprocessed block drops require entity and random-stream save integration"
+        );
+        Ok(())
     }
 }
 
@@ -413,6 +432,7 @@ impl GeneratedPostprocessing {
             washed_blocks: None,
             lava_fluids: None,
             water_source_conversion: None,
+            block_drops: None,
             edits: Vec::new(),
             read_chunks: RefCell::new(BTreeSet::new()),
             light_reads: RefCell::new(BTreeSet::new()),
@@ -494,6 +514,7 @@ impl GeneratedPostprocessing {
         stage.required = completed.chunks.clone();
         stage.light_checkpoint = completed.light_checkpoint.clone();
         stage.water_source_conversion = completed.water_source_conversion;
+        stage.block_drops = completed.block_drops.clone();
         stage.edits = completed.edits.clone();
         stage.read_chunks = RefCell::new(completed.read_chunks.clone());
         stage.light_reads = RefCell::new(completed.light_reads.clone());
@@ -648,6 +669,22 @@ impl GeneratedPostprocessing {
         Ok(())
     }
 
+    /// Freeze drop rules and RNG streams before the first chunk callback.
+    pub fn set_block_drops(
+        &mut self,
+        drops: super::postprocessing_drops::GeneratedBlockDrops,
+    ) -> Result<()> {
+        ensure!(
+            !self.failed
+                && self.active.is_none()
+                && self.completed.is_empty()
+                && self.block_drops.is_none(),
+            "block drops must be set once before postprocessing begins"
+        );
+        self.block_drops = Some(drops);
+        Ok(())
+    }
+
     pub(super) fn select_initial_targets(&mut self, targets: BTreeSet<ChunkPos>) -> Result<()> {
         ensure!(
             !self.failed && self.active.is_none() && self.completed.is_empty(),
@@ -789,6 +826,7 @@ impl GeneratedPostprocessing {
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
             water_source_conversion: self.water_source_conversion,
+            block_drops: &mut self.block_drops,
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
@@ -856,6 +894,7 @@ impl GeneratedPostprocessing {
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
             water_source_conversion: self.water_source_conversion,
+            block_drops: &mut self.block_drops,
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
@@ -904,6 +943,7 @@ impl GeneratedPostprocessing {
             max_y: self.max_y,
             light_checkpoint: self.light_checkpoint,
             water_source_conversion: self.water_source_conversion,
+            block_drops: self.block_drops,
             block_entities: self.block_entities,
             block_entity_edits: self.block_entity_edits,
             bonus_chest_attempted: self.bonus_chest_attempted,
@@ -930,6 +970,7 @@ struct GeneratedBlockView<'a> {
     washed_blocks: Option<&'a BTreeSet<String>>,
     lava_fluids: Option<&'a BTreeSet<String>>,
     water_source_conversion: Option<bool>,
+    block_drops: &'a mut Option<super::postprocessing_drops::GeneratedBlockDrops>,
     edits: &'a mut Vec<BlockPosition>,
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -1692,6 +1733,17 @@ impl GeneratedBlockView<'_> {
         old: &BlockState,
         next: &BlockState,
     ) -> Result<()> {
+        self.apply_water_change_with_depth(target, old, next, 512)
+    }
+
+    fn apply_water_change_with_depth(
+        &mut self,
+        target: glam::IVec3,
+        old: &BlockState,
+        next: &BlockState,
+        depth: usize,
+    ) -> Result<()> {
+        ensure!(depth > 0, "water update depth exceeded");
         use native_world::fluid_sim::Cell;
         let lava_tags = self.lava_fluids.context("lava fluid tags unavailable")?;
         ensure!(
@@ -1731,7 +1783,15 @@ impl GeneratedBlockView<'_> {
                     && old.name == next.name)
                 || (ladder_state(old)
                     .is_some_and(|(facing, wet)| !wet && next_ladder == Some((facing, true)))
-                    && old.name == next.name),
+                    && old.name == next.name)
+                || ladder_state(old).is_some_and(|(_, wet)| {
+                    if wet {
+                        next.name == "minecraft:water"
+                            && next_fluid.is_some_and(|fluid| fluid.source)
+                    } else {
+                        next.name == "minecraft:air" && next.properties.is_empty()
+                    }
+                }),
             "unsupported original water state"
         );
         let next_air = next.name == "minecraft:air";
@@ -1862,24 +1922,23 @@ impl GeneratedBlockView<'_> {
                     target.to_array(),
                     next,
                 )?;
-                ensure!(
-                    updated == state,
-                    "water-triggered ladder destruction requires block drops"
-                );
+                if updated != state {
+                    self.destroy_ladder(p.to_array(), &state, depth - 1)?;
+                }
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
                     self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
                 if updated != state {
                     self.write_postprocessed_state(p.to_array(), &state, &updated)?;
-                    self.update_water_shape_neighbors(p.to_array(), &updated, 512)?;
+                    self.update_water_shape_neighbors(p.to_array(), &updated, depth - 1)?;
                 }
             } else if d == [0, -1, 0] && snowy_fluid_barrier(&state) {
                 let updated =
                     self.update_shape(p.to_array(), &state, [0, 1, 0], target.to_array(), next)?;
                 if updated != state {
                     self.write_postprocessed_state(p.to_array(), &state, &updated)?;
-                    self.update_water_shape_neighbors(p.to_array(), &updated, 512)?;
+                    self.update_water_shape_neighbors(p.to_array(), &updated, depth - 1)?;
                 }
             } else if super::ore::valid_lichen(&state) {
                 let direction = [-d[0], -d[1], -d[2]];
@@ -1906,6 +1965,26 @@ impl GeneratedBlockView<'_> {
             }
         }
         Ok(())
+    }
+
+    fn destroy_ladder(&mut self, pos: [i32; 3], state: &BlockState, depth: usize) -> Result<()> {
+        let (_, wet) = ladder_state(state).context("invalid ladder state")?;
+        self.block_drops
+            .as_mut()
+            .context("ladder destruction requires block drops")?
+            .drop_block(glam::IVec3::from_array(pos), state)?;
+        let replacement = if wet {
+            BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), "0".into())]),
+            }
+        } else {
+            BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            }
+        };
+        self.apply_water_change_with_depth(glam::IVec3::from_array(pos), state, &replacement, depth)
     }
 
     /// A shape-update write has Java's flag 2: shape notifications, but no
@@ -1979,10 +2058,9 @@ impl GeneratedBlockView<'_> {
             } else if ladder_state(&state).is_some() {
                 let updated =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
-                ensure!(
-                    updated == state,
-                    "shape-triggered ladder destruction requires block drops"
-                );
+                if updated != state {
+                    self.destroy_ladder(neighbor, &state, depth - 1)?;
+                }
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let next =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
@@ -6256,6 +6334,9 @@ mod tests {
                 Ok(None)
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/loot_table/blocks/ladder.json" {
+                    return Ok(Some(br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder"}]}]}"#.to_vec()));
+                }
                 if path.ends_with("blocks_motion_in_heightmap.json")
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
@@ -6506,12 +6587,17 @@ mod tests {
                 world.set_block_id(7, 7, 8, water).unwrap();
                 world.set_block_id(9, 7, 8, water).unwrap();
             }
-            "ladder_break_unsupported" => {
+            "ladder_break_unsupported"
+            | "ladder_break_failed_loot"
+            | "ladder_break_dry_on"
+            | "ladder_break_dry_off"
+            | "ladder_break_wet_on"
+            | "ladder_break_wet_off" => {
                 let ladder = world.intern_state(BlockState {
                     name: "minecraft:ladder".into(),
                     properties: BTreeMap::from([
                         ("facing".into(), "east".into()),
-                        ("waterlogged".into(), "false".into()),
+                        ("waterlogged".into(), case.contains("_wet_").to_string()),
                     ]),
                 });
                 world.set_block_id(9, 8, 8, air).unwrap();
@@ -7013,6 +7099,53 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
+            struct InvalidLoot;
+            impl ResourceProvider for InvalidLoot {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    Ok((path == "data/minecraft/loot_table/blocks/ladder.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"condition":{"type":"example:unknown"},"entries":[{"type":"minecraft:item","name":"minecraft:ladder"}]}]}"#.to_vec()))
+                }
+            }
+            let loot = if case == "ladder_break_failed_loot" {
+                native_resources::loot::BlockLootTables::load(&mut InvalidLoot).unwrap()
+            } else {
+                native_resources::loot::BlockLootTables::load(&mut Tags).unwrap()
+            };
+            stage
+                .set_block_drops(
+                    super::super::postprocessing_drops::GeneratedBlockDrops::new(
+                        Arc::new(loot),
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                        native_core::random::LegacyRandom::new(42),
+                        native_core::random::XoroshiroRandom::new(77),
+                        case.ends_with("_on"),
+                    ),
+                )
+                .unwrap();
+        }
+        if case == "ladder_break_failed_loot" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let mut before_random = stage.block_drops.as_ref().unwrap().level_random().clone();
+            assert!(stage.try_poll(chunk, 1).is_err());
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(9, 8, 8).unwrap().name, "minecraft:air");
+            assert_eq!(
+                stage.world.block(10, 8, 8).unwrap().name,
+                "minecraft:ladder"
+            );
+            let drops = stage.block_drops.as_ref().unwrap();
+            assert_eq!(drops.operations(), 0);
+            assert!(drops.records(chunk).is_empty());
+            assert_eq!(
+                drops.level_random().clone().next_int(),
+                before_random.next_int()
+            );
+            return vec!["rolled back".into()];
+        }
         if case == "ladder_break_unsupported" {
             let error = stage.poll(chunk, 1).unwrap_err();
             assert!(stage.finish().is_err());
@@ -7047,6 +7180,23 @@ mod tests {
             while !stage.poll(east_chunk, 1).unwrap() {}
         }
         let result = stage.finish().unwrap();
+        if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
+            let drops = result.block_drops().unwrap();
+            assert_eq!(drops.operations(), 1);
+            assert_eq!(
+                drops.records(chunk).len(),
+                usize::from(case.ends_with("_on"))
+            );
+            let resumed = GeneratedPostprocessing::from_completed(
+                &result,
+                None,
+                None,
+                Arc::clone(&heightmap_tags),
+            )
+            .unwrap();
+            assert_eq!(resumed.block_drops.as_ref().unwrap().operations(), 1);
+            assert!(result.ensure_drops_integrated_for_save().is_err());
+        }
         if case == "edge_deferred" {
             assert_eq!(
                 result.deferred_chunks().collect::<Vec<_>>(),
@@ -7214,6 +7364,14 @@ mod tests {
                     state.properties["east"]
                 ));
             }
+        }
+        if case.starts_with("ladder_break_") {
+            let state = result.world.block(10, 8, 8).unwrap();
+            trace.push(format!(
+                "destroyed {} {}",
+                state.name,
+                state.properties.get("level").map_or("-", String::as_str)
+            ));
         }
         if case.starts_with("snow_water_") || case.starts_with("snow_fence_") {
             let y = if case.starts_with("snow_water_") {
@@ -7688,6 +7846,57 @@ mod tests {
             trace[0].contains("ladder destruction requires block drops"),
             "{trace:?}"
         );
+    }
+
+    #[test]
+    fn generated_ladder_drops_roll_back_failed_loot() {
+        assert_eq!(
+            water_spread_trace("ladder_break_failed_loot"),
+            ["rolled back"]
+        );
+    }
+
+    #[test]
+    fn generated_water_destroys_unsupported_ladders_and_preserves_fluid() {
+        for wet in [false, true] {
+            for enabled in [false, true] {
+                let case = format!(
+                    "ladder_break_{}_{}",
+                    if wet { "wet" } else { "dry" },
+                    if enabled { "on" } else { "off" }
+                );
+                let trace = water_spread_trace(&case);
+                let expected = if wet {
+                    "destroyed minecraft:water 0"
+                } else {
+                    "destroyed minecraft:air -"
+                };
+                assert!(
+                    trace.iter().any(|line| line == expected),
+                    "{case}: {trace:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_water_ladder_destruction_callbacks_match_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["ladder_break"],
+        );
+        let mut expected = Vec::new();
+        for case in [
+            "ladder_break_dry_on",
+            "ladder_break_dry_off",
+            "ladder_break_wet_on",
+            "ladder_break_wet_off",
+        ] {
+            expected.extend(water_spread_trace(case));
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

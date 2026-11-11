@@ -28,6 +28,7 @@ pub struct GeneratedBlockDrops {
     enabled: bool,
     records: Arc<BTreeMap<ChunkPos, Arc<Vec<Tag>>>>,
     uuids: Arc<BTreeSet<[i32; 4]>>,
+    operations: u64,
 }
 
 impl GeneratedBlockDrops {
@@ -48,12 +49,17 @@ impl GeneratedBlockDrops {
             enabled,
             records: Arc::new(BTreeMap::new()),
             uuids: Arc::new(BTreeSet::new()),
+            operations: 0,
         }
     }
 
     /// Evaluate the original block state, then prepare the resulting item NBT.
     /// Errors do not change either random stream or any previously saved item.
     pub fn drop_block(&mut self, pos: IVec3, block: &BlockState) -> Result<()> {
+        let operations = self
+            .operations
+            .checked_add(1)
+            .context("generated drop count overflow")?;
         let mut level = self.level_random.clone();
         let mut seeder = self.entity_seeder.clone();
         let sequence = self.loot.random_sequence_for_block(&block.name)?.cloned();
@@ -106,6 +112,7 @@ impl GeneratedBlockDrops {
         }
         self.level_random = level;
         self.entity_seeder = seeder;
+        self.operations = operations;
         Ok(())
     }
 
@@ -133,6 +140,9 @@ impl GeneratedBlockDrops {
     }
     pub fn block_drops_enabled(&self) -> bool {
         self.enabled
+    }
+    pub fn operations(&self) -> u64 {
+        self.operations
     }
 }
 

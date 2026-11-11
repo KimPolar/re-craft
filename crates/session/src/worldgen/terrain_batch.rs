@@ -3728,6 +3728,8 @@ impl FreshTerrainBatch {
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkComponents>> {
         use native_world::loaded::{SavedBlockTick, SavedFluidTick};
 
+        processed.ensure_drops_integrated_for_save()?;
+
         let sections =
             self.converted_sections_data(processed, positions, deferred_entities.is_some())?;
         let registry = &self

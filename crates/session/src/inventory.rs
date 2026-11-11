@@ -3123,7 +3123,13 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
             | "minecraft:music_disc_13"
             | "minecraft:music_disc_cat"
             | "minecraft:wolf_armor"
+            | "minecraft:wooden_spear"
+            | "minecraft:stone_spear"
+            | "minecraft:copper_spear"
             | "minecraft:iron_spear"
+            | "minecraft:golden_spear"
+            | "minecraft:diamond_spear"
+            | "minecraft:netherite_spear"
             | "minecraft:copper_nautilus_armor"
             | "minecraft:iron_nautilus_armor"
             | "minecraft:golden_nautilus_armor"
@@ -3229,7 +3235,7 @@ pub fn ordinary_item_default_durability(id: &str) -> Option<u32> {
         return None;
     }
     let (material, kind) = id.strip_prefix("minecraft:")?.split_once('_')?;
-    if !TOOL_KINDS.contains(&kind) && id != "minecraft:iron_spear" {
+    if !TOOL_KINDS.contains(&kind) && kind != "spear" {
         return None;
     }
     Some(match material {

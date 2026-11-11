@@ -34,12 +34,36 @@ impl Default for SwingAnimation {
     }
 }
 
-/// Explicit components are effective item data. Prototype defaults for items
-/// without an explicit component still need their registry to be loaded.
+/// Explicit components override the 26.3 prototype; a removal uses Java's
+/// fallback, even when the prototype supplies an animation.
 fn item_swing_animation(item: Option<&ItemStack>, component: &str) -> SwingAnimation {
-    item.and_then(|item| item.components().get(component))
-        .and_then(decode_swing_animation)
-        .unwrap_or_default()
+    let Some(item) = item else {
+        return SwingAnimation::default();
+    };
+    if let Some(value) = item.components().get(component) {
+        return decode_swing_animation(value).unwrap_or_default();
+    }
+    if component == "minecraft:attack_animation"
+        && item
+            .components()
+            .get("!minecraft:attack_animation")
+            .is_none()
+    {
+        let duration = match item.id() {
+            "minecraft:wooden_spear" => 13,
+            "minecraft:stone_spear" => 15,
+            "minecraft:copper_spear" => 17,
+            "minecraft:iron_spear" | "minecraft:golden_spear" => 19,
+            "minecraft:diamond_spear" => 21,
+            "minecraft:netherite_spear" => 23,
+            _ => return SwingAnimation::default(),
+        };
+        return SwingAnimation {
+            kind: SwingKind::Stab,
+            duration,
+        };
+    }
+    SwingAnimation::default()
 }
 
 fn decode_swing_animation(value: &native_persistence::nbt::Tag) -> Option<SwingAnimation> {
@@ -465,6 +489,60 @@ mod tests {
     }
 
     #[test]
+    fn spear_default_can_be_removed_or_overridden() {
+        for (id, duration, durability) in [
+            ("minecraft:wooden_spear", 13, 59),
+            ("minecraft:stone_spear", 15, 131),
+            ("minecraft:copper_spear", 17, 190),
+            ("minecraft:iron_spear", 19, 250),
+            ("minecraft:golden_spear", 19, 32),
+            ("minecraft:diamond_spear", 21, 1561),
+            ("minecraft:netherite_spear", 23, 2031),
+        ] {
+            let make = |components| ItemStack::new(id.into(), 1, 1, components).unwrap();
+            let default = make(Tag::Compound(vec![]));
+            assert_eq!(
+                item_swing_animation(Some(&default), "minecraft:attack_animation"),
+                SwingAnimation {
+                    kind: SwingKind::Stab,
+                    duration
+                }
+            );
+            assert_eq!(
+                item_swing_animation(Some(&default), "minecraft:interact_animation"),
+                SwingAnimation::default()
+            );
+            assert_eq!(crate::inventory::ordinary_item_default_max(id), Some(1));
+            assert_eq!(
+                crate::inventory::ordinary_item_default_durability(id),
+                Some(durability)
+            );
+            let removed = make(Tag::Compound(vec![(
+                "!minecraft:attack_animation".into(),
+                Tag::Compound(vec![]),
+            )]));
+            assert_eq!(
+                item_swing_animation(Some(&removed), "minecraft:attack_animation"),
+                SwingAnimation::default()
+            );
+            let overridden = make(Tag::Compound(vec![(
+                "minecraft:attack_animation".into(),
+                Tag::Compound(vec![
+                    ("type".into(), Tag::String("none".into())),
+                    ("duration".into(), Tag::Int(11)),
+                ]),
+            )]));
+            assert_eq!(
+                item_swing_animation(Some(&overridden), "minecraft:attack_animation"),
+                SwingAnimation {
+                    kind: SwingKind::None,
+                    duration: 11
+                }
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn default_swing_and_equip_sequences_match_java() {
         use serde_json::Value;
@@ -490,6 +568,7 @@ import net.minecraft.world.item.Items;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.component.DataComponentMap;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.player.FirstPersonHandsAndItems;
@@ -526,8 +605,24 @@ public class SwingOracle {
   }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
-    for(var item:new net.minecraft.world.item.Item[]{Items.STONE,Items.DIRT})
-      item.builtInRegistryHolder().bindComponents(DataComponentMap.builder().set(DataComponents.MAX_STACK_SIZE,64).build());
+    var registries=VanillaRegistries.createReloadableLookup(VanillaRegistries.createWorldLookup());
+    for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+    var prototypes=new JsonArray();
+    var prototypePatches=new JsonArray();
+    for(var item:BuiltInRegistries.ITEM) {
+      var stack=new ItemStack(item,1); var attack=stack.getAttackAnimation(); var interact=stack.getInteractAnimation();
+      var row=new JsonArray(); row.add(BuiltInRegistries.ITEM.getKey(item).toString());
+      row.add(attack.type().getSerializedName()); row.add(attack.duration());
+      row.add(interact.type().getSerializedName()); row.add(interact.duration());
+      row.add(stack.getMaxStackSize()); row.add(stack.getMaxDamage()); prototypes.add(row);
+      if(attack.type()==SwingAnimationType.STAB) {
+        stack.remove(DataComponents.ATTACK_ANIMATION); var removed=stack.getAttackAnimation();
+        stack.set(DataComponents.ATTACK_ANIMATION,new SwingAnimation(SwingAnimationType.NONE,11)); var overridden=stack.getAttackAnimation();
+        var patch=new JsonArray(); patch.add(BuiltInRegistries.ITEM.getKey(item).toString());
+        patch.add(removed.type().getSerializedName()); patch.add(removed.duration());
+        patch.add(overridden.type().getSerializedName()); patch.add(overridden.duration()); prototypePatches.add(patch);
+      }
+    }
     var current=SwingState.class.getDeclaredField("currentSwing"); current.setAccessible(true);
     var out=new JsonArray();
     for(int scenario=0;scenario<2187;scenario++) {
@@ -637,7 +732,7 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -689,6 +784,85 @@ public class SwingOracle {
             .arg("SwingOracle")
             .arg(&result));
         let result: Value = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        let parse_kind = |value: &Value| match value.as_str().unwrap() {
+            "none" => SwingKind::None,
+            "whack" => SwingKind::Whack,
+            "stab" => SwingKind::Stab,
+            other => panic!("unknown Java swing kind {other}"),
+        };
+        let prototypes = result["prototypes"].as_array().unwrap();
+        for row in prototypes {
+            let id = row[0].as_str().unwrap();
+            let stack = ItemStack::new(id.into(), 1, 1, Tag::Compound(vec![])).unwrap();
+            for (component, offset) in [
+                ("minecraft:attack_animation", 1),
+                ("minecraft:interact_animation", 3),
+            ] {
+                let actual = item_swing_animation(Some(&stack), component);
+                assert_eq!(actual.kind, parse_kind(&row[offset]), "{id} {component}");
+                assert_eq!(
+                    i64::from(actual.duration),
+                    row[offset + 1].as_i64().unwrap(),
+                    "{id} {component}"
+                );
+            }
+            if id.strip_prefix("minecraft:").is_some_and(|name| {
+                matches!(
+                    name,
+                    "wooden_spear"
+                        | "stone_spear"
+                        | "copper_spear"
+                        | "iron_spear"
+                        | "golden_spear"
+                        | "diamond_spear"
+                        | "netherite_spear"
+                )
+            }) {
+                assert_eq!(
+                    crate::inventory::ordinary_item_default_max(id).map(u64::from),
+                    row[5].as_u64(),
+                    "{id} max stack"
+                );
+                assert_eq!(
+                    crate::inventory::ordinary_item_default_durability(id).map(u64::from),
+                    row[6].as_u64(),
+                    "{id} durability"
+                );
+            }
+        }
+        let patches = result["prototypePatches"].as_array().unwrap();
+        assert_eq!(patches.len(), 7);
+        for row in patches {
+            let id = row[0].as_str().unwrap();
+            for (components, offset) in [
+                (
+                    Tag::Compound(vec![(
+                        "!minecraft:attack_animation".into(),
+                        Tag::Compound(vec![]),
+                    )]),
+                    1,
+                ),
+                (
+                    Tag::Compound(vec![(
+                        "minecraft:attack_animation".into(),
+                        Tag::Compound(vec![
+                            ("type".into(), Tag::String("none".into())),
+                            ("duration".into(), Tag::Int(11)),
+                        ]),
+                    )]),
+                    3,
+                ),
+            ] {
+                let stack = ItemStack::new(id.into(), 1, 1, components).unwrap();
+                let actual = item_swing_animation(Some(&stack), "minecraft:attack_animation");
+                assert_eq!(actual.kind, parse_kind(&row[offset]), "{id} patch");
+                assert_eq!(
+                    i64::from(actual.duration),
+                    row[offset + 1].as_i64().unwrap(),
+                    "{id} patch"
+                );
+            }
+        }
         let rows = result["swings"].as_array().unwrap();
         let mut index = 0;
         for scenario in 0..2187 {

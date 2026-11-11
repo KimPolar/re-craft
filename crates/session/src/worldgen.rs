@@ -4309,6 +4309,40 @@ mod tests {
         );
     }
     struct Data;
+    fn test_generated_drops(
+        position: glam::IVec3,
+        enabled: bool,
+    ) -> postprocessing_drops::GeneratedBlockDrops {
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/ladder.json").then(|| {
+                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder"}]}]}"#.to_vec()
+                }))
+            }
+        }
+        let mut drops = postprocessing_drops::GeneratedBlockDrops::new(
+            Arc::new(native_resources::loot::BlockLootTables::load(&mut Loot).unwrap()),
+            42,
+            native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+            native_core::random::LegacyRandom::new(9182),
+            native_core::random::XoroshiroRandom::new(77),
+            enabled,
+        );
+        drops
+            .drop_block(
+                position,
+                &native_world::loaded::BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        drops
+    }
     impl ResourceProvider for Data {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
             Ok(None)
@@ -6016,7 +6050,7 @@ mod tests {
             .begin_generated_postprocessing_with_neighbors([center], [center], 42, 10)
             .unwrap();
         while !generated.poll(center, 4).unwrap() {}
-        let mut processed = generated.finish().unwrap();
+        let mut processed = generated.clone().finish().unwrap();
         assert!(Arc::ptr_eq(&original, &processed.world));
         assert!(processed.edits.is_empty());
         assert!(processed.light_checks.is_empty());
@@ -6032,8 +6066,44 @@ mod tests {
                 assert_eq!(snapshot.len(), 1);
                 assert_eq!(snapshot[&center], records);
             }
-            None => assert!(batch.postprocessed_complete_entity_records(&processed).is_err()),
+            None => assert!(
+                batch
+                    .postprocessed_complete_entity_records(&processed)
+                    .is_err()
+            ),
         }
+        let mut disabled_drops = generated.clone().finish().unwrap();
+        disabled_drops
+            .set_block_drops_for_test(test_generated_drops(glam::IVec3::new(8, 8, 8), false));
+        assert!(
+            batch
+                .postprocessed_chunk_components(&disabled_drops, [center])
+                .is_ok()
+        );
+        let error = batch
+            .postprocessed_region_drafts(&disabled_drops, [center], 0)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("random-stream save integration"));
+        for error in [
+            batch.converted_region_drafts(&disabled_drops, 0).err(),
+            batch
+                .prepare_structure_region_drafts(&disabled_drops, [center], 0)
+                .err(),
+            batch
+                .prepare_converted_structure_region_drafts(&disabled_drops, 0)
+                .err(),
+        ] {
+            assert!(error.unwrap().to_string().contains("random-stream save integration"));
+        }
+        let mut enabled_drops = generated.finish().unwrap();
+        enabled_drops
+            .set_block_drops_for_test(test_generated_drops(glam::IVec3::new(8, 8, 8), true));
+        assert!(
+            batch
+                .postprocessed_chunk_components(&enabled_drops, [center])
+                .is_err()
+        );
         let mut captured = processed
             .ticks()
             .captured_indexed_queue(chunk_ticks::TickRegistry::Block, &[center])
@@ -9483,10 +9553,30 @@ mod tests {
                     let mut postprocess = batch.begin_generated_postprocessing([target], 0, 0)?;
                     postprocess.set_water_source_conversion(false)?;
                     while !postprocess.poll(target, 256)? {}
-                    let processed = postprocess.finish()?;
+                    let processed = postprocess.clone().finish()?;
                     let snapshot = batch.postprocessed_complete_entity_records(&processed)?;
                     assert_eq!(snapshot.get(&target).map(Arc::as_ref), Some(&expected));
-                    let prepared = batch.prepare_structure_region_drafts(&processed, [target], 1)?;
+                    let mut with_drop = postprocess.finish()?;
+                    with_drop.set_block_drops_for_test(test_generated_drops(
+                        glam::IVec3::new(target.x * 16 + 8, 8, target.z * 16 + 8),
+                        true,
+                    ));
+                    let mut components =
+                        batch.postprocessed_chunk_components(&with_drop, [target])?;
+                    let records = components.remove(&target).unwrap().entity_records.unwrap();
+                    assert_eq!(&records[..expected.len()], &expected);
+                    assert_eq!(records.len(), expected.len() + 1);
+                    let mut drafts = batch.postprocessed_chunk_drafts(&with_drop, [target])?;
+                    let draft = drafts.remove(&target).unwrap();
+                    assert_eq!(draft.entity_records.as_deref(), Some(&*records));
+                    assert!(draft.entity_chunk.is_some());
+                    assert!(
+                        batch
+                            .prepare_structure_region_drafts(&with_drop, [target], 1)
+                            .is_err()
+                    );
+                    let prepared =
+                        batch.prepare_structure_region_drafts(&processed, [target], 1)?;
                     let key = (
                         native_persistence::save::FreshRegionKind::Entities,
                         target.x.div_euclid(32),

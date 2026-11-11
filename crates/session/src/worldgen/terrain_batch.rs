@@ -3787,10 +3787,16 @@ impl FreshTerrainBatch {
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkComponents>> {
         use native_world::loaded::{SavedBlockTick, SavedFluidTick};
 
-        processed.ensure_drops_integrated_for_save()?;
-
         let sections =
             self.converted_sections_data(processed, positions, deferred_entities.is_some())?;
+        let merged_entities = if processed
+            .block_drops()
+            .is_some_and(|drops| drops.item_chunks().next().is_some())
+        {
+            Some(self.postprocessed_complete_entity_records(processed)?)
+        } else {
+            None
+        };
         let registry = &self
             .decoration
             .as_ref()
@@ -3882,7 +3888,14 @@ impl FreshTerrainBatch {
                                 .context("deferred block entity snapshot is missing")?
                                 .clone()
                         },
-                        entity_records: self.complete_generated_entity_records_shared(pos)?,
+                        entity_records: match &merged_entities {
+                            Some(records) => Some(Arc::clone(
+                                records
+                                    .get(&pos)
+                                    .context("converted entity snapshot is missing")?,
+                            )),
+                            None => self.complete_generated_entity_records_shared(pos)?,
+                        },
                     },
                 ))
             })
@@ -4119,6 +4132,7 @@ impl FreshTerrainBatch {
         positions: impl IntoIterator<Item = ChunkPos>,
         timestamp: u32,
     ) -> Result<PreparedStructureRegions> {
+        processed.ensure_drops_integrated_for_save()?;
         ensure!(
             self.structures.is_some(),
             "structure generation is disabled"
@@ -4155,6 +4169,7 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
         timestamp: u32,
     ) -> Result<PreparedStructureRegions> {
+        processed.ensure_drops_integrated_for_save()?;
         ensure!(
             self.structures.is_some(),
             "structure generation is disabled"
@@ -4198,6 +4213,7 @@ impl FreshTerrainBatch {
             native_persistence::save::FreshRegionDraft,
         >,
     > {
+        processed.ensure_drops_integrated_for_save()?;
         ensure!(
             self.structures.is_none(),
             "structure world persistence is not yet supported"
@@ -4221,6 +4237,7 @@ impl FreshTerrainBatch {
             native_persistence::save::FreshRegionDraft,
         >,
     > {
+        processed.ensure_drops_integrated_for_save()?;
         ensure!(
             self.structures.is_none(),
             "structure world persistence is not yet supported"

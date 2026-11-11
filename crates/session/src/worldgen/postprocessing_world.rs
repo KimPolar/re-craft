@@ -313,6 +313,14 @@ impl PostprocessedGeneratedRegion {
         self.block_drops.as_ref()
     }
 
+    #[cfg(test)]
+    pub(super) fn set_block_drops_for_test(
+        &mut self,
+        drops: super::postprocessing_drops::GeneratedBlockDrops,
+    ) {
+        self.block_drops = Some(drops);
+    }
+
     /// Prepare a combined entity snapshot without authorizing world saving.
     /// `original` must cover all entity chunks whose UUIDs can conflict.
     pub fn merge_complete_entity_records(

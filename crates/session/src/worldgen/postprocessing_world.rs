@@ -1139,6 +1139,18 @@ fn supported_postprocessing_block(state: &BlockState) -> Result<DryBlock> {
     }
 }
 
+fn ladder_state(state: &BlockState) -> Option<(glam::IVec3, bool)> {
+    let (facing, waterlogged) = native_world::collision::ladder_state(state)?;
+    let facing = match facing {
+        "north" => glam::IVec3::NEG_Z,
+        "south" => glam::IVec3::Z,
+        "west" => glam::IVec3::NEG_X,
+        "east" => glam::IVec3::X,
+        _ => return None,
+    };
+    Some((facing, waterlogged))
+}
+
 fn liquid_state(state: &BlockState) -> Result<Option<native_world::fluid::FluidState>> {
     if !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
         return Ok(None);
@@ -1289,6 +1301,12 @@ impl GeneratedBlockView<'_> {
         let Ok(state) = self.read(pos.to_array()) else {
             return Cell::Unknown;
         };
+        if let Some((facing, waterlogged)) = ladder_state(&state) {
+            return Cell::Ladder {
+                facing,
+                waterlogged,
+            };
+        }
         if native_world::collision::fence_waterlogged(&state) == Some(true) {
             return Cell::FenceWater(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
@@ -1514,6 +1532,10 @@ impl GeneratedBlockView<'_> {
                 ChangedBlock::WaterloggedFence => {
                     matches!(self.fluid_cell_for_spread(change.position), Cell::FenceDry)
                 }
+                ChangedBlock::WaterloggedLadder { facing } => matches!(
+                    self.fluid_cell_for_spread(change.position),
+                    Cell::Ladder { facing: actual, waterlogged: false } if actual == facing
+                ),
                 _ => false,
             };
             ensure!(
@@ -1619,6 +1641,10 @@ impl GeneratedBlockView<'_> {
                 waterlogged: false,
                 ..
             } | Cell::FenceDry
+                | Cell::Ladder {
+                    waterlogged: false,
+                    ..
+                }
         ) {
             ensure!(
                 fluid.source && !fluid.falling,
@@ -1677,9 +1703,11 @@ impl GeneratedBlockView<'_> {
         let next_slab = self.slab(next);
         let next_stair = self.stair(next);
         let next_fence = native_world::collision::fence_waterlogged(next);
+        let next_ladder = ladder_state(next);
         let contained_source = next_slab.is_some_and(|(_, wet)| wet)
             || next_stair.is_some_and(|(_, wet)| wet)
-            || next_fence == Some(true);
+            || next_fence == Some(true)
+            || next_ladder.is_some_and(|(_, wet)| wet);
         ensure!(
             next_fluid.is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
                 || (next.name == "minecraft:air" && next.properties.is_empty())
@@ -1700,6 +1728,9 @@ impl GeneratedBlockView<'_> {
                     && next_stair.is_some_and(|(_, wet)| wet))
                 || (native_world::collision::fence_waterlogged(old) == Some(false)
                     && next_fence == Some(true)
+                    && old.name == next.name)
+                || (ladder_state(old)
+                    .is_some_and(|(facing, wet)| !wet && next_ladder == Some((facing, true)))
                     && old.name == next.name),
             "unsupported original water state"
         );
@@ -1758,6 +1789,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::Fluid(_)
                         | Cell::FenceDry
                         | Cell::FenceWater(_)
+                        | Cell::Ladder { .. }
                         | Cell::OpenWater(_)
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
@@ -1822,6 +1854,18 @@ impl GeneratedBlockView<'_> {
                         );
                     }
                 }
+            } else if ladder_state(&state).is_some() {
+                let updated = self.update_shape(
+                    p.to_array(),
+                    &state,
+                    [-d[0], -d[1], -d[2]],
+                    target.to_array(),
+                    next,
+                )?;
+                ensure!(
+                    updated == state,
+                    "water-triggered ladder destruction requires block drops"
+                );
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
@@ -1898,6 +1942,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::Fluid(_)
                         | Cell::FenceDry
                         | Cell::FenceWater(_)
+                        | Cell::Ladder { .. }
                         | Cell::OpenWater(_)
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
@@ -1931,6 +1976,13 @@ impl GeneratedBlockView<'_> {
                         );
                     }
                 }
+            } else if ladder_state(&state).is_some() {
+                let updated =
+                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
+                ensure!(
+                    updated == state,
+                    "shape-triggered ladder destruction requires block drops"
+                );
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let next =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
@@ -2026,6 +2078,46 @@ impl GeneratedBlockView<'_> {
         flags: i32,
     ) -> Result<()> {
         let old = self.read(pos)?;
+        if ladder_state(&old).is_some() {
+            ensure!(
+                flags == 276 && next.name == "minecraft:air" && next.properties.is_empty(),
+                "unsupported generated ladder shape write"
+            );
+            let chunk = ChunkPos {
+                x: pos[0].div_euclid(16),
+                z: pos[2].div_euclid(16),
+            };
+            let section =
+                i8::try_from(pos[1].div_euclid(16)).context("ladder section out of range")?;
+            let blocks = self
+                .world
+                .chunks
+                .get(&chunk)
+                .and_then(|chunk| chunk.sections.get(&section))
+                .and_then(|section| section.blocks.as_ref())
+                .context("ladder section unavailable")?;
+            let mut nonempty = 0;
+            for id in blocks.iter() {
+                let state = self
+                    .world
+                    .state(*id)
+                    .context("ladder section state missing")?;
+                if !matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ) {
+                    nonempty += 1;
+                    if nonempty == 2 {
+                        break;
+                    }
+                }
+            }
+            ensure!(
+                nonempty >= 2,
+                "ladder removal requires light section allocation update"
+            );
+            return self.write_postprocessed_state(pos, &old, next);
+        }
         if snowy_fluid_barrier(&old) && snowy_fluid_barrier(next) {
             ensure!(
                 flags == 276 && old.name == next.name,
@@ -2294,6 +2386,10 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                         waterlogged: false,
                         ..
                     } | Cell::FenceDry
+                        | Cell::Ladder {
+                            waterlogged: false,
+                            ..
+                        }
                 ) && fluid.source)
                 && pos == self.origin + direction
                 && fluid.kind == FluidKind::Water
@@ -2301,6 +2397,17 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                     && !fluid.source
                     && fluid.falling
                     && fluid.amount == 8)
+                    || (direction == glam::IVec3::NEG_Y
+                        && matches!(
+                            old,
+                            Cell::Ladder {
+                                waterlogged: false,
+                                ..
+                            }
+                        )
+                        && fluid.source
+                        && !fluid.falling
+                        && fluid.amount == 8)
                     || (horizontal
                         && !fluid.falling
                         && ((fluid.source && fluid.amount == 8)
@@ -2326,6 +2433,23 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if let Some((facing, wet)) = ladder_state(state) {
+            let changed = glam::IVec3::from_array(direction);
+            if changed == -facing {
+                let sturdy = native_world::collision::button_support_face(neighbor, facing)
+                    .context("ladder support face is unavailable")?;
+                if !sturdy {
+                    return Ok(BlockState {
+                        name: "minecraft:air".into(),
+                        properties: Default::default(),
+                    });
+                }
+            }
+            if wet {
+                self.schedule_contained_water(pos)?;
+            }
+            return Ok(state.clone());
+        }
         if super::ore::valid_lichen(state) {
             if state.properties["waterlogged"] == "true" {
                 self.schedule_contained_water(pos)?;
@@ -2494,6 +2618,13 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         self.read(pos)
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
+        if let Some((facing, waterlogged)) = ladder_state(state) {
+            return Ok(native_world::fluid_sim::Cell::Ladder {
+                facing,
+                waterlogged,
+            }
+            .contained_fluid());
+        }
         if super::ore::valid_lichen(state) {
             return Ok((state.properties["waterlogged"] == "true").then_some(
                 native_world::fluid::FluidState {
@@ -6324,6 +6455,97 @@ mod tests {
                 }
                 world.set_block_id(9, 8, 7, water).unwrap();
             }
+            "ladder_on" | "ladder_off" => {
+                let ladder = world.intern_state(BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                });
+                world.set_block_id(9, 8, 8, ladder).unwrap();
+                world.set_block_id(9, 8, 7, water).unwrap();
+            }
+            "ladder_down_source" | "ladder_down_source_off" => {
+                let ladder = world.intern_state(BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                });
+                world.set_block_id(8, 7, 8, ladder).unwrap();
+                world.set_block_id(7, 7, 8, water).unwrap();
+                world.set_block_id(9, 7, 8, water).unwrap();
+            }
+            "ladder_break_unsupported" => {
+                let ladder = world.intern_state(BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "east".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                });
+                world.set_block_id(9, 8, 8, air).unwrap();
+                world.set_block_id(10, 8, 8, ladder).unwrap();
+            }
+            "marked_ladder_dry"
+            | "marked_ladder_wet"
+            | "marked_ladder_side"
+            | "marked_ladder_down"
+            | "marked_ladder_back"
+            | "marked_ladder_dry_back" => {
+                let ladder = world.intern_state(BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        (
+                            "waterlogged".into(),
+                            (!matches!(case, "marked_ladder_dry" | "marked_ladder_dry_back"))
+                                .to_string(),
+                        ),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, ladder).unwrap();
+                if case == "marked_ladder_side" {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+                if case == "marked_ladder_down" {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                }
+                if matches!(case, "marked_ladder_back" | "marked_ladder_dry_back") {
+                    world.set_block_id(8, 8, 9, air).unwrap();
+                }
+            }
+            case if case.starts_with("marked_ladder_variant_") => {
+                let parts: Vec<_> = case["marked_ladder_variant_".len()..].split('_').collect();
+                assert_eq!(parts.len(), 3);
+                let direction = match parts[0] {
+                    "north" => glam::IVec3::NEG_Z,
+                    "south" => glam::IVec3::Z,
+                    "west" => glam::IVec3::NEG_X,
+                    "east" => glam::IVec3::X,
+                    _ => unreachable!(),
+                };
+                let ladder = world.intern_state(BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), parts[0].into()),
+                        ("waterlogged".into(), parts[1].into()),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, ladder).unwrap();
+                let offset = match parts[2] {
+                    "sealed" => None,
+                    "front" => Some(direction),
+                    "back" => Some(-direction),
+                    "down" => Some(glam::IVec3::NEG_Y),
+                    _ => unreachable!(),
+                };
+                if let Some(p) = offset.map(|offset| glam::IVec3::new(8, 8, 8) + offset) {
+                    world.set_block_id(p.x, p.y, p.z, air).unwrap();
+                }
+            }
             "stair_bottom" | "stair_top" | "stair_bottom_off" => {
                 let stair = world.intern_state(BlockState {
                     name: "minecraft:oak_stairs".into(),
@@ -6657,6 +6879,7 @@ mod tests {
             "oak_stairs",
             "oak_leaves",
             "oak_fence",
+            "ladder",
             "glow_lichen",
             "grass_block",
             "podzol",
@@ -6738,6 +6961,10 @@ mod tests {
                 | "fence_on"
                 | "fence_off"
                 | "fence_on_neighbor"
+                | "ladder_on"
+                | "ladder_off"
+                | "ladder_down_source"
+                | "ladder_down_source_off"
         ) {
             stage
                 .set_water_source_conversion(!matches!(
@@ -6747,10 +6974,19 @@ mod tests {
                         | "slab_bottom_off"
                         | "stair_bottom_off"
                         | "fence_off"
+                        | "ladder_off"
+                        | "ladder_down_source_off"
                 ))
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if case == "ladder_break_unsupported" {
+            let error = stage.poll(chunk, 1).unwrap_err();
+            assert!(stage.finish().is_err());
+            assert_eq!(source.block(9, 8, 8).unwrap().name, "minecraft:air");
+            assert_eq!(source.block(10, 8, 8).unwrap().name, "minecraft:ladder");
+            return vec![format!("{error:#}")];
+        }
         if case.ends_with("_missing") {
             let error = stage.poll(chunk, 1).unwrap_err();
             assert!(stage.finish().is_err());
@@ -6870,11 +7106,16 @@ mod tests {
         assert_eq!(
             result.water_source_conversion(),
             match case {
-                "convert_off" | "origin_source_off" | "slab_bottom_off" | "stair_bottom_off"
-                | "fence_off" => Some(false),
+                "convert_off"
+                | "origin_source_off"
+                | "slab_bottom_off"
+                | "stair_bottom_off"
+                | "fence_off"
+                | "ladder_off"
+                | "ladder_down_source_off" => Some(false),
                 "convert_on" | "convert_bubble" | "origin_source_on" | "slab_bottom"
                 | "slab_top" | "slab_oak" | "stair_bottom" | "stair_top" | "fence_on"
-                | "fence_on_neighbor" => Some(true),
+                | "fence_on_neighbor" | "ladder_on" | "ladder_down_source" => Some(true),
                 _ => None,
             }
         );
@@ -6924,6 +7165,9 @@ mod tests {
                     state.properties["south"],
                     state.properties["west"]
                 ));
+            }
+            if state.name == "minecraft:ladder" {
+                trace.push(format!("ladder {x},{y},{z} {}", state.properties["facing"]));
             }
             if state.name == "minecraft:glow_lichen" {
                 trace.push(format!(
@@ -7342,6 +7586,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn generated_ladders_tick_water_and_check_support() {
+        let enabled = water_spread_trace("ladder_on");
+        assert!(
+            enabled
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:ladder true")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|line| line == "fluid minecraft:water 9,8,8 5")
+        );
+        let disabled = water_spread_trace("ladder_off");
+        assert!(
+            disabled
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:ladder false")
+        );
+        let below = water_spread_trace("ladder_down_source");
+        assert!(
+            below
+                .iter()
+                .any(|line| line == "state 8,7,8 minecraft:ladder true"),
+            "{below:?}"
+        );
+        let below_disabled = water_spread_trace("ladder_down_source_off");
+        assert!(
+            below_disabled
+                .iter()
+                .any(|line| line == "state 8,7,8 minecraft:ladder false"),
+            "{below_disabled:?}"
+        );
+        let wet = water_spread_trace("marked_ladder_wet");
+        assert!(
+            wet.iter()
+                .any(|line| line == "fluid minecraft:water 8,8,8 5")
+        );
+        let side = water_spread_trace("marked_ladder_side");
+        assert!(
+            side.iter()
+                .any(|line| line == "state 9,8,8 minecraft:water 1")
+        );
+        let down = water_spread_trace("marked_ladder_down");
+        assert!(
+            down.iter()
+                .any(|line| line == "state 8,7,8 minecraft:water 8")
+        );
+        for case in ["marked_ladder_back", "marked_ladder_dry_back"] {
+            let trace = water_spread_trace(case);
+            assert!(
+                trace
+                    .iter()
+                    .any(|line| line == "state 8,8,8 minecraft:air -"),
+                "{case}: {trace:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_water_rejects_unresolved_ladder_destruction_transactionally() {
+        let trace = water_spread_trace("ladder_break_unsupported");
+        assert!(
+            trace[0].contains("ladder destruction requires block drops"),
+            "{trace:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_ladder_postprocessing_matches_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["ladder"],
+        );
+        let mut expected = Vec::new();
+        for case in [
+            "ladder_on",
+            "ladder_off",
+            "ladder_down_source",
+            "ladder_down_source_off",
+            "marked_ladder_dry",
+            "marked_ladder_wet",
+            "marked_ladder_side",
+            "marked_ladder_down",
+            "marked_ladder_back",
+            "marked_ladder_dry_back",
+        ] {
+            expected.extend(water_spread_trace(case));
+        }
+        for facing in ["north", "south", "west", "east"] {
+            for wet in [false, true] {
+                for mode in ["sealed", "front", "back", "down"] {
+                    expected.extend(water_spread_trace(&format!(
+                        "marked_ladder_variant_{facing}_{wet}_{mode}"
+                    )));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

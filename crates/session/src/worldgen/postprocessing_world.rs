@@ -693,6 +693,10 @@ impl GeneratedPostprocessing {
                 && self.block_drops.is_none(),
             "block drops must be set once before postprocessing begins"
         );
+        ensure!(
+            drops.operations() == 0,
+            "new postprocessing drop context was already used"
+        );
         self.block_drops = Some(drops);
         Ok(())
     }
@@ -7195,6 +7199,9 @@ mod tests {
         if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
             let drops = result.block_drops().unwrap();
             assert_eq!(drops.operations(), 1);
+            let (mut fresh, _, _) = fixture(false);
+            assert!(fresh.set_block_drops(drops.clone()).is_err());
+            assert!(fresh.block_drops.is_none());
             assert_eq!(
                 drops.records(chunk).len(),
                 usize::from(case.ends_with("_on"))

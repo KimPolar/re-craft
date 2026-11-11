@@ -1814,6 +1814,13 @@ impl FreshTerrainBatch {
         pos: ChunkPos,
     ) -> Result<Option<&[native_persistence::nbt::Tag]>> {
         ensure!(self.is_complete(), "generation batch has pending work");
+        self.complete_generated_entity_records_in_complete_batch(pos)
+    }
+
+    fn complete_generated_entity_records_in_complete_batch(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Option<&[native_persistence::nbt::Tag]>> {
         ensure!(
             self.schedule
                 .completed(pos)
@@ -1854,7 +1861,18 @@ impl FreshTerrainBatch {
         &self,
         pos: ChunkPos,
     ) -> Result<Option<Arc<Vec<native_persistence::nbt::Tag>>>> {
-        if self.complete_generated_entity_records(pos)?.is_none() {
+        ensure!(self.is_complete(), "generation batch has pending work");
+        self.complete_generated_entity_records_shared_in_complete_batch(pos)
+    }
+
+    fn complete_generated_entity_records_shared_in_complete_batch(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Option<Arc<Vec<native_persistence::nbt::Tag>>>> {
+        if self
+            .complete_generated_entity_records_in_complete_batch(pos)?
+            .is_none()
+        {
             return Ok(None);
         }
         let terrain = self
@@ -3320,6 +3338,47 @@ impl FreshTerrainBatch {
             "postprocessing light bounds changed"
         );
         Ok(())
+    }
+
+    /// Prepare one complete entity snapshot for every converted chunk, with
+    /// postprocessing drops appended. This is intermediate data: callers
+    /// must still coordinate other loaded chunks, random streams and saving.
+    pub fn postprocessed_complete_entity_records(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>> {
+        self.validate_postprocessing(processed)?;
+        ensure!(self.is_complete(), "generation batch has pending work");
+        let positions: BTreeSet<_> = processed
+            .chunks
+            .iter()
+            .copied()
+            .chain(processed.deferred_chunks())
+            .collect();
+        ensure!(!positions.is_empty(), "no converted entity chunks");
+        ensure!(
+            positions
+                == processed
+                    .ticks()
+                    .registration_order()
+                    .iter()
+                    .copied()
+                    .collect(),
+            "converted entity chunks differ from tick registration"
+        );
+        let mut source = BTreeMap::new();
+        for pos in positions {
+            let records = self
+                .complete_generated_entity_records_shared_in_complete_batch(pos)?
+                .with_context(|| {
+                    format!(
+                        "generated entity coverage is incomplete for chunk {}, {}",
+                        pos.x, pos.z
+                    )
+                })?;
+            source.insert(pos, records);
+        }
+        processed.merge_complete_entity_records(&source)
     }
 
     fn postprocessing_source_inputs(&self, pos: ChunkPos) -> Result<PostprocessingSourceInputs> {

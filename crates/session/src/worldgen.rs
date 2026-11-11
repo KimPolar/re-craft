@@ -6021,6 +6021,19 @@ mod tests {
         assert!(processed.edits.is_empty());
         assert!(processed.light_checks.is_empty());
         assert_eq!(processed.ticks().registration_order(), &[center]);
+        match batch
+            .complete_generated_entity_records_shared(center)
+            .unwrap()
+        {
+            Some(records) => {
+                let snapshot = batch
+                    .postprocessed_complete_entity_records(&processed)
+                    .unwrap();
+                assert_eq!(snapshot.len(), 1);
+                assert_eq!(snapshot[&center], records);
+            }
+            None => assert!(batch.postprocessed_complete_entity_records(&processed).is_err()),
+        }
         let mut captured = processed
             .ticks()
             .captured_indexed_queue(chunk_ticks::TickRegistry::Block, &[center])
@@ -9471,6 +9484,8 @@ mod tests {
                     postprocess.set_water_source_conversion(false)?;
                     while !postprocess.poll(target, 256)? {}
                     let processed = postprocess.finish()?;
+                    let snapshot = batch.postprocessed_complete_entity_records(&processed)?;
+                    assert_eq!(snapshot.get(&target).map(Arc::as_ref), Some(&expected));
                     let prepared = batch.prepare_structure_region_drafts(&processed, [target], 1)?;
                     let key = (
                         native_persistence::save::FreshRegionKind::Entities,

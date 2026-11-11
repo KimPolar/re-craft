@@ -3114,6 +3114,47 @@ pub(crate) fn is_vanilla_spear(id: &str) -> bool {
     )
 }
 
+/// Default main-hand attack-speed modifier from the 26.3 item prototype.
+/// A component patch can replace or remove this modifier for an individual stack.
+pub fn vanilla_attack_speed_modifier(id: &str) -> Option<f64> {
+    let name = id.strip_prefix("minecraft:")?;
+    match name {
+        "mace" => return Some(f64::from(-3.4_f32)),
+        "trident" => return Some(f64::from(-2.9_f32)),
+        _ => {}
+    }
+    let (material, kind) = name.split_once('_')?;
+    let tier = match material {
+        "wooden" | "golden" => 0,
+        "stone" | "copper" => 1,
+        "iron" => 2,
+        "diamond" => 3,
+        "netherite" => 4,
+        _ => return None,
+    };
+    Some(match kind {
+        "sword" => f64::from(-2.4_f32),
+        "shovel" => -3.0,
+        "pickaxe" => f64::from(-2.8_f32),
+        "axe" => f64::from(match material {
+            "wooden" | "stone" | "copper" => -3.2_f32,
+            "iron" => -3.1_f32,
+            _ => -3.0_f32,
+        }),
+        "hoe" => [-3.0, -2.0, -1.0, 0.0, 0.0][tier],
+        "spear" => match material {
+            "wooden" => -2.4615384340286255,
+            "stone" => -2.666666626930237,
+            "copper" => -2.8235294818878174,
+            "iron" | "golden" => -2.9473683834075928,
+            "diamond" => -3.0476189851760864,
+            "netherite" => -3.13043475151062,
+            _ => unreachable!(),
+        },
+        _ => return None,
+    })
+}
+
 /// Java routes attack input by component presence, before targeting a block.
 pub(crate) fn has_piercing_weapon(item: Option<&ItemStack>) -> bool {
     item.is_some_and(|item| {

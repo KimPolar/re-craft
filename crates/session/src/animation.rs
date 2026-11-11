@@ -557,6 +557,8 @@ import com.google.gson.*;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity.SwingState;
 import net.minecraft.world.entity.LivingEntity.SwingDescription;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.SwingAnimationType;
 import net.minecraft.world.item.component.PiercingWeapon;
@@ -626,7 +628,13 @@ public class SwingOracle {
       var row=new JsonArray(); row.add(BuiltInRegistries.ITEM.getKey(item).toString());
       row.add(attack.type().getSerializedName()); row.add(attack.duration());
       row.add(interact.type().getSerializedName()); row.add(interact.duration());
-      row.add(stack.getMaxStackSize()); row.add(stack.getMaxDamage()); row.add(stack.has(DataComponents.PIERCING_WEAPON)); prototypes.add(row);
+      row.add(stack.getMaxStackSize()); row.add(stack.getMaxDamage()); row.add(stack.has(DataComponents.PIERCING_WEAPON));
+      var speed=new double[1]; var hasSpeed=new boolean[1];
+      stack.forEachModifier(EquipmentSlot.MAINHAND,(attribute,modifier) -> {
+        if(attribute==Attributes.ATTACK_SPEED) { hasSpeed[0]=true; speed[0]+=modifier.amount(); }
+      });
+      if(hasSpeed[0]) row.add(speed[0]); else row.add((Number)null);
+      prototypes.add(row);
       if(attack.type()==SwingAnimationType.STAB) {
         stack.remove(DataComponents.ATTACK_ANIMATION); var removed=stack.getAttackAnimation();
         stack.set(DataComponents.ATTACK_ANIMATION,new SwingAnimation(SwingAnimationType.NONE,11)); var overridden=stack.getAttackAnimation();
@@ -838,6 +846,11 @@ public class SwingOracle {
                 crate::inventory::has_piercing_weapon(Some(&stack)),
                 row[7].as_bool().unwrap(),
                 "{id} piercing prototype"
+            );
+            assert_eq!(
+                crate::inventory::vanilla_attack_speed_modifier(id),
+                row[8].as_f64(),
+                "{id} attack-speed prototype"
             );
             if id.strip_prefix("minecraft:").is_some_and(|name| {
                 matches!(

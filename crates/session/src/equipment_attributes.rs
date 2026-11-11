@@ -288,7 +288,20 @@ pub(crate) fn equipped_attribute(
                 .get("!minecraft:attribute_modifiers")
                 .is_none()
             && let Some(modifier) =
-                default_armor_modifier(item.id(), equipment_slot, attribute_name)
+                default_armor_modifier(item.id(), equipment_slot, attribute_name).or_else(|| {
+                    if equipment_slot != EquipmentSlot::Mainhand || attribute_name != "attack_speed"
+                    {
+                        return None;
+                    }
+                    Some(AttributeModifier {
+                        id: ResourceId {
+                            namespace: "minecraft".into(),
+                            path: "base_attack_speed".into(),
+                        },
+                        operation: AttributeOperation::AddValue,
+                        amount: crate::inventory::vanilla_attack_speed_modifier(item.id())?,
+                    })
+                })
         {
             apply(&mut attribute, modifier)?;
         }
@@ -385,6 +398,51 @@ mod tests {
     }
     fn string(value: &str) -> Tag {
         Tag::String(value.into())
+    }
+
+    #[test]
+    fn attack_speed_applies_mainhand_defaults_and_component_patches() {
+        let registry = OxygenEnchantments::default();
+        let saved = SavedAttribute::with_base(4.0);
+        let mut inventory = PlayerInventory::default();
+        let spear = |components| {
+            ItemStack::unresolved("minecraft:iron_spear".into(), 1, components).unwrap()
+        };
+        let speed = |inventory: &PlayerInventory| {
+            equipped_attribute(&saved, inventory, &registry, "attack_speed")
+                .unwrap()
+                .value(0.0, 1024.0)
+                .unwrap()
+        };
+        inventory.set_slot(PlayerSlot::Offhand, Some(spear(Tag::Compound(vec![]))));
+        assert_eq!(speed(&inventory), 4.0);
+        inventory.set_slot(PlayerSlot::Storage(0), Some(spear(Tag::Compound(vec![]))));
+        assert_eq!(speed(&inventory), 4.0 - 2.9473683834075928);
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(spear(Tag::Compound(vec![(
+                "!minecraft:attribute_modifiers".into(),
+                Tag::Compound(vec![]),
+            )]))),
+        );
+        assert_eq!(speed(&inventory), 4.0);
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(spear(Tag::Compound(vec![(
+                "minecraft:attribute_modifiers".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("type".into(), string("minecraft:attack_speed")),
+                        ("id".into(), string("example:bonus")),
+                        ("amount".into(), Tag::Double(2.0)),
+                        ("operation".into(), string("add_value")),
+                        ("slot".into(), string("mainhand")),
+                    ])],
+                },
+            )]))),
+        );
+        assert_eq!(speed(&inventory), 6.0);
     }
 
     #[test]

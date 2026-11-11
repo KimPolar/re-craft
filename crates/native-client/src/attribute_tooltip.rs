@@ -30,6 +30,7 @@ fn modifier(attribute: &str, id: &str, slot: &str, amount: f64) -> Modifier {
 }
 
 fn default_modifiers(id: &str) -> Vec<Modifier> {
+    let full_id = id;
     let Some(id) = id.strip_prefix("minecraft:") else {
         return vec![];
     };
@@ -42,54 +43,31 @@ fn default_modifiers(id: &str) -> Vec<Modifier> {
         "netherite" => Some(4),
         _ => None,
     };
-    let tool = tier
+    let tool_damage = tier
         .and_then(|tier| {
             let tier_damage = [0.0, 1.0, 2.0, 3.0, 4.0][tier];
             Some(match kind {
-                "sword" => (tier_damage + 3.0, f64::from(-2.4_f32)),
-                "shovel" => (tier_damage + 1.5, -3.0),
-                "pickaxe" => (tier_damage + 1.0, f64::from(-2.8_f32)),
-                "axe" => (
-                    match material {
-                        "wooden" | "golden" => 6.0,
-                        "netherite" => 9.0,
-                        _ => 8.0,
-                    },
-                    f64::from(match material {
-                        "wooden" | "stone" | "copper" => -3.2_f32,
-                        "iron" => -3.1_f32,
-                        _ => -3.0_f32,
-                    }),
-                ),
-                "hoe" => (
-                    0.0,
-                    match tier {
-                        0 => -3.0,
-                        1 => -2.0,
-                        2 => -1.0,
-                        _ => 0.0,
-                    },
-                ),
-                "spear" => (
-                    tier_damage,
-                    match material {
-                        "wooden" => -2.4615384340286255,
-                        "stone" => -2.666666626930237,
-                        "copper" => -2.8235294818878174,
-                        "iron" | "golden" => -2.9473683834075928,
-                        "diamond" => -3.0476189851760864,
-                        _ => -3.13043475151062,
-                    },
-                ),
+                "sword" => tier_damage + 3.0,
+                "shovel" => tier_damage + 1.5,
+                "pickaxe" => tier_damage + 1.0,
+                "axe" => match material {
+                    "wooden" | "golden" => 6.0,
+                    "netherite" => 9.0,
+                    _ => 8.0,
+                },
+                "hoe" => 0.0,
+                "spear" => tier_damage,
                 _ => return None,
             })
         })
         .or_else(|| match id {
-            "mace" => Some((5.0, f64::from(-3.4_f32))),
-            "trident" => Some((8.0, f64::from(-2.9_f32))),
+            "mace" => Some(5.0),
+            "trident" => Some(8.0),
             _ => None,
         });
-    if let Some((damage, speed)) = tool {
+    if let Some(damage) = tool_damage {
+        let speed = native_session::inventory::vanilla_attack_speed_modifier(full_id)
+            .expect("known vanilla weapon has an attack-speed modifier");
         return vec![
             modifier("attack_damage", "base_attack_damage", "mainhand", damage),
             modifier("attack_speed", "base_attack_speed", "mainhand", speed),

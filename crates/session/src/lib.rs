@@ -21,6 +21,7 @@ pub mod bubble_column;
 pub mod camera;
 pub mod chest_lid;
 pub mod chest_placement;
+mod combat;
 pub mod consume_particles;
 mod custom_tool;
 mod equipment_attributes;
@@ -28,12 +29,12 @@ mod fire_contact;
 mod frosted_ice;
 mod honey;
 pub use equipment_attributes::ArmorValues;
+pub mod crop;
 pub mod equippable;
 pub mod experience;
 pub mod fall;
 pub mod falling_block;
 pub mod farmland;
-pub mod crop;
 pub mod fence_placement;
 pub mod gamemode_command;
 mod interaction;
@@ -747,6 +748,7 @@ pub struct LocalSession {
     food_use: survival::FoodUse,
     use_repeat: interaction::UseRepeat,
     mining: mining::Mining,
+    attack_charge: combat::AttackCharge,
     first_person: animation::FirstPersonState,
     commands: VecDeque<PlayerCommand>,
     movement: (f32, f32, bool),
@@ -1109,6 +1111,7 @@ impl LocalSession {
             food_use: survival::FoodUse::default(),
             use_repeat: interaction::UseRepeat::default(),
             mining: mining::Mining::default(),
+            attack_charge: combat::AttackCharge::default(),
             first_person: animation::FirstPersonState::default(),
             commands: VecDeque::new(),
             movement: (0.0, 0.0, false),
@@ -1762,6 +1765,14 @@ impl LocalSession {
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
+                    let hand = self
+                        .inventory
+                        .slot(PlayerSlot::Storage(self.inventory.selected()));
+                    let piercing = inventory::has_piercing_weapon(hand);
+                    if !self.attack_charge.can_attack(hand) {
+                        self.mining.hold_without_start();
+                        continue;
+                    }
                     self.first_person.start_attack_swing(
                         animation::Hand::Main,
                         self.inventory
@@ -1773,18 +1784,38 @@ impl LocalSession {
                     let hand = self
                         .inventory
                         .slot(PlayerSlot::Storage(self.inventory.selected()));
-                    if inventory::has_piercing_weapon(hand) {
+                    if piercing {
+                        self.attack_charge.attacked();
                         self.mining.hold_without_start();
-                    } else if let Some(position) =
-                        self.mining
-                            .press(target, hand, self.game_mode == GameMode::Creative)
-                    {
-                        self.finish_breaking(position);
+                    } else {
+                        if target.is_none() {
+                            self.attack_charge.missed();
+                        }
+                        if let Some(position) =
+                            self.mining
+                                .press(target, hand, self.game_mode == GameMode::Creative)
+                        {
+                            self.finish_breaking(position);
+                        }
                     }
                 }
                 PlayerCommand::Break
                     if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
                 {
+                    if !self.attack_charge.can_attack(
+                        self.inventory
+                            .slot(PlayerSlot::Storage(self.inventory.selected())),
+                    ) {
+                        continue;
+                    }
+                    if inventory::has_piercing_weapon(
+                        self.inventory
+                            .slot(PlayerSlot::Storage(self.inventory.selected())),
+                    ) {
+                        self.attack_charge.attacked();
+                    } else if self.mining_target().is_none() {
+                        self.attack_charge.missed();
+                    }
                     self.first_person.start_attack_swing(
                         animation::Hand::Main,
                         self.inventory
@@ -2263,6 +2294,17 @@ impl LocalSession {
             self.process_food_events();
         }
         self.selected_block = selected_inventory_block(&self.inventory);
+        if let Err(error) = self.attack_charge.tick(
+            &self.inventory,
+            self.fall.effects(),
+            self.enchantments
+                .as_deref()
+                .unwrap_or(&native_resources::enchantments::OxygenEnchantments::default()),
+            false,
+            Ok,
+        ) {
+            eprintln!("player attack speed equipment: {error:#}");
+        }
         self.first_person.item_use = self.food_use.visual_state();
         self.first_person.tick(&self.inventory);
         if self.death.is_none() {
@@ -2398,6 +2440,7 @@ impl LocalSession {
         self.use_repeat = interaction::UseRepeat::default();
         self.mining.release();
         self.first_person = animation::FirstPersonState::default();
+        self.attack_charge = combat::AttackCharge::default();
         self.armor.invalidate();
         if let Err(error) = self.armor.refresh(&self.inventory) {
             eprintln!("player armor equipment: {error:#}");
@@ -5795,6 +5838,17 @@ mod tests {
                 session.update(TICK * 3);
                 session.submit_command(PlayerCommand::Break);
                 session.update(TICK);
+                assert_eq!(
+                    session.snapshot().first_person.swing.hand(),
+                    None,
+                    "uncharged {id}"
+                );
+                session.submit_command(PlayerCommand::StopBreak);
+                for _ in 0..25 {
+                    session.update(TICK);
+                }
+                session.submit_command(PlayerCommand::Break);
+                session.update(TICK);
                 assert_eq!(session.world.block(target), Block::Dirt, "{mode:?} {id}");
                 assert_eq!(
                     session.snapshot().first_person.swing.kind(),
@@ -5820,6 +5874,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn attack_charge_is_independent_of_render_update_rate() {
+        use crate::inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+
+        let mut sessions = [
+            LocalSession::new(World::default()),
+            LocalSession::new(World::default()),
+        ];
+        for session in &mut sessions {
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:iron_spear".into(), 1, 1, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+        }
+        for _ in 0..25 {
+            sessions[0].update(TICK);
+            sessions[1].update(TICK / 2);
+            sessions[1].update(TICK / 2);
+        }
+        for session in &mut sessions {
+            session.submit_command(PlayerCommand::Break);
+            session.update(TICK);
+            assert_eq!(
+                session.snapshot().first_person.swing.kind(),
+                Some(animation::SwingKind::Stab)
+            );
+        }
+        assert_eq!(
+            sessions[0].snapshot().first_person.swing,
+            sessions[1].snapshot().first_person.swing
+        );
     }
 
     #[test]

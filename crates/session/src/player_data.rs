@@ -570,6 +570,11 @@ pub fn read_saved_movement_speed_attribute(player: &NamedTag) -> Result<SavedAtt
     saved_attribute(player, "movement_speed", f64::from(0.1_f32))
 }
 
+/// Persistent player attack speed before equipment and transient effects.
+pub fn read_saved_attack_speed_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "attack_speed", 4.0)
+}
+
 /// Player.load overwrites this attribute's saved base with abilities.walkSpeed.
 pub fn read_loaded_movement_speed_attribute(player: &NamedTag) -> Result<SavedAttribute> {
     let mut attribute = read_saved_movement_speed_attribute(player)?;
@@ -1304,6 +1309,24 @@ impl PlayerStateDraft {
             3.0,
             &["minecraft:effect.jump_boost"],
             AttributeOperation::AddValue,
+            false,
+        )
+    }
+
+    pub(crate) fn set_attack_effect_modifiers(
+        &mut self,
+        original: &NamedTag,
+        initial: &SavedAttribute,
+        current: &SavedAttribute,
+    ) -> Result<()> {
+        self.set_effect_attribute_modifiers(
+            original,
+            initial,
+            current,
+            "attack_speed",
+            4.0,
+            &["minecraft:effect.haste", "minecraft:effect.mining_fatigue"],
+            AttributeOperation::AddMultipliedTotal,
             false,
         )
     }
@@ -3812,6 +3835,44 @@ mod tests {
         .unwrap();
         assert!(read_last_death_location(&unknown).is_err());
         assert!(draft.set_last_death_location(&unknown, &target).is_err());
+    }
+
+    #[test]
+    fn attack_effect_modifiers_round_trip_without_losing_other_attributes() {
+        let original = player_with_inventory();
+        let inventory = read_saved_player(&original).unwrap();
+        let initial = read_saved_attack_speed_attribute(&original).unwrap();
+        let mut current = initial.clone();
+        let id = ResourceId::parse("minecraft:effect.haste").unwrap();
+        current.apply(AttributeModifier {
+            id: id.clone(),
+            operation: AttributeOperation::AddMultipliedTotal,
+            amount: f64::from(0.1_f32) * 2.0,
+        });
+        let mut draft = PlayerStateDraft(draft_player_inventory(&original, &inventory).unwrap());
+        draft
+            .set_attack_effect_modifiers(&original, &initial, &current)
+            .unwrap();
+        assert_eq!(
+            read_saved_attack_speed_attribute(draft.document()).unwrap(),
+            current
+        );
+        assert_eq!(
+            draft.document().value.get("custom_world_data"),
+            original.value.get("custom_world_data")
+        );
+        let with_effect = draft.document().clone();
+        let mut removed =
+            PlayerStateDraft(draft_player_inventory(&with_effect, &inventory).unwrap());
+        current.remove_modifier(&id);
+        let saved_effect = read_saved_attack_speed_attribute(&with_effect).unwrap();
+        removed
+            .set_attack_effect_modifiers(&with_effect, &saved_effect, &current)
+            .unwrap();
+        assert_eq!(
+            read_saved_attack_speed_attribute(removed.document()).unwrap(),
+            initial
+        );
     }
 
     #[test]

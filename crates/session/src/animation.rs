@@ -612,6 +612,10 @@ public class SwingOracle {
     public ItemStack getItemInHand(InteractionHand hand) { return held; }
     public boolean isUsingItem() { return false; }
   }
+  static class ChargePlayer extends Player {
+    double speed;
+    public double getAttributeValue(Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) { return speed; }
+  }
   static class AttackMode extends MultiPlayerGameMode {
     int stops;
     AttackMode() { super(null,null); }
@@ -634,6 +638,7 @@ public class SwingOracle {
         if(attribute==Attributes.ATTACK_SPEED) { hasSpeed[0]=true; speed[0]+=modifier.amount(); }
       });
       if(hasSpeed[0]) row.add(speed[0]); else row.add((Number)null);
+      row.add(stack.getOrDefault(DataComponents.MINIMUM_ATTACK_CHARGE,0f));
       prototypes.add(row);
       if(attack.type()==SwingAnimationType.STAB) {
         stack.remove(DataComponents.ATTACK_ANIMATION); var removed=stack.getAttackAnimation();
@@ -660,6 +665,17 @@ public class SwingOracle {
     }
     var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
     var unsafe=(Unsafe)unsafeField.get(null);
+    var chargePlayer=(ChargePlayer)unsafe.allocateInstance(ChargePlayer.class);
+    var ticker=net.minecraft.world.entity.LivingEntity.class.getDeclaredField("attackStrengthTicker"); ticker.setAccessible(true);
+    var charges=new JsonArray();
+    for(double speed:new double[]{0,0.1,1,4,1024})
+    for(float minimum:new float[]{0f,0.25f,0.5f,1f})
+    for(int ticks:new int[]{-1,0,1,4,19,20,21,100}) {
+      chargePlayer.speed=speed; ticker.setInt(chargePlayer,ticks);
+      var stack=new ItemStack(Items.STONE,1); stack.set(DataComponents.MINIMUM_ATTACK_CHARGE,minimum);
+      var row=new JsonArray(); row.add(speed); row.add(minimum); row.add(ticks);
+      row.add(chargePlayer.cannotAttackWithItem(stack,0)); charges.add(row);
+    }
     var attackPlayer=(AttackPlayer)unsafe.allocateInstance(AttackPlayer.class);
     var attackMode=(AttackMode)unsafe.allocateInstance(AttackMode.class);
     var attackGame=(Game)unsafe.allocateInstance(Game.class);
@@ -768,7 +784,7 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes); result.add("charges",charges);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -852,6 +868,11 @@ public class SwingOracle {
                 row[8].as_f64(),
                 "{id} attack-speed prototype"
             );
+            assert_eq!(
+                crate::combat::minimum_charge(Some(&stack)),
+                row[9].as_f64().unwrap() as f32,
+                "{id} minimum charge"
+            );
             if id.strip_prefix("minecraft:").is_some_and(|name| {
                 matches!(
                     name,
@@ -875,6 +896,26 @@ public class SwingOracle {
                     "{id} durability"
                 );
             }
+        }
+        for row in result["charges"].as_array().unwrap() {
+            let speed = row[0].as_f64().unwrap();
+            let minimum = row[1].as_f64().unwrap() as f32;
+            let ticks = row[2].as_i64().unwrap() as i32;
+            let stack = ItemStack::new(
+                "minecraft:stone".into(),
+                1,
+                64,
+                Tag::Compound(vec![(
+                    "minecraft:minimum_attack_charge".into(),
+                    Tag::Float(minimum),
+                )]),
+            )
+            .unwrap();
+            assert_eq!(
+                !crate::combat::AttackCharge::for_test(ticks, speed).can_attack(Some(&stack)),
+                row[3].as_bool().unwrap(),
+                "{speed} {minimum} {ticks}"
+            );
         }
         let patches = result["prototypePatches"].as_array().unwrap();
         assert_eq!(patches.len(), 7);

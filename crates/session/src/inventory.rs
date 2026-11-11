@@ -3332,7 +3332,7 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     };
     let mut max = default;
-    let mut seen = 0_u32;
+    let mut seen = 0_u64;
     for (name, value) in entries {
         let flag = if name.matches("minecraft:max_stack_size") {
             max = value
@@ -3429,6 +3429,16 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             2147483648
+        } else if name.matches("minecraft:minimum_attack_charge") {
+            if !crate::combat::valid_minimum_charge(value) {
+                return None;
+            }
+            1_u64 << 32
+        } else if name.matches("!minecraft:minimum_attack_charge") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            1_u64 << 33
         } else if name.matches("minecraft:dyed_color") {
             value.as_java_int()?;
             131072
@@ -3550,6 +3560,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {
+        return None;
+    }
+    if seen & (3_u64 << 32) == (3_u64 << 32) {
         return None;
     }
     // Durable item prototypes require special stackability rules when their

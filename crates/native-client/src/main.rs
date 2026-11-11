@@ -1724,6 +1724,12 @@ fn prepare_existing_world(
                         .context("cannot read saved movement speed")?,
                 )
                 .context("cannot restore saved movement speed")?;
+            session
+                .set_saved_attack_speed(
+                    native_session::player_data::read_saved_attack_speed_attribute(player_data)
+                        .context("cannot read saved attack speed")?,
+                )
+                .context("cannot restore saved attack speed")?;
 
             let mut prepare_respawn =
                 || -> Result<Option<Option<native_session::loaded::SavedRespawnSupport>>> {

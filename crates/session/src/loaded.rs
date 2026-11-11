@@ -860,6 +860,7 @@ pub struct LoadedSession {
     food_use: crate::survival::FoodUse,
     use_repeat: crate::interaction::UseRepeat,
     mining: mining::Mining,
+    attack_charge: crate::combat::AttackCharge,
     first_person: crate::animation::FirstPersonState,
     commands: VecDeque<PlayerCommand>,
     movement: (f32, f32, bool),
@@ -3388,6 +3389,18 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Restore the persistent attack-speed attribute before the first player tick.
+    pub fn set_saved_attack_speed(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "attack speed must be restored before the first tick"
+        );
+        self.attack_charge.restore(attribute, self.fall.effects())
+    }
+
     fn refresh_movement_speed(&mut self) {
         let revision = self.inventory.revision();
         let speed = self
@@ -3495,6 +3508,9 @@ impl LoadedSession {
             .ok_or_else(|| anyhow::anyhow!("active enchantment registry is unavailable"))?;
         self.effect_save_invalid |= self.tick != 0;
         self.fall.configure(safe, multiplier, effects, registry);
+        if self.tick == 0 {
+            self.attack_charge.initialize_effects(self.fall.effects())?;
+        }
         Arc::make_mut(&mut self.snapshot).active_effects =
             crate::survival::display_effects(self.fall.effects(), &self.breathing_effects);
         Arc::make_mut(&mut self.snapshot).hunger_effect = self.fall.effects().hunger.is_some();
@@ -4454,6 +4470,8 @@ impl LoadedSession {
             &self.movement_speed_attribute,
         )?;
         draft.set_jump_effect_modifier(original, initial_safe_fall, self.fall.safe_attribute())?;
+        let (initial_attack, current_attack) = self.attack_charge.saved_attributes();
+        draft.set_attack_effect_modifiers(original, initial_attack, current_attack)?;
         Ok(draft)
     }
 
@@ -7171,6 +7189,7 @@ impl LoadedSession {
             food_use: crate::survival::FoodUse::default(),
             use_repeat: crate::interaction::UseRepeat::default(),
             mining: mining::Mining::default(),
+            attack_charge: crate::combat::AttackCharge::default(),
             first_person: crate::animation::FirstPersonState::default(),
             commands: VecDeque::new(),
             movement: (0.0, 0.0, false),
@@ -11160,6 +11179,7 @@ impl LoadedSession {
         self.use_repeat = crate::interaction::UseRepeat::default();
         self.mining.release();
         self.first_person = crate::animation::FirstPersonState::default();
+        self.attack_charge = crate::combat::AttackCharge::default();
         self.selected = selected_inventory_block(&self.inventory);
         self.armor.reset_after_death();
         if let Err(error) = self.armor.refresh(&self.inventory) {
@@ -20521,6 +20541,14 @@ impl LoadedSession {
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
+                    let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+                        self.inventory.selected(),
+                    ));
+                    let piercing = crate::inventory::has_piercing_weapon(hand);
+                    if !self.attack_charge.can_attack(hand) {
+                        self.mining.hold_without_start();
+                        continue;
+                    }
                     self.first_person.start_attack_swing(
                         crate::animation::Hand::Main,
                         self.inventory.slot(crate::inventory::PlayerSlot::Storage(
@@ -20529,13 +20557,14 @@ impl LoadedSession {
                         self.fall.effects(),
                         &self.breathing_effects,
                     );
-                    let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
-                        self.inventory.selected(),
-                    ));
-                    if crate::inventory::has_piercing_weapon(hand) {
+                    if piercing {
+                        self.attack_charge.attacked();
                         self.mining.hold_without_start();
                     } else {
                         let target = self.mining_target();
+                        if target.is_none() {
+                            self.attack_charge.missed();
+                        }
                         if let Some(relative) =
                             target.and_then(|target| subtract(target.position, self.origin))
                         {
@@ -20558,6 +20587,17 @@ impl LoadedSession {
                 PlayerCommand::Break
                     if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
                 {
+                    let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+                        self.inventory.selected(),
+                    ));
+                    if !self.attack_charge.can_attack(hand) {
+                        continue;
+                    }
+                    if crate::inventory::has_piercing_weapon(hand) {
+                        self.attack_charge.attacked();
+                    } else if self.mining_target().is_none() {
+                        self.attack_charge.missed();
+                    }
                     self.first_person.start_attack_swing(
                         crate::animation::Hand::Main,
                         self.inventory.slot(crate::inventory::PlayerSlot::Storage(
@@ -22178,6 +22218,21 @@ impl LoadedSession {
             self.process_food_events();
         }
         self.selected = selected_inventory_block(&self.inventory);
+        let default_registry = OxygenEnchantments::default();
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map_or(&default_registry, |(_, registry)| registry.as_ref());
+        if let Err(error) = self.attack_charge.tick(
+            &self.inventory,
+            self.fall.effects(),
+            registry,
+            self.location_effects.has_active(),
+            |attribute| self.location_effects.apply("attack_speed", attribute),
+        ) {
+            self.stream_errors
+                .push(format!("player attack speed equipment: {error:#}"));
+        }
         self.first_person.item_use = self.food_use.visual_state();
         self.first_person.tick(&self.inventory);
         if self.death.is_none() {
@@ -66551,6 +66606,18 @@ pub(crate) mod tests {
             session.set_player_inventory(inventory);
             session.update(TICK * 3);
             session.submit_command(PlayerCommand::Break);
+            session.update(TICK);
+            assert_eq!(session.snapshot().first_person.swing.hand(), None);
+            session.submit_command(PlayerCommand::StopBreak);
+            for _ in 0..25 {
+                session.update(TICK);
+            }
+            session.submit_command(PlayerCommand::Break);
+            session.update(TICK);
+            assert_eq!(
+                session.snapshot().first_person.swing.kind(),
+                Some(crate::animation::SwingKind::Stab)
+            );
             for _ in 0..30 {
                 session.update(TICK);
             }

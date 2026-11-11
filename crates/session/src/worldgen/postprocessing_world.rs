@@ -313,6 +313,18 @@ impl PostprocessedGeneratedRegion {
         self.block_drops.as_ref()
     }
 
+    /// Prepare a combined entity snapshot without authorizing world saving.
+    /// `original` must cover all entity chunks whose UUIDs can conflict.
+    pub fn merge_complete_entity_records(
+        &self,
+        original: &BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>,
+    ) -> Result<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>> {
+        match &self.block_drops {
+            Some(drops) => drops.merge_complete_entities(original),
+            None => Ok(original.clone()),
+        }
+    }
+
     pub(super) fn ensure_drops_integrated_for_save(&self) -> Result<()> {
         ensure!(
             self.block_drops
@@ -7196,6 +7208,10 @@ mod tests {
             .unwrap();
             assert_eq!(resumed.block_drops.as_ref().unwrap().operations(), 1);
             assert!(result.ensure_drops_integrated_for_save().is_err());
+            let original = BTreeMap::from([(chunk, Arc::new(Vec::new()))]);
+            let merged = result.merge_complete_entity_records(&original).unwrap();
+            assert_eq!(merged[&chunk].len(), usize::from(case.ends_with("_on")));
+            assert!(original[&chunk].is_empty());
         }
         if case == "edge_deferred" {
             assert_eq!(

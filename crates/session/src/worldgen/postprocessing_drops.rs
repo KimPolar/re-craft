@@ -144,6 +144,93 @@ impl GeneratedBlockDrops {
     pub fn operations(&self) -> u64 {
         self.operations
     }
+
+    /// Append item records to a caller-supplied complete entity snapshot.
+    /// This validates identities in every supplied chunk, including passengers.
+    /// The caller must include every potentially conflicting entity chunk and
+    /// still coordinate the saved random streams and remaining world effects.
+    pub fn merge_complete_entities(
+        &self,
+        original: &BTreeMap<ChunkPos, Arc<Vec<Tag>>>,
+    ) -> Result<BTreeMap<ChunkPos, Arc<Vec<Tag>>>> {
+        if self.records.is_empty() {
+            return Ok(original.clone());
+        }
+        ensure!(
+            self.records.keys().all(|pos| original.contains_key(pos)),
+            "generated item destination entity chunk is missing"
+        );
+        let mut seen = BTreeSet::new();
+        for records in original.values() {
+            let mut pending: Vec<(&Tag, usize)> = records.iter().map(|tag| (tag, 0)).collect();
+            while let Some((entity, depth)) = pending.pop() {
+                ensure!(
+                    depth <= 512,
+                    "generated entity passenger nesting is too deep"
+                );
+                let Tag::Compound(fields) = entity else {
+                    anyhow::bail!("generated entity must be a compound")
+                };
+                ensure!(
+                    fields
+                        .iter()
+                        .filter(|(name, _)| name.matches("UUID"))
+                        .count()
+                        <= 1,
+                    "duplicate entity UUID field"
+                );
+                let uuid = crate::saved_item::optional_uuid(entity, "UUID")?
+                    .context("existing entity UUID is unavailable")?;
+                ensure!(seen.insert(uuid), "duplicate existing entity UUID");
+                let mut passengers = fields.iter().filter(|(name, _)| name.matches("Passengers"));
+                if let Some((_, value)) = passengers.next() {
+                    ensure!(passengers.next().is_none(), "duplicate Passengers field");
+                    match value {
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::Compound,
+                            values,
+                        } => {
+                            pending.extend(values.iter().map(|tag| (tag, depth + 1)));
+                        }
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::End,
+                            values,
+                        } if values.is_empty() => {}
+                        _ => anyhow::bail!("generated entity Passengers must be a compound list"),
+                    }
+                }
+            }
+        }
+        let mut merged = original.clone();
+        for (&chunk, additions) in self.records.iter() {
+            for entity in additions.iter() {
+                let item =
+                    crate::saved_item::read(entity)?.context("generated drop is not an item")?;
+                let uuid = item.uuid.context("generated item UUID is missing")?;
+                ensure!(
+                    seen.insert(uuid),
+                    "generated item UUID conflicts with another entity"
+                );
+                ensure!(
+                    item.position.is_finite()
+                        && item.position.x.abs() <= 30_000_512.0
+                        && item.position.z.abs() <= 30_000_512.0,
+                    "generated item position is invalid"
+                );
+                let destination = ChunkPos {
+                    x: (item.position.x.floor() as i32).div_euclid(16),
+                    z: (item.position.z.floor() as i32).div_euclid(16),
+                };
+                ensure!(
+                    destination == chunk,
+                    "generated item belongs to a different chunk"
+                );
+            }
+            Arc::make_mut(merged.get_mut(&chunk).expect("destination prechecked"))
+                .extend(additions.iter().cloned());
+        }
+        Ok(merged)
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +382,105 @@ mod tests {
         );
         assert!(!generated.sequences.is_dirty());
         assert_eq!(generated.records(ChunkPos { x: 0, z: 0 }).len(), 1);
+    }
+
+    #[test]
+    fn entity_merge_preserves_records_and_rejects_missing_chunks_or_conflicting_passengers() {
+        use native_persistence::nbt::TagType;
+        let mut generated = fixture(true);
+        let destination = ChunkPos { x: -1, z: -2 };
+        let other = ChunkPos { x: 0, z: 0 };
+        generated
+            .drop_block(IVec3::new(-1, 70, -17), &ladder())
+            .unwrap();
+        let item_uuid =
+            crate::saved_item::optional_uuid(&generated.records(destination)[0], "UUID")
+                .unwrap()
+                .unwrap();
+        let entity = |uuid: [i32; 4]| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:pig".into())),
+                ("UUID".into(), Tag::IntArray(uuid.into())),
+            ])
+        };
+        let first = Arc::new(vec![entity([1, 2, 3, 4])]);
+        let untouched = Arc::new(vec![entity([5, 6, 7, 8])]);
+        let source = BTreeMap::from([
+            (destination, Arc::clone(&first)),
+            (other, Arc::clone(&untouched)),
+        ]);
+        let merged = generated.merge_complete_entities(&source).unwrap();
+        assert_eq!(merged[&destination].len(), 2);
+        assert_eq!(merged[&destination][0], first[0]);
+        assert_eq!(merged[&destination][1], generated.records(destination)[0]);
+        assert_eq!(source[&destination].len(), 1);
+        assert!(Arc::ptr_eq(&merged[&other], &untouched));
+        let document = native_persistence::generated_chunk::assemble_entity_chunk(
+            destination,
+            &merged[&destination],
+        )
+        .unwrap();
+        let bytes = native_persistence::nbt::write(&document).unwrap();
+        assert_eq!(native_persistence::nbt::read(&bytes).unwrap(), document);
+        assert!(generated.merge_complete_entities(&BTreeMap::new()).is_err());
+        let passenger = Tag::Compound(vec![
+            ("UUID".into(), Tag::IntArray([9, 10, 11, 12].into())),
+            (
+                "Passengers".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity(item_uuid)],
+                },
+            ),
+        ]);
+        assert!(
+            generated
+                .merge_complete_entities(&BTreeMap::from([(
+                    destination,
+                    Arc::new(vec![passenger])
+                )]))
+                .is_err()
+        );
+        let missing_uuid = Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]);
+        assert!(
+            generated
+                .merge_complete_entities(&BTreeMap::from([(
+                    destination,
+                    Arc::new(vec![missing_uuid])
+                )]))
+                .is_err()
+        );
+        let duplicate_uuid = Tag::Compound(vec![
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+        ]);
+        assert!(
+            generated
+                .merge_complete_entities(&BTreeMap::from([(
+                    destination,
+                    Arc::new(vec![duplicate_uuid])
+                )]))
+                .is_err()
+        );
+        assert!(
+            generated
+                .merge_complete_entities(&BTreeMap::from([
+                    (destination, Arc::clone(&first)),
+                    (other, Arc::new(vec![entity(item_uuid)])),
+                ]))
+                .is_err()
+        );
+        assert_eq!(source[&destination].len(), 1);
+    }
+
+    #[test]
+    fn entity_merge_without_items_preserves_unknown_identity_and_shares_records() {
+        let generated = fixture(false);
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let records = Arc::new(vec![Tag::Compound(vec![])]);
+        let source = BTreeMap::from([(chunk, Arc::clone(&records))]);
+        let merged = generated.merge_complete_entities(&source).unwrap();
+        assert!(Arc::ptr_eq(&merged[&chunk], &records));
     }
 
     #[cfg(target_os = "windows")]

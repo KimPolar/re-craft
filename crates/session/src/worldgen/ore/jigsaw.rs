@@ -77,6 +77,10 @@ pub(super) fn jigsaw_carpet(state: &BlockState) -> bool {
     native_world::collision::simple_carpet(state)
 }
 
+pub(super) fn jigsaw_ladder(state: &BlockState) -> bool {
+    native_world::collision::ladder_state(state).is_some()
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::wall::Wall::from_state(state).is_some() {
         return Ok(false);
@@ -84,7 +88,11 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if jigsaw_wood(state) {
         return Ok(true);
     }
-    if jigsaw_torch(state) || jigsaw_lantern(state) || jigsaw_candle(state) || jigsaw_carpet(state)
+    if jigsaw_torch(state)
+        || jigsaw_lantern(state)
+        || jigsaw_candle(state)
+        || jigsaw_carpet(state)
+        || jigsaw_ladder(state)
     {
         return Ok(false);
     }
@@ -313,7 +321,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || jigsaw_torch(state)
                 || jigsaw_lantern(state)
                 || jigsaw_candle(state)
-                || jigsaw_carpet(state);
+                || jigsaw_carpet(state)
+                || jigsaw_ladder(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -330,6 +339,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::trapdoor_state(state).is_some()
                 || jigsaw_lantern(state)
                 || jigsaw_candle(state)
+                || jigsaw_ladder(state)
                 || state.name == "minecraft:chest")
             && self
                 .registry
@@ -371,7 +381,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     || native_world::collision::trapdoor_state(state).is_some()
                     || native_world::collision::pane_waterlogged(state).is_some()
                     || jigsaw_lantern(state)
-                    || jigsaw_candle(state);
+                    || jigsaw_candle(state)
+                    || jigsaw_ladder(state);
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
                 result?;
@@ -1322,6 +1333,99 @@ mod tests {
             carpets_checked += 1;
         }
         assert_eq!(carpets_checked, 204);
+        let mut ladders_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("LADDER\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                facing,
+                wet,
+                mirror,
+                rotation,
+                expected_facing,
+                expected_wet,
+                x0,
+                y0,
+                z0,
+                x1,
+                y1,
+                z1,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java ladder result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let state = BlockState {
+                name: "minecraft:ladder".into(),
+                properties: BTreeMap::from([
+                    ("facing".into(), (*facing).into()),
+                    ("waterlogged".into(), (*wet).into()),
+                ]),
+            };
+            assert!(registry.is_canonical_state(&state.name, &state.properties));
+            assert_eq!(registry.has_block_entity(&state.name), Some(false));
+            assert!(jigsaw_ladder(&state));
+            assert!(!jigsaw_static_full(&state)?);
+            let transformed = registry.transform_template_state(
+                &state.name,
+                &state.properties,
+                mirror,
+                rotation,
+            )?;
+            assert_eq!(transformed["facing"], *expected_facing);
+            assert_eq!(transformed["waterlogged"], *expected_wet);
+            let boxes =
+                native_world::collision::block_shape(&state).context("ladder shape missing")?;
+            assert_eq!(boxes.len(), 1);
+            let b = boxes[0];
+            assert_eq!(
+                [
+                    b.min.x * 16.0,
+                    b.min.y * 16.0,
+                    b.min.z * 16.0,
+                    b.max.x * 16.0,
+                    b.max.y * 16.0,
+                    b.max.z * 16.0
+                ],
+                [
+                    x0.parse::<f32>()?,
+                    y0.parse::<f32>()?,
+                    z0.parse::<f32>()?,
+                    x1.parse::<f32>()?,
+                    y1.parse::<f32>()?,
+                    z1.parse::<f32>()?
+                ],
+                "{line}"
+            );
+            let air = BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            };
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&air, &state),
+                Some(*wet == "false")
+            );
+            assert_eq!(
+                FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some_and(|fluid| fluid.source),
+                *wet == "true"
+            );
+            ladders_checked += 1;
+        }
+        assert_eq!(ladders_checked, 96);
         let mut liquids_checked = 0;
         for line in output
             .lines()
@@ -2457,6 +2561,71 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_ladders_waterlog_only_from_source_water() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for facing in ["north", "south", "east", "west"] {
+            for source in [false, true] {
+                let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                let state = BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), facing.into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                };
+                let pos = [1, 8, 1];
+                let mut random = DecorationRandom::new(42);
+                let mut original = random.clone();
+                {
+                    let mut draft = JigsawRegion {
+                        region: &mut region,
+                        registry: &registry,
+                    };
+                    assert!(draft.place_template_block(pos, &state, None, &mut random)?);
+                    assert!(draft.is_liquid_container(&state)?);
+                    draft.place_liquid(
+                        pos,
+                        &state,
+                        Some(FluidState {
+                            kind: FluidKind::Water,
+                            source,
+                            falling: false,
+                            amount: if source { 8 } else { 7 },
+                        }),
+                    )?;
+                }
+                region.finish()?;
+                assert_eq!(random.next_long(), original.next_long());
+                let world = terrain.snapshot();
+                let placed = world
+                    .block(pos[0], pos[1], pos[2])
+                    .context("missing ladder")?;
+                assert_eq!(placed.properties["facing"], facing);
+                assert_eq!(placed.properties["waterlogged"], source.to_string());
+                let ticks = world.saved_fluid_ticks.get(&ChunkPos { x: 0, z: 0 });
+                if source {
+                    let ticks = ticks.context("waterlogged ladder tick missing")?;
+                    assert_eq!(ticks.len(), 1);
+                    assert_eq!(ticks[0].position, pos);
+                    assert_eq!(ticks[0].fluid, "minecraft:water");
+                    assert_eq!(ticks[0].delay, 0);
+                } else {
+                    assert!(ticks.is_none_or(|ticks| ticks.is_empty()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn jigsaw_slabs_accept_water_only_when_not_double() -> Result<()> {
         let game =
             native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
@@ -3173,8 +3342,10 @@ mod tests {
         let mut saw_candle = false;
         let mut saw_soul_lantern = false;
         let mut saw_carpet = false;
+        let mut saw_ladder = false;
         let entrance = "city/entrance/entrance_connector";
         let wall = "walls/ruined_corner_wall_2";
+        let ladder_path = "city/entrance/entrance_path_4";
         for (template, processor, origin, rotation, java_rotation) in [
             (
                 entrance,
@@ -3221,6 +3392,20 @@ mod tests {
             (
                 wall,
                 "ancient_city_walls_degradation",
+                [16, 0, 0],
+                Rotation::Clockwise90,
+                "CLOCKWISE_90",
+            ),
+            (
+                ladder_path,
+                "ancient_city_generic_degradation",
+                [0, 0, 0],
+                Rotation::None,
+                "NONE",
+            ),
+            (
+                ladder_path,
+                "ancient_city_generic_degradation",
                 [16, 0, 0],
                 Rotation::Clockwise90,
                 "CLOCKWISE_90",
@@ -3306,6 +3491,7 @@ mod tests {
                 saw_candle |= expected.name == "minecraft:candle";
                 saw_soul_lantern |= expected.name == "minecraft:soul_lantern";
                 saw_carpet |= expected.name == "minecraft:light_blue_carpet";
+                saw_ladder |= expected.name == "minecraft:ladder";
                 assert_eq!(
                     world.block(pos[0], pos[1], pos[2]),
                     Some(expected),
@@ -3320,7 +3506,7 @@ mod tests {
             }))));
         }
         assert!(
-            saw_candle && saw_soul_lantern && saw_carpet,
+            saw_candle && saw_soul_lantern && saw_carpet && saw_ladder,
             "expected structure blocks were not exercised"
         );
         Ok(())

@@ -352,6 +352,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             let (count, lit, waterlogged) = crate::collision::candle_state(state)?;
             (u8::from(waterlogged), if lit { count * 3 } else { 0 })
         }
+        "minecraft:ladder" => {
+            let (_, waterlogged) = crate::collision::ladder_state(state)?;
+            (u8::from(waterlogged), 0)
+        }
         "minecraft:water" | "minecraft:lava" if state.properties.len() == 1 => {
             let level = state.properties.get("level")?;
             let parsed: u8 = level.parse().ok()?;
@@ -1388,6 +1392,28 @@ mod tests {
             properties: lit
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn ladder_light_tracks_contained_water_and_validates_facing() {
+        for facing in ["north", "south", "west", "east"] {
+            let mut ladder = state("ladder", None);
+            ladder.properties.insert("facing".into(), facing.into());
+            ladder
+                .properties
+                .insert("waterlogged".into(), "false".into());
+            assert_eq!(properties(&ladder), Some((0, 0)));
+            assert_eq!(
+                same_light_behavior(&ladder, &state("air", None)),
+                Some(true)
+            );
+            ladder
+                .properties
+                .insert("waterlogged".into(), "true".into());
+            assert_eq!(properties(&ladder), Some((1, 0)));
+            ladder.properties.insert("facing".into(), "up".into());
+            assert!(properties(&ladder).is_none());
         }
     }
 

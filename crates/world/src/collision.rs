@@ -145,6 +145,23 @@ pub fn simple_carpet(state: &BlockState) -> bool {
         && (id == "moss_carpet" || id.strip_suffix("_carpet").is_some_and(dye_color))
 }
 
+/// Validate the built-in ladder's facing and contained-water state.
+pub fn ladder_state(state: &BlockState) -> Option<(&str, bool)> {
+    if state.name != "minecraft:ladder" || state.properties.len() != 2 {
+        return None;
+    }
+    let facing = match state.properties.get("facing")?.as_str() {
+        facing @ ("north" | "south" | "east" | "west") => facing,
+        _ => return None,
+    };
+    let waterlogged = match state.properties.get("waterlogged")?.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some((facing, waterlogged))
+}
+
 /// Validate the 17 built-in candle blocks and return count, lit, waterlogged.
 pub fn candle_state(state: &BlockState) -> Option<(u8, bool, bool)> {
     let id = state.name.strip_prefix("minecraft:")?;
@@ -936,6 +953,15 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     if simple_carpet(state) {
         return Some(vec![pixel_box(0.0, 0.0, 0.0, 16.0, 1.0, 16.0)]);
+    }
+    if let Some((facing, _)) = ladder_state(state) {
+        return Some(vec![match facing {
+            "north" => pixel_box(0.0, 0.0, 13.0, 16.0, 16.0, 16.0),
+            "south" => pixel_box(0.0, 0.0, 0.0, 16.0, 16.0, 3.0),
+            "west" => pixel_box(13.0, 0.0, 0.0, 16.0, 16.0, 16.0),
+            "east" => pixel_box(0.0, 0.0, 0.0, 3.0, 16.0, 16.0),
+            _ => unreachable!("validated ladder facing"),
+        }]);
     }
     if let Some((count, _, _)) = candle_state(state) {
         let bounds = match count {
@@ -2001,6 +2027,32 @@ pub fn unknown_barrier() -> &'static [Aabb] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn ladders_validate_facing_and_use_the_wall_side_shape() {
+        for (facing, expected) in [
+            ("north", pixel_box(0.0, 0.0, 13.0, 16.0, 16.0, 16.0)),
+            ("south", pixel_box(0.0, 0.0, 0.0, 16.0, 16.0, 3.0)),
+            ("west", pixel_box(13.0, 0.0, 0.0, 16.0, 16.0, 16.0)),
+            ("east", pixel_box(0.0, 0.0, 0.0, 3.0, 16.0, 16.0)),
+        ] {
+            for waterlogged in [false, true] {
+                let mut state = BlockState {
+                    name: "minecraft:ladder".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), facing.into()),
+                        ("waterlogged".into(), waterlogged.to_string()),
+                    ]),
+                };
+                assert_eq!(ladder_state(&state), Some((facing, waterlogged)));
+                assert_eq!(block_shape(&state), Some(vec![expected]));
+                assert_eq!(block_outline(&state), block_shape(&state));
+                state.properties.insert("facing".into(), "up".into());
+                assert!(ladder_state(&state).is_none());
+                assert!(block_shape(&state).is_none());
+            }
+        }
+    }
 
     #[test]
     fn vanilla_carpets_have_thin_collision_and_validate_identity() {

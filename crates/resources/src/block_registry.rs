@@ -59,6 +59,7 @@ enum StateSchema {
     Waterlogged,
     Lantern,
     Candle,
+    Ladder,
     Bed,
     Rail,
     PoweredRail,
@@ -188,6 +189,12 @@ impl StateSchema {
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
+            Self::Ladder => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             Self::SulfurSpike => {
                 return BTreeMap::from([
                     ("thickness".into(), "tip".into()),
@@ -310,6 +317,12 @@ impl StateSchema {
                 if (name == "candles" && matches!(value, "1" | "2" | "3" | "4"))
                     || (matches!(name, "lit" | "waterlogged")
                         && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Ladder
+                if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
+                    || (name == "waterlogged" && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -886,6 +899,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
                 "net/minecraft/world/level/block/LanternBlock" => Some(StateSchema::Lantern),
                 "net/minecraft/world/level/block/CandleBlock" => Some(StateSchema::Candle),
+                "net/minecraft/world/level/block/LadderBlock" => Some(StateSchema::Ladder),
                 "net/minecraft/world/level/block/CarpetBlock"
                 | "net/minecraft/world/level/block/WoolCarpetBlock" => Some(StateSchema::Stateless),
                 "net/minecraft/world/level/block/ChestBlock"
@@ -1134,6 +1148,7 @@ impl GeneratedBlockRegistry {
             matches!(
                 schema,
                 StateSchema::HorizontalFacing
+                    | StateSchema::Ladder
                     | StateSchema::Stairs
                     | StateSchema::Chest
                     | StateSchema::Bed

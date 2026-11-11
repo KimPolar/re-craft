@@ -118,7 +118,7 @@ public class JigsawChestOracle {
                 if(changed && ticks.scheduledTicks().get(0).delay()!=0)throw new AssertionError("candle water tick");
                 out.printf("CANDLE_LIQUID\t%d\t%s\t%s\t%s\t%s\t%s\t%s%n",count,lit,wet,source,changed,result.getValue(BlockStateProperties.LIT),result.getValue(BlockStateProperties.WATERLOGGED));
             }
-        for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS,Blocks.DARK_OAK_TRAPDOOR}) {
+        for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS,Blocks.DARK_OAK_TRAPDOOR,Blocks.LADDER}) {
             var ticks=new net.minecraft.world.ticks.ProtoChunkTicks<net.minecraft.world.level.material.Fluid>();
             var delays=new java.util.ArrayList<Integer>();
             var states=new java.util.ArrayList<net.minecraft.world.level.block.state.BlockState>();
@@ -216,6 +216,24 @@ public class JigsawChestOracle {
                         id.getPath(),count,lit,wet,mirror.name(),rotation.name(),state.getLightEmission(),state.getLightDampening(),
                         Math.round(box.minX*16),Math.round(box.minZ*16),Math.round(box.maxX*16),Math.round(box.maxZ*16));
                 }
+            }
+        }
+        for(var state:Blocks.LADDER.getStateDefinition().getPossibleStates()) {
+            var shape=state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO).toAabbs();
+            boolean wet=state.getValue(BlockStateProperties.WATERLOGGED);
+            if(shape.size()!=1 || !shape.equals(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO).toAabbs())
+                || state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                || state.getPostProcessPos(null,BlockPos.ZERO)!=null || state.useShapeForLightOcclusion()
+                || state.getLightEmission()!=0 || state.getLightDampening()!=(wet?1:0)
+                || state.getFluidState().isSource()!=wet)throw new AssertionError(state);
+            var box=shape.get(0);
+            for(var mirror:Mirror.values())for(var rotation:Rotation.values()) {
+                var next=state.mirror(mirror).rotate(rotation);
+                out.printf("LADDER\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d%n",
+                    state.getValue(BlockStateProperties.HORIZONTAL_FACING).getName(),wet,mirror.name(),rotation.name(),
+                    next.getValue(BlockStateProperties.HORIZONTAL_FACING).getName(),next.getValue(BlockStateProperties.WATERLOGGED),
+                    Math.round(box.minX*16),Math.round(box.minY*16),Math.round(box.minZ*16),
+                    Math.round(box.maxX*16),Math.round(box.maxY*16),Math.round(box.maxZ*16));
             }
         }
         for (var id : BuiltInRegistries.BLOCK.keySet()) {

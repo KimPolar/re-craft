@@ -12315,6 +12315,71 @@ impl LoadedSession {
         self.set_player_placed(target, id).then_some(hand)
     }
 
+    fn place_ladder(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if held.id() != "minecraft:ladder"
+            || !crate::inventory::ordinary_return_supported(held)
+            || !self.vanilla_block_ids.as_ref()?.contains(held.id())
+        {
+            return None;
+        }
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let clicked = self.world.state(clicked)?;
+        let replace = ordinary_can_replace(clicked)?;
+        let target = self.ordinary_placement_target(hit)?;
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let wet = self
+            .ordinary_fluid(existing)
+            .is_some_and(|fluid| fluid.kind == FluidKind::Water && fluid.source);
+        let directions =
+            button_placement_directions(self.player.yaw, self.player.pitch, hit.face, replace)?;
+        let block = ladder_placement(directions, hit.face, replace, clicked, wet, |direction| {
+            let pos = add(target, direction)?;
+            let Cell::State(id) = cell(&self.world, self.origin, self.bounds, pos, self.states[0])
+            else {
+                return None;
+            };
+            button_support_face(self.world.state(id)?, -direction)
+        })?;
+        let shape = block_shape(&block)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let id = self.intern_block(block);
+        self.set_player_placed(target, id).then_some(hand)
+    }
+
     fn place_slab(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
         let hand = crate::placement_input_hand(&self.inventory);
         let held = self.inventory.slot(hand)?;
@@ -13355,8 +13420,12 @@ impl LoadedSession {
         let Some(clicked) = self.world.state(clicked) else {
             return false;
         };
-        let clicked_waterloggable =
-            fluid == "minecraft:water" && bucket_waterloggable(clicked) == Some(true);
+        let clicked_waterloggable = fluid == "minecraft:water"
+            && bucket_waterloggable(clicked) == Some(true)
+            && clicked
+                .properties
+                .get("waterlogged")
+                .is_some_and(|value| value == "false");
         if fluid == "minecraft:water"
             && clicked.properties.contains_key("waterlogged")
             && bucket_waterloggable(clicked).is_none()
@@ -13382,7 +13451,12 @@ impl LoadedSession {
         let Some(block) = self.world.state(existing) else {
             return false;
         };
-        let waterloggable = fluid == "minecraft:water" && bucket_waterloggable(block) == Some(true);
+        let waterloggable = fluid == "minecraft:water"
+            && bucket_waterloggable(block) == Some(true)
+            && block
+                .properties
+                .get("waterlogged")
+                .is_some_and(|value| value == "false");
         let replaceable_plant = matches!(
             block.name.as_str(),
             "minecraft:short_grass" | "minecraft:fern" | "minecraft:dead_bush"
@@ -13944,6 +14018,7 @@ impl LoadedSession {
             _ if block.properties.get("waterlogged").map(String::as_str) == Some("true")
                 && (crate::stair_items::is_stair_item(&block.name)
                     || crate::slab_mining::material(&block.name).is_some()
+                    || native_world::collision::ladder_state(block).is_some()
                     || native_world::collision::fence_waterlogged(block) == Some(true)
                     || matches!(
                         block.name.as_str(),
@@ -15022,11 +15097,21 @@ impl LoadedSession {
         let slab = crate::slab_mining::material(&name).is_some();
         let lodestone = name == "minecraft:lodestone";
         let honey = name == "minecraft:honey_block";
+        let ladder = name == "minecraft:ladder";
         let crop = matches!(
             name.as_str(),
             "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots"
         );
         if crop && self.world.state(id).and_then(crop_state).is_none() {
+            return;
+        }
+        if ladder
+            && self
+                .world
+                .state(id)
+                .and_then(native_world::collision::ladder_state)
+                .is_none()
+        {
             return;
         }
         if honey
@@ -15061,7 +15146,7 @@ impl LoadedSession {
         {
             return;
         }
-        if (snow || stair || slab || lodestone || honey || crop)
+        if (snow || stair || slab || lodestone || honey || crop || ladder)
             && self.game_mode != GameMode::Creative
             && properties.is_none()
         {
@@ -15073,6 +15158,7 @@ impl LoadedSession {
             || lodestone
             || honey
             || crop
+            || ladder
             || (self.loot.is_some() && properties.is_some());
         let player_loot = checked
             && self.game_mode != GameMode::Creative
@@ -15103,7 +15189,7 @@ impl LoadedSession {
                     .get("waterlogged")
                     .is_some_and(|value| value == "true")
             }))
-            || (stair
+            || ((stair || ladder)
                 && self
                     .simulated_fluid(id)
                     .is_some_and(|fluid| fluid.kind == FluidKind::Water))
@@ -15921,6 +16007,41 @@ impl LoadedSession {
                 }
             }
         }
+        for offset in [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z] {
+            let Some(neighbor) = add(relative, offset) else {
+                continue;
+            };
+            let Cell::State(other) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                neighbor,
+                self.states[0],
+            ) else {
+                continue;
+            };
+            let Some(ladder) = self
+                .world
+                .state(other)
+                .filter(|state| ladder_support_direction(state) == Some(-offset))
+            else {
+                continue;
+            };
+            if button_support_face(&replacement_state, offset) != Some(true) {
+                if !notify
+                    || button_support_face(&replacement_state, offset) != Some(false)
+                    || (self.block_drops
+                        && !self.dropped_items.can_drop_block_without_entity(
+                            &ladder.name,
+                            &ladder.properties,
+                            self.loot.as_deref(),
+                        ))
+                    || !self.ladder_cascade_safe(neighbor)
+                {
+                    return None;
+                }
+            }
+        }
         Some(BlockSetCheck {
             pos,
             chunk_pos,
@@ -15931,6 +16052,49 @@ impl LoadedSession {
             original_state,
             replacement_state,
         })
+    }
+
+    /// Preflight dependent ladders before a support change is committed.
+    fn ladder_cascade_safe(&self, first: IVec3) -> bool {
+        let mut pending = vec![first];
+        let mut seen = BTreeSet::new();
+        while let Some(support) = pending.pop() {
+            if !seen.insert(support.to_array()) {
+                return false;
+            }
+            for offset in [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z] {
+                let Some(neighbor) = add(support, offset) else {
+                    return false;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    neighbor,
+                    self.states[0],
+                ) else {
+                    return false;
+                };
+                let Some(ladder) = self
+                    .world
+                    .state(id)
+                    .filter(|state| ladder_support_direction(state) == Some(-offset))
+                else {
+                    continue;
+                };
+                if self.block_drops
+                    && !self.dropped_items.can_drop_block_without_entity(
+                        &ladder.name,
+                        &ladder.properties,
+                        self.loot.as_deref(),
+                    )
+                {
+                    return false;
+                }
+                pending.push(neighbor);
+            }
+        }
+        true
     }
 
     fn set_with_banner_removal(
@@ -16202,6 +16366,9 @@ impl LoadedSession {
             return Some(fluid);
         }
         if native_world::collision::fence_waterlogged(state) == Some(true) {
+            return Some(fluid);
+        }
+        if native_world::collision::ladder_state(state).is_some_and(|(_, wet)| wet) {
             return Some(fluid);
         }
         if self.slab_top(state).is_none()
@@ -19193,6 +19360,72 @@ impl LoadedSession {
                 self.remove_banner(neighbor, id, false);
                 continue;
             }
+            if let Some((support, wet)) = self.world.state(id).and_then(|state| {
+                let support = ladder_support_direction(state)?;
+                let (_, wet) = native_world::collision::ladder_state(state)?;
+                Some((support, wet))
+            }) {
+                let survives = if support == -direction {
+                    match cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        position,
+                        self.states[0],
+                    ) {
+                        Cell::State(current) => self
+                            .world
+                            .state(current)
+                            .and_then(|state| button_support_face(state, direction)),
+                        Cell::Missing => None,
+                    }
+                } else {
+                    Some(true)
+                };
+                if survives == Some(false) {
+                    let Some(block) = self.world.state(id).cloned() else {
+                        continue;
+                    };
+                    let Some(absolute) = add(self.origin, neighbor) else {
+                        continue;
+                    };
+                    let replacement = if wet {
+                        self.intern_liquid(FluidState {
+                            kind: FluidKind::Water,
+                            amount: 8,
+                            source: true,
+                            falling: false,
+                        })
+                    } else {
+                        self.states[0]
+                    };
+                    let Some(checked) = self.check_block_set(neighbor, replacement, true, false)
+                    else {
+                        continue;
+                    };
+                    if self.block_drops
+                        && self
+                            .dropped_items
+                            .drop_block_without_entity(
+                                absolute,
+                                &block.name,
+                                &block.properties,
+                                true,
+                                self.loot.as_deref(),
+                            )
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    self.apply_block_set(neighbor, replacement, true, checked);
+                    continue;
+                }
+                if wet && survives == Some(true) {
+                    if let Some(fluid) = self.simulated_fluid(id) {
+                        self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
+                    }
+                }
+            }
             let button_support = self.world.state(id).and_then(button_support_direction);
             let attached_item = self.world.state(id).and_then(|state| {
                 (state.name == "minecraft:lever"
@@ -20646,6 +20879,7 @@ impl LoadedSession {
                                     "minecraft:redstone_lamp"
                                         | "minecraft:redstone_block"
                                         | "minecraft:lever"
+                                        | "minecraft:ladder"
                                         | "minecraft:snow"
                                         | "minecraft:snow_block"
                                         | "minecraft:honey_block"
@@ -20763,6 +20997,7 @@ impl LoadedSession {
                             } else if self.game_mode.allows_basic_building()
                                 && let Some(hand) = self
                                     .place_button(hit)
+                                    .or_else(|| self.place_ladder(hit))
                                     .or_else(|| self.place_redstone(hit))
                                     .or_else(|| self.place_snow(hit))
                                     .or_else(|| self.place_snow_block(hit))
@@ -23464,7 +23699,8 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
         || native_core::button::Button::from_id(&block.name).is_some()
     {
         block_outline(block).is_some()
-    } else if native_world::collision::fence_waterlogged(block).is_some()
+    } else if native_world::collision::ladder_state(block).is_some()
+        || native_world::collision::fence_waterlogged(block).is_some()
         || native_world::collision::fence_gate_open(block).is_some()
         || native_world::collision::door_open(block).is_some()
         || native_world::collision::trapdoor_state(block).is_some()
@@ -23548,6 +23784,9 @@ fn button_can_replace(block: &BlockState) -> Option<bool> {
     if native_world::collision::banner_item_id(block).is_some() {
         return Some(false);
     }
+    if native_world::collision::ladder_state(block).is_some() {
+        return Some(false);
+    }
     if block.name == "minecraft:snow" {
         return native_world::collision::snow_layers(block).map(|layers| layers == 1);
     }
@@ -23598,6 +23837,44 @@ fn button_can_replace(block: &BlockState) -> Option<bool> {
     None
 }
 
+fn ladder_placement(
+    directions: [IVec3; 6],
+    face: IVec3,
+    replace_clicked: bool,
+    clicked: &BlockState,
+    waterlogged: bool,
+    mut support: impl FnMut(IVec3) -> Option<bool>,
+) -> Option<BlockState> {
+    let facing_name = |facing| match facing {
+        IVec3::NEG_Z => Some("north"),
+        IVec3::Z => Some("south"),
+        IVec3::NEG_X => Some("west"),
+        IVec3::X => Some("east"),
+        _ => None,
+    };
+    if !replace_clicked
+        && native_world::collision::ladder_state(clicked)
+            .is_some_and(|(facing, _)| Some(facing) == facing_name(face))
+    {
+        return None;
+    }
+    for direction in directions {
+        let Some(facing) = facing_name(-direction) else {
+            continue;
+        };
+        if support(direction)? {
+            return Some(state(
+                "minecraft:ladder",
+                &[
+                    ("facing", facing),
+                    ("waterlogged", if waterlogged { "true" } else { "false" }),
+                ],
+            ));
+        }
+    }
+    None
+}
+
 fn banner_placement(
     item: &str,
     yaw: f32,
@@ -23642,6 +23919,17 @@ fn banner_placement(
     None
 }
 
+fn ladder_support_direction(state: &BlockState) -> Option<IVec3> {
+    let (facing, _) = native_world::collision::ladder_state(state)?;
+    Some(match facing {
+        "north" => IVec3::Z,
+        "south" => IVec3::NEG_Z,
+        "west" => IVec3::X,
+        "east" => IVec3::NEG_X,
+        _ => return None,
+    })
+}
+
 fn banner_support_direction(state: &BlockState) -> Option<IVec3> {
     native_world::collision::banner_item_id(state)?;
     if !state.name.ends_with("_wall_banner") {
@@ -23670,6 +23958,9 @@ fn bucket_waterloggable(block: &BlockState) -> Option<bool> {
         return None;
     }
     if native_world::collision::fence_waterlogged(block).is_some() {
+        return Some(true);
+    }
+    if native_world::collision::ladder_state(block).is_some() {
         return Some(true);
     }
     if crate::stair_items::is_stair_item(&block.name)
@@ -26355,6 +26646,318 @@ pub(crate) mod tests {
         assert!((session.motion.position.y - (2.4 - f64::from(0.15_f32))).abs() < 1e-7);
         assert!((session.motion.velocity.y - (0.2 - 0.08) * f64::from(0.98_f32)).abs() < 1e-7);
         assert!(session.fall_distance > 0.0 && session.fall_distance < 0.16);
+    }
+
+    #[test]
+    fn player_places_and_breaks_ladders_with_water_preserved() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for water in [false, true] {
+            let mut session = session();
+            session
+                .set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:ladder".to_owned()])));
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:ladder".into(), 1, 64, Tag::Compound(vec![]))
+            ));
+            session.set_player_inventory(inventory);
+            let hit = ShapeRayHit {
+                position: IVec3::new(8, 2, 6),
+                face: IVec3::X,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            let target = hit.position + hit.face;
+            if water {
+                let id = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                assert!(session.set(target, id));
+            }
+            assert_eq!(session.place_ladder(hit), Some(PlayerSlot::Storage(0)));
+            let absolute = session.origin + target;
+            let placed = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(
+                native_world::collision::ladder_state(placed),
+                Some(("east", water))
+            );
+            assert_eq!(bucket_waterloggable(placed), Some(true));
+            assert_eq!(
+                picked_loaded_block_item(placed).unwrap().id(),
+                "minecraft:ladder"
+            );
+            session.game_mode = GameMode::Creative;
+            session.finish_breaking(absolute);
+            let after = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(
+                after.name,
+                if water {
+                    "minecraft:water"
+                } else {
+                    "minecraft:air"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ladders_drop_from_removed_support_and_preserve_water() {
+        for water in [false, true] {
+            let mut session = session();
+            session.set_block_drops(false);
+            let support = IVec3::new(8, 2, 6);
+            let target = support + IVec3::X;
+            let id = session.intern_block(state(
+                "minecraft:ladder",
+                &[
+                    ("facing", "east"),
+                    ("waterlogged", if water { "true" } else { "false" }),
+                ],
+            ));
+            assert!(session.set(target, id));
+            assert!(session.set(support, session.states[0]));
+            let absolute = session.origin + target;
+            let after = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(
+                after.name,
+                if water {
+                    "minecraft:water"
+                } else {
+                    "minecraft:air"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ladder_support_change_waits_for_loot_and_schedules_water_on_other_updates() {
+        let mut session = session();
+        let support = IVec3::new(8, 2, 6);
+        let target = support + IVec3::X;
+        let ladder = session.intern_block(state(
+            "minecraft:ladder",
+            &[("facing", "east"), ("waterlogged", "true")],
+        ));
+        assert!(session.set(target, ladder));
+        assert!(!session.set(support, session.states[0]));
+        let absolute_support = session.origin + support;
+        assert_eq!(
+            session
+                .world
+                .block(absolute_support.x, absolute_support.y, absolute_support.z)
+                .unwrap()
+                .name,
+            "minecraft:stone"
+        );
+        let other = target + IVec3::Z;
+        assert!(session.set(other, session.states[3]));
+        let absolute = session.origin + target;
+        assert!(session.fluid_pending.iter().any(|tick| tick.x == absolute.x
+            && tick.y == absolute.y
+            && tick.z == absolute.z
+            && tick.kind == FluidKind::Water));
+    }
+
+    #[test]
+    fn ladder_neighbor_updates_cover_each_facing_and_changed_side() {
+        let horizontal = [
+            ("north", IVec3::Z),
+            ("south", IVec3::NEG_Z),
+            ("west", IVec3::X),
+            ("east", IVec3::NEG_X),
+        ];
+        let changes = [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ];
+        for (facing, support_direction) in horizontal {
+            for wet in [false, true] {
+                for supported in [false, true] {
+                    for changed in changes {
+                        let mut session = session();
+                        session.set_block_drops(false);
+                        let pos = IVec3::new(8, 5, 8);
+                        if supported {
+                            assert!(session.set_with_notify(
+                                pos + support_direction,
+                                session.states[3],
+                                false
+                            ));
+                        }
+                        let ladder = session.intern_block(state(
+                            "minecraft:ladder",
+                            &[
+                                ("facing", facing),
+                                ("waterlogged", if wet { "true" } else { "false" }),
+                            ],
+                        ));
+                        assert!(session.set_with_notify(pos, ladder, false));
+                        let replacement = if changed == support_direction && supported {
+                            session.states[2]
+                        } else if changed == support_direction {
+                            session.intern_block(state("minecraft:snow", &[("layers", "1")]))
+                        } else {
+                            session.states[3]
+                        };
+                        assert!(
+                            session.set(pos + changed, replacement),
+                            "{facing} {wet} {supported} {changed:?}"
+                        );
+                        let absolute = session.origin + pos;
+                        let after = session
+                            .world
+                            .block(absolute.x, absolute.y, absolute.z)
+                            .unwrap();
+                        let removed = changed == support_direction && !supported;
+                        if removed {
+                            assert_eq!(
+                                after.name,
+                                if wet {
+                                    "minecraft:water"
+                                } else {
+                                    "minecraft:air"
+                                }
+                            );
+                        } else {
+                            assert_eq!(
+                                native_world::collision::ladder_state(after),
+                                Some((facing, wet))
+                            );
+                            if wet {
+                                assert!(session.fluid_pending.iter().any(|tick| tick.x
+                                    == absolute.x
+                                    && tick.y == absolute.y
+                                    && tick.z == absolute.z
+                                    && tick.kind == FluidKind::Water));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn ladder_placement_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("LadderPlacementOracle.java");
+        let output = temp.path().join("placements.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/LadderPlacementOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("LadderPlacementOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 768);
+        let horizontal = [IVec3::NEG_Z, IVec3::Z, IVec3::NEG_X, IVec3::X];
+        let names = ["north", "south", "west", "east"];
+        for row in rows {
+            let shift = row["shift"].as_u64().unwrap() as usize;
+            let mask = row["mask"].as_u64().unwrap();
+            let adjacent = row["adjacent"].as_bool().unwrap();
+            let replace = row["replace"].as_bool().unwrap();
+            let face = horizontal[shift];
+            let ladder = state(
+                "minecraft:ladder",
+                &[("facing", names[shift]), ("waterlogged", "false")],
+            );
+            let stone = state("minecraft:stone", &[]);
+            let clicked = if adjacent { &ladder } else { &stone };
+            let directions = [
+                IVec3::Y,
+                horizontal[shift],
+                horizontal[(shift + 1) % 4],
+                IVec3::NEG_Y,
+                horizontal[(shift + 2) % 4],
+                horizontal[(shift + 3) % 4],
+            ];
+            let actual = ladder_placement(
+                directions,
+                face,
+                replace,
+                clicked,
+                row["fluid"].as_u64() == Some(1),
+                |direction| {
+                    if adjacent && direction == -face {
+                        return button_support_face(&ladder, -direction);
+                    }
+                    Some(
+                        horizontal
+                            .iter()
+                            .position(|candidate| *candidate == direction)
+                            .is_some_and(|i| mask & (1 << i) != 0),
+                    )
+                },
+            );
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .and_then(|state| state.properties.get("facing"))
+                    .map(String::as_str),
+                row["facing"].as_str(),
+                "{row}"
+            );
+            if let Some(actual) = actual {
+                assert_eq!(
+                    actual.properties["waterlogged"] == "true",
+                    row["waterlogged"].as_bool().unwrap(),
+                    "{row}"
+                );
+            }
+        }
     }
 
     fn session() -> LoadedSession {
@@ -31978,6 +32581,10 @@ pub(crate) mod tests {
                     ("waterlogged", "true"),
                 ],
             ),
+            state(
+                "minecraft:ladder",
+                &[("facing", "north"), ("waterlogged", "true")],
+            ),
         ];
         for block in cases {
             for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
@@ -32337,6 +32944,61 @@ pub(crate) mod tests {
             block.properties.get("drag").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn water_bucket_waterlogs_ladder_or_places_next_to_a_wet_one() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for wet in [false, true] {
+            let mut session = session();
+            session.set_water_evaporation_environment(bucket_environment(false));
+            let pos = IVec3::new(8, 2, 6);
+            assert!(session.set(pos + IVec3::NEG_Z, session.states[3]));
+            let id = session.intern_block(state(
+                "minecraft:ladder",
+                &[
+                    ("facing", "south"),
+                    ("waterlogged", if wet { "true" } else { "false" }),
+                ],
+            ));
+            assert!(session.set_with_notify(pos, id, false));
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            assert!(
+                session.try_empty_bucket(PlayerSlot::Storage(0)),
+                "wet={wet}"
+            );
+            let absolute = session.origin + pos;
+            let ladder = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(
+                native_world::collision::ladder_state(ladder),
+                Some(("south", true))
+            );
+            if wet {
+                let adjacent = absolute + IVec3::Z;
+                assert_eq!(
+                    session
+                        .world
+                        .block(adjacent.x, adjacent.y, adjacent.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:water"
+                );
+            } else {
+                assert!(session.fluid_pending.iter().any(|tick| tick.x == absolute.x
+                    && tick.y == absolute.y
+                    && tick.z == absolute.z
+                    && tick.kind == FluidKind::Water));
+            }
+        }
     }
 
     #[test]

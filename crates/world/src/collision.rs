@@ -527,6 +527,9 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
     if simple_carpet(state) {
         return Some(direction == IVec3::NEG_Y);
     }
+    if ladder_state(state).is_some() {
+        return Some(covers_full_face(&block_shape(state)?, direction));
+    }
     if matches!(id, "air" | "cave_air" | "void_air") {
         return Some(false);
     }
@@ -2047,6 +2050,26 @@ mod tests {
                 assert_eq!(ladder_state(&state), Some((facing, waterlogged)));
                 assert_eq!(block_shape(&state), Some(vec![expected]));
                 assert_eq!(block_outline(&state), block_shape(&state));
+                for direction in [
+                    IVec3::X,
+                    IVec3::NEG_X,
+                    IVec3::Y,
+                    IVec3::NEG_Y,
+                    IVec3::Z,
+                    IVec3::NEG_Z,
+                ] {
+                    let support_face = match facing {
+                        "north" => IVec3::Z,
+                        "south" => IVec3::NEG_Z,
+                        "west" => IVec3::X,
+                        "east" => IVec3::NEG_X,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        button_support_face(&state, direction),
+                        Some(direction == support_face)
+                    );
+                }
                 state.properties.insert("facing".into(), "up".into());
                 assert!(ladder_state(&state).is_none());
                 assert!(block_shape(&state).is_none());

@@ -113,6 +113,7 @@ pub enum Material {
     CraftingTable,
     Chest,
     Banner,
+    Ladder,
     Stair {
         hardness_tenths: u8,
         tool: StairTool,
@@ -202,6 +203,7 @@ impl Material {
             }),
             "minecraft:crafting_table" => Some(Self::CraftingTable),
             "minecraft:chest" | "minecraft:trapped_chest" => Some(Self::Chest),
+            "minecraft:ladder" => Some(Self::Ladder),
             "minecraft:bedrock"
             | "minecraft:moving_piston"
             | "minecraft:nether_portal"
@@ -242,6 +244,7 @@ impl Material {
             Self::SnowBlock => 0.2,
             Self::HoneyBlock | Self::Crop => 0.0,
             Self::RedstoneLamp => 0.3,
+            Self::Ladder => 0.4,
             Self::Banner => 1.0,
             Self::RedstoneBlock => 5.0,
             Self::Lodestone => 3.5,
@@ -423,6 +426,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 | Material::CraftingTable
                 | Material::Chest
                 | Material::Banner
+                | Material::Ladder
                 | Material::Wood
                 | Material::WoodButton
                 | Material::Stair {

@@ -3227,7 +3227,7 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         return Some(max);
     }
     let name = id.strip_prefix("minecraft:")?;
-    if matches!(name, "book" | "name_tag") {
+    if matches!(name, "book" | "name_tag" | "ladder") {
         return Some(64);
     }
     if matches!(name, "ender_pearl" | "snowball" | "honey_bottle" | "bucket") {

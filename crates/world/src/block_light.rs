@@ -348,6 +348,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 },
             )
         }
+        _ if crate::collision::candle_state(state).is_some() => {
+            let (count, lit, waterlogged) = crate::collision::candle_state(state)?;
+            (u8::from(waterlogged), if lit { count * 3 } else { 0 })
+        }
         "minecraft:water" | "minecraft:lava" if state.properties.len() == 1 => {
             let level = state.properties.get("level")?;
             let parsed: u8 = level.parse().ok()?;
@@ -1384,6 +1388,33 @@ mod tests {
             properties: lit
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn candle_light_uses_count_lit_and_waterlogged() {
+        for count in 1..=4 {
+            for lit in [false, true] {
+                for waterlogged in [false, true] {
+                    let mut candle = state("red_candle", Some(lit));
+                    candle
+                        .properties
+                        .insert("candles".into(), count.to_string());
+                    candle
+                        .properties
+                        .insert("waterlogged".into(), waterlogged.to_string());
+                    assert_eq!(
+                        properties(&candle),
+                        Some((u8::from(waterlogged), if lit { count * 3 } else { 0 }))
+                    );
+                    assert_eq!(
+                        same_light_behavior(&candle, &state("air", None)),
+                        Some(!lit && !waterlogged)
+                    );
+                    candle.properties.insert("candles".into(), "5".into());
+                    assert!(properties(&candle).is_none());
+                }
+            }
         }
     }
 

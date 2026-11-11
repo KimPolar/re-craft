@@ -58,6 +58,7 @@ enum StateSchema {
     Jigsaw,
     Waterlogged,
     Lantern,
+    Candle,
     Bed,
     Rail,
     PoweredRail,
@@ -180,6 +181,13 @@ impl StateSchema {
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
+            Self::Candle => {
+                return BTreeMap::from([
+                    ("candles".into(), "1".into()),
+                    ("lit".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             Self::SulfurSpike => {
                 return BTreeMap::from([
                     ("thickness".into(), "tip".into()),
@@ -295,6 +303,13 @@ impl StateSchema {
             Self::Lantern
                 if matches!(name, "hanging" | "waterlogged")
                     && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Candle
+                if (name == "candles" && matches!(value, "1" | "2" | "3" | "4"))
+                    || (matches!(name, "lit" | "waterlogged")
+                        && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -738,6 +753,9 @@ impl GeneratedBlockRegistry {
                     )),
                     "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
                     "WOOL" => Some(("wool", BASE)),
+                    "DYED_CANDLE" => {
+                        Some(("candle", "net/minecraft/world/level/block/CandleBlock"))
+                    }
                     "BED" => Some(("bed", "net/minecraft/world/level/block/BedBlock")),
                     "STAINED_GLASS" => Some((
                         "stained_glass",
@@ -866,6 +884,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/JigsawBlock" => Some(StateSchema::Jigsaw),
                 "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
                 "net/minecraft/world/level/block/LanternBlock" => Some(StateSchema::Lantern),
+                "net/minecraft/world/level/block/CandleBlock" => Some(StateSchema::Candle),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock"
@@ -1054,6 +1073,7 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Slab
                 | StateSchema::Waterlogged
                 | StateSchema::Lantern
+                | StateSchema::Candle
                 | StateSchema::Liquid
                 | StateSchema::PotentSulfur
                 | StateSchema::SulfurSpike

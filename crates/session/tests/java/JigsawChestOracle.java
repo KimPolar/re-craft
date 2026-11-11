@@ -96,6 +96,28 @@ public class JigsawChestOracle {
                 }
             }
         }
+        for(int count=1;count<=4;count++) for(boolean lit:new boolean[]{false,true})
+            for(boolean wet:new boolean[]{false,true}) for(boolean source:new boolean[]{false,true}) {
+                var initial=Blocks.CANDLE.defaultBlockState().setValue(net.minecraft.world.level.block.CandleBlock.CANDLES,count)
+                    .setValue(BlockStateProperties.LIT,lit).setValue(BlockStateProperties.WATERLOGGED,wet);
+                var written=new java.util.ArrayList<net.minecraft.world.level.block.state.BlockState>();
+                var ticks=new net.minecraft.world.ticks.ProtoChunkTicks<net.minecraft.world.level.material.Fluid>();
+                var level=(net.minecraft.world.level.LevelAccessor)java.lang.reflect.Proxy.newProxyInstance(
+                    net.minecraft.world.level.LevelAccessor.class.getClassLoader(),new Class<?>[]{net.minecraft.world.level.LevelAccessor.class},
+                    (proxy,method,values)->switch(method.getName()) {
+                        case "isClientSide" -> false;
+                        case "setBlock", "setBlockAndUpdate" -> { written.add((net.minecraft.world.level.block.state.BlockState)values[1]); yield true; }
+                        case "scheduleTick" -> {ticks.schedule(new net.minecraft.world.ticks.ScheduledTick<>((net.minecraft.world.level.material.Fluid)values[1],(BlockPos)values[0],(Integer)values[2],0));yield null;}
+                        case "playSound", "gameEvent", "addParticle" -> null;
+                        default -> throw new UnsupportedOperationException(method.toString());
+                    });
+                var fluid=(source?net.minecraft.world.level.material.Fluids.WATER:net.minecraft.world.level.material.Fluids.FLOWING_WATER).defaultFluidState();
+                boolean changed=((net.minecraft.world.level.block.CandleBlock)Blocks.CANDLE).placeLiquid(level,BlockPos.ZERO,initial,fluid);
+                var result=written.isEmpty()?initial:written.get(written.size()-1);
+                if(changed!=(source && !wet) || written.size()!=(changed?1:0) || ticks.scheduledTicks().size()!=(changed?1:0))throw new AssertionError("candle waterlogging");
+                if(changed && ticks.scheduledTicks().get(0).delay()!=0)throw new AssertionError("candle water tick");
+                out.printf("CANDLE_LIQUID\t%d\t%s\t%s\t%s\t%s\t%s\t%s%n",count,lit,wet,source,changed,result.getValue(BlockStateProperties.LIT),result.getValue(BlockStateProperties.WATERLOGGED));
+            }
         for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS,Blocks.DARK_OAK_TRAPDOOR}) {
             var ticks=new net.minecraft.world.ticks.ProtoChunkTicks<net.minecraft.world.level.material.Fluid>();
             var delays=new java.util.ArrayList<Integer>();
@@ -175,6 +197,27 @@ public class JigsawChestOracle {
                         state.getLightEmission());
                 }
             }
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            var block = BuiltInRegistries.BLOCK.getValue(id);
+            if (!(block instanceof net.minecraft.world.level.block.CandleBlock)) continue;
+            for (var state : block.getStateDefinition().getPossibleStates()) {
+                int count=state.getValue(net.minecraft.world.level.block.CandleBlock.CANDLES);
+                boolean lit=state.getValue(BlockStateProperties.LIT), wet=state.getValue(BlockStateProperties.WATERLOGGED);
+                var shape=state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO).toAabbs();
+                if(shape.size()!=1 || !shape.equals(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO).toAabbs())
+                    || state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                    || state.getPostProcessPos(null,BlockPos.ZERO)!=null || state.useShapeForLightOcclusion()
+                    || state.getFluidState().isSource()!=wet) throw new AssertionError(state);
+                var box=shape.get(0);
+                if(box.minY!=0.0 || box.maxY!=0.375)throw new AssertionError("unexpected candle height");
+                for(var mirror:Mirror.values())for(var rotation:Rotation.values()) {
+                    if(state.mirror(mirror).rotate(rotation)!=state)throw new AssertionError("candle changed under transform");
+                    out.printf("CANDLE\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d%n",
+                        id.getPath(),count,lit,wet,mirror.name(),rotation.name(),state.getLightEmission(),state.getLightDampening(),
+                        Math.round(box.minX*16),Math.round(box.minZ*16),Math.round(box.maxX*16),Math.round(box.maxZ*16));
+                }
+            }
+        }
         String[] stones = {"stone", "deepslate", "cobbled_deepslate", "polished_deepslate", "deepslate_bricks",
             "cracked_deepslate_bricks", "deepslate_tiles", "cracked_deepslate_tiles", "chiseled_deepslate",
             "reinforced_deepslate", "basalt", "polished_basalt", "smooth_basalt",

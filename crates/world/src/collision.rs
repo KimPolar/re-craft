@@ -136,6 +136,30 @@ fn dye_color(name: &str) -> bool {
     )
 }
 
+/// Validate the 17 built-in candle blocks and return count, lit, waterlogged.
+pub fn candle_state(state: &BlockState) -> Option<(u8, bool, bool)> {
+    let id = state.name.strip_prefix("minecraft:")?;
+    if id != "candle" && !id.strip_suffix("_candle").is_some_and(dye_color) {
+        return None;
+    }
+    if state.properties.len() != 3 {
+        return None;
+    }
+    let count = match state.properties.get("candles")?.as_str() {
+        "1" => 1,
+        "2" => 2,
+        "3" => 3,
+        "4" => 4,
+        _ => return None,
+    };
+    let boolean = |name: &str| match state.properties.get(name)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    Some((count, boolean("lit")?, boolean("waterlogged")?))
+}
+
 /// Validate a vanilla bed state, returning the end bearing its legs.
 pub fn bed_leg_end(state: &BlockState) -> Option<&str> {
     let color = state
@@ -496,6 +520,7 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
         || id == "glass_pane"
         || id == "iron_bars"
         || matches!(id, "lantern" | "soul_lantern")
+        || candle_state(state).is_some()
         || id.ends_with("_stained_glass_pane")
         || id.ends_with("_fence")
         || id.ends_with("_leaves")
@@ -896,6 +921,18 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if crop_outline_height(state).is_some() {
         return Some(EMPTY.to_vec());
+    }
+    if let Some((count, _, _)) = candle_state(state) {
+        let bounds = match count {
+            1 => (7.0, 7.0, 9.0, 9.0),
+            2 => (5.0, 6.0, 11.0, 9.0),
+            3 => (5.0, 6.0, 10.0, 11.0),
+            4 => (5.0, 5.0, 11.0, 10.0),
+            _ => unreachable!("validated candle count"),
+        };
+        return Some(vec![pixel_box(
+            bounds.0, 0.0, bounds.1, bounds.2, 6.0, bounds.3,
+        )]);
     }
     let id = state.name.strip_prefix("minecraft:")?;
     if id == "iron_chain" {
@@ -1949,6 +1986,39 @@ pub fn unknown_barrier() -> &'static [Aabb] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn candles_validate_color_count_and_collision_shape() {
+        let mut state = BlockState {
+            name: "minecraft:light_blue_candle".into(),
+            properties: BTreeMap::from([
+                ("candles".into(), "1".into()),
+                ("lit".into(), "false".into()),
+                ("waterlogged".into(), "true".into()),
+            ]),
+        };
+        for (count, bounds) in [
+            ("1", (7.0, 7.0, 9.0, 9.0)),
+            ("2", (5.0, 6.0, 11.0, 9.0)),
+            ("3", (5.0, 6.0, 10.0, 11.0)),
+            ("4", (5.0, 5.0, 11.0, 10.0)),
+        ] {
+            state.properties.insert("candles".into(), count.into());
+            assert_eq!(
+                block_shape(&state),
+                Some(vec![pixel_box(
+                    bounds.0, 0.0, bounds.1, bounds.2, 6.0, bounds.3
+                )])
+            );
+            assert_eq!(block_outline(&state), block_shape(&state));
+            assert_eq!(button_support_face(&state, IVec3::Y), Some(false));
+        }
+        state.properties.insert("candles".into(), "5".into());
+        assert!(block_shape(&state).is_none());
+        state.properties.insert("candles".into(), "1".into());
+        state.name = "minecraft:invented_candle".into();
+        assert!(block_shape(&state).is_none());
+    }
 
     #[test]
     fn terracotta_classifier_accepts_only_stateless_vanilla_colors() {

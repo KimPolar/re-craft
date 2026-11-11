@@ -69,6 +69,10 @@ pub(super) fn jigsaw_lantern(state: &BlockState) -> bool {
         && native_world::block_light::same_light_behavior(state, state).is_some()
 }
 
+pub(super) fn jigsaw_candle(state: &BlockState) -> bool {
+    native_world::collision::candle_state(state).is_some()
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::wall::Wall::from_state(state).is_some() {
         return Ok(false);
@@ -76,7 +80,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if jigsaw_wood(state) {
         return Ok(true);
     }
-    if jigsaw_torch(state) || jigsaw_lantern(state) {
+    if jigsaw_torch(state) || jigsaw_lantern(state) || jigsaw_candle(state) {
         return Ok(false);
     }
     if native_world::collision::full_glass(state) {
@@ -302,7 +306,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_terracotta(state)
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state)
-                || jigsaw_lantern(state);
+                || jigsaw_lantern(state)
+                || jigsaw_candle(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -318,6 +323,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || native_world::collision::trapdoor_state(state).is_some()
                 || jigsaw_lantern(state)
+                || jigsaw_candle(state)
                 || state.name == "minecraft:chest")
             && self
                 .registry
@@ -336,6 +342,11 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         {
             let mut wet = state.clone();
             wet.properties.insert("waterlogged".into(), "true".into());
+            if jigsaw_candle(state) {
+                // WorldGenRegion ignores the extinguish sound, particles and
+                // game event; the block update still clears the lit flag.
+                wet.properties.insert("lit".into(), "false".into());
+            }
             if self.region.writable.contains(&chunk(pos)) && !self.region.is_outside(pos[1]) {
                 let chest = if state.name == "minecraft:chest" {
                     let Some(Some(chest)) =
@@ -353,7 +364,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     || native_world::collision::fence_waterlogged(state).is_some()
                     || native_world::collision::trapdoor_state(state).is_some()
                     || native_world::collision::pane_waterlogged(state).is_some()
-                    || jigsaw_lantern(state);
+                    || jigsaw_lantern(state)
+                    || jigsaw_candle(state);
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
                 result?;
@@ -1130,6 +1142,172 @@ mod tests {
             lanterns_checked += 1;
         }
         assert_eq!(lanterns_checked, 96);
+        let mut candles_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("CANDLE\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                count,
+                lit,
+                wet,
+                mirror,
+                rotation,
+                emission,
+                dampening,
+                x0,
+                z0,
+                x1,
+                z1,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java candle result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let id = format!("minecraft:{name}");
+            let properties = BTreeMap::from([
+                ("candles".into(), (*count).into()),
+                ("lit".into(), (*lit).into()),
+                ("waterlogged".into(), (*wet).into()),
+            ]);
+            let state = BlockState {
+                name: id.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&id, &properties), "{line}");
+            assert_eq!(registry.has_block_entity(&id), Some(false));
+            assert!(jigsaw_candle(&state));
+            assert!(!jigsaw_static_full(&state)?);
+            assert_eq!(
+                registry.transform_template_state(&id, &properties, mirror, rotation)?,
+                properties
+            );
+            let boxes =
+                native_world::collision::block_shape(&state).context("candle shape missing")?;
+            assert_eq!(boxes.len(), 1);
+            let b = boxes[0];
+            assert_eq!(
+                [
+                    b.min.x * 16.0,
+                    b.min.y * 16.0,
+                    b.min.z * 16.0,
+                    b.max.x * 16.0,
+                    b.max.y * 16.0,
+                    b.max.z * 16.0
+                ],
+                [
+                    x0.parse::<f32>()?,
+                    0.0,
+                    z0.parse::<f32>()?,
+                    x1.parse::<f32>()?,
+                    6.0,
+                    z1.parse::<f32>()?
+                ],
+                "{line}"
+            );
+            assert_eq!(
+                *emission,
+                if *lit == "true" {
+                    (count.parse::<u8>()? * 3).to_string()
+                } else {
+                    "0".to_string()
+                }
+            );
+            assert_eq!(*dampening, if *wet == "true" { "1" } else { "0" });
+            assert_eq!(
+                FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some_and(|fluid| fluid.source),
+                *wet == "true"
+            );
+            let air = BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            };
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&air, &state),
+                Some(*lit == "false" && *wet == "false")
+            );
+            candles_checked += 1;
+        }
+        assert_eq!(candles_checked, 3264);
+        let mut liquids_checked = 0;
+        for line in output
+            .lines()
+            .filter(|line| line.starts_with("CANDLE_LIQUID\t"))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [_, count, lit, wet, source, changed, result_lit, result_wet] = fields.as_slice()
+            else {
+                bail!("invalid Java candle liquid result")
+            };
+            let state = BlockState {
+                name: "minecraft:candle".into(),
+                properties: BTreeMap::from([
+                    ("candles".into(), (*count).into()),
+                    ("lit".into(), (*lit).into()),
+                    ("waterlogged".into(), (*wet).into()),
+                ]),
+            };
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let pos = [1, 8, 1];
+            let mut random = DecorationRandom::new(42);
+            let mut expected_random = random.clone();
+            {
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(pos, &state, None, &mut random)?);
+                assert!(draft.is_liquid_container(&state)?);
+                let source = *source == "true";
+                draft.place_liquid(
+                    pos,
+                    &state,
+                    Some(FluidState {
+                        kind: FluidKind::Water,
+                        source,
+                        falling: false,
+                        amount: if source { 8 } else { 7 },
+                    }),
+                )?;
+            }
+            region.finish()?;
+            assert_eq!(random.next_long(), expected_random.next_long());
+            let world = terrain.snapshot();
+            let placed = world
+                .block(pos[0], pos[1], pos[2])
+                .context("missing candle")?;
+            assert_eq!(placed.properties["candles"], *count);
+            assert_eq!(placed.properties["lit"], *result_lit, "{line}");
+            assert_eq!(placed.properties["waterlogged"], *result_wet, "{line}");
+            let ticks = world.saved_fluid_ticks.get(&ChunkPos { x: 0, z: 0 });
+            if *changed == "true" {
+                let ticks = ticks.context("missing candle water tick")?;
+                assert_eq!(ticks.len(), 1);
+                assert_eq!(ticks[0].position, pos);
+                assert_eq!(ticks[0].fluid, "minecraft:water");
+                assert_eq!(ticks[0].delay, 0);
+            } else {
+                assert!(ticks.is_none_or(|ticks| ticks.is_empty()));
+            }
+            liquids_checked += 1;
+        }
+        assert_eq!(liquids_checked, 32);
         let mut stones_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("STONE\t")) {
             let fields: Vec<_> = line.split('\t').collect();

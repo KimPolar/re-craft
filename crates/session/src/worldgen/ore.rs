@@ -4594,6 +4594,7 @@ fn generation_rail_state(state: &BlockState) -> bool {
 fn generation_non_sturdy_structure(state: &BlockState) -> bool {
     generation_rail_state(state)
         || jigsaw::jigsaw_torch(state)
+        || jigsaw::jigsaw_candle(state)
         || native_world::collision::fence_waterlogged(state).is_some()
         || native_world::collision::fence_gate_open(state).is_some()
         || native_world::collision::pane_waterlogged(state).is_some()
@@ -7922,7 +7923,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::full_terracotta(state)
                             || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state)
-                            || jigsaw::jigsaw_lantern(state))
+                            || jigsaw::jigsaw_lantern(state)
+                            || jigsaw::jigsaw_candle(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
                         && old.properties.len() == 1
@@ -7933,7 +7935,12 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && old.properties.get("waterlogged").map(String::as_str) == Some("false")
                         && state.properties.get("waterlogged").map(String::as_str) == Some("true")
                         && old.properties.iter().all(|(key, value)| {
-                            key == "waterlogged" || state.properties.get(key) == Some(value)
+                            key == "waterlogged"
+                                || (key == "lit"
+                                    && jigsaw::jigsaw_candle(&old)
+                                    && value == "true"
+                                    && state.properties.get(key).map(String::as_str) == Some("false"))
+                                || state.properties.get(key) == Some(value)
                         });
                     let jigsaw_light_update = self.jigsaw_block_write
                         && ((old_air && jigsaw::jigsaw_wood(state))
@@ -7953,6 +7960,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && native_world::collision::trapdoor_state(state).is_none()
                             && native_world::collision::bed_leg_end(state).is_none()
                             && !native_world::collision::full_glass(state)
+                            && !jigsaw::jigsaw_candle(state)
                             && native_world::collision::pane_waterlogged(state).is_none())
                             || native_world::block_light::same_light_behavior(&old, state)
                                 == Some(false));
@@ -12660,6 +12668,19 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_candles_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_candle",
+            "vine_active_self_jigsaw_lit_candle",
+            "vine_active_empty_jigsaw_lit_candle",
+            "vine_active_self_empty_jigsaw_candle",
+            "vine_active_jigsaw_wet_candle",
+            "vine_active_self_jigsaw_wet_lit_candle",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -13051,6 +13072,8 @@ mod tests {
                         "soul_lantern"
                     } else if mode.ends_with("_lantern") {
                         "lantern"
+                    } else if mode.ends_with("_candle") {
+                        "candle"
                     } else if mode.ends_with("_pane") {
                         "glass_pane"
                     } else if mode.ends_with("_glass") {
@@ -13111,6 +13134,12 @@ mod tests {
                     } else if mode.ends_with("_lantern") {
                         block.properties = BTreeMap::from([
                             ("hanging".into(), "false".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]);
+                    } else if mode.ends_with("_candle") {
+                        block.properties = BTreeMap::from([
+                            ("candles".into(), "3".into()),
+                            ("lit".into(), mode.contains("_lit_").to_string()),
                             ("waterlogged".into(), "false".into()),
                         ]);
                     } else if mode.ends_with("_pane") {
@@ -13248,6 +13277,8 @@ mod tests {
                 0
             } else if mode.contains("_jigsaw_wet_") {
                 2
+            } else if mode.ends_with("_candle") && !mode.contains("_lit_") {
+                0
             } else if mode.ends_with("_jigsaw_gate")
                 || mode.ends_with("_jigsaw_door")
                 || mode.ends_with("_jigsaw_trapdoor")

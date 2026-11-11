@@ -3439,6 +3439,14 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             1_u64 << 33
+        } else if name.matches("minecraft:attack_range") {
+            crate::attack_range::AttackRange::parse(value)?;
+            1_u64 << 34
+        } else if name.matches("!minecraft:attack_range") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            1_u64 << 35
         } else if name.matches("minecraft:dyed_color") {
             value.as_java_int()?;
             131072
@@ -3563,6 +3571,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & (3_u64 << 32) == (3_u64 << 32) {
+        return None;
+    }
+    if seen & (3_u64 << 34) == (3_u64 << 34) {
         return None;
     }
     // Durable item prototypes require special stackability rules when their

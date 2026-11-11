@@ -569,6 +569,7 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.SwingAnimationType;
 import net.minecraft.world.item.component.PiercingWeapon;
+import net.minecraft.world.item.component.AttackRange;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
@@ -624,6 +625,10 @@ public class SwingOracle {
     double speed;
     public double getAttributeValue(Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) { return speed; }
   }
+  static class RangePlayer extends Player {
+    boolean creative;
+    public boolean isCreative() { return creative; }
+  }
   static class SwapPlayer extends LocalPlayer {
     double speed;
     SwapPlayer() { super(null,null,null,null,null,null,false,null,null); }
@@ -652,6 +657,10 @@ public class SwingOracle {
       });
       if(hasSpeed[0]) row.add(speed[0]); else row.add((Number)null);
       row.add(stack.getOrDefault(DataComponents.MINIMUM_ATTACK_CHARGE,0f));
+      var range=stack.get(DataComponents.ATTACK_RANGE);
+      if(range==null) row.add((Number)null); else {
+        var r=new JsonArray(); for(float value:new float[]{range.minReach(),range.maxReach(),range.minCreativeReach(),range.maxCreativeReach(),range.hitboxMargin(),range.mobFactor()}) r.add(value); row.add(r);
+      }
       prototypes.add(row);
       if(attack.type()==SwingAnimationType.STAB) {
         stack.remove(DataComponents.ATTACK_ANIMATION); var removed=stack.getAttackAnimation();
@@ -678,6 +687,34 @@ public class SwingOracle {
     }
     var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
     var unsafe=(Unsafe)unsafeField.get(null);
+    var rangePlayer=(RangePlayer)unsafe.allocateInstance(RangePlayer.class);
+    var rangeMob=(net.minecraft.world.entity.decoration.ArmorStand)unsafe.allocateInstance(net.minecraft.world.entity.decoration.ArmorStand.class);
+    var position=net.minecraft.world.entity.Entity.class.getDeclaredField("position"); position.setAccessible(true);
+    position.set(rangePlayer,net.minecraft.world.phys.Vec3.ZERO); position.set(rangeMob,net.minecraft.world.phys.Vec3.ZERO);
+    var ranges=new AttackRange[]{new AttackRange(2f,4.5f,2f,6.5f,0.125f,0.5f),new AttackRange(0f,3f,0f,5f,0.3f,1f),new AttackRange(1.2f,7.7f,2.3f,9.1f,0.7f,1.3f)};
+    var rangeCodec=new JsonArray();
+    for(String json:new String[]{"{}","{\"max_reach\":7.25}","{\"min_reach\":64,\"max_creative_reach\":0,\"hitbox_margin\":1,\"mob_factor\":2}","{\"min_reach\":-0.01}","{\"max_reach\":64.01}","{\"hitbox_margin\":1.01}","{\"mob_factor\":2.01}","{\"max_reach\":\"bad\"}"}) {
+      var parsed=AttackRange.CODEC.parse(com.mojang.serialization.JsonOps.INSTANCE,JsonParser.parseString(json)).result();
+      if(parsed.isEmpty()) rangeCodec.add((Number)null); else { var r=parsed.get(); var row=new JsonArray(); for(float value:new float[]{r.minReach(),r.maxReach(),r.minCreativeReach(),r.maxCreativeReach(),r.hitboxMargin(),r.mobFactor()}) row.add(value); rangeCodec.add(row); }
+    }
+    var rangeRows=new JsonArray();
+    for(int index=0;index<ranges.length;index++) for(int mode=0;mode<3;mode++)
+    for(double x:new double[]{0,0.5,1,1.875,2,3,4.5,4.625,4.6250001,6.625,6.6250001,9.8}) {
+      rangePlayer.creative=mode==1;
+      net.minecraft.world.entity.LivingEntity actor=mode==2?rangeMob:rangePlayer;
+      var range=ranges[index]; var row=new JsonArray(); row.add(index); row.add(mode); row.add(x);
+      row.add(range.effectiveMinRange(actor)); row.add(range.effectiveMaxRange(actor));
+      row.add(range.isInRange(actor,new net.minecraft.world.phys.Vec3(x,0,0))); rangeRows.add(row);
+    }
+    var boxRows=new JsonArray();
+    for(int index=0;index<ranges.length;index++) for(int mode=0;mode<3;mode++)
+    for(double x:new double[]{-0.25,1.75,4.0,4.625,6.625,9.8}) for(double tolerance:new double[]{0,0.125,1}) {
+      rangePlayer.creative=mode==1;
+      net.minecraft.world.entity.LivingEntity actor=mode==2?rangeMob:rangePlayer;
+      var box=new net.minecraft.world.phys.AABB(x,-1,-1,x+0.5,1,1);
+      var row=new JsonArray(); row.add(index); row.add(mode); row.add(x); row.add(tolerance);
+      row.add(ranges[index].isInRange(actor,box,tolerance)); boxRows.add(row);
+    }
     var swapPlayer=(SwapPlayer)unsafe.allocateInstance(SwapPlayer.class);
     var swapTicker=net.minecraft.world.entity.LivingEntity.class.getDeclaredField("itemSwapTicker"); swapTicker.setAccessible(true);
     var swaps=new JsonArray();
@@ -824,7 +861,7 @@ public class SwingOracle {
       }
       scaled.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("scaledEquipment",scaled); result.add("swapScales",swaps); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes); result.add("charges",charges);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("scaledEquipment",scaled); result.add("swapScales",swaps); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact); result.add("prototypes",prototypes); result.add("prototypePatches",prototypePatches); result.add("piercingRoutes",routes); result.add("charges",charges); result.add("ranges",rangeRows); result.add("rangeBoxes",boxRows); result.add("rangeCodec",rangeCodec);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -913,6 +950,18 @@ public class SwingOracle {
                 row[9].as_f64().unwrap() as f32,
                 "{id} minimum charge"
             );
+            let range = crate::attack_range::item_attack_range(Some(&stack)).unwrap();
+            let expected = row[10]
+                .as_array()
+                .map(|fields| crate::attack_range::AttackRange {
+                    min_reach: fields[0].as_f64().unwrap() as f32,
+                    max_reach: fields[1].as_f64().unwrap() as f32,
+                    min_creative_reach: fields[2].as_f64().unwrap() as f32,
+                    max_creative_reach: fields[3].as_f64().unwrap() as f32,
+                    hitbox_margin: fields[4].as_f64().unwrap() as f32,
+                    mob_factor: fields[5].as_f64().unwrap() as f32,
+                });
+            assert_eq!(range, expected, "{id} attack range");
             if id.strip_prefix("minecraft:").is_some_and(|name| {
                 matches!(
                     name,
@@ -959,6 +1008,98 @@ public class SwingOracle {
             assert_eq!(
                 crate::combat::AttackCharge::for_test(ticks, speed).attack_strength(),
                 Some(row[4].as_f64().unwrap() as f32)
+            );
+        }
+        let ranges = [
+            crate::attack_range::AttackRange {
+                min_reach: 2.0,
+                max_reach: 4.5,
+                min_creative_reach: 2.0,
+                max_creative_reach: 6.5,
+                hitbox_margin: 0.125,
+                mob_factor: 0.5,
+            },
+            crate::attack_range::AttackRange::default(),
+            crate::attack_range::AttackRange {
+                min_reach: 1.2,
+                max_reach: 7.7,
+                min_creative_reach: 2.3,
+                max_creative_reach: 9.1,
+                hitbox_margin: 0.7,
+                mob_factor: 1.3,
+            },
+        ];
+        for row in result["ranges"].as_array().unwrap() {
+            let range = ranges[row[0].as_u64().unwrap() as usize];
+            let mode = match row[1].as_u64().unwrap() {
+                0 => Some(crate::GameMode::Survival),
+                1 => Some(crate::GameMode::Creative),
+                _ => None,
+            };
+            let hit = glam::DVec3::X * row[2].as_f64().unwrap();
+            let (min, max) = range.effective_range(mode);
+            assert_eq!(min, row[3].as_f64().unwrap() as f32, "{row}");
+            assert_eq!(max, row[4].as_f64().unwrap() as f32, "{row}");
+            assert_eq!(
+                range.contains_point(glam::DVec3::ZERO, hit, mode),
+                row[5].as_bool().unwrap(),
+                "{row}"
+            );
+        }
+        for row in result["rangeBoxes"].as_array().unwrap() {
+            let range = ranges[row[0].as_u64().unwrap() as usize];
+            let mode = match row[1].as_u64().unwrap() {
+                0 => Some(crate::GameMode::Survival),
+                1 => Some(crate::GameMode::Creative),
+                _ => None,
+            };
+            let x = row[2].as_f64().unwrap();
+            let tolerance = row[3].as_f64().unwrap();
+            assert_eq!(
+                range.contains_box(
+                    glam::DVec3::ZERO,
+                    glam::DVec3::new(x, -1.0, -1.0),
+                    glam::DVec3::new(x + 0.5, 1.0, 1.0),
+                    mode,
+                    tolerance
+                ),
+                row[4].as_bool().unwrap(),
+                "{row}"
+            );
+        }
+        let codec_cases = [
+            Tag::Compound(vec![]),
+            Tag::Compound(vec![("max_reach".into(), Tag::Double(7.25))]),
+            Tag::Compound(vec![
+                ("min_reach".into(), Tag::Int(64)),
+                ("max_creative_reach".into(), Tag::Int(0)),
+                ("hitbox_margin".into(), Tag::Int(1)),
+                ("mob_factor".into(), Tag::Int(2)),
+            ]),
+            Tag::Compound(vec![("min_reach".into(), Tag::Double(-0.01))]),
+            Tag::Compound(vec![("max_reach".into(), Tag::Double(64.01))]),
+            Tag::Compound(vec![("hitbox_margin".into(), Tag::Double(1.01))]),
+            Tag::Compound(vec![("mob_factor".into(), Tag::Double(2.01))]),
+            Tag::Compound(vec![("max_reach".into(), Tag::String("bad".into()))]),
+        ];
+        for (tag, row) in codec_cases
+            .iter()
+            .zip(result["rangeCodec"].as_array().unwrap())
+        {
+            let expected = row
+                .as_array()
+                .map(|values| crate::attack_range::AttackRange {
+                    min_reach: values[0].as_f64().unwrap() as f32,
+                    max_reach: values[1].as_f64().unwrap() as f32,
+                    min_creative_reach: values[2].as_f64().unwrap() as f32,
+                    max_creative_reach: values[3].as_f64().unwrap() as f32,
+                    hitbox_margin: values[4].as_f64().unwrap() as f32,
+                    mob_factor: values[5].as_f64().unwrap() as f32,
+                });
+            assert_eq!(
+                crate::attack_range::AttackRange::parse(tag),
+                expected,
+                "{tag:?}"
             );
         }
         let patches = result["prototypePatches"].as_array().unwrap();

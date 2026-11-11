@@ -140,6 +140,10 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
             "!minecraft:attribute_modifiers" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
                 {}
             "minecraft:minimum_attack_charge" if crate::combat::valid_minimum_charge(value) => {}
+            "minecraft:attack_range"
+                if crate::attack_range::AttackRange::parse(value).is_some() => {}
+            "!minecraft:attack_range" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
+                {}
             "!minecraft:minimum_attack_charge" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
                 {}
             "minecraft:enchantments" if valid_enchantments(value) => {}
@@ -183,6 +187,9 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
     if seen.contains("minecraft:minimum_attack_charge")
         && seen.contains("!minecraft:minimum_attack_charge")
     {
+        return None;
+    }
+    if seen.contains("minecraft:attack_range") && seen.contains("!minecraft:attack_range") {
         return None;
     }
     if default == 1 && max != 1 {

@@ -3876,6 +3876,46 @@ mod tests {
     }
 
     #[test]
+    fn player_inventory_round_trips_a_custom_attack_range() {
+        let mut original = player_with_inventory();
+        let components = Tag::Compound(vec![(
+            "minecraft:attack_range".into(),
+            Tag::Compound(vec![
+                ("min_reach".into(), Tag::Float(1.25)),
+                ("max_reach".into(), Tag::Float(7.5)),
+            ]),
+        )]);
+        set_field(
+            &mut original.value,
+            "Inventory",
+            Some(Tag::List {
+                element_type: TagType::Compound,
+                values: vec![item("minecraft:iron_spear", 0, 1, components.clone())],
+            }),
+        )
+        .unwrap();
+        let mut inventory = read_saved_player(&original).unwrap();
+        let spear = inventory.slot(PlayerSlot::Storage(0)).cloned().unwrap();
+        assert_eq!(spear.max_count(), Some(1));
+        inventory.set_slot(PlayerSlot::Storage(0), None);
+        inventory.set_slot(PlayerSlot::Storage(1), Some(spear));
+        let draft = draft_player_inventory(&original, &inventory).unwrap();
+        let encoded = native_persistence::nbt::write(draft.document()).unwrap();
+        let reopened = native_persistence::nbt::read(&encoded).unwrap();
+        let inventory = read_saved_player(&reopened).unwrap();
+        let spear = inventory.slot(PlayerSlot::Storage(1)).unwrap();
+        assert_eq!(spear.components(), &components);
+        let range = crate::attack_range::item_attack_range(Some(spear))
+            .unwrap()
+            .unwrap();
+        assert_eq!((range.min_reach, range.max_reach), (1.25, 7.5));
+        assert_eq!(
+            reopened.value.get("custom_world_data"),
+            original.value.get("custom_world_data")
+        );
+    }
+
+    #[test]
     fn player_state_draft_preserves_unknown_data_and_round_trips_simulated_fields() {
         let original = player_with_inventory();
         let before = native_persistence::nbt::write(&original).unwrap();

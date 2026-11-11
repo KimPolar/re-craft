@@ -239,6 +239,8 @@ pub struct VideoSettings {
     pub fullscreen: bool,
     /// Zero selects the largest GUI scale that fits the framebuffer.
     pub gui_scale: u32,
+    /// Position of the attack cooldown indicator in the HUD.
+    pub attack_indicator: AttackIndicator,
     /// 260 is the vanilla unlimited setting; lower values are frames per second.
     pub max_fps: u16,
     /// Vertical field of view in degrees, 30 through 110 in Java 26.3.
@@ -269,6 +271,25 @@ pub struct VideoSettings {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AttackIndicator {
+    Off,
+    #[default]
+    Crosshair,
+    Hotbar,
+}
+
+impl AttackIndicator {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Crosshair,
+            Self::Crosshair => Self::Hotbar,
+            Self::Hotbar => Self::Off,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InactivityFpsLimit {
     #[default]
     Afk,
@@ -295,6 +316,7 @@ impl Default for VideoSettings {
             vsync: true,
             fullscreen: false,
             gui_scale: 0,
+            attack_indicator: AttackIndicator::Crosshair,
             max_fps: 120,
             fov: 70,
             view_bobbing: true,
@@ -505,6 +527,27 @@ pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attack_indicator_defaults_and_persists_across_other_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("options.json");
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.video.attack_indicator, AttackIndicator::Crosshair);
+        let mut video = defaults.video;
+        for expected in [
+            AttackIndicator::Hotbar,
+            AttackIndicator::Off,
+            AttackIndicator::Crosshair,
+        ] {
+            video.attack_indicator = video.attack_indicator.next();
+            assert_eq!(video.attack_indicator, expected);
+            save_video_to(&path, video).unwrap();
+            save_sound_to(&path, SoundSettings::default()).unwrap();
+            let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(loaded.video.attack_indicator, expected);
+        }
+    }
 
     #[test]
     fn japanese_glyph_default_uses_locale_language() {

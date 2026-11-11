@@ -94,6 +94,7 @@ enum ButtonId {
     VideoFullscreen,
     VideoGuiScale,
     VideoInactivity,
+    VideoAttackIndicator,
     VideoBlur,
     VideoDistance,
     VideoBlend,
@@ -1474,6 +1475,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoFullscreen => Some(VideoControl::Fullscreen),
             ButtonId::VideoGuiScale => Some(VideoControl::GuiScale),
             ButtonId::VideoInactivity => Some(VideoControl::Inactivity),
+            ButtonId::VideoAttackIndicator => Some(VideoControl::AttackIndicator),
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
             ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
             ButtonId::VideoBlend => Some(VideoControl::BiomeBlend),
@@ -2093,6 +2095,10 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
                     (ButtonId::VideoBlur, VideoControl::MenuBlur),
                     (ButtonId::VideoWeather, VideoControl::WeatherRadius),
+                    (
+                        ButtonId::VideoAttackIndicator,
+                        VideoControl::AttackIndicator,
+                    ),
                 ] {
                     let rect = self.video_ui.control_rect(w, control);
                     add(
@@ -2107,6 +2113,7 @@ impl<'a> Menu<'a> {
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
+                                | ButtonId::VideoAttackIndicator
                         ) || self.video_ui.visible(h, rect),
                     );
                 }
@@ -2500,6 +2507,10 @@ impl<'a> Menu<'a> {
                     self.state.video.inactivity_fps_limit.next();
                 self.state.video_dirty = true;
             }
+            ButtonId::VideoAttackIndicator => {
+                self.state.video.attack_indicator = self.state.video.attack_indicator.next();
+                self.state.video_dirty = true;
+            }
             ButtonId::VideoFps => {
                 let (width, _) = self.logical_size();
                 if self
@@ -2721,6 +2732,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoFullscreen
                     | ButtonId::VideoGuiScale
                     | ButtonId::VideoInactivity
+                    | ButtonId::VideoAttackIndicator
                     | ButtonId::OptionsFov
                     | ButtonId::ViewBobbing
             )
@@ -3280,6 +3292,7 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoFullscreen) => Some(VideoControl::Fullscreen),
                         Some(ButtonId::VideoGuiScale) => Some(VideoControl::GuiScale),
                         Some(ButtonId::VideoInactivity) => Some(VideoControl::Inactivity),
+                        Some(ButtonId::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
                         Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
                         Some(ButtonId::VideoBlend) => Some(VideoControl::BiomeBlend),
@@ -3458,6 +3471,7 @@ impl<'a> Menu<'a> {
                         | ButtonId::VideoFullscreen
                         | ButtonId::VideoGuiScale
                         | ButtonId::VideoInactivity
+                        | ButtonId::VideoAttackIndicator
                         | ButtonId::VideoBlur
                         | ButtonId::VideoDistance
                         | ButtonId::VideoBlend
@@ -3860,6 +3874,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoFullscreen
                                 | ButtonId::VideoGuiScale
                                 | ButtonId::VideoInactivity
+                                | ButtonId::VideoAttackIndicator
                                 | ButtonId::OptionsFov
                                 | ButtonId::ViewBobbing
                                 | ButtonId::FovEffectScale
@@ -4478,6 +4493,7 @@ impl ApplicationHandler for Menu<'_> {
                                         | ButtonId::VideoDistance
                                         | ButtonId::VideoBlend
                                         | ButtonId::VideoWeather
+                                        | ButtonId::VideoAttackIndicator
                                 )
                             )
                         {
@@ -4490,6 +4506,8 @@ impl ApplicationHandler for Menu<'_> {
                                     VideoControl::BiomeBlend
                                 } else if self.focused == Some(ButtonId::VideoWeather) {
                                     VideoControl::WeatherRadius
+                                } else if self.focused == Some(ButtonId::VideoAttackIndicator) {
+                                    VideoControl::AttackIndicator
                                 } else {
                                     VideoControl::RenderDistance
                                 },
@@ -6245,6 +6263,27 @@ mod tests {
                     );
                 }
                 click(&mut self.menu, event_loop, ButtonId::VideoInactivity, false);
+                let (_, video_height) = self.menu.logical_size();
+                self.menu
+                    .video_ui
+                    .ensure_control_visible(video_height, VideoControl::AttackIndicator);
+                for expected in [
+                    menu_settings::AttackIndicator::Hotbar,
+                    menu_settings::AttackIndicator::Off,
+                    menu_settings::AttackIndicator::Crosshair,
+                    menu_settings::AttackIndicator::Hotbar,
+                ] {
+                    click(
+                        &mut self.menu,
+                        event_loop,
+                        ButtonId::VideoAttackIndicator,
+                        false,
+                    );
+                    assert_eq!(self.menu.state.video.attack_indicator, expected);
+                }
+                self.menu
+                    .video_ui
+                    .ensure_control_visible(video_height, VideoControl::Framerate);
                 click(&mut self.menu, event_loop, ButtonId::VideoFps, true);
                 assert_eq!(
                     self.menu.state.video,
@@ -6259,6 +6298,7 @@ mod tests {
                         toggle_use: true,
                         view_bobbing: true,
                         inactivity_fps_limit: menu_settings::InactivityFpsLimit::Minimized,
+                        attack_indicator: menu_settings::AttackIndicator::Hotbar,
                         ..VideoSettings::default()
                     }
                 );

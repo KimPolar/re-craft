@@ -2,7 +2,7 @@
 use crate::{
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
-    menu_settings::{InactivityFpsLimit, VideoSettings},
+    menu_settings::{AttackIndicator, InactivityFpsLimit, VideoSettings},
 };
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ pub enum VideoControl {
     RenderDistance,
     BiomeBlend,
     WeatherRadius,
+    AttackIndicator,
 }
 
 #[derive(Clone, Copy)]
@@ -235,6 +236,7 @@ impl VideoUi {
                 VideoControl::Fullscreen => 130,
                 VideoControl::MenuBlur => 366,
                 VideoControl::WeatherRadius => 441,
+                VideoControl::AttackIndicator => 527,
                 VideoControl::RenderDistance | VideoControl::BiomeBlend => 241,
                 _ => 80,
             } - self.scroll as i32,
@@ -259,6 +261,7 @@ impl VideoUi {
             VideoControl::RenderDistance,
             VideoControl::BiomeBlend,
             VideoControl::WeatherRadius,
+            VideoControl::AttackIndicator,
         ]
         .into_iter()
         .find(|control| {
@@ -699,6 +702,25 @@ impl VideoUi {
                                         }),
                                 &value,
                             );
+                        } else if label.key == "options.attackIndicator" {
+                            let (key, fallback) = match video.attack_indicator {
+                                AttackIndicator::Off => ("options.off", "OFF"),
+                                AttackIndicator::Crosshair => {
+                                    ("options.attack.crosshair", "Crosshair")
+                                }
+                                AttackIndicator::Hotbar => ("options.attack.hotbar", "Hotbar"),
+                            };
+                            let value = crate::text_component::format_plain(
+                                assets.translate("options.generic_value", "%s: %s"),
+                                &[tr(label), assets.translate(key, fallback)],
+                            );
+                            list.button(
+                                Some(assets),
+                                rect,
+                                true,
+                                hovered || focused == Some(VideoControl::AttackIndicator),
+                                &value,
+                            );
                         } else if label.key == "options.guiScale" {
                             let value = if video.gui_scale == 0 {
                                 assets.translate("options.guiScale.auto", "Auto").to_owned()
@@ -777,6 +799,18 @@ impl VideoUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attack_indicator_control_scrolls_into_view_and_accepts_pointer() {
+        let mut ui = VideoUi::new(VideoSettings::default());
+        assert_eq!(ui.control_rect(426, VideoControl::AttackIndicator).y, 527);
+        ui.ensure_control_visible(240, VideoControl::AttackIndicator);
+        let rect = ui.control_rect(426, VideoControl::AttackIndicator);
+        assert!(ui.visible(240, rect));
+        assert_eq!(
+            ui.hit(426, 240, (rect.x + 5, rect.y + 5)),
+            Some(VideoControl::AttackIndicator)
+        );
+    }
     #[test]
     fn weather_radius_slider_applies_immediately_and_supports_keyboard() {
         let mut video = VideoSettings::default();

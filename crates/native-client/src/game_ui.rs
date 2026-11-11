@@ -87,6 +87,7 @@ enum PauseButton {
     Fullscreen,
     GuiScale,
     Inactivity,
+    VideoAttackIndicator,
     Accessibility,
     ViewBobbing,
     FovEffectScale,
@@ -1571,6 +1572,7 @@ impl GameUi {
                             VideoControl::Fullscreen => PauseButton::Fullscreen,
                             VideoControl::GuiScale => PauseButton::GuiScale,
                             VideoControl::Inactivity => PauseButton::Inactivity,
+                            VideoControl::AttackIndicator => PauseButton::VideoAttackIndicator,
                             VideoControl::MenuBlur => PauseButton::VideoBlur,
                             VideoControl::RenderDistance => PauseButton::VideoDistance,
                             VideoControl::BiomeBlend => PauseButton::VideoBlend,
@@ -1807,6 +1809,12 @@ impl GameUi {
                 self.video_dirty = true;
                 PauseAction::None
             }
+            PauseButton::VideoAttackIndicator => {
+                self.video.attack_indicator = self.video.attack_indicator.next();
+                self.video_dirty = true;
+                self.last_draw = None;
+                PauseAction::None
+            }
             PauseButton::Framerate => {
                 if mouse {
                     let (w, _) = self.logical_size();
@@ -2032,6 +2040,7 @@ impl GameUi {
                     Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
                     Some(PauseButton::GuiScale) => Some(VideoControl::GuiScale),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
+                    Some(PauseButton::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
                     Some(PauseButton::VideoBlend) => Some(VideoControl::BiomeBlend),
@@ -2204,6 +2213,7 @@ impl GameUi {
                     buttons.push(PauseButton::VideoDistance);
                     buttons.push(PauseButton::VideoBlur);
                     buttons.push(PauseButton::VideoWeather);
+                    buttons.push(PauseButton::VideoAttackIndicator);
                     buttons.push(PauseButton::Done);
                     buttons
                 }
@@ -2235,6 +2245,7 @@ impl GameUi {
                             | PauseButton::VideoDistance
                             | PauseButton::VideoBlend
                             | PauseButton::VideoWeather
+                            | PauseButton::VideoAttackIndicator
                     )
                 )
             {
@@ -2247,6 +2258,8 @@ impl GameUi {
                         VideoControl::BiomeBlend
                     } else if self.pause_focus == Some(PauseButton::VideoWeather) {
                         VideoControl::WeatherRadius
+                    } else if self.pause_focus == Some(PauseButton::VideoAttackIndicator) {
+                        VideoControl::AttackIndicator
                     } else {
                         VideoControl::RenderDistance
                     },
@@ -2968,6 +2981,7 @@ impl GameUi {
         self.attack_indicator = crate::attack_hud::Display::new(
             snapshot.first_person.attack_strength,
             snapshot.game_mode,
+            self.video.attack_indicator,
         );
     }
 
@@ -3178,6 +3192,12 @@ impl GameUi {
                     );
                 }
             }
+            crate::attack_hud::draw_hotbar(
+                &mut canvas,
+                &assets.hud,
+                self.attack_indicator,
+                assets.main_hand_left,
+            );
             crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
             crate::experience_hud::draw(&mut canvas, assets, self.experience);
             if !player_shows_effects {
@@ -3962,6 +3982,7 @@ impl GameUi {
                     Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
                     Some(PauseButton::GuiScale) => Some(VideoControl::GuiScale),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
+                    Some(PauseButton::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
                     Some(PauseButton::VideoBlend) => Some(VideoControl::BiomeBlend),
@@ -6088,6 +6109,26 @@ mod inventory_tests {
         );
         assert_eq!(ui.video_settings().render_distance, 32);
 
+        ui.video_ui
+            .ensure_control_visible(h, VideoControl::AttackIndicator);
+        let rect = ui.video_ui.control_rect(w, VideoControl::AttackIndicator);
+        ui.cursor_moved(f64::from(rect.x + 5) * scale, f64::from(rect.y + 5) * scale);
+        assert_eq!(ui.click(), PauseAction::None);
+        assert_eq!(
+            ui.video_settings().attack_indicator,
+            crate::menu_settings::AttackIndicator::Hotbar
+        );
+        ui.pause_key(KeyCode::Enter, false);
+        assert_eq!(
+            ui.video_settings().attack_indicator,
+            crate::menu_settings::AttackIndicator::Off
+        );
+        ui.pause_key(KeyCode::Enter, false);
+        assert_eq!(
+            ui.video_settings().attack_indicator,
+            crate::menu_settings::AttackIndicator::Crosshair
+        );
+
         assert_eq!(ui.pause_key(KeyCode::Escape, false), PauseAction::SaveVideo);
         assert!(ui.paused());
         assert_eq!(ui.pause_page, PausePage::Options);
@@ -6191,6 +6232,17 @@ mod inventory_tests {
         ui.pause_key(KeyCode::Enter, false);
         ui.pause_key(KeyCode::ArrowLeft, false);
         assert_eq!(ui.video_settings().weather_radius, 9);
+        ui.pause_key(KeyCode::Tab, false);
+        assert_eq!(ui.pause_focus, Some(PauseButton::VideoAttackIndicator));
+        assert!(ui.video_ui.visible(
+            h,
+            ui.video_ui.control_rect(w, VideoControl::AttackIndicator)
+        ));
+        ui.pause_key(KeyCode::Enter, false);
+        assert_eq!(
+            ui.video_settings().attack_indicator,
+            crate::menu_settings::AttackIndicator::Hotbar
+        );
         ui.pause_key(KeyCode::Tab, false);
         assert_eq!(ui.pause_focus, Some(PauseButton::Done));
     }

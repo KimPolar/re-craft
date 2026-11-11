@@ -5,6 +5,7 @@ use native_session::GameMode;
 use crate::{
     menu_assets::{GuiSprite, HudSprites},
     menu_draw::{Canvas, Rect},
+    menu_settings::AttackIndicator,
 };
 
 /// Cache the number of visible pixels rather than invalidating the HUD for
@@ -12,15 +13,21 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Display {
     width: Option<u8>,
+    mode: AttackIndicator,
 }
 
 impl Display {
-    pub fn new(strength: Option<f32>, mode: GameMode) -> Self {
+    pub fn new(strength: Option<f32>, mode: GameMode, setting: AttackIndicator) -> Self {
         Self {
             width: strength
                 .filter(|strength| strength.is_finite() && *strength < 1.0)
                 .filter(|_| mode != GameMode::Spectator)
-                .map(|strength| ((strength.clamp(0.0, 1.0) * 17.0) as u8).min(16)),
+                .filter(|_| setting != AttackIndicator::Off)
+                .map(|strength| match setting {
+                    AttackIndicator::Hotbar => ((strength.clamp(0.0, 1.0) * 19.0) as u8).min(18),
+                    _ => ((strength.clamp(0.0, 1.0) * 17.0) as u8).min(16),
+                }),
+            mode: setting,
         }
     }
 }
@@ -53,12 +60,86 @@ pub fn crosshair_layers(
     sprites: &HudSprites,
     display: Display,
 ) -> Option<(Canvas, Canvas)> {
+    if display.mode != AttackIndicator::Crosshair {
+        return None;
+    }
     layers(
         size,
         &sprites.crosshair_attack_background,
         &sprites.crosshair_attack_progress,
         display,
     )
+}
+
+pub fn draw_hotbar(
+    canvas: &mut Canvas,
+    sprites: &HudSprites,
+    display: Display,
+    main_hand_left: bool,
+) {
+    hotbar(
+        canvas,
+        &sprites.hotbar_attack_background,
+        &sprites.hotbar_attack_progress,
+        display,
+        main_hand_left,
+    );
+}
+
+fn hotbar(
+    canvas: &mut Canvas,
+    background: &GuiSprite,
+    progress: &GuiSprite,
+    display: Display,
+    main_hand_left: bool,
+) {
+    if display.mode != AttackIndicator::Hotbar {
+        return;
+    }
+    let Some(height) = display.width.map(i32::from) else {
+        return;
+    };
+    let Rect { x, y, .. } = hotbar_rect(canvas.width, canvas.height, main_hand_left);
+    canvas.gui_sprite(
+        &background.image,
+        Rect { x, y, w: 18, h: 18 },
+        background.scaling,
+    );
+    let mut full = Canvas::new(18, 18);
+    full.gui_sprite(
+        &progress.image,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 18,
+            h: 18,
+        },
+        progress.scaling,
+    );
+    for sy in (18 - height)..18 {
+        for sx in 0..18 {
+            let color = full.pixels[(sy * 18 + sx) as usize];
+            canvas.pixel(
+                x + sx,
+                y + sy,
+                [
+                    (color >> 16) as u8,
+                    (color >> 8) as u8,
+                    color as u8,
+                    (color >> 24) as u8,
+                ],
+            );
+        }
+    }
+}
+
+fn hotbar_rect(width: i32, height: i32, main_hand_left: bool) -> Rect {
+    Rect {
+        x: width / 2 + if main_hand_left { -113 } else { 97 },
+        y: height - 20,
+        w: 18,
+        h: 18,
+    }
 }
 
 fn layers(
@@ -110,17 +191,26 @@ fn layers(
 mod tests {
     use super::*;
 
+    fn crosshair(strength: Option<f32>, mode: GameMode) -> Display {
+        Display::new(strength, mode, AttackIndicator::Crosshair)
+    }
+
     #[test]
     fn charge_is_cached_by_java_pixel_width_and_hidden_at_full() {
-        assert_eq!(Display::new(Some(0.0), GameMode::Survival).width, Some(0));
-        assert_eq!(Display::new(Some(0.5), GameMode::Creative).width, Some(8));
+        assert_eq!(crosshair(Some(0.0), GameMode::Survival).width, Some(0));
+        assert_eq!(crosshair(Some(0.5), GameMode::Creative).width, Some(8));
+        assert_eq!(crosshair(Some(0.999), GameMode::Survival).width, Some(16));
+        assert_eq!(crosshair(Some(1.0), GameMode::Survival).width, None);
+        assert_eq!(crosshair(None, GameMode::Survival).width, None);
+        assert_eq!(crosshair(Some(0.5), GameMode::Spectator).width, None);
         assert_eq!(
-            Display::new(Some(0.999), GameMode::Survival).width,
-            Some(16)
+            Display::new(Some(0.5), GameMode::Survival, AttackIndicator::Off).width,
+            None
         );
-        assert_eq!(Display::new(Some(1.0), GameMode::Survival).width, None);
-        assert_eq!(Display::new(None, GameMode::Survival).width, None);
-        assert_eq!(Display::new(Some(0.5), GameMode::Spectator).width, None);
+        assert_eq!(
+            Display::new(Some(0.5), GameMode::Survival, AttackIndicator::Hotbar).width,
+            Some(9)
+        );
     }
 
     #[test]
@@ -131,6 +221,125 @@ mod tests {
         );
         assert_eq!(scissor((8, 4), 1, (8, 4)), None);
         assert_eq!(scissor((10, 20), 1, (10, 20)), Some((0, 19, 10, 1)));
+    }
+
+    #[test]
+    fn hotbar_indicator_uses_opposite_arm_and_fills_upward() {
+        use crate::menu_assets::GuiSpriteScaling;
+        let background = GuiSprite {
+            image: image::RgbaImage::from_pixel(18, 18, image::Rgba([16, 32, 48, 255])),
+            scaling: GuiSpriteScaling::Stretch,
+        };
+        let progress = GuiSprite {
+            image: image::RgbaImage::from_fn(18, 18, |_, y| image::Rgba([y as u8, 128, 64, 255])),
+            scaling: GuiSpriteScaling::Stretch,
+        };
+        let display = Display::new(Some(0.5), GameMode::Survival, AttackIndicator::Hotbar);
+        for left in [false, true] {
+            let mut canvas = Canvas::new(426, 240);
+            hotbar(&mut canvas, &background, &progress, display, left);
+            let x = 213 + if left { -113 } else { 97 };
+            let at =
+                |dx: i32, dy: i32| canvas.pixels[((220 + dy) * canvas.width + x + dx) as usize];
+            assert_eq!(at(0, 8), 0xff10_2030);
+            assert_eq!(at(0, 9), 0xff09_8040);
+            assert_eq!(at(17, 17), 0xff11_8040);
+            assert_eq!(at(18, 17), 0);
+        }
+        let mut hidden = Canvas::new(426, 240);
+        hotbar(
+            &mut hidden,
+            &background,
+            &progress,
+            Display::new(Some(0.5), GameMode::Survival, AttackIndicator::Off),
+            false,
+        );
+        assert!(hidden.pixels.iter().all(|pixel| *pixel == 0));
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn hotbar_indicator_layout_matches_installed_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("AttackIndicatorHudOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/AttackIndicatorHudOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let result = cmd.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java attack HUD oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("AttackIndicatorHudOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 36);
+        for row in rows {
+            let width = row["w"].as_i64().unwrap() as i32;
+            let window_height = row["h"].as_i64().unwrap() as i32;
+            let left = row["left"].as_bool().unwrap();
+            let strength = row["charge"].as_f64().unwrap() as f32;
+            let display = Display::new(Some(strength), GameMode::Survival, AttackIndicator::Hotbar);
+            let mut expected = Vec::new();
+            if let Some(height) = display.width.map(i32::from) {
+                let rect = hotbar_rect(width, window_height, left);
+                expected.push(serde_json::json!([
+                    "hud/hotbar_attack_indicator_background",
+                    rect.x,
+                    rect.y,
+                    18,
+                    18
+                ]));
+                expected.push(serde_json::json!([
+                    "hud/hotbar_attack_indicator_progress",
+                    18,
+                    18,
+                    0,
+                    18 - height,
+                    rect.x,
+                    rect.y + 18 - height,
+                    18,
+                    height
+                ]));
+            }
+            assert_eq!(serde_json::json!(expected), row["draws"], "{row}");
+        }
     }
 
     #[test]
@@ -148,7 +357,7 @@ mod tests {
             (321, 241),
             &background,
             &progress,
-            Display::new(Some(0.5), GameMode::Survival),
+            crosshair(Some(0.5), GameMode::Survival),
         )
         .unwrap();
         let at = |x: usize, y: usize| y * 321 + x;
@@ -181,12 +390,23 @@ mod tests {
             br#"{"gui":{"scaling":{"type":"tile","width":4,"height":4}}}"#,
         )
         .unwrap();
+        image::RgbaImage::from_pixel(18, 18, image::Rgba([10, 20, 30, 255]))
+            .save(dir.join("hotbar_attack_indicator_background.png"))
+            .unwrap();
+        image::RgbaImage::from_fn(18, 3, |_, y| image::Rgba([40 + y as u8 * 50, 60, 80, 255]))
+            .save(dir.join("hotbar_attack_indicator_progress.png"))
+            .unwrap();
+        std::fs::write(
+            dir.join("hotbar_attack_indicator_progress.png.mcmeta"),
+            br#"{"gui":{"scaling":{"type":"tile","width":18,"height":3}}}"#,
+        )
+        .unwrap();
         let assets =
             crate::menu_assets::MenuAssets::load(&game, &[pack.path().to_path_buf()]).unwrap();
         let (background, progress) = crosshair_layers(
             (426, 240),
             &assets.hud,
-            Display::new(Some(0.5), GameMode::Survival),
+            crosshair(Some(0.5), GameMode::Survival),
         )
         .unwrap();
         let (x, y) = (426 / 2 - 8, 240 / 2 + 9);
@@ -199,6 +419,22 @@ mod tests {
                 0
             };
             assert_eq!(progress.pixels[index], expected, "pixel {sx}");
+        }
+        let mut canvas = Canvas::new(426, 240);
+        draw_hotbar(
+            &mut canvas,
+            &assets.hud,
+            Display::new(Some(0.5), GameMode::Survival, AttackIndicator::Hotbar),
+            false,
+        );
+        for sy in 0..18 {
+            let index = ((220 + sy) * 426 + 310) as usize;
+            let expected = if sy >= 9 {
+                0xff00_0000 | ((40 + (sy % 3) * 50) as u32) << 16 | 60 << 8 | 80
+            } else {
+                0xff0a_141e
+            };
+            assert_eq!(canvas.pixels[index], expected, "row {sy}");
         }
     }
 }

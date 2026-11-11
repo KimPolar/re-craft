@@ -8014,6 +8014,24 @@ impl LoadedSession {
         &mut self,
         drops: &crate::worldgen::postprocessing_drops::GeneratedBlockDrops,
     ) -> anyhow::Result<()> {
+        self.install_initial_generated_drops_inner(drops, None)
+    }
+
+    /// Install drops after the generation batch proved that the recorded
+    /// destruction events had no possible listeners.
+    pub fn install_initial_generated_drops_with_inert_events(
+        &mut self,
+        drops: &crate::worldgen::postprocessing_drops::GeneratedBlockDrops,
+        proof: &crate::worldgen::postprocessing_drops::InertGeneratedDestroyEvents,
+    ) -> anyhow::Result<()> {
+        self.install_initial_generated_drops_inner(drops, Some(proof))
+    }
+
+    fn install_initial_generated_drops_inner(
+        &mut self,
+        drops: &crate::worldgen::postprocessing_drops::GeneratedBlockDrops,
+        proof: Option<&crate::worldgen::postprocessing_drops::InertGeneratedDestroyEvents>,
+    ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         ensure!(
             self.tick == 0 && self.accumulated == Duration::ZERO && !self.generated_drops_installed,
@@ -8036,7 +8054,8 @@ impl LoadedSession {
             "generated drop rule differs from the session"
         );
         ensure!(
-            drops.destroy_events().is_empty(),
+            drops.destroy_events().is_empty()
+                || proof.is_some_and(|proof| drops.verify_inert_proof(proof)),
             "generated block destroy events require listener integration"
         );
 
@@ -27063,6 +27082,85 @@ pub(crate) mod tests {
                 Some(random)
             );
         }
+    }
+
+    #[test]
+    fn generated_inert_events_can_install_without_losing_items() {
+        use crate::worldgen::postprocessing_drops::GeneratedBlockDrops;
+        use native_core::random::{LegacyRandom, XoroshiroRandom};
+        use native_persistence::random_sequences::RandomSequences;
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        let position = session.origin + IVec3::new(6, 2, 6);
+        let ladder = state(
+            "minecraft:ladder",
+            &[("facing", "east"), ("waterlogged", "false")],
+        );
+        let mut drops = GeneratedBlockDrops::new(
+            test_ladder_loot(),
+            42,
+            RandomSequences::read(None).unwrap(),
+            LegacyRandom::new(77),
+            XoroshiroRandom::new(77),
+            true,
+        );
+        drops.drop_block(position, &ladder).unwrap();
+        let mut event_world = (*session.world).clone();
+        let chunks: Vec<_> = (-1..=1)
+            .flat_map(|dx| {
+                (-1..=1).map(move |dz| ChunkPos {
+                    x: chunk.x + dx,
+                    z: chunk.z + dz,
+                })
+            })
+            .collect();
+        for &pos in &chunks {
+            event_world.chunks.entry(pos).or_insert_with(|| {
+                Arc::new(native_world::loaded::Chunk {
+                    position: pos,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: true,
+                    sections: BTreeMap::new(),
+                })
+            });
+        }
+        let blocks = chunks
+            .iter()
+            .copied()
+            .map(|pos| (pos, Vec::new()))
+            .collect();
+        let entities = chunks
+            .iter()
+            .copied()
+            .map(|pos| (pos, Some(Arc::new(Vec::new()))))
+            .collect();
+        drops.record_destroy_event(
+            position.to_array(),
+            &ladder,
+            Arc::new(event_world),
+            &chunks,
+            blocks,
+            entities,
+        );
+        let proof = drops.certify_inert_events(|_| Ok(true)).unwrap();
+        session
+            .set_initial_entity_chunk(
+                chunk,
+                SavedEntityData::from_generated(chunk, drops.records(chunk)).unwrap(),
+            )
+            .unwrap();
+        let mut different = drops.clone();
+        different.drop_block(position + IVec3::X, &ladder).unwrap();
+        assert!(
+            session
+                .install_initial_generated_drops_with_inert_events(&different, &proof)
+                .is_err()
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+        session
+            .install_initial_generated_drops_with_inert_events(&drops, &proof)
+            .unwrap();
+        assert_eq!(session.dropped_items.snapshot().len(), 1);
     }
 
     #[test]

@@ -3450,6 +3450,25 @@ impl FreshTerrainBatch {
         processed.merge_complete_entity_records(&source)
     }
 
+    /// Prove that recorded destruction events could not reach a block or
+    /// entity listener. Every section-column in Java's notification radius
+    /// must be converted, present and have complete empty entity coverage.
+    pub fn certify_inert_destroy_events(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<super::postprocessing_drops::InertGeneratedDestroyEvents> {
+        self.validate_postprocessing(processed)?;
+        ensure!(self.is_complete(), "generation batch has pending work");
+        let drops = processed
+            .block_drops()
+            .context("block drop checkpoint is missing")?;
+        drops.certify_inert_events(|pos| {
+            Ok(self
+                .complete_generated_entity_records_in_complete_batch(pos)?
+                .is_some_and(<[_]>::is_empty))
+        })
+    }
+
     fn postprocessing_source_inputs(&self, pos: ChunkPos) -> Result<PostprocessingSourceInputs> {
         let (block_ticks, fluid_ticks) = self.spawned_tick_data(pos)?;
         Ok(PostprocessingSourceInputs {

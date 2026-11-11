@@ -70,6 +70,12 @@ impl PartialEq for GeneratedBlockDestroyEvent {
 }
 impl Eq for GeneratedBlockDestroyEvent {}
 
+/// Proof tied to one immutable event sequence. Construction is restricted to
+/// a validated generation batch with complete entity coverage.
+pub struct InertGeneratedDestroyEvents {
+    events: Arc<Vec<GeneratedBlockDestroyEvent>>,
+}
+
 /// A forkable checkpoint of one level's loot, item and level random streams.
 /// The caller supplies the same initial random streams and rules used by the
 /// level; no random state is inferred from the terrain seed.
@@ -242,6 +248,64 @@ impl GeneratedBlockDrops {
     /// Events have not yet been delivered to game-event listeners.
     pub fn destroy_events(&self) -> &[GeneratedBlockDestroyEvent] {
         &self.destroy_events
+    }
+
+    pub(crate) fn verify_inert_proof(&self, proof: &InertGeneratedDestroyEvents) -> bool {
+        Arc::ptr_eq(&self.destroy_events, &proof.events)
+            && u64::try_from(self.destroy_events.len()).ok() == Some(self.operations)
+    }
+
+    pub(crate) fn certify_inert_events(
+        &self,
+        mut complete_empty_source: impl FnMut(ChunkPos) -> Result<bool>,
+    ) -> Result<InertGeneratedDestroyEvents> {
+        ensure!(
+            !self.destroy_events.is_empty(),
+            "no generated destroy events"
+        );
+        ensure!(
+            u64::try_from(self.destroy_events.len()).ok() == Some(self.operations),
+            "generated drop operations differ from destroy events"
+        );
+        let mut checked = BTreeSet::new();
+        for event in self.destroy_events.iter() {
+            let x = i64::from(event.position[0]);
+            let z = i64::from(event.position[2]);
+            for cx in (x - 16).div_euclid(16)..=(x + 16).div_euclid(16) {
+                for cz in (z - 16).div_euclid(16)..=(z + 16).div_euclid(16) {
+                    let chunk = ChunkPos {
+                        x: i32::try_from(cx)?,
+                        z: i32::try_from(cz)?,
+                    };
+                    ensure!(
+                        event.registered_chunks.contains(&chunk)
+                            && event.world.chunks.contains_key(&chunk),
+                        "event listener chunk is unavailable"
+                    );
+                    ensure!(
+                        event.block_entities.get(&chunk).is_some_and(Vec::is_empty),
+                        "event block listeners are not known to be absent"
+                    );
+                    ensure!(
+                        event
+                            .entities
+                            .get(&chunk)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|records| records.is_empty()),
+                        "event entity listeners are not known to be absent"
+                    );
+                    if checked.insert(chunk) {
+                        ensure!(
+                            complete_empty_source(chunk)?,
+                            "event entity coverage is incomplete or nonempty"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(InertGeneratedDestroyEvents {
+            events: Arc::clone(&self.destroy_events),
+        })
     }
 
     pub(crate) fn record_destroy_event(
@@ -421,6 +485,68 @@ mod tests {
                 ("waterlogged".into(), "true".into()),
             ]),
         }
+    }
+
+    #[test]
+    fn inert_destroy_proof_requires_complete_empty_radius_and_tracks_sequence() {
+        use native_world::loaded::Chunk;
+        let chunks: Vec<_> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| ChunkPos { x, z }))
+            .collect();
+        let mut world = World::new("minecraft:overworld");
+        for &position in &chunks {
+            world.chunks.insert(
+                position,
+                Arc::new(Chunk {
+                    position,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: true,
+                    sections: BTreeMap::new(),
+                }),
+            );
+        }
+        let block_entities = chunks
+            .iter()
+            .copied()
+            .map(|pos| (pos, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        let entities = chunks
+            .iter()
+            .copied()
+            .map(|pos| (pos, Some(Arc::new(Vec::new()))))
+            .collect::<BTreeMap<_, _>>();
+        let mut drops = fixture(true);
+        drops.drop_block(IVec3::new(1, 5, 1), &ladder()).unwrap();
+        drops.record_destroy_event(
+            [1, 5, 1],
+            &ladder(),
+            Arc::new(world),
+            &chunks,
+            block_entities,
+            entities,
+        );
+        assert!(drops.certify_inert_events(|pos| Ok(pos.x != 1)).is_err());
+        let mut unknown = drops.clone();
+        let event = &mut Arc::make_mut(&mut unknown.destroy_events)[0];
+        Arc::make_mut(&mut event.entities).insert(chunks[0], None);
+        assert!(unknown.certify_inert_events(|_| Ok(true)).is_err());
+        let mut listener = drops.clone();
+        let event = &mut Arc::make_mut(&mut listener.destroy_events)[0];
+        Arc::make_mut(&mut event.block_entities)
+            .get_mut(&chunks[0])
+            .unwrap()
+            .push(Tag::Compound(vec![]));
+        assert!(listener.certify_inert_events(|_| Ok(true)).is_err());
+        let mut incomplete = drops.clone();
+        let event = &mut Arc::make_mut(&mut incomplete.destroy_events)[0];
+        Arc::make_mut(&mut event.block_entities).remove(&chunks[0]);
+        assert!(incomplete.certify_inert_events(|_| Ok(true)).is_err());
+        let proof = drops.certify_inert_events(|_| Ok(true)).unwrap();
+        assert!(drops.verify_inert_proof(&proof));
+        let mut changed = drops.clone();
+        changed.drop_block(IVec3::new(2, 5, 1), &ladder()).unwrap();
+        assert!(!changed.verify_inert_proof(&proof));
+        assert!(changed.certify_inert_events(|_| Ok(true)).is_err());
     }
 
     #[test]

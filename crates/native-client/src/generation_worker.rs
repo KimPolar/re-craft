@@ -851,6 +851,12 @@ impl GenerationReady {
                 "generated session mesh snapshot is stale"
             );
         }
+        let inert_events = match (&self.postprocessed, generated_drops) {
+            (Some(processed), Some(drops)) if !drops.destroy_events().is_empty() => {
+                Some(self.batch.certify_inert_destroy_events(&processed.region)?)
+            }
+            _ => None,
+        };
         let mesh = self
             .postprocessed
             .as_ref()
@@ -1075,7 +1081,11 @@ impl GenerationReady {
             session.set_block_drops(rules.block_drops);
             session.set_entity_drops(rules.entity_drops);
             if let Some(drops) = generated_drops {
-                session.install_initial_generated_drops(drops)?;
+                if let Some(proof) = &inert_events {
+                    session.install_initial_generated_drops_with_inert_events(drops, proof)?;
+                } else {
+                    session.install_initial_generated_drops(drops)?;
+                }
             }
             session.set_source_conversion(
                 rules.water_source_conversion,

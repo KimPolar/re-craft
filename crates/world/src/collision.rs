@@ -1079,6 +1079,31 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
     Some(f32::from(2 + step * age) / 16.0)
 }
 
+pub fn full_copper(state: &BlockState) -> bool {
+    if !state.properties.is_empty() {
+        return false;
+    }
+    let Some(id) = state.name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    let id = id.strip_prefix("waxed_").unwrap_or(id);
+    matches!(
+        id,
+        "copper_block"
+            | "exposed_copper"
+            | "weathered_copper"
+            | "oxidized_copper"
+            | "cut_copper"
+            | "exposed_cut_copper"
+            | "weathered_cut_copper"
+            | "oxidized_cut_copper"
+            | "chiseled_copper"
+            | "exposed_chiseled_copper"
+            | "weathered_chiseled_copper"
+            | "oxidized_chiseled_copper"
+    )
+}
+
 pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
     if !matches!(
         state.name.as_str(),
@@ -1104,7 +1129,7 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
-    if copper_bulb_state(state).is_some() {
+    if copper_bulb_state(state).is_some() || full_copper(state) {
         return Some(FULL.to_vec());
     }
     if state.name == "minecraft:glow_lichen" {

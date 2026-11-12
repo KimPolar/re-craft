@@ -262,6 +262,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         "minecraft:redstone_lamp" if state.properties.len() == 1 => {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
+        _ if crate::collision::full_copper(state) => (15, 0),
         name if crate::collision::copper_bulb_state(state).is_some() => {
             let (lit, _) = crate::collision::copper_bulb_state(state)?;
             let id = name.strip_prefix("minecraft:")?;
@@ -1425,6 +1426,19 @@ mod tests {
         bulb.properties.insert("extra".into(), "true".into());
         assert!(properties(&bulb).is_none());
         assert!(crate::collision::block_shape(&bulb).is_none());
+    }
+
+    #[test]
+    fn full_copper_rejects_unknown_names_and_properties() {
+        let mut copper = state("waxed_oxidized_copper", None);
+        assert_eq!(properties(&copper), Some((15, 0)));
+        assert!(crate::collision::block_shape(&copper).is_some());
+        copper.properties.insert("extra".into(), "true".into());
+        assert!(properties(&copper).is_none());
+        assert!(crate::collision::block_shape(&copper).is_none());
+        let unknown = state("oxidized_copper_block", None);
+        assert!(properties(&unknown).is_none());
+        assert!(crate::collision::block_shape(&unknown).is_none());
     }
 
     #[test]
@@ -2611,6 +2625,27 @@ mod tests {
             .map(|n| format!("minecraft:{n}"))
             .collect::<Vec<_>>();
         requested.extend(native_core::wood::Wood::all().map(|wood| wood.id().to_owned()));
+        for prefix in [
+            "",
+            "exposed_",
+            "weathered_",
+            "oxidized_",
+            "waxed_",
+            "waxed_exposed_",
+            "waxed_weathered_",
+            "waxed_oxidized_",
+        ] {
+            requested.push(format!(
+                "minecraft:{prefix}{}",
+                if matches!(prefix, "" | "waxed_") {
+                    "copper_block"
+                } else {
+                    "copper"
+                }
+            ));
+            requested.push(format!("minecraft:{prefix}cut_copper"));
+            requested.push(format!("minecraft:{prefix}chiseled_copper"));
+        }
         requested.extend(
             native_core::wood::Planks::ALL
                 .into_iter()
@@ -2649,7 +2684,10 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
-            if s.name == "minecraft:frosted_ice" || s.name.ends_with("copper_bulb") {
+            if s.name == "minecraft:frosted_ice"
+                || s.name.ends_with("copper_bulb")
+                || crate::collision::full_copper(&s)
+            {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
                 }

@@ -34,7 +34,7 @@ public class BlockLightStatesOracle {
                 entry.addProperty("opacity", state.getLightDampening());
                 entry.addProperty("emission", state.getLightEmission());
                 entry.addProperty("shaped", state.useShapeForLightOcclusion());
-                if (name.equals("minecraft:frosted_ice")) {
+                if (name.equals("minecraft:frosted_ice") || name.endsWith("copper_bulb")) {
                     entry.addProperty("friction", block.getFriction());
                     var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
                     var pos = net.minecraft.core.BlockPos.ZERO;

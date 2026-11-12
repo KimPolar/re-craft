@@ -262,6 +262,18 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         "minecraft:redstone_lamp" if state.properties.len() == 1 => {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
+        name if crate::collision::copper_bulb_state(state).is_some() => {
+            let (lit, _) = crate::collision::copper_bulb_state(state)?;
+            let id = name.strip_prefix("minecraft:")?;
+            let emission = match id.strip_prefix("waxed_").unwrap_or(id) {
+                "copper_bulb" => 15,
+                "exposed_copper_bulb" => 12,
+                "weathered_copper_bulb" => 8,
+                "oxidized_copper_bulb" => 4,
+                _ => return None,
+            };
+            (15, if lit { emission } else { 0 })
+        }
         "minecraft:cave_vines" | "minecraft:cave_vines_plant" => {
             let head = state.name == "minecraft:cave_vines";
             if state.properties.len() != if head { 2 } else { 1 } {
@@ -1401,6 +1413,21 @@ mod tests {
     }
 
     #[test]
+    fn copper_bulb_light_requires_valid_state() {
+        let mut bulb = state("waxed_weathered_copper_bulb", Some(true));
+        bulb.properties.insert("powered".into(), "false".into());
+        assert_eq!(properties(&bulb), Some((15, 8)));
+        assert!(crate::collision::block_shape(&bulb).is_some());
+        bulb.properties.insert("powered".into(), "invalid".into());
+        assert!(properties(&bulb).is_none());
+        assert!(crate::collision::block_shape(&bulb).is_none());
+        bulb.properties.insert("powered".into(), "true".into());
+        bulb.properties.insert("extra".into(), "true".into());
+        assert!(properties(&bulb).is_none());
+        assert!(crate::collision::block_shape(&bulb).is_none());
+    }
+
+    #[test]
     fn ladder_light_tracks_contained_water_and_validates_facing() {
         for facing in ["north", "south", "west", "east"] {
             let mut ladder = state("ladder", None);
@@ -2510,6 +2537,14 @@ mod tests {
             "redstone_torch",
             "redstone_wall_torch",
             "redstone_lamp",
+            "copper_bulb",
+            "exposed_copper_bulb",
+            "weathered_copper_bulb",
+            "oxidized_copper_bulb",
+            "waxed_copper_bulb",
+            "waxed_exposed_copper_bulb",
+            "waxed_weathered_copper_bulb",
+            "waxed_oxidized_copper_bulb",
             "redstone_block",
             "lever",
             "stone_button",
@@ -2614,8 +2649,10 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
-            if s.name == "minecraft:frosted_ice" {
-                assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
+            if s.name == "minecraft:frosted_ice" || s.name.ends_with("copper_bulb") {
+                if s.name == "minecraft:frosted_ice" {
+                    assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
+                }
                 let shape = crate::collision::block_shape(&s).unwrap();
                 assert_eq!(shape.len(), 1);
                 assert_eq!(

@@ -1079,8 +1079,34 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
     Some(f32::from(2 + step * age) / 16.0)
 }
 
+pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:copper_bulb"
+            | "minecraft:exposed_copper_bulb"
+            | "minecraft:weathered_copper_bulb"
+            | "minecraft:oxidized_copper_bulb"
+            | "minecraft:waxed_copper_bulb"
+            | "minecraft:waxed_exposed_copper_bulb"
+            | "minecraft:waxed_weathered_copper_bulb"
+            | "minecraft:waxed_oxidized_copper_bulb"
+    ) || state.properties.len() != 2
+    {
+        return None;
+    }
+    let boolean = |name| match state.properties.get(name)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    Some((boolean("lit")?, boolean("powered")?))
+}
+
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if copper_bulb_state(state).is_some() {
+        return Some(FULL.to_vec());
+    }
     if state.name == "minecraft:glow_lichen" {
         return glow_lichen_faces(state).map(|_| Vec::new());
     }

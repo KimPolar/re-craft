@@ -292,6 +292,36 @@ fn generated_block_defaults_match_java() {
         for waterlogged in ["true", "false", "invalid"] {
             cases.push(serde_json::json!({"id":grate,"properties":{"waterlogged":waterlogged}}));
         }
+        let stairs = format!("minecraft:{prefix}cut_copper_stairs");
+        let trapdoor = format!("minecraft:{prefix}copper_trapdoor");
+        assert!(
+            registry.contains(&stairs),
+            "missing copper stairs: {stairs}"
+        );
+        assert!(
+            registry.contains(&trapdoor),
+            "missing copper trapdoor: {trapdoor}"
+        );
+        for facing in ["north", "south", "east", "west"] {
+            for half in ["bottom", "top"] {
+                for waterlogged in ["false", "true"] {
+                    for shape in [
+                        "straight",
+                        "inner_left",
+                        "inner_right",
+                        "outer_left",
+                        "outer_right",
+                    ] {
+                        cases.push(serde_json::json!({"id":stairs,"properties":{"facing":facing,"half":half,"shape":shape,"waterlogged":waterlogged}}));
+                    }
+                    for open in ["false", "true"] {
+                        for powered in ["false", "true"] {
+                            cases.push(serde_json::json!({"id":trapdoor,"properties":{"facing":facing,"half":half,"open":open,"powered":powered,"waterlogged":waterlogged}}));
+                        }
+                    }
+                }
+            }
+        }
         let id = format!("minecraft:{prefix}copper_bulb");
         assert!(registry.contains(&id), "missing copper bulb schema: {id}");
         for lit in ["true", "false", "invalid"] {

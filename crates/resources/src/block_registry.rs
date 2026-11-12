@@ -716,8 +716,10 @@ impl GeneratedBlockRegistry {
                         | "CUT_COPPER"
                         | "CHISELED_COPPER"
                         | "COPPER_GRATE"
+                        | "CUT_COPPER_STAIRS"
                         | "CUT_COPPER_SLAB"
                         | "COPPER_DOOR"
+                        | "COPPER_TRAPDOOR"
                         | "COPPER_BARS"
                         | "COPPER_BULB"
                 ) && copper_factory
@@ -759,6 +761,14 @@ impl GeneratedBlockRegistry {
                                 "cut_copper_slab",
                                 "net/minecraft/world/level/block/SlabBlock",
                             ),
+                            ("CUT_COPPER_STAIRS", true) => (
+                                "cut_copper_stairs",
+                                "net/minecraft/world/level/block/WeatheringCopperStairBlock",
+                            ),
+                            ("CUT_COPPER_STAIRS", false) => (
+                                "cut_copper_stairs",
+                                "net/minecraft/world/level/block/StairBlock",
+                            ),
                             ("COPPER_DOOR", true) => (
                                 "copper_door",
                                 "net/minecraft/world/level/block/WeatheringCopperDoorBlock",
@@ -766,6 +776,14 @@ impl GeneratedBlockRegistry {
                             ("COPPER_DOOR", false) => {
                                 ("copper_door", "net/minecraft/world/level/block/DoorBlock")
                             }
+                            ("COPPER_TRAPDOOR", true) => (
+                                "copper_trapdoor",
+                                "net/minecraft/world/level/block/WeatheringCopperTrapDoorBlock",
+                            ),
+                            ("COPPER_TRAPDOOR", false) => (
+                                "copper_trapdoor",
+                                "net/minecraft/world/level/block/TrapDoorBlock",
+                            ),
                             ("COPPER_BARS", true) => (
                                 "copper_bars",
                                 "net/minecraft/world/level/block/WeatheringCopperBarsBlock",
@@ -996,7 +1014,10 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/WeatheringCopperSlabBlock" => {
                     Some(StateSchema::Slab)
                 }
-                "net/minecraft/world/level/block/StairBlock" => Some(StateSchema::Stairs),
+                "net/minecraft/world/level/block/StairBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperStairBlock" => {
+                    Some(StateSchema::Stairs)
+                }
                 "net/minecraft/world/level/block/GlazedTerracottaBlock"
                 | "net/minecraft/world/level/block/WallTorchBlock"
                 | "net/minecraft/world/level/block/CarvedPumpkinBlock" => {

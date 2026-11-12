@@ -23,9 +23,10 @@ public class JigsawPieceOracle {
         var feature=vanilla.lookupOrThrow(Registries.PLACED_FEATURE).listElements().findFirst().orElseThrow().key().identifier().toString();
         var single=JsonParser.parseString("{\"element_type\":\"minecraft:single_pool_element\",\"location\":\"example:room\",\"processors\":\"minecraft:empty\",\"projection\":\"rigid\",\"override_liquid_settings\":\"ignore_waterlogging\"}").getAsJsonObject();
         var legacy=single.deepCopy(); legacy.addProperty("element_type","minecraft:legacy_single_pool_element"); legacy.remove("override_liquid_settings");
+        var inline=single.deepCopy(); inline.add("processors",JsonParser.parseString("{\"processors\":[]}"));
         var feat=new JsonObject(); feat.addProperty("element_type","minecraft:feature_pool_element"); feat.addProperty("feature",feature); feat.addProperty("projection","terrain_matching");
         var nested=new JsonObject(); nested.addProperty("element_type","minecraft:list_pool_element"); nested.addProperty("projection","terrain_matching"); var members=new JsonArray(); members.add(single.deepCopy()); members.add(feat.deepCopy()); nested.add("elements",members);
-        var inputs=new JsonObject[]{single,legacy,feat,nested};
+        var inputs=new JsonObject[]{single,legacy,feat,nested,inline};
         Field uf=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); uf.setAccessible(true); var unsafe=(sun.misc.Unsafe)uf.get(null);
         var manager=(StructureTemplateManager)unsafe.allocateInstance(StructureTemplateManager.class);
         RegistryAccess access=new RegistryAccess() {

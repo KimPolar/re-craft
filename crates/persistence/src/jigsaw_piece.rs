@@ -1,8 +1,8 @@
 //! Lossless supported subset of Java 26.3 jigsaw piece NBT.
 //!
 //! This prepares and reads tags; it does not authorize writing a world. Inline
-//! feature and processor holders are rejected until their codecs can be saved
-//! without losing types or fields.
+//! feature and nonempty processor holders are rejected until their codecs can
+//! be saved without losing types or fields.
 use anyhow::{Context, Result, bail, ensure};
 use native_core::beardifier::BoundingBox;
 use native_resources::{
@@ -110,6 +110,30 @@ fn holder_tag(value: &HolderValue) -> Result<Tag> {
     }
 }
 
+fn processor_holder_tag(value: &HolderValue) -> Result<Tag> {
+    if let HolderValue::Inline(json) = value {
+        let object = json
+            .as_object()
+            .context("invalid inline processor holder")?;
+        ensure!(
+            object.len() == 1
+                && object
+                    .get("processors")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|v| v.is_empty()),
+            "unsupported inline processor holder"
+        );
+        return Ok(Tag::Compound(vec![(
+            "processors".into(),
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            },
+        )]));
+    }
+    holder_tag(value)
+}
+
 fn element_tag(element: &PoolElement, depth: usize) -> Result<Tag> {
     ensure!(depth <= 64, "jigsaw element nesting is too deep");
     let mut fields = Vec::new();
@@ -134,7 +158,7 @@ fn element_tag(element: &PoolElement, depth: usize) -> Result<Tag> {
                 }),
             ));
             fields.push(("location".into(), string(&id_text(location)?)));
-            fields.push(("processors".into(), holder_tag(processors)?));
+            fields.push(("processors".into(), processor_holder_tag(processors)?));
             fields.push(("projection".into(), string(projection_name(*projection))));
             if let Some(liquid) = override_liquid_settings {
                 fields.push((
@@ -257,6 +281,22 @@ fn parse_liquid(value: &str) -> Result<LiquidSettings> {
         _ => bail!("invalid jigsaw liquid settings"),
     }
 }
+
+fn parse_processor_holder(tag: &Tag) -> Result<HolderValue> {
+    if let Tag::String(text) = tag {
+        return Ok(HolderValue::Reference(parse_id(&String::from_utf16(
+            &text.0,
+        )?)?));
+    }
+    strict_fields(tag, &["processors"], &[])?;
+    match tag.get("processors") {
+        Some(Tag::List {
+            element_type: TagType::End,
+            values,
+        }) if values.is_empty() => Ok(HolderValue::Inline(serde_json::json!({"processors":[]}))),
+        _ => bail!("unsupported inline processor holder"),
+    }
+}
 fn parse_element(tag: &Tag, depth: usize) -> Result<PoolElement> {
     ensure!(depth <= 64, "jigsaw element nesting is too deep");
     let kind = text(tag, "element_type")?;
@@ -274,7 +314,9 @@ fn parse_element(tag: &Tag, depth: usize) -> Result<PoolElement> {
             Ok(PoolElement::Single {
                 legacy: kind == "minecraft:legacy_single_pool_element",
                 location: parse_id(&text(tag, "location")?)?,
-                processors: HolderValue::Reference(parse_id(&text(tag, "processors")?)?),
+                processors: parse_processor_holder(
+                    tag.get("processors").context("missing processors")?,
+                )?,
                 projection: parse_projection(&text(tag, "projection")?)?,
                 override_liquid_settings: tag
                     .get("override_liquid_settings")
@@ -551,7 +593,18 @@ mod tests {
             unreachable!()
         };
         *processors = HolderValue::Inline(json!({"processors":[]}));
-        assert!(inline.to_tag().is_err());
+        let inline_tag = inline.to_tag()?;
+        assert_eq!(SavedJigsawPiece::from_tag(&inline_tag)?, inline);
+        for unsupported in [
+            json!({"processors":[],"extra":true}),
+            json!({"processors":[{"processor_type":"minecraft:nop"}]}),
+        ] {
+            let PoolElement::Single { processors, .. } = &mut inline.piece.element else {
+                unreachable!()
+            };
+            *processors = HolderValue::Inline(unsupported);
+            assert!(inline.to_tag().is_err());
+        }
         let mut default = value;
         default.piece.junctions.clear();
         default.liquid_settings = LiquidSettings::ApplyWaterlogging;
@@ -578,6 +631,33 @@ mod tests {
         };
         assert!(SavedJigsawPiece::from_tag(&typed_empty).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn inline_processor_holder_rejects_unpreservable_nbt() {
+        for tag in [
+            Tag::Compound(vec![]),
+            Tag::Compound(vec![("processors".into(), Tag::Int(0))]),
+            Tag::Compound(vec![(
+                "processors".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![],
+                },
+            )]),
+            Tag::Compound(vec![
+                (
+                    "processors".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+                ("extra".into(), Tag::Byte(1)),
+            ]),
+        ] {
+            assert!(parse_processor_holder(&tag).is_err(), "{tag:?}");
+        }
     }
 
     fn equivalent(a: &Tag, b: &Tag) -> bool {
@@ -725,7 +805,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(count, 32);
+        assert_eq!(count, 40);
         Ok(())
     }
 

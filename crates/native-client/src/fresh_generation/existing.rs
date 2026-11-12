@@ -247,6 +247,7 @@ pub(crate) struct CapturedStagedLight {
     initialized: BTreeSet<native_world::loaded::ChunkPos>,
     activated: BTreeSet<native_world::loaded::ChunkPos>,
     light_revision: Arc<()>,
+    completed_empty_spawns: BTreeMap<native_world::loaded::ChunkPos, bool>,
 }
 
 /// An in-memory LIGHT-stage draft for a previously absent terrain chunk.
@@ -316,6 +317,71 @@ impl CapturedSavedLitDraft {
             && Arc::ptr_eq(&self.identity, &light.identity)
             && Arc::ptr_eq(&self.revision, &light.revision)
             && Arc::ptr_eq(&self.light_revision, &light.light_revision)
+    }
+}
+
+enum CapturedLitChunkDraft {
+    New(CapturedNewLitDraft),
+    Saved(CapturedSavedLitDraft),
+}
+
+/// Intermediate SPAWN result with no original mob spawning. Entity sidecars,
+/// live rules and the remaining save dependencies still require validation.
+pub(crate) struct CapturedEmptySpawnDraft {
+    lit: CapturedLitChunkDraft,
+    position: native_world::loaded::ChunkPos,
+    spawn_mobs: bool,
+}
+
+impl CapturedEmptySpawnDraft {
+    pub fn document(&self) -> &NamedTag {
+        match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.document(),
+            CapturedLitChunkDraft::Saved(draft) => draft.document(),
+        }
+    }
+
+    pub fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        match (&self.lit, source) {
+            (CapturedLitChunkDraft::New(_), None) => Ok(true),
+            (CapturedLitChunkDraft::Saved(draft), Some(source)) => draft.matches_source(source),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn entity_sidecar_source(&self) -> Option<&NamedTag> {
+        match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.entity_sidecar_source(),
+            CapturedLitChunkDraft::Saved(draft) => draft.entity_sidecar_source(),
+        }
+    }
+
+    pub fn has_entity_free_feature_coverage(&self) -> bool {
+        match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.has_entity_free_feature_coverage(),
+            CapturedLitChunkDraft::Saved(draft) => draft.has_entity_free_feature_coverage(),
+        }
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+    ) -> bool {
+        let lit_matches = match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.matches_state(batch, light),
+            CapturedLitChunkDraft::Saved(draft) => draft.matches_state(batch, light),
+        };
+        lit_matches
+            && self.spawn_mobs == spawn_mobs
+            && light.completed_empty_spawns.get(&self.position) == Some(&spawn_mobs)
+            && batch
+                .schedule
+                .completed(self.position)
+                .is_some_and(|stage| {
+                    stage >= native_session::worldgen::schedule::GenerationStage::Spawn
+                })
     }
 }
 
@@ -939,6 +1005,7 @@ impl PreparedExistingGenerator {
             initialized: light.initialized,
             activated: BTreeSet::new(),
             light_revision: Arc::new(()),
+            completed_empty_spawns: BTreeMap::new(),
         })
     }
 
@@ -1215,6 +1282,129 @@ impl PreparedExistingGenerator {
             document,
             entity_sidecar,
             feature_entity_coverage: batch.feature_entity_sources.covers(key),
+        })
+    }
+
+    /// Complete the mixed chunk's spawn stage when original mobs are disabled.
+    /// The caller must capture the rule from the live session and recheck it
+    /// before publishing the resulting world state.
+    pub fn complete_captured_spawn_without_mobs(
+        &self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedStagedLight,
+        position: native_world::loaded::ChunkPos,
+        spawn_mobs: bool,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && Arc::ptr_eq(&light.identity, &batch.identity)
+                && Arc::ptr_eq(&light.revision, &batch.revision),
+            "spawn belongs to another terrain revision"
+        );
+        ensure!(
+            light.activated.contains(&position),
+            "spawn chunk has not been lit"
+        );
+        ensure!(
+            batch.schedule.ready(position, GenerationStage::Spawn),
+            "spawn dependencies are incomplete"
+        );
+        for (radius, &needed) in GenerationStage::Spawn
+            .accumulated()
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let radius = i32::try_from(radius)?;
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx.abs().max(dz.abs()) != radius {
+                        continue;
+                    }
+                    let neighbor = native_world::loaded::ChunkPos {
+                        x: position
+                            .x
+                            .checked_add(dx)
+                            .context("spawn chunk X overflow")?,
+                        z: position
+                            .z
+                            .checked_add(dz)
+                            .context("spawn chunk Z overflow")?,
+                    };
+                    ensure!(
+                        batch
+                            .schedule
+                            .completed(neighbor)
+                            .is_some_and(|stage| stage >= needed),
+                        "spawn dependencies are incomplete"
+                    );
+                }
+            }
+        }
+        ensure!(
+            !light.completed_empty_spawns.contains_key(&position),
+            "spawn already completed"
+        );
+        let disabled = self
+            .generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")?;
+        ensure!(
+            disabled || !spawn_mobs,
+            "world-generation mob spawning needs a complete spawn context"
+        );
+        batch.schedule.complete(position, GenerationStage::Spawn)?;
+        light.completed_empty_spawns.insert(position, spawn_mobs);
+        Ok(())
+    }
+
+    /// Construct a non-writable spawn draft for either captured source kind.
+    pub fn draft_captured_empty_spawn(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        position: native_persistence::world::ChunkPos,
+        spawn_mobs: bool,
+        last_update: i64,
+    ) -> Result<CapturedEmptySpawnDraft> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let key = native_world::loaded::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        ensure!(
+            light.completed_empty_spawns.get(&key) == Some(&spawn_mobs)
+                && batch
+                    .schedule
+                    .completed(key)
+                    .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "spawn rule or stage differs"
+        );
+        let lit = match batch
+            .sources
+            .get(&position)
+            .context("terrain source was not captured")?
+        {
+            None => {
+                let mut draft =
+                    self.draft_captured_new_lit_chunk(batch, light, position, last_update)?;
+                replace_unique_root_field(
+                    &mut draft.document,
+                    "Status",
+                    Tag::String("minecraft:spawn".into()),
+                )?;
+                native_persistence::nbt::write(&draft.document)?;
+                CapturedLitChunkDraft::New(draft)
+            }
+            Some(_) => CapturedLitChunkDraft::Saved(
+                self.draft_captured_saved_lit_chunk(batch, light, position)?,
+            ),
+        };
+        Ok(CapturedEmptySpawnDraft {
+            lit,
+            position: key,
+            spawn_mobs,
         })
     }
 
@@ -5037,8 +5227,8 @@ mod tests {
             z: second.z,
         };
         let mut schedule = GenerationSchedule::new();
-        schedule.request(target, GenerationStage::Light)?;
-        schedule.request(second, GenerationStage::Light)?;
+        schedule.request(target, GenerationStage::Spawn)?;
+        schedule.request(second, GenerationStage::Spawn)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
         let selected = actual.context.selection();
@@ -5398,6 +5588,55 @@ mod tests {
             batch.schedule().completed(target),
             Some(GenerationStage::Light)
         );
+        assert!(
+            actual
+                .draft_captured_empty_spawn(&batch, &staged, saved_target, false, 42)
+                .is_err()
+        );
+        assert!(
+            actual
+                .complete_captured_spawn_without_mobs(&mut batch, &mut staged, target, true)
+                .is_err()
+        );
+        assert_eq!(
+            batch.schedule().completed(target),
+            Some(GenerationStage::Light)
+        );
+        actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, target, false)?;
+        actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, second, false)?;
+        assert!(
+            actual
+                .complete_captured_spawn_without_mobs(&mut batch, &mut staged, target, false)
+                .is_err()
+        );
+        assert!(
+            actual
+                .draft_captured_empty_spawn(&batch, &staged, saved_target, true, 42)
+                .is_err()
+        );
+        let new_spawn =
+            actual.draft_captured_empty_spawn(&batch, &staged, saved_target, false, 42)?;
+        let saved_spawn =
+            actual.draft_captured_empty_spawn(&batch, &staged, saved_second, false, 42)?;
+        assert!(new_spawn.matches_state(&batch, &staged, false));
+        assert!(saved_spawn.matches_state(&batch, &staged, false));
+        assert!(!new_spawn.matches_state(&batch, &staged, true));
+        assert!(new_spawn.matches_source(None)?);
+        assert!(!new_spawn.matches_source(Some(&saved))?);
+        assert!(saved_spawn.matches_source(Some(&saved))?);
+        assert!(!saved_spawn.matches_source(None)?);
+        assert!(new_spawn.entity_sidecar_source().is_none());
+        assert!(saved_spawn.entity_sidecar_source().is_none());
+        assert!(new_spawn.has_entity_free_feature_coverage());
+        assert!(saved_spawn.has_entity_free_feature_coverage());
+        assert_eq!(
+            new_spawn.document().value.get("Status"),
+            Some(&Tag::String("minecraft:spawn".into()))
+        );
+        assert_eq!(
+            saved_spawn.document().value.get("Status"),
+            Some(&Tag::String("minecraft:biomes".into()))
+        );
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
         assert!(saved_draft.matches_state(&batch, &staged));
@@ -5504,6 +5743,8 @@ mod tests {
         staged.light_revision = Arc::new(());
         assert!(!draft.matches_state(&batch, &staged));
         assert!(!saved_draft.matches_state(&batch, &staged));
+        assert!(!new_spawn.matches_state(&batch, &staged, false));
+        assert!(!saved_spawn.matches_state(&batch, &staged, false));
         staged.light_revision = original_revision;
         assert!(draft.matches_state(&batch, &staged));
         assert!(
@@ -5546,17 +5787,25 @@ mod tests {
             "Java oracle compilation failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        for (name, document) in [("new", draft.document()), ("saved", saved_draft.document())] {
+        for (name, document, spawn_status) in [
+            ("new", draft.document(), false),
+            ("saved", saved_draft.document(), false),
+            ("spawn", new_spawn.document(), true),
+        ] {
             let nbt = oracle.path().join(format!("{name}-light.nbt"));
             std::fs::write(&nbt, native_persistence::nbt::write(document)?)?;
-            let checked = std::process::Command::new(java.join("java.exe"))
+            let mut command = std::process::Command::new(java.join("java.exe"));
+            command
                 .arg("-cp")
                 .arg(&classpath)
                 .arg("ResumedLightOracle")
                 .arg(&nbt)
                 .arg(lighting.min_y.to_string())
-                .arg(lighting.height.to_string())
-                .output()?;
+                .arg(lighting.height.to_string());
+            if spawn_status {
+                command.arg("status:spawn");
+            }
+            let checked = command.output()?;
             ensure!(
                 checked.status.success(),
                 "Java {name} light validation failed: {}\n{}",

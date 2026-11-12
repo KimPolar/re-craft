@@ -40,10 +40,11 @@ public class ResumedLightOracle {
         try (var input = new java.io.DataInputStream(Files.newInputStream(Path.of(args[0])))) {
             original = NbtIo.read((DataInput) input);
         }
-        original.putString("Status", "minecraft:light");
+        boolean spawnStatus = args.length > 3 && args[3].equals("status:spawn");
+        if (!spawnStatus) original.putString("Status", "minecraft:light");
         var height = LevelHeightAccessor.create(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
         var parsed = SerializableChunkData.parse(height, factory, original);
-        if (parsed == null || parsed.chunkStatus() != ChunkStatus.LIGHT) throw new AssertionError("status");
+        if (parsed == null || parsed.chunkStatus() != (spawnStatus ? ChunkStatus.SPAWN : ChunkStatus.LIGHT)) throw new AssertionError("status");
         var rewritten = parsed.write();
         if (args.length > 3 && args[3].startsWith("entities:")) {
             String expectedEntity = "minecraft:" + args[3].substring("entities:".length());

@@ -36,6 +36,7 @@ public class BucketPlacementOracle {
     if(state.is(Blocks.LAVA)) return "lava";
     if(state.is(Blocks.STONE)) return "stone";
     if(state.is(Blocks.STONE_SLAB)) return "slab_"+state.getValue(SlabBlock.TYPE)+"_"+state.getValue(SlabBlock.WATERLOGGED);
+    if(state.is(Blocks.GLOW_LICHEN)) return "lichen_"+state.getValue(MultifaceBlock.WATERLOGGED);
     throw new AssertionError(state);
   }
   public static void main(String[] args) throws Exception {
@@ -48,11 +49,11 @@ public class BucketPlacementOracle {
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var unsafe=(sun.misc.Unsafe)f.get(null);
     var world=(World)unsafe.allocateInstance(World.class); var output=new JsonArray();
     for(boolean lava:new boolean[]{false,true}) for(boolean evaporates:new boolean[]{false,true})
-    for(String shape:new String[]{"stone","slab_dry","slab_wet","slab_double"}) {
+    for(String shape:new String[]{"stone","slab_dry","slab_wet","slab_double","lichen_dry","lichen_wet"}) {
       // This fake level does not run the neighbor updates that turn lava next
       // to a waterlogged slab into obsidian.
-      if(lava && shape.equals("slab_wet")) continue;
-      BlockState clicked=shape.equals("stone")?Blocks.STONE.defaultBlockState():Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,shape.equals("slab_double")?SlabType.DOUBLE:SlabType.TOP).setValue(SlabBlock.WATERLOGGED,shape.equals("slab_wet"));
+      if(lava && (shape.equals("slab_wet") || shape.equals("lichen_wet"))) continue;
+      BlockState clicked=shape.equals("stone")?Blocks.STONE.defaultBlockState():shape.startsWith("lichen_")?Blocks.GLOW_LICHEN.defaultBlockState().setValue(MultifaceBlock.getFaceProperty(Direction.SOUTH),true).setValue(MultifaceBlock.WATERLOGGED,shape.equals("lichen_wet")):Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,shape.equals("slab_double")?SlabType.DOUBLE:SlabType.TOP).setValue(SlabBlock.WATERLOGGED,shape.equals("slab_wet"));
       world.blocks=new HashMap<>(); world.blocks.put(CLICKED,clicked); world.rng=RandomSource.create(123); world.sound=null; world.soundPosition=null;
       world.environment=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributes.WATER_EVAPORATES, base -> evaporates).build();
       var bucket=(BucketItem)(lava?Items.LAVA_BUCKET:Items.WATER_BUCKET);

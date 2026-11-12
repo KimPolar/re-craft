@@ -14367,6 +14367,7 @@ impl LoadedSession {
                     || crate::slab_mining::material(&block.name).is_some()
                     || native_world::collision::ladder_state(block).is_some()
                     || native_world::collision::fence_waterlogged(block) == Some(true)
+                    || native_world::collision::glow_lichen_faces(block).is_some()
                     || matches!(
                         block.name.as_str(),
                         "minecraft:chest" | "minecraft:trapped_chest"
@@ -16706,6 +16707,11 @@ impl LoadedSession {
             return Some(fluid);
         }
         if native_world::collision::fence_waterlogged(state) == Some(true) {
+            return Some(fluid);
+        }
+        if native_world::collision::glow_lichen_faces(state).is_some()
+            && state.properties["waterlogged"] == "true"
+        {
             return Some(fluid);
         }
         if native_world::collision::ladder_state(state).is_some_and(|(_, wet)| wet) {
@@ -20171,6 +20177,17 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::GrateWater(fluid);
         }
+        if native_world::collision::glow_lichen_faces(state).is_some() {
+            return if state.properties["waterlogged"] == "true" {
+                self.fluids
+                    .get(id.0 as usize)
+                    .copied()
+                    .flatten()
+                    .map_or(fluid_sim::Cell::Unknown, fluid_sim::Cell::OpenWater)
+            } else {
+                fluid_sim::Cell::OpenDry
+            };
+        }
         if native_world::collision::fence_waterlogged(state) == Some(true)
             && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
         {
@@ -20310,15 +20327,14 @@ impl LoadedSession {
             fluid_sim::ChangedBlock::Air => self.states[0],
             fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
             fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
-            // Live open-container callbacks are not wired yet; do not replace
-            // an unknown block if a caller supplies this generation-only plan.
-            fluid_sim::ChangedBlock::WaterloggedOpen => return false,
-            fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+            fluid_sim::ChangedBlock::WaterloggedOpen
+            | fluid_sim::ChangedBlock::WaterloggedSlab { .. }
             | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
             | fluid_sim::ChangedBlock::WaterloggedChest
             | fluid_sim::ChangedBlock::WaterloggedFence
             | fluid_sim::ChangedBlock::WaterloggedLadder { .. } => {
                 let expected = match change.block {
+                    fluid_sim::ChangedBlock::WaterloggedOpen => fluid_sim::Cell::OpenDry,
                     fluid_sim::ChangedBlock::WaterloggedSlab { top } => fluid_sim::Cell::Slab {
                         top,
                         waterlogged: false,
@@ -20406,6 +20422,7 @@ impl LoadedSession {
             if matches!(
                 change.block,
                 fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+                    | fluid_sim::ChangedBlock::WaterloggedOpen
                     | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
                     | fluid_sim::ChangedBlock::WaterloggedChest
                     | fluid_sim::ChangedBlock::WaterloggedFence
@@ -23376,7 +23393,9 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             FluidCell::FenceDry if fluid.kind == FluidKind::Water && fluid.source => {
                 ChangedBlock::WaterloggedFence
             }
-            FluidCell::OpenDry => return Ok(()),
+            FluidCell::OpenDry if fluid.kind == FluidKind::Water && fluid.source => {
+                ChangedBlock::WaterloggedOpen
+            }
             FluidCell::Ladder {
                 facing,
                 waterlogged: false,
@@ -23387,6 +23406,7 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             | FluidCell::Stairs { .. }
             | FluidCell::Chest { .. }
             | FluidCell::FenceDry
+            | FluidCell::OpenDry
             | FluidCell::Ladder { .. } => {
                 return Ok(());
             }
@@ -24383,6 +24403,9 @@ fn bucket_waterloggable(block: &BlockState) -> Option<bool> {
         return None;
     }
     if native_world::collision::fence_waterlogged(block).is_some() {
+        return Some(true);
+    }
+    if native_world::collision::glow_lichen_faces(block).is_some() {
         return Some(true);
     }
     if native_world::collision::ladder_state(block).is_some() {
@@ -33665,6 +33688,18 @@ pub(crate) mod tests {
                 "minecraft:ladder",
                 &[("facing", "north"), ("waterlogged", "true")],
             ),
+            state(
+                "minecraft:glow_lichen",
+                &[
+                    ("down", "false"),
+                    ("up", "true"),
+                    ("north", "false"),
+                    ("south", "false"),
+                    ("west", "true"),
+                    ("east", "false"),
+                    ("waterlogged", "true"),
+                ],
+            ),
         ];
         for block in cases {
             for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
@@ -34130,6 +34165,160 @@ pub(crate) mod tests {
                 && key.z == absolute.z
                 && key.kind == FluidKind::Water
                 && key.source));
+        }
+    }
+
+    #[test]
+    fn water_spread_waterlogs_lichen_without_losing_faces() {
+        use native_world::fluid_sim::LiveFluidWorld;
+        let position = IVec3::new(8, 3, 8);
+        let lichen = state(
+            "minecraft:glow_lichen",
+            &[
+                ("down", "true"),
+                ("up", "false"),
+                ("north", "true"),
+                ("south", "false"),
+                ("west", "false"),
+                ("east", "false"),
+                ("waterlogged", "false"),
+            ],
+        );
+        let source = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let mut session = session();
+        let id = session.intern_block(lichen.clone());
+        assert!(session.set_with_notify(position, id, false));
+        assert_eq!(session.simulation_cell(position), fluid_sim::Cell::OpenDry);
+        let settings = session.fluid_settings();
+        let mut live = SessionFluidTick {
+            session: &mut session,
+            settings,
+            kind: FluidKind::Water,
+            retry_wash: false,
+        };
+        live.spread_to(
+            position,
+            fluid_sim::Cell::OpenDry,
+            FluidState {
+                source: false,
+                amount: 7,
+                ..source
+            },
+            IVec3::Y,
+        )
+        .unwrap();
+        assert_eq!(
+            live.session.simulation_cell(position),
+            fluid_sim::Cell::OpenDry
+        );
+        live.spread_to(position, fluid_sim::Cell::OpenDry, source, IVec3::Y)
+            .unwrap();
+        let session = live.session;
+        let absolute = session.origin + position;
+        let wet = session
+            .world
+            .block(absolute.x, absolute.y, absolute.z)
+            .unwrap();
+        assert_eq!(wet.properties["waterlogged"], "true");
+        for (key, value) in lichen
+            .properties
+            .iter()
+            .filter(|(key, _)| *key != "waterlogged")
+        {
+            assert_eq!(&wet.properties[key], value);
+        }
+        assert_eq!(
+            session.simulation_cell(position),
+            fluid_sim::Cell::OpenWater(source)
+        );
+        assert!(session.fluid_pending.iter().any(|tick| tick.x == absolute.x
+            && tick.y == absolute.y
+            && tick.z == absolute.z
+            && tick.kind == FluidKind::Water));
+    }
+
+    #[test]
+    fn live_water_tick_handles_lichen_source_conversion() {
+        for case in ["on", "off", "down", "support"] {
+            let mut session = session();
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.values_mut().next().unwrap());
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+                .blocks
+                .as_mut()
+                .unwrap()
+                .fill(stone);
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            let flowing = session.intern_block(state("minecraft:water", &[("level", "4")]));
+            let lichen = session.intern_block(state(
+                "minecraft:glow_lichen",
+                &[
+                    ("down", "false"),
+                    ("up", "false"),
+                    ("north", "false"),
+                    ("south", "false"),
+                    ("west", "false"),
+                    ("east", "true"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            let origin = IVec3::new(8, 8, 8);
+            let target = if matches!(case, "down" | "support") {
+                origin - IVec3::Y
+            } else {
+                origin + IVec3::X
+            };
+            assert!(session.set_with_notify(
+                origin,
+                if case == "support" { flowing } else { water },
+                false
+            ));
+            assert!(session.set_with_notify(target, lichen, false));
+            let others = match case {
+                "down" => vec![target + IVec3::NEG_Z, target + IVec3::Z],
+                "support" => vec![origin + IVec3::NEG_X, origin + IVec3::NEG_Z],
+                _ => vec![target + IVec3::NEG_Z],
+            };
+            for pos in others {
+                assert!(session.set_with_notify(pos, water, false));
+            }
+            session.set_source_conversion(case != "off", false);
+            let original = session
+                .simulated_fluid(if case == "support" { flowing } else { water })
+                .unwrap();
+            let settings = session.fluid_settings();
+            let mut live = SessionFluidTick {
+                session: &mut session,
+                settings,
+                kind: FluidKind::Water,
+                retry_wash: false,
+            };
+            fluid_sim::tick_live(&mut live, origin, original, settings).unwrap();
+            let absolute = live.session.origin + if case == "support" { origin } else { target };
+            let actual = live
+                .session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            if case == "support" {
+                assert_eq!(
+                    (actual.name.as_str(), actual.properties["level"].as_str()),
+                    ("minecraft:water", "1")
+                );
+            } else {
+                assert_eq!(actual.name, "minecraft:glow_lichen");
+                assert_eq!(
+                    actual.properties["waterlogged"],
+                    (case != "off").to_string(),
+                    "{case}"
+                );
+            }
         }
     }
 
@@ -35324,7 +35513,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 14);
+        assert_eq!(rows.len(), 20);
         for row in rows {
             let lava = row["lava"].as_bool().unwrap();
             let shape = row["shape"].as_str().unwrap();
@@ -35335,6 +35524,26 @@ pub(crate) mod tests {
             let clicked = IVec3::new(8, 2, 6);
             let state = if shape == "stone" {
                 state("minecraft:stone", &[])
+            } else if shape.starts_with("lichen_") {
+                state(
+                    "minecraft:glow_lichen",
+                    &[
+                        ("down", "false"),
+                        ("up", "false"),
+                        ("north", "false"),
+                        ("south", "true"),
+                        ("west", "false"),
+                        ("east", "false"),
+                        (
+                            "waterlogged",
+                            if shape == "lichen_wet" {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        ),
+                    ],
+                )
             } else {
                 state(
                     "minecraft:stone_slab",
@@ -35385,6 +35594,9 @@ pub(crate) mod tests {
                         "slab_{}_{}",
                         block.properties["type"], block.properties["waterlogged"]
                     ),
+                    "minecraft:glow_lichen" => {
+                        format!("lichen_{}", block.properties["waterlogged"])
+                    }
                     _ => panic!("unexpected block: {block:?}"),
                 };
                 assert_eq!(actual, row[key].as_str().unwrap(), "{row}");

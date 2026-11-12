@@ -46,7 +46,7 @@ pub fn barrier_waterlogged(state: &BlockState) -> Option<bool> {
 }
 
 /// Return the face mask of a fully specified vanilla glow lichen state.
-fn glow_lichen_faces(state: &BlockState) -> Option<u8> {
+pub fn glow_lichen_faces(state: &BlockState) -> Option<u8> {
     if state.name != "minecraft:glow_lichen" || state.properties.len() != 7 {
         return None;
     }

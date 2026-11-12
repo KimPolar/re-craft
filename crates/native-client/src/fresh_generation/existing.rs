@@ -249,6 +249,39 @@ pub(crate) struct CapturedStagedLight {
     light_revision: Arc<()>,
 }
 
+/// An in-memory LIGHT-stage draft for a previously absent terrain chunk.
+/// The captured entity sidecar and feature coverage do not prove save safety.
+pub(crate) struct CapturedNewLitDraft {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    light_revision: Arc<()>,
+    document: NamedTag,
+    entity_sidecar: Option<Arc<NamedTag>>,
+    feature_entity_coverage: bool,
+}
+
+impl CapturedNewLitDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+
+    pub fn entity_sidecar_source(&self) -> Option<&NamedTag> {
+        self.entity_sidecar.as_deref()
+    }
+
+    pub fn has_entity_free_feature_coverage(&self) -> bool {
+        self.feature_entity_coverage
+    }
+
+    pub fn matches_state(&self, batch: &CapturedTerrainBatch, light: &CapturedStagedLight) -> bool {
+        Arc::ptr_eq(&self.identity, &batch.identity)
+            && Arc::ptr_eq(&self.revision, &batch.revision)
+            && Arc::ptr_eq(&self.identity, &light.identity)
+            && Arc::ptr_eq(&self.revision, &light.revision)
+            && Arc::ptr_eq(&self.light_revision, &light.light_revision)
+    }
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -907,6 +940,159 @@ impl PreparedExistingGenerator {
         light.activated.insert(position);
         light.light_revision = Arc::new(());
         Ok(visible)
+    }
+
+    /// Build a non-writable LIGHT-stage draft for a captured absent chunk.
+    /// Entity/POI completeness, live state, clocks and save dependencies must
+    /// still be established independently.
+    pub fn draft_captured_new_lit_chunk(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        position: native_persistence::world::ChunkPos,
+        last_update: i64,
+    ) -> Result<CapturedNewLitDraft> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let key = native_world::loaded::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && Arc::ptr_eq(&light.identity, &batch.identity)
+                && Arc::ptr_eq(&light.revision, &batch.revision),
+            "light belongs to another terrain revision"
+        );
+        ensure!(
+            !self.generate_structures,
+            "new structure data is not prepared"
+        );
+        ensure!(
+            light.activated.contains(&key)
+                && batch
+                    .schedule
+                    .completed(key)
+                    .is_some_and(|stage| stage >= GenerationStage::Light),
+            "light chunk has not been propagated"
+        );
+        let captured = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&position)
+            .context("terrain source was not captured")?;
+        ensure!(
+            captured.terrain.is_none() && matches!(batch.sources.get(&position), Some(None)),
+            "terrain source is not absent"
+        );
+        let entity_sidecar = captured
+            .entities
+            .as_ref()
+            .map(|value| Arc::clone(&value.document));
+        let biome_ids: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/biome")?
+            .into_iter()
+            .collect();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let snapshot = batch.terrain.snapshot();
+        let sections = native_persistence::generated_section::encode_generated_sections(
+            &snapshot,
+            key,
+            self.lighting.min_y,
+            self.lighting.height,
+            self.lighting.has_skylight,
+            |state| {
+                assets
+                    .blocks
+                    .is_canonical_state(&state.name, &state.properties)
+            },
+            |name| {
+                ResourceId::parse(name)
+                    .ok()
+                    .is_some_and(|id| biome_ids.contains(&id))
+            },
+        )?;
+        let visible = light
+            .engine
+            .snapshot(&batch.terrain, [key], &assets.blocks)?;
+        let sections = native_persistence::generated_section::merge_generated_light_sections(
+            &sections,
+            &visible,
+            key,
+            self.lighting.min_y,
+            self.lighting.height,
+            self.lighting.has_skylight,
+        )?;
+        let heightmaps = batch.terrain.generated_heightmap_data(key)?;
+        let Tag::Compound(maps) = &heightmaps else {
+            bail!("generated heightmaps are invalid")
+        };
+        ensure!(
+            maps.iter()
+                .any(|(name, _)| name.matches("WORLD_SURFACE_WG"))
+                && maps.iter().any(|(name, _)| name.matches("OCEAN_FLOOR_WG")),
+            "generated world-generation heightmaps are missing"
+        );
+        let block_ticks = native_persistence::generated_ticks::encode_block_ticks(
+            key,
+            snapshot
+                .saved_block_ticks
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            |id| assets.block_ids.contains(id),
+        )?;
+        let fluid_ticks = native_persistence::generated_ticks::encode_fluid_ticks(
+            key,
+            snapshot
+                .saved_fluid_ticks
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )?;
+        let marks = batch
+            .terrain
+            .postprocessing_marks_to_date(key)
+            .context("generation postprocessing is missing")?;
+        let postprocessing = native_persistence::postprocessing::encode(&marks);
+        let block_entities = batch
+            .terrain
+            .generated_block_entity_data(key, &assets.blocks)?;
+        let entities = batch.terrain.recorded_generated_entities(key)?.to_vec();
+        let mut document = native_persistence::generated_chunk::assemble_spawn_chunk(
+            native_persistence::generated_chunk::SpawnChunkComponents {
+                position: key,
+                min_y: self.lighting.min_y,
+                height: self.lighting.height,
+                last_update,
+                sections,
+                heightmaps,
+                block_ticks,
+                fluid_ticks,
+                postprocessing,
+                block_entities,
+                entities,
+            },
+        )?;
+        replace_unique_root_field(
+            &mut document,
+            "Status",
+            Tag::String("minecraft:light".into()),
+        )?;
+        native_persistence::nbt::write(&document)?;
+        Ok(CapturedNewLitDraft {
+            identity: Arc::clone(&batch.identity),
+            revision: Arc::clone(&batch.revision),
+            light_revision: Arc::clone(&light.light_revision),
+            document,
+            entity_sidecar,
+            feature_entity_coverage: batch.feature_entity_sources.covers(key),
+        })
     }
 
     /// Start a new empty engine for captured, unlit terrain. The caller must
@@ -5060,6 +5246,107 @@ mod tests {
         assert_eq!(
             batch.schedule().completed(target),
             Some(GenerationStage::Light)
+        );
+        let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
+        assert!(draft.matches_state(&batch, &staged));
+        assert!(draft.has_entity_free_feature_coverage());
+        assert!(draft.entity_sidecar_source().is_none());
+        assert_eq!(
+            draft.document().value.get("Status"),
+            Some(&Tag::String("minecraft:light".into()))
+        );
+        assert_eq!(
+            draft.document().value.get("LastUpdate"),
+            Some(&Tag::Long(42))
+        );
+        let sections = native_persistence::palette::decode_sections(&draft.document().value)?;
+        let section = sections
+            .iter()
+            .find(|section| i32::from(section.y) == marker[1].div_euclid(16))
+            .context("draft marker section missing")?;
+        let block = section
+            .blocks
+            .as_ref()
+            .context("draft marker blocks missing")?
+            .block(
+                marker[0].rem_euclid(16) as usize,
+                marker[1].rem_euclid(16) as usize,
+                marker[2].rem_euclid(16) as usize,
+            )
+            .context("draft marker block missing")?;
+        assert!(block.name.matches("minecraft:melon"));
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_ticks") else {
+            bail!("draft block ticks missing");
+        };
+        assert!(
+            values.iter().any(|tick| {
+                matches!(tick.get("i"), Some(Tag::String(id)) if id.matches("minecraft:melon"))
+                    && tick.get("x") == Some(&Tag::Int(marker[0]))
+                    && tick.get("y") == Some(&Tag::Int(marker[1]))
+                    && tick.get("z") == Some(&Tag::Int(marker[2]))
+            }),
+            "draft scheduled melon tick missing"
+        );
+        let original_revision = Arc::clone(&staged.light_revision);
+        staged.light_revision = Arc::new(());
+        assert!(!draft.matches_state(&batch, &staged));
+        staged.light_revision = original_revision;
+        assert!(draft.matches_state(&batch, &staged));
+        assert!(
+            actual
+                .draft_captured_new_lit_chunk(&batch, &staged, saved_second, 42)
+                .is_err()
+        );
+
+        let oracle = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), oracle.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = oracle.path().join("ResumedLightOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/ResumedLightOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let nbt = oracle.path().join("new-light.nbt");
+        std::fs::write(&nbt, native_persistence::nbt::write(draft.document())?)?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ResumedLightOracle")
+            .arg(&nbt)
+            .arg(lighting.min_y.to_string())
+            .arg(lighting.height.to_string())
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java light validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
         );
         assert!(
             actual

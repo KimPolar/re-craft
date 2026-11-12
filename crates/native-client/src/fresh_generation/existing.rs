@@ -214,6 +214,8 @@ pub(crate) struct CapturedTerrainBatch {
     biomes: native_session::worldgen::BiomeNeighborhood,
     terrain: native_session::worldgen::CarvedTerrainWorld,
     sources: BTreeMap<native_persistence::world::ChunkPos, Option<Arc<NamedTag>>>,
+    feature_entity_sources: ResumedFeatureEntitySources,
+    revision: Arc<()>,
 }
 
 impl CapturedTerrainBatch {
@@ -231,6 +233,13 @@ impl CapturedTerrainBatch {
 
     pub fn sources(&self) -> &BTreeMap<native_persistence::world::ChunkPos, Option<Arc<NamedTag>>> {
         &self.sources
+    }
+
+    pub fn has_entity_free_feature_coverage(
+        &self,
+        position: native_world::loaded::ChunkPos,
+    ) -> bool {
+        self.feature_entity_sources.covers(position)
     }
 }
 
@@ -2397,6 +2406,14 @@ impl PreparedExistingGenerator {
         for biome in restored.into_values() {
             biomes.insert(biome)?;
         }
+        self.prepare_decoration_with_biomes(target, biomes)
+    }
+
+    fn prepare_decoration_with_biomes(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        biomes: native_session::worldgen::BiomeNeighborhood,
+    ) -> Result<SavedDecorationContext> {
         if self.feature_schedule.is_none() {
             let registry = self
                 .resources
@@ -2434,6 +2451,140 @@ impl PreparedExistingGenerator {
         };
         context.plan(self)?;
         Ok(context)
+    }
+
+    /// Build a feature plan from the frozen mixed biome neighborhood.
+    pub fn prepare_captured_decoration(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        target: native_persistence::world::ChunkPos,
+    ) -> Result<SavedDecorationContext> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "decoration belongs to another generation capture"
+        );
+        let mut biomes = self.generator.biome_neighborhood()?;
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let x = target
+                    .x
+                    .checked_add(dx)
+                    .context("neighbor chunk X overflow")?;
+                let z = target
+                    .z
+                    .checked_add(dz)
+                    .context("neighbor chunk Z overflow")?;
+                let biome = batch
+                    .biomes
+                    .chunk([x, z])
+                    .context("decoration biome neighbor is missing")?;
+                biomes.insert(Arc::clone(biome))?;
+            }
+        }
+        self.prepare_decoration_with_biomes(target, biomes)
+    }
+
+    /// Run FEATURES for a mixed captured batch with structures disabled.
+    /// A light-dependent feature fails until an appropriate light view exists.
+    /// Results remain intermediate and do not authorize saving the world.
+    pub fn run_captured_features(
+        &mut self,
+        batch: &mut CapturedTerrainBatch,
+        context: &SavedDecorationContext,
+    ) -> Result<Vec<bool>> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && Arc::ptr_eq(&self.identity, &context.identity),
+            "decoration belongs to another generation capture"
+        );
+        ensure!(
+            !self.generate_structures,
+            "captured structure decoration is not prepared"
+        );
+        let center = native_world::loaded::ChunkPos {
+            x: context.position.x,
+            z: context.position.z,
+        };
+        ensure!(
+            batch.schedule.ready(center, GenerationStage::Features),
+            "features dependencies are incomplete"
+        );
+        let captured = self.context.inputs().sources().chunks();
+        let mut positions = Vec::with_capacity(9);
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let x = center
+                    .x
+                    .checked_add(dx)
+                    .context("neighbor chunk X overflow")?;
+                let z = center
+                    .z
+                    .checked_add(dz)
+                    .context("neighbor chunk Z overflow")?;
+                let position = native_persistence::world::ChunkPos { x, z };
+                let expected = captured
+                    .get(&position)
+                    .context("terrain neighbor was not captured")?;
+                let source = batch
+                    .sources
+                    .get(&position)
+                    .context("terrain neighbor is missing")?;
+                match (&expected.terrain, source) {
+                    (None, None) => {}
+                    (Some(saved), Some(source)) if Arc::ptr_eq(&saved.document, source) => {}
+                    _ => bail!("terrain neighbor source differs"),
+                }
+                let selected = context
+                    .biomes
+                    .chunk([x, z])
+                    .context("decoration biome is missing")?;
+                let current = batch
+                    .biomes
+                    .chunk([x, z])
+                    .context("batch biome is missing")?;
+                ensure!(
+                    Arc::ptr_eq(selected, current),
+                    "decoration biome differs from batch"
+                );
+                positions.push(native_world::loaded::ChunkPos { x, z });
+            }
+        }
+        let evidence = self
+            .feature_entity_evidence
+            .as_ref()
+            .context("feature entity evidence is missing")?;
+        let entity_free = context
+            .plan(self)?
+            .features()
+            .iter()
+            .all(|feature| evidence.get(feature.feature) == Some(&true));
+        if self.heightmap_tags.is_none() {
+            let blocks = self.resources.vanilla_block_ids()?;
+            self.heightmap_tags = Some(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut self.resources,
+                &blocks,
+            )?);
+        }
+        let tags = self
+            .heightmap_tags
+            .as_ref()
+            .expect("heightmap tags initialized");
+        for position in positions {
+            if batch.terrain.worldgen_heightmaps(position).is_none() {
+                batch
+                    .terrain
+                    .initialize_worldgen_heightmaps(position, tags)?;
+            }
+        }
+        let result = self.with_saved_prepared_decoration(context, |prepared| {
+            batch
+                .schedule
+                .run_features(&mut batch.terrain, prepared, false, None)
+        })?;
+        batch.feature_entity_sources.complete(center, entity_free);
+        batch.revision = Arc::new(());
+        Ok(result)
     }
 
     /// Restore captured biome volumes against this generator's pack registry.
@@ -2858,6 +3009,8 @@ impl PreparedExistingGenerator {
             biomes,
             terrain: world,
             sources,
+            feature_entity_sources: ResumedFeatureEntitySources::default(),
+            revision: Arc::new(()),
         })
     }
 
@@ -4205,11 +4358,62 @@ mod tests {
             root.join("data/minecraft/world_gen_settings.dat"),
             native_persistence::nbt::write(&settings)?,
         )?;
+        let pack = root.join("datapacks/mixed");
+        let dimension_file = pack.join("data/minecraft/dimension/overworld.json");
+        let biome_file = pack.join("data/minecraft/worldgen/biome/plains.json");
+        std::fs::create_dir_all(dimension_file.parent().unwrap())?;
+        std::fs::create_dir_all(biome_file.parent().unwrap())?;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+        )?;
+        std::fs::write(
+            &dimension_file,
+            serde_json::to_vec(&json!({
+                "type":"minecraft:overworld",
+                "generator":{"type":"minecraft:noise","settings":"minecraft:overworld",
+                    "biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"}}
+            }))?,
+        )?;
+        let mut plains: Value = serde_json::from_slice(
+            &resources
+                .read_data("data/minecraft/worldgen/biome/plains.json")?
+                .context("plains biome missing")?,
+        )?;
+        plains["features"] = json!([[{
+            "feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
+            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]
+        }]]);
+        std::fs::write(&biome_file, serde_json::to_vec(&plains)?)?;
         let level = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![(
                 "Data".into(),
-                Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "DataPacks".into(),
+                        Tag::Compound(vec![
+                            (
+                                "Enabled".into(),
+                                Tag::List {
+                                    element_type: TagType::String,
+                                    values: vec![
+                                        Tag::String("vanilla".into()),
+                                        Tag::String("file/mixed".into()),
+                                    ],
+                                },
+                            ),
+                            (
+                                "Disabled".into(),
+                                Tag::List {
+                                    element_type: TagType::End,
+                                    values: vec![],
+                                },
+                            ),
+                        ]),
+                    ),
+                ]),
             )]),
         };
         let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
@@ -4217,7 +4421,7 @@ mod tests {
         std::fs::write(root.join("level.dat"), gzip.finish()?)?;
         let target = native_world::loaded::ChunkPos { x: -1, z: 2 };
         let second = native_world::loaded::ChunkPos { x: 0, z: 2 };
-        let (lighting, definition, _) = GeneratedDimensionLighting::load_preset_with_definition(
+        let (lighting, _, _) = GeneratedDimensionLighting::load_preset_with_definition(
             &mut resources,
             "minecraft:normal",
             "minecraft:overworld",
@@ -4290,12 +4494,32 @@ mod tests {
             z: second.z,
         };
         let mut schedule = GenerationSchedule::new();
-        schedule.request_many([
-            (target, GenerationStage::Terrain),
-            (second, GenerationStage::Terrain),
-        ])?;
+        schedule.request(target, GenerationStage::Features)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
+        let selected = actual.context.selection();
+        let selection = DataPackSettings {
+            enabled: selected.enabled.clone(),
+            disabled: selected.disabled.clone(),
+            enabled_features: selected.enabled_features.clone(),
+        };
+        let warnings =
+            resources.configure_snapshot_data(Arc::clone(actual.context.packs()), &selection)?;
+        ensure!(warnings.is_empty(), "reference data-pack selection differs");
+        let (stem, _) = resolve_stem(
+            &mut resources,
+            actual.context.inputs().settings().document(),
+            &DimensionId::parse("overworld")?,
+        )?;
+        let (_, definition, _) = GeneratedDimensionLighting::from_stem(
+            &mut resources,
+            ResourceId::parse("minecraft:overworld")?,
+            &stem,
+        )?;
+        let biome_positions: Vec<_> = schedule
+            .requirements()
+            .filter_map(|(pos, required)| (required >= GenerationStage::Biomes).then_some(pos))
+            .collect();
         // With structures disabled these stages produce no starts or references.
         let completed: Vec<_> = schedule
             .requirements()
@@ -4325,19 +4549,9 @@ mod tests {
             work.schedule().completed(target),
             Some(GenerationStage::StructureReferences)
         );
-        for dz in -1..=1 {
-            for dx in -1..=2 {
-                if target.x + dx == second.x && target.z + dz == second.z {
-                    continue;
-                }
-                actual.run_captured_biomes(
-                    &mut work,
-                    &mut evaluator,
-                    native_world::loaded::ChunkPos {
-                        x: target.x + dx,
-                        z: target.z + dz,
-                    },
-                )?;
+        for &pos in &biome_positions {
+            if pos != second {
+                actual.run_captured_biomes(&mut work, &mut evaluator, pos)?;
             }
         }
         assert!(work.schedule().ready(target, GenerationStage::Terrain));
@@ -4361,16 +4575,14 @@ mod tests {
         )?;
         let mut reference_biomes = reference.biome_neighborhood()?;
         let mut reference_evaluator = native_resources::density::DensityEvaluator::default();
-        for dz in -1..=1 {
-            for dx in -1..=2 {
-                let pos = [target.x + dx, target.z + dz];
-                let biome = if pos == [second.x, second.z] {
-                    Arc::clone(work.biomes().chunk(pos).context("saved biome missing")?)
-                } else {
-                    Arc::new(reference.generate_biomes(pos, &mut reference_evaluator)?)
-                };
-                reference_biomes.insert(biome)?;
-            }
+        for &position in &biome_positions {
+            let pos = [position.x, position.z];
+            let biome = if pos == [second.x, second.z] {
+                Arc::clone(work.biomes().chunk(pos).context("saved biome missing")?)
+            } else {
+                Arc::new(reference.generate_biomes(pos, &mut reference_evaluator)?)
+            };
+            reference_biomes.insert(biome)?;
         }
         let block_ids = resources.vanilla_block_ids()?;
         let tags = CarverBlockTags::load(&mut resources, &block_ids)?;
@@ -4421,6 +4633,17 @@ mod tests {
             }
         }
         actual.run_captured_saved_terrain(&mut work, &mut evaluator, second, &[])?;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let position = native_world::loaded::ChunkPos {
+                    x: target.x + dx,
+                    z: target.z + dz,
+                };
+                if position != target && position != second {
+                    actual.run_captured_new_terrain(&mut work, &mut evaluator, position)?;
+                }
+            }
+        }
         let sample_y = [lighting.min_y, 0, 63, lighting.min_y + lighting.height - 1];
         let positions = [target, second]
             .into_iter()
@@ -4445,7 +4668,7 @@ mod tests {
                 chunk.world().block(x, y, z).cloned()
             })
             .collect::<Vec<_>>();
-        let batch = actual.assemble_captured_terrain(work)?;
+        let mut batch = actual.assemble_captured_terrain(work)?;
         assert!(Arc::ptr_eq(&actual.identity, &batch.identity));
         assert_eq!(
             batch.schedule().completed(target),
@@ -4455,7 +4678,7 @@ mod tests {
             batch.schedule().completed(second),
             Some(GenerationStage::Terrain)
         );
-        assert_eq!(batch.sources().len(), 2);
+        assert_eq!(batch.sources().len(), 9);
         assert!(matches!(batch.sources().get(&saved_target), Some(None)));
         assert!(
             matches!(batch.sources().get(&saved_second), Some(Some(source)) if source.as_ref() == &saved)
@@ -4467,6 +4690,33 @@ mod tests {
         for ((x, y, z), expected) in positions.into_iter().zip(samples) {
             assert_eq!(world.block(x, y, z), expected.as_ref());
         }
+        let context = actual.prepare_captured_decoration(&batch, saved_target)?;
+        assert_eq!(context.plan(&actual)?.features().len(), 1);
+        assert!(batch.schedule().ready(target, GenerationStage::Features));
+        let marker = [target.x * 16 + 8, lighting.min_y + 8, target.z * 16 + 8];
+        assert_ne!(
+            world.block(marker[0], marker[1], marker[2]).unwrap().name,
+            "minecraft:melon"
+        );
+        assert_eq!(
+            actual.run_captured_features(&mut batch, &context)?,
+            vec![true]
+        );
+        assert_eq!(
+            batch.schedule().completed(target),
+            Some(GenerationStage::Features)
+        );
+        assert_eq!(
+            batch
+                .terrain()
+                .snapshot()
+                .block(marker[0], marker[1], marker[2])
+                .unwrap()
+                .name,
+            "minecraft:melon"
+        );
+        assert!(!batch.has_entity_free_feature_coverage(target));
+        assert!(actual.run_captured_features(&mut batch, &context).is_err());
         Ok(())
     }
 

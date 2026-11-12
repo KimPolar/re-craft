@@ -202,11 +202,44 @@ impl StructurePreparationPlan {
     }
 }
 
-/// One structure kind has a known per-kind reference order. Two total
-/// contributions also commute under Java's finite IEEE-754 addition.
-fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<ResourceId>> {
-    let kinds: BTreeSet<_> = starts.iter().map(|(id, _)| id.clone()).collect();
-    (kinds.len() <= 1 || starts.len() <= 2).then(|| kinds.into_iter().collect())
+/// Rigid pieces are summed from zero before junctions. Two initial terms
+/// commute, but junctions from different kinds cannot generally commute
+/// after a nonzero rigid sum because floating-point addition is not associative.
+fn terrain_contributions_commute(counts: impl IntoIterator<Item = (usize, usize)>) -> bool {
+    let mut rigid_total = 0usize;
+    let mut junction_total = 0usize;
+    let mut rigid_kinds = 0usize;
+    let mut junction_kinds = 0usize;
+    for (rigids, junctions) in counts {
+        rigid_total = rigid_total.saturating_add(rigids);
+        junction_total = junction_total.saturating_add(junctions);
+        rigid_kinds += usize::from(rigids > 0);
+        junction_kinds += usize::from(junctions > 0);
+    }
+    (rigid_kinds <= 1 || rigid_total <= 2)
+        && (junction_kinds <= 1 || (rigid_total == 0 && junction_total <= 2))
+}
+
+/// Different structure kinds can be reordered when none of their possible
+/// nonzero contributions overlap. Unknown or overflowing bounds are rejected.
+fn terrain_supports_disjoint(
+    supports: &BTreeMap<ResourceId, Option<Vec<native_core::beardifier::BoundingBox>>>,
+) -> bool {
+    let mut previous: Vec<&[native_core::beardifier::BoundingBox]> = Vec::new();
+    for regions in supports.values() {
+        let Some(regions) = regions.as_deref() else {
+            return false;
+        };
+        if previous.iter().any(|other| {
+            regions
+                .iter()
+                .any(|region| other.iter().any(|value| region.intersects(value)))
+        }) {
+            return false;
+        }
+        previous.push(regions);
+    }
+    true
 }
 
 /// Validated structure stages retained for an intermediate terrain batch.
@@ -1618,54 +1651,48 @@ impl StructureGenerationBatch {
         Ok(result)
     }
 
-    /// Infer a Java-equivalent order without object identity hashes only when
-    /// there is one contributing structure kind or at most two contributions.
-    /// Multiple additions of different kinds may round differently and remain
-    /// unresolved unless the actual Java structure-key order is supplied.
+    /// Infer an order only when chunk-clipped contributions cannot change the
+    /// floating-point sum. Preserve each kind's original reference order.
     pub fn unambiguous_terrain_start_order(
         &self,
         pos: ChunkPos,
     ) -> Result<Option<Vec<TerrainStartKey>>> {
         let starts = self.terrain_start_keys(pos)?;
-        let Some(kinds) = unambiguous_structure_keys(&starts) else {
-            return Ok(None);
-        };
-        // A single multi-piece start contributes multiple additions. Two
-        // starts of distinct kinds therefore do not necessarily commute.
+        let kinds: Vec<_> = starts
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         if kinds.len() > 1 {
-            let pieces = starts.iter().try_fold(0usize, |count, (id, pos)| {
-                let n = if self.starts.get(pos).is_some_and(|s| s.contains_key(id)) {
-                    1
-                } else if let Some(start) = self.ocean_starts.get(pos).and_then(|s| s.get(id)) {
-                    start.pieces.len()
-                } else if let Some(start) = self.jigsaw_starts.get(pos).and_then(|s| s.get(id)) {
-                    start.pieces.iter().try_fold(0usize, |total, piece| {
-                        total
-                            .checked_add(1)
-                            .and_then(|n| n.checked_add(piece.junctions.len()))
-                            .context("too many jigsaw terrain contributions")
-                    })?
-                } else if self
-                    .ruined_portal_starts
-                    .get(pos)
-                    .is_some_and(|s| s.contains_key(id))
-                    || self
-                        .shipwreck_starts
-                        .get(pos)
-                        .is_some_and(|s| s.contains_key(id))
-                {
-                    1
-                } else {
-                    self.mineshafts
-                        .get(pos)
-                        .and_then(|s| s.get(id))
-                        .context("referenced structure start is missing")?
-                        .pieces
-                        .len()
-                };
-                count.checked_add(n).context("too many structure pieces")
-            })?;
-            if pieces > 2 {
+            let mut counts = BTreeMap::<ResourceId, (usize, usize)>::new();
+            let mut supports =
+                BTreeMap::<ResourceId, Option<Vec<native_core::beardifier::BoundingBox>>>::new();
+            for (id, source) in &starts {
+                let pieces = self.terrain_pieces_for_start(id, *source)?;
+                let clipped =
+                    Beardifier::for_chunk([pos.x, pos.z], &pieces).map_err(anyhow::Error::msg)?;
+                let (rigids, junctions) = clipped.contribution_counts();
+                let entry = counts.entry(id.clone()).or_default();
+                entry.0 = entry
+                    .0
+                    .checked_add(rigids)
+                    .context("too many rigid pieces")?;
+                entry.1 = entry
+                    .1
+                    .checked_add(junctions)
+                    .context("too many junctions")?;
+                let entry = supports
+                    .entry(id.clone())
+                    .or_insert_with(|| Some(Vec::new()));
+                match (entry.as_mut(), clipped.contribution_supports()) {
+                    (Some(existing), Some(regions)) => existing.extend(regions),
+                    _ => *entry = None,
+                }
+            }
+            if !terrain_contributions_commute(counts.values().copied())
+                && !terrain_supports_disjoint(&supports)
+            {
                 return Ok(None);
             }
         }
@@ -1739,72 +1766,82 @@ impl StructureGenerationBatch {
         );
         let mut pieces = Vec::with_capacity(order.len());
         for (structure, source) in order {
-            if let Some(start) = self
-                .starts
-                .get(source)
-                .and_then(|starts| starts.get(structure))
-            {
-                pieces.push(start.terrain_piece());
-            } else if let Some(start) = self
-                .ocean_starts
-                .get(source)
-                .and_then(|starts| starts.get(structure))
-            {
-                pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
-                    bounds: piece.bounds,
-                    adjustment: start.terrain_adjustment,
-                    ground_delta: 0,
-                    projection: PieceProjection::NonPool,
-                    junctions: vec![],
-                }));
-            } else if let Some(start) = self
-                .jigsaw_starts
-                .get(source)
-                .and_then(|starts| starts.get(structure))
-            {
-                pieces.extend(start.terrain_pieces()?);
-            } else if let Some(start) = self
-                .ruined_portal_starts
-                .get(source)
-                .and_then(|starts| starts.get(structure))
-            {
-                pieces.push(StructurePiece {
-                    bounds: start.piece.bounds,
-                    adjustment: start.terrain_adjustment,
-                    ground_delta: 0,
-                    projection: PieceProjection::NonPool,
-                    junctions: vec![],
-                });
-            } else if let Some(start) = self
-                .shipwreck_starts
-                .get(source)
-                .and_then(|starts| starts.get(structure))
-            {
-                pieces.push(StructurePiece {
-                    bounds: start.bounds,
-                    adjustment: start.terrain_adjustment,
-                    ground_delta: 0,
-                    projection: PieceProjection::NonPool,
-                    junctions: vec![],
-                });
-            } else {
-                let start = self
-                    .mineshafts
-                    .get(source)
-                    .and_then(|starts| starts.get(structure))
-                    .context("referenced structure start is missing")?;
-                pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
-                    bounds: piece.piece.bounds,
-                    adjustment: start.terrain_adjustment,
-                    ground_delta: 0,
-                    projection: PieceProjection::NonPool,
-                    junctions: vec![],
-                }));
-            }
+            pieces.extend(self.terrain_pieces_for_start(structure, *source)?);
         }
         Ok(Arc::new(
             Beardifier::for_chunk([pos.x, pos.z], &pieces).map_err(anyhow::Error::msg)?,
         ))
+    }
+
+    fn terrain_pieces_for_start(
+        &self,
+        structure: &ResourceId,
+        source: ChunkPos,
+    ) -> Result<Vec<StructurePiece>> {
+        let mut pieces = Vec::new();
+        if let Some(start) = self
+            .starts
+            .get(&source)
+            .and_then(|starts| starts.get(structure))
+        {
+            pieces.push(start.terrain_piece());
+        } else if let Some(start) = self
+            .ocean_starts
+            .get(&source)
+            .and_then(|starts| starts.get(structure))
+        {
+            pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
+                bounds: piece.bounds,
+                adjustment: start.terrain_adjustment,
+                ground_delta: 0,
+                projection: PieceProjection::NonPool,
+                junctions: vec![],
+            }));
+        } else if let Some(start) = self
+            .jigsaw_starts
+            .get(&source)
+            .and_then(|starts| starts.get(structure))
+        {
+            pieces.extend(start.terrain_pieces()?);
+        } else if let Some(start) = self
+            .ruined_portal_starts
+            .get(&source)
+            .and_then(|starts| starts.get(structure))
+        {
+            pieces.push(StructurePiece {
+                bounds: start.piece.bounds,
+                adjustment: start.terrain_adjustment,
+                ground_delta: 0,
+                projection: PieceProjection::NonPool,
+                junctions: vec![],
+            });
+        } else if let Some(start) = self
+            .shipwreck_starts
+            .get(&source)
+            .and_then(|starts| starts.get(structure))
+        {
+            pieces.push(StructurePiece {
+                bounds: start.bounds,
+                adjustment: start.terrain_adjustment,
+                ground_delta: 0,
+                projection: PieceProjection::NonPool,
+                junctions: vec![],
+            });
+        } else {
+            let start = self
+                .mineshafts
+                .get(&source)
+                .and_then(|starts| starts.get(structure))
+                .context("referenced structure start is missing")?;
+            pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
+                bounds: piece.piece.bounds,
+                adjustment: start.terrain_adjustment,
+                ground_delta: 0,
+                projection: PieceProjection::NonPool,
+                junctions: vec![],
+            }));
+        }
+        Ok(pieces)
     }
 
     /// Generate intermediate terrain using the referenced simple pieces. The
@@ -2075,6 +2112,85 @@ mod tests {
                     matches!(result, StructureSetStart::Generated { .. }),
                     "trial chamber fixture did not generate a start"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "diagnostic: requires installed Minecraft 26.3"]
+    fn inspect_trial_terrain_contributions() -> Result<()> {
+        use native_resources::{heightmap_tags::HeightmapTags, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut provider = ResourceStack::open(&game)?;
+        let preset: Value = serde_json::from_slice(
+            &provider
+                .read_builtin_data("data/minecraft/worldgen/world_preset/normal.json")?
+                .context("normal preset missing")?,
+        )?;
+        let generator = TerrainGenerator::with_structure_context(
+            &mut provider,
+            &preset["dimensions"]["minecraft:overworld"]["generator"],
+            1,
+            -64,
+            384,
+        )?;
+        let mut batch = StructureGenerationBatch::from_registry(generator, &mut provider)?;
+        let block_ids = provider.vanilla_block_ids()?;
+        let tags = HeightmapTags::load(&mut provider, &block_ids)?;
+        let target = ChunkPos { x: 17, z: 12 };
+        batch.request_references(target)?;
+        while !batch.is_complete() {
+            batch.step(&mut provider, &mut |value| {
+                let name = value
+                    .as_str()
+                    .or_else(|| value.get("id").and_then(Value::as_str))
+                    .context("block id missing")?;
+                let motion = tags.for_block(name)?;
+                Ok(BlockHeightFlags {
+                    is_air: matches!(
+                        name,
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ),
+                    blocks_motion: motion.blocks_motion,
+                    blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            })?;
+        }
+        for (id, source) in batch.terrain_start_keys(target)? {
+            let pieces = batch.terrain_pieces_for_start(&id, source)?;
+            let clipped =
+                Beardifier::for_chunk([target.x, target.z], &pieces).map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "{}:{} at {source:?}: {:?} of {}",
+                id.namespace,
+                id.path,
+                clipped.contribution_counts(),
+                pieces.len()
+            );
+        }
+        let order = batch
+            .unambiguous_terrain_start_order(target)?
+            .context("trial terrain order remained ambiguous")?;
+        ensure!(
+            order.len() == 2 && order[0].0 != order[1].0,
+            "unexpected trial fixture"
+        );
+        let forward = batch.beardifier_for_chunk(target, &order)?;
+        let mut reversed = order.clone();
+        reversed.reverse();
+        let reverse = batch.beardifier_for_chunk(target, &reversed)?;
+        for z in target.z * 16..target.z * 16 + 16 {
+            for x in target.x * 16..target.x * 16 + 16 {
+                for y in -64..320 {
+                    ensure!(
+                        forward.sample(x, y, z).to_bits() == reverse.sample(x, y, z).to_bits(),
+                        "structure order changed density at {x},{y},{z}"
+                    );
+                }
             }
         }
         Ok(())
@@ -2355,22 +2471,83 @@ mod tests {
 
     #[test]
     fn inferred_structure_order_requires_unambiguous_float_sum() {
-        let a = ResourceId::parse("test:a").unwrap();
-        let b = ResourceId::parse("test:b").unwrap();
-        let pos = |x| ChunkPos { x, z: 0 };
-        assert_eq!(unambiguous_structure_keys(&BTreeSet::new()), Some(vec![]));
-        let mut starts = BTreeSet::from([
-            (a.clone(), pos(0)),
-            (a.clone(), pos(1)),
-            (a.clone(), pos(2)),
-        ]);
-        assert_eq!(unambiguous_structure_keys(&starts), Some(vec![a.clone()]));
-        starts = BTreeSet::from([(a.clone(), pos(0)), (b.clone(), pos(1))]);
-        assert_eq!(
-            unambiguous_structure_keys(&starts),
-            Some(vec![a.clone(), b.clone()])
+        assert!(terrain_contributions_commute([]));
+        assert!(terrain_contributions_commute([(3, 4), (0, 0)]));
+        assert!(terrain_contributions_commute([(1, 0), (1, 0)]));
+        assert!(terrain_contributions_commute([(0, 1), (0, 1)]));
+        assert!(terrain_contributions_commute([(1, 2), (1, 0)]));
+        assert!(!terrain_contributions_commute([(2, 0), (1, 0)]));
+        assert!(!terrain_contributions_commute([(0, 2), (0, 1)]));
+        assert!(!terrain_contributions_commute([(1, 1), (0, 1)]));
+    }
+
+    #[test]
+    fn chunk_clipping_excludes_remote_structure_contributions() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, Junction};
+        let piece = |min, max, projection, junctions| StructurePiece {
+            bounds: BoundingBox::new(min, max).unwrap(),
+            adjustment: TerrainAdjustment::BeardThin,
+            ground_delta: 0,
+            projection,
+            junctions,
+        };
+        let local = piece(
+            [0, 0, 0],
+            [4, 8, 4],
+            PieceProjection::Rigid,
+            vec![Junction {
+                position: [0, 0, 0],
+            }],
         );
-        starts.insert((b, pos(2)));
-        assert_eq!(unambiguous_structure_keys(&starts), None);
+        let far = piece(
+            [100, 0, 100],
+            [105, 8, 105],
+            PieceProjection::Rigid,
+            vec![Junction {
+                position: [101, 0, 101],
+            }],
+        );
+        let local_beard =
+            Beardifier::for_chunk([0, 0], &[local.clone()]).map_err(anyhow::Error::msg)?;
+        let far_beard =
+            Beardifier::for_chunk([0, 0], &[far.clone()]).map_err(anyhow::Error::msg)?;
+        assert_eq!(local_beard.contribution_counts(), (1, 1));
+        assert_eq!(far_beard.contribution_counts(), (0, 0));
+        assert!(terrain_contributions_commute([
+            local_beard.contribution_counts(),
+            far_beard.contribution_counts()
+        ]));
+        let first = Beardifier::for_chunk([0, 0], &[local.clone(), far.clone()])
+            .map_err(anyhow::Error::msg)?;
+        let second = Beardifier::for_chunk([0, 0], &[far, local]).map_err(anyhow::Error::msg)?;
+        for x in -12..=27 {
+            for z in -12..=27 {
+                assert_eq!(
+                    first.sample(x, 0, z).to_bits(),
+                    second.sample(x, 0, z).to_bits()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disjoint_support_proof_rejects_overlap_and_unknown_bounds() -> Result<()> {
+        use native_core::beardifier::BoundingBox;
+        let a = ResourceId::parse("test:a")?;
+        let b = ResourceId::parse("test:b")?;
+        let near = BoundingBox::new([0, 0, 0], [10, 10, 10]).unwrap();
+        let far = BoundingBox::new([11, 0, 0], [20, 10, 10]).unwrap();
+        let mut supports =
+            BTreeMap::from([(a.clone(), Some(vec![near])), (b.clone(), Some(vec![far]))]);
+        assert!(terrain_supports_disjoint(&supports));
+        supports.insert(
+            b.clone(),
+            Some(vec![BoundingBox::new([10, 0, 0], [20, 10, 10]).unwrap()]),
+        );
+        assert!(!terrain_supports_disjoint(&supports));
+        supports.insert(b, None);
+        assert!(!terrain_supports_disjoint(&supports));
+        Ok(())
     }
 }

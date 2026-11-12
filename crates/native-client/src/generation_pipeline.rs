@@ -206,7 +206,7 @@ impl InitialWorldPipeline {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-    use anyhow::Context;
+    use anyhow::{Context, ensure};
     use std::time::{Duration, Instant};
 
     fn options(parent: PathBuf) -> InitialWorldOptions {
@@ -255,6 +255,66 @@ mod tests {
             .context("inconsistent settings were accepted")?;
         assert!(format!("{error:#}").contains("session seed differs"));
         assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and trial chamber block placement"]
+    fn seed_one_trial_chamber_chunk_reaches_light_stage() -> Result<()> {
+        use glam::IVec3;
+        use native_world::loaded::ChunkPos;
+        use std::collections::BTreeSet;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
+        settings.seed = crate::chat_input::ChatInput::field("1");
+        settings.generate_structures = true;
+        let frozen = settings.freeze(game, None);
+        let target = ChunkPos { x: 18, z: 14 };
+        let worker = GenerationWorker::start_with_structures(
+            move || crate::fresh_generation::prepare_with_structures(frozen.generation),
+            BTreeSet::from([target]),
+            1,
+            0,
+            IVec3::new(target.x * 16, 0, target.z * 16),
+        )?;
+        let started = Instant::now();
+        let mut next_report = started + Duration::from_secs(30);
+        loop {
+            match worker.try_result()? {
+                Some(GenerationResult::Ready(ready)) => {
+                    ensure!(
+                        ready
+                            .mesh
+                            .targets
+                            .as_ref()
+                            .is_some_and(|targets| targets.contains(&target)),
+                        "trial chunk missing"
+                    );
+                    break;
+                }
+                Some(GenerationResult::Failed(error)) => {
+                    return Err(error.context(format!("trial generation: {:?}", worker.progress())));
+                }
+                Some(GenerationResult::Cancelled) => anyhow::bail!("trial generation cancelled"),
+                None => {}
+            }
+            let now = Instant::now();
+            if now >= next_report {
+                eprintln!(
+                    "trial generation after {:?}: {:?}",
+                    now - started,
+                    worker.progress()
+                );
+                next_report = now + Duration::from_secs(30);
+            }
+            ensure!(
+                now.duration_since(started) < Duration::from_secs(900),
+                "trial generation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 

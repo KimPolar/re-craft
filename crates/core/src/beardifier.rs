@@ -23,7 +23,7 @@ impl BoundingBox {
     fn contains(&self, p: [i32; 3]) -> bool {
         (0..3).all(|i| p[i] >= self.min[i] && p[i] <= self.max[i])
     }
-    fn intersects(&self, other: &Self) -> bool {
+    pub fn intersects(&self, other: &Self) -> bool {
         (0..3).all(|i| self.max[i] >= other.min[i] && self.min[i] <= other.max[i])
     }
     fn inflate(&self, n: i32) -> Result<Self, &'static str> {
@@ -175,6 +175,35 @@ impl Beardifier {
     }
     pub fn affected_bounds(&self) -> Option<BoundingBox> {
         self.affected
+    }
+
+    /// Number of contributing rigid pieces and junctions after chunk clipping.
+    pub fn contribution_counts(&self) -> (usize, usize) {
+        (self.pieces.len(), self.junctions.len())
+    }
+
+    /// Conservative nonzero-support boxes for each clipped contribution.
+    /// Coordinates that could wrap cannot be used for an ordering proof.
+    pub fn contribution_supports(&self) -> Option<Vec<BoundingBox>> {
+        let mut result = Vec::with_capacity(self.pieces.len() + self.junctions.len());
+        for piece in &self.pieces {
+            let ground = piece.bounds.min[1].checked_add(piece.ground_delta)?;
+            let mut bounds = piece.bounds;
+            bounds.min[1] = bounds.min[1].min(ground);
+            bounds.max[1] = bounds.max[1].max(ground);
+            result.push(bounds.inflate(12).ok()?);
+        }
+        for junction in &self.junctions {
+            result.push(
+                BoundingBox {
+                    min: junction.position,
+                    max: junction.position,
+                }
+                .inflate(12)
+                .ok()?,
+            );
+        }
+        Some(result)
     }
     pub fn sample(&self, x: i32, y: i32, z: i32) -> f32 {
         if self.affected.is_some_and(|b| b.contains([x, y, z])) {
@@ -362,6 +391,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn contribution_support_boxes_cover_nonzero_samples() {
+        for adjustment in [
+            TerrainAdjustment::Bury,
+            TerrainAdjustment::BeardThin,
+            TerrainAdjustment::BeardBox,
+            TerrainAdjustment::Encapsulate,
+        ] {
+            let piece = StructurePiece {
+                bounds: bounds([0, -3, 1], [3, 4, 5]),
+                adjustment,
+                ground_delta: 8,
+                projection: PieceProjection::Rigid,
+                junctions: vec![Junction {
+                    position: [2, -2, 3],
+                }],
+            };
+            let beardifier = Beardifier::for_chunk([0, 0], &[piece]).unwrap();
+            let supports = beardifier.contribution_supports().unwrap();
+            assert_eq!(supports.len(), 2);
+            for x in -16..=19 {
+                for y in -20..=20 {
+                    for z in -15..=21 {
+                        if beardifier.sample(x, y, z) != 0.0 {
+                            assert!(
+                                supports.iter().any(|region| region.contains([x, y, z])),
+                                "missing support at {x},{y},{z} for {adjustment:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let overflow = Beardifier::new(
+            vec![RigidPiece {
+                bounds: bounds([i32::MAX - 4, 0, 0], [i32::MAX - 1, 1, 1]),
+                adjustment: TerrainAdjustment::BeardThin,
+                ground_delta: 0,
+            }],
+            vec![],
+            None,
+        );
+        assert!(overflow.contribution_supports().is_none());
     }
 
     #[test]

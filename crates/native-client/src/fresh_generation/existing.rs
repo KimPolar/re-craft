@@ -231,6 +231,24 @@ impl CapturedFeatureLight {
     }
 }
 
+/// Fresh section registrations bound to a single mixed terrain revision.
+pub(crate) struct CapturedInitialLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    tracker: native_session::worldgen::FreshGenerationLightTracker,
+    initialized: BTreeSet<native_world::loaded::ChunkPos>,
+}
+
+/// Initialized generation light before or during propagation.
+pub(crate) struct CapturedStagedLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    engine: native_session::worldgen::StagedGenerationLightEngine,
+    initialized: BTreeSet<native_world::loaded::ChunkPos>,
+    activated: BTreeSet<native_world::loaded::ChunkPos>,
+    light_revision: Arc<()>,
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -758,6 +776,139 @@ impl RestoredSavedTerrain {
 }
 
 impl PreparedExistingGenerator {
+    /// Start a fresh engine for a frozen mixed batch. The caller must still
+    /// establish that no saved or live engine state contributes to the area.
+    pub fn begin_captured_initial_light(
+        &self,
+        batch: &CapturedTerrainBatch,
+    ) -> Result<CapturedInitialLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "terrain belongs to another generation capture"
+        );
+        let captured = self.context.inputs().sources().chunks();
+        for (position, source) in &batch.sources {
+            let expected = captured
+                .get(position)
+                .context("light terrain source was not captured")?;
+            match (&expected.terrain, source) {
+                (None, None) => {}
+                (Some(saved), Some(source)) if Arc::ptr_eq(&saved.document, source) => {
+                    reject_saved_lighting(saved)?
+                }
+                _ => bail!("light terrain source differs"),
+            }
+        }
+        Ok(CapturedInitialLight {
+            identity: Arc::clone(&batch.identity),
+            revision: Arc::clone(&batch.revision),
+            tracker: native_session::worldgen::FreshGenerationLightTracker::new(
+                &batch.terrain,
+                self.lighting.has_skylight,
+            )?,
+            initialized: BTreeSet::new(),
+        })
+    }
+
+    /// Register one feature-complete chunk in the batch's own schedule.
+    pub fn initialize_captured_light(
+        &self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedInitialLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && Arc::ptr_eq(&light.identity, &batch.identity)
+                && Arc::ptr_eq(&light.revision, &batch.revision),
+            "light belongs to another terrain revision"
+        );
+        ensure!(
+            batch.feature_entity_sources.completed.contains(&position),
+            "light chunk has not completed features"
+        );
+        ensure!(
+            batch
+                .schedule
+                .ready(position, GenerationStage::InitializeLight),
+            "light initialization dependencies are incomplete"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        batch.schedule.run_light_initialization(
+            &batch.terrain,
+            position,
+            &mut light.tracker,
+            registry,
+        )?;
+        light.initialized.insert(position);
+        Ok(())
+    }
+
+    /// Freeze section registrations before light propagation.
+    pub fn seal_captured_light(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: CapturedInitialLight,
+    ) -> Result<CapturedStagedLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && Arc::ptr_eq(&light.identity, &batch.identity)
+                && Arc::ptr_eq(&light.revision, &batch.revision),
+            "light belongs to another terrain revision"
+        );
+        ensure!(!light.initialized.is_empty(), "no light chunks initialized");
+        Ok(CapturedStagedLight {
+            identity: light.identity,
+            revision: light.revision,
+            engine: native_session::worldgen::StagedGenerationLightEngine::new(light.tracker),
+            initialized: light.initialized,
+            activated: BTreeSet::new(),
+            light_revision: Arc::new(()),
+        })
+    }
+
+    /// Propagate one ready chunk after its complete 3×3 input is initialized.
+    /// The visible result remains an intermediate, non-writable snapshot.
+    pub fn propagate_captured_light(
+        &self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedStagedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && Arc::ptr_eq(&light.identity, &batch.identity)
+                && Arc::ptr_eq(&light.revision, &batch.revision),
+            "light belongs to another terrain revision"
+        );
+        ensure!(
+            initialized_light_neighborhood(&light.initialized, position),
+            "light neighborhood is not initialized"
+        );
+        ensure!(
+            batch.schedule.ready(position, GenerationStage::Light),
+            "light dependencies are incomplete"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let visible =
+            batch
+                .schedule
+                .run_light(&batch.terrain, position, &mut light.engine, registry)?;
+        light.activated.insert(position);
+        light.light_revision = Arc::new(());
+        Ok(visible)
+    }
+
     /// Start a new empty engine for captured, unlit terrain. The caller must
     /// independently establish that no saved or live engine state contributes
     /// to this region. Any later terrain change invalidates this tracker.
@@ -4561,7 +4712,7 @@ mod tests {
             z: second.z,
         };
         let mut schedule = GenerationSchedule::new();
-        schedule.request(target, GenerationStage::Features)?;
+        schedule.request(target, GenerationStage::Light)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
         let selected = actual.context.selection();
@@ -4700,8 +4851,8 @@ mod tests {
             }
         }
         actual.run_captured_saved_terrain(&mut work, &mut evaluator, second, &[])?;
-        for dz in -1..=1 {
-            for dx in -1..=1 {
+        for dz in -2..=2 {
+            for dx in -2..=2 {
                 let position = native_world::loaded::ChunkPos {
                     x: target.x + dx,
                     z: target.z + dz,
@@ -4745,7 +4896,7 @@ mod tests {
             batch.schedule().completed(second),
             Some(GenerationStage::Terrain)
         );
-        assert_eq!(batch.sources().len(), 9);
+        assert_eq!(batch.sources().len(), 25);
         assert!(matches!(batch.sources().get(&saved_target), Some(None)));
         assert!(
             matches!(batch.sources().get(&saved_second), Some(Some(source)) if source.as_ref() == &saved)
@@ -4827,6 +4978,92 @@ mod tests {
         assert!(
             actual
                 .run_captured_features_with_initial_light(&mut batch, &context, &light)
+                .is_err()
+        );
+
+        let empty = actual.begin_captured_initial_light(&batch)?;
+        assert!(actual.seal_captured_light(&batch, empty).is_err());
+        let mut stale = actual.begin_captured_initial_light(&batch)?;
+        let mut checked_stale = false;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let position = native_world::loaded::ChunkPos {
+                    x: target.x + dx,
+                    z: target.z + dz,
+                };
+                let context = actual.prepare_captured_decoration(
+                    &batch,
+                    native_persistence::world::ChunkPos {
+                        x: position.x,
+                        z: position.z,
+                    },
+                )?;
+                let columns = (-1..=1).flat_map(|z| {
+                    (-1..=1).map(move |x| native_world::loaded::ChunkPos {
+                        x: position.x + x,
+                        z: position.z + z,
+                    })
+                });
+                let light = native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(true, true, [], columns)
+                    .context("initial light snapshot unavailable")?;
+                let light = actual.bind_captured_initial_feature_light(&batch, light)?;
+                assert_eq!(
+                    actual
+                        .run_captured_features_with_initial_light(&mut batch, &context, &light)?,
+                    vec![true]
+                );
+                if !checked_stale {
+                    assert!(
+                        actual
+                            .initialize_captured_light(&mut batch, &mut stale, target)
+                            .is_err()
+                    );
+                    assert_eq!(
+                        batch.schedule().completed(target),
+                        Some(GenerationStage::Features)
+                    );
+                    checked_stale = true;
+                }
+            }
+        }
+        assert!(batch.has_entity_free_feature_coverage(target));
+        let mut initial = actual.begin_captured_initial_light(&batch)?;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                actual.initialize_captured_light(
+                    &mut batch,
+                    &mut initial,
+                    native_world::loaded::ChunkPos {
+                        x: target.x + dx,
+                        z: target.z + dz,
+                    },
+                )?;
+            }
+        }
+        assert!(
+            actual
+                .initialize_captured_light(&mut batch, &mut initial, target)
+                .is_err()
+        );
+        let mut staged = actual.seal_captured_light(&batch, initial)?;
+        assert!(
+            actual
+                .propagate_captured_light(&mut batch, &mut staged, second)
+                .is_err()
+        );
+        let visible = actual.propagate_captured_light(&mut batch, &mut staged, target)?;
+        assert!(visible.raw_brightness(marker, 0).is_some());
+        assert!(staged.activated.contains(&target));
+        assert_eq!(
+            batch.schedule().completed(target),
+            Some(GenerationStage::Light)
+        );
+        assert!(
+            actual
+                .propagate_captured_light(&mut batch, &mut staged, target)
                 .is_err()
         );
         Ok(())

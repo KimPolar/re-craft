@@ -284,6 +284,14 @@ fn generated_block_defaults_match_java() {
             assert!(registry.contains(&id), "missing copper block schema: {id}");
             cases.push(serde_json::json!({"id": id}));
         }
+        let grate = format!("minecraft:{prefix}copper_grate");
+        assert!(
+            registry.contains(&grate),
+            "missing copper grate schema: {grate}"
+        );
+        for waterlogged in ["true", "false", "invalid"] {
+            cases.push(serde_json::json!({"id":grate,"properties":{"waterlogged":waterlogged}}));
+        }
         let id = format!("minecraft:{prefix}copper_bulb");
         assert!(registry.contains(&id), "missing copper bulb schema: {id}");
         for lit in ["true", "false", "invalid"] {

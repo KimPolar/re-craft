@@ -715,6 +715,7 @@ impl GeneratedBlockRegistry {
                     "COPPER_BLOCK"
                         | "CUT_COPPER"
                         | "CHISELED_COPPER"
+                        | "COPPER_GRATE"
                         | "CUT_COPPER_SLAB"
                         | "COPPER_DOOR"
                         | "COPPER_BARS"
@@ -780,6 +781,14 @@ impl GeneratedBlockRegistry {
                             ("COPPER_BULB", false) => (
                                 "copper_bulb",
                                 "net/minecraft/world/level/block/CopperBulbBlock",
+                            ),
+                            ("COPPER_GRATE", true) => (
+                                "copper_grate",
+                                "net/minecraft/world/level/block/WeatheringCopperGrateBlock",
+                            ),
+                            ("COPPER_GRATE", false) => (
+                                "copper_grate",
+                                "net/minecraft/world/level/block/WaterloggedTransparentBlock",
                             ),
                             _ => unreachable!(),
                         };
@@ -945,7 +954,11 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
                 "net/minecraft/world/level/block/JigsawBlock" => Some(StateSchema::Jigsaw),
-                "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
+                "net/minecraft/world/level/block/BarrierBlock"
+                | "net/minecraft/world/level/block/WaterloggedTransparentBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperGrateBlock" => {
+                    Some(StateSchema::Waterlogged)
+                }
                 "net/minecraft/world/level/block/LanternBlock" => Some(StateSchema::Lantern),
                 "net/minecraft/world/level/block/CandleBlock" => Some(StateSchema::Candle),
                 "net/minecraft/world/level/block/LadderBlock" => Some(StateSchema::Ladder),

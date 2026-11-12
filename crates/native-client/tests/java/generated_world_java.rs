@@ -241,6 +241,12 @@ fn generated_world_spawn_chunk_round_trips_through_java() -> Result<()> {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
+fn generated_world_seed_one_round_trips_through_java() -> Result<()> {
+    generated_world_round_trips_through_java(1)
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_seed_42_round_trips_through_java() -> Result<()> {
     generated_world_round_trips_through_java(42)
 }

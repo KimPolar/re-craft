@@ -274,17 +274,73 @@ mod tests {
             options(parent.path().to_path_buf()),
         )?;
         match wait(&mut pipeline) {
-            InitialWorldResult::Ready { world, .. } => {
-                let path = match &world {
-                    StagedWorld::Regular(world) => world.path(),
-                    StagedWorld::Structured(world) => world.path(),
+            InitialWorldResult::Ready { generation, world } => {
+                let (path, uuid) = match &world {
+                    StagedWorld::Regular(world) => (world.path(), world.initial.uuid),
+                    StagedWorld::Structured(world) => (world.path(), world.initial.uuid),
                 };
-                let reader = native_persistence::world::WorldReader::open(
+                let mut reader = native_persistence::world::WorldReader::open(
                     path,
                     native_persistence::world::DimensionId::parse("overworld")?,
                 )?;
                 assert_eq!(reader.saved_world_seed()?, Some(1));
-                assert!(reader.read_player()?.is_some());
+                assert_eq!(reader.singleplayer_uuid_words()?, Some(uuid));
+                assert_eq!(
+                    reader
+                        .read_player()?
+                        .context("staged player missing")?
+                        .value
+                        .get("UUID"),
+                    Some(&native_persistence::nbt::Tag::IntArray(uuid.to_vec()))
+                );
+                let processed = generation
+                    .postprocessed
+                    .as_ref()
+                    .context("postprocessed generation missing")?;
+                assert!(!processed.chunks.is_empty());
+                for (position, expected) in &processed.chunks {
+                    let saved = reader
+                        .read_chunk(position.x, position.z)?
+                        .context("staged terrain chunk missing")?;
+                    assert!(saved.is_full());
+                    for field in [
+                        "sections",
+                        "Heightmaps",
+                        "block_entities",
+                        "block_ticks",
+                        "fluid_ticks",
+                        "PostProcessing",
+                    ] {
+                        assert_eq!(
+                            saved.document.value.get(field),
+                            expected.chunk.value.get(field),
+                            "chunk {position:?}: {field}"
+                        );
+                    }
+                    let records = expected
+                        .entity_records
+                        .as_ref()
+                        .context("entity coverage missing")?;
+                    let saved_entities = reader.read_entity_chunk(position.x, position.z)?;
+                    if records.is_empty() {
+                        assert!(
+                            saved_entities.is_none(),
+                            "empty entity chunk unexpectedly stored at {position:?}"
+                        );
+                    } else {
+                        let expected_entities = expected
+                            .entity_chunk
+                            .as_ref()
+                            .context("entity draft missing")?;
+                        assert_eq!(
+                            saved_entities
+                                .context("staged entities missing")?
+                                .document
+                                .as_ref(),
+                            expected_entities
+                        );
+                    }
+                }
             }
             InitialWorldResult::Failed { error, .. } => return Err(error),
             InitialWorldResult::Cancelled { .. } => {

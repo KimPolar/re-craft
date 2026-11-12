@@ -712,7 +712,13 @@ impl GeneratedBlockRegistry {
             } else if ins.op == 0xb3 && owner == BLOCKS {
                 if matches!(
                     member,
-                    "CUT_COPPER_SLAB" | "COPPER_DOOR" | "COPPER_BARS" | "COPPER_BULB"
+                    "COPPER_BLOCK"
+                        | "CUT_COPPER"
+                        | "CHISELED_COPPER"
+                        | "CUT_COPPER_SLAB"
+                        | "COPPER_DOOR"
+                        | "COPPER_BARS"
+                        | "COPPER_BULB"
                 ) && copper_factory
                     && registration.is_none()
                     && candidates.len() == 1
@@ -731,6 +737,19 @@ impl GeneratedBlockRegistry {
                         ("oxidized_", "waxed_"),
                     ] {
                         let (base, class) = match (member, prefix.is_empty()) {
+                            ("COPPER_BLOCK" | "CUT_COPPER" | "CHISELED_COPPER", weathering) => (
+                                match member {
+                                    "COPPER_BLOCK" => "copper",
+                                    "CUT_COPPER" => "cut_copper",
+                                    "CHISELED_COPPER" => "chiseled_copper",
+                                    _ => unreachable!(),
+                                },
+                                if weathering {
+                                    "net/minecraft/world/level/block/WeatheringCopperFullBlock"
+                                } else {
+                                    BASE
+                                },
+                            ),
                             ("CUT_COPPER_SLAB", true) => (
                                 "cut_copper_slab",
                                 "net/minecraft/world/level/block/WeatheringCopperSlabBlock",
@@ -767,11 +786,15 @@ impl GeneratedBlockRegistry {
                         ensure!(
                             registered_classes
                                 .insert(
-                                    format!("minecraft:{prefix}{stage}{base}"),
+                                    if member == "COPPER_BLOCK" && stage.is_empty() {
+                                        format!("minecraft:{prefix}copper_block")
+                                    } else {
+                                        format!("minecraft:{prefix}{stage}{base}")
+                                    },
                                     class.to_owned()
                                 )
                                 .is_none(),
-                            "duplicate copper slab registration"
+                            "duplicate copper collection registration"
                         );
                     }
                     candidates.clear();

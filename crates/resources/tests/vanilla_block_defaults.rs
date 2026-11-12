@@ -271,6 +271,19 @@ fn generated_block_defaults_match_java() {
         "waxed_weathered_",
         "waxed_oxidized_",
     ] {
+        let copper = if prefix.is_empty() || prefix == "waxed_" {
+            format!("minecraft:{prefix}copper_block")
+        } else {
+            format!("minecraft:{prefix}copper")
+        };
+        for id in [
+            copper,
+            format!("minecraft:{prefix}cut_copper"),
+            format!("minecraft:{prefix}chiseled_copper"),
+        ] {
+            assert!(registry.contains(&id), "missing copper block schema: {id}");
+            cases.push(serde_json::json!({"id": id}));
+        }
         let id = format!("minecraft:{prefix}copper_bulb");
         assert!(registry.contains(&id), "missing copper bulb schema: {id}");
         for lit in ["true", "false", "invalid"] {

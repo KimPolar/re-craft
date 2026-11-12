@@ -195,6 +195,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     throw new AssertionError("unsupported magma ore source "+state);
         }
         boolean lichenActive=vineActive && args[1].endsWith("_lichen");
+        boolean dryLichen=lichenActive && args[1].contains("_dry_lichen");
         boolean lakeActive=vineActive && args[1].contains("_lake_");
         boolean lakeMixed=lakeActive && args[1].endsWith("_mixed");
         boolean lakeOre=lakeActive && args[1].contains("_iron_ore_");
@@ -262,7 +263,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
             if(x==1 && z==0 && !blockCase && !magma && !magmaActive && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
-            if(x==1 && z==0 && lichenActive) {
+            if(x==1 && z==0 && lichenActive && !dryLichen) {
                 var water=Blocks.WATER.defaultBlockState();
                 fake.section.setBlockState(0,10,8,water); w.edits.put(new BlockPos(16,10,8),water);
             }
@@ -507,7 +508,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 var block=args[1].equals("vine_active_head") ? Blocks.CAVE_VINES : Blocks.CAVE_VINES_PLANT;
                 var pile=args[1].endsWith("_pile_snow") ? Blocks.SNOW : args[1].endsWith("_pile_hay") ? Blocks.HAY_BLOCK : args[1].endsWith("_pile_ice") ? Blocks.BLUE_ICE : args[1].endsWith("_pile_melon") ? Blocks.MELON : args[1].endsWith("_pile_pumpkin") ? Blocks.PUMPKIN : Blocks.JACK_O_LANTERN;
                 var state=jigsawWood ? (args[1].endsWith("_log") ? Blocks.OAK_LOG.defaultBlockState() : args[1].endsWith("_slab") ? Blocks.OAK_SLAB.defaultBlockState() : args[1].endsWith("_stairs") ? Blocks.OAK_STAIRS.defaultBlockState() : jigsawFence ? Blocks.OAK_FENCE.defaultBlockState() : jigsawGate ? Blocks.OAK_FENCE_GATE.defaultBlockState() : jigsawDoor ? Blocks.OAK_DOOR.defaultBlockState() : jigsawTrapdoor ? Blocks.DARK_OAK_TRAPDOOR.defaultBlockState() : jigsawTerracotta ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:white_terracotta")).defaultBlockState() : jigsawBed ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:white_bed")).defaultBlockState() : jigsawTorch ? (args[1].endsWith("_walltorch") ? Blocks.WALL_TORCH.defaultBlockState() : Blocks.TORCH.defaultBlockState()) : jigsawLadder ? Blocks.LADDER.defaultBlockState() : jigsawCarpet ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:blue_carpet")).defaultBlockState() : jigsawCandle ? Blocks.CANDLE.defaultBlockState() : jigsawLantern ? (args[1].endsWith("_soul_lantern") ? Blocks.SOUL_LANTERN.defaultBlockState() : Blocks.LANTERN.defaultBlockState()) : jigsawGlass ? (args[1].endsWith("_pane") ? Blocks.GLASS_PANE.defaultBlockState() : Blocks.GLASS.defaultBlockState()) : Blocks.OAK_PLANKS.defaultBlockState()) : pileActive ? pile.defaultBlockState() : magmaActive ? Blocks.MAGMA_BLOCK.defaultBlockState() : patchActive ? Blocks.WATER.defaultBlockState() : patchVine ? (args[1].endsWith("_clay") ? Blocks.CLAY.defaultBlockState() : Blocks.MOSS_BLOCK.defaultBlockState()) : lakeActive ? (lakeOre ? Blocks.STONE.defaultBlockState() : args[1].endsWith("_sulfur") ? Blocks.SULFUR.defaultBlockState() : args[1].endsWith("_water") ? Blocks.WATER.defaultBlockState() : (args[1].endsWith("_lava") || (lakeMixed && i==1)) ? Blocks.LAVA.defaultBlockState() : Blocks.CAVE_AIR.defaultBlockState()) : lichenActive
-                    ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true).setValue(net.minecraft.world.level.block.MultifaceBlock.getFaceProperty(net.minecraft.core.Direction.UP),true)
+                    ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,!dryLichen).setValue(net.minecraft.world.level.block.MultifaceBlock.getFaceProperty(net.minecraft.core.Direction.UP),true)
                     : block.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,berries);
                 if(jigsawCandle)state=state.setValue(net.minecraft.world.level.block.CandleBlock.CANDLES,3).setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.LIT,args[1].contains("_lit_"));
                 if(plantActive){

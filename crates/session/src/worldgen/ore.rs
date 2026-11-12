@@ -8035,21 +8035,25 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     } else {
                         false
                     };
-                    let water_lichen_write = guard.require_unchanged_light
+                    let lichen_write = guard.require_unchanged_light
                         && self.multiface_block_write
-                        && old.name == "minecraft:water"
-                        && old.properties.len() == 1
-                        && old.properties.get("level").map(String::as_str) == Some("0")
                         && valid_lichen(state)
-                        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+                        && ((old_air
+                            && state.properties.get("waterlogged").map(String::as_str)
+                                == Some("false"))
+                            || (old.name == "minecraft:water"
+                                && old.properties.len() == 1
+                                && old.properties.get("level").map(String::as_str) == Some("0")
+                                && state.properties.get("waterlogged").map(String::as_str)
+                                    == Some("true")))
                         && ["down", "up", "north", "south", "west", "east"]
                             .into_iter()
                             .any(|face| {
                                 state.properties.get(face).map(String::as_str) == Some("true")
                             });
-                    // A source-water block emits no light; a lichen with a
+                    // Air and source water emit no light; a lichen with a
                     // face emits light and always requires a block check.
-                    let lichen_check = water_lichen_write;
+                    let lichen_check = lichen_write;
                     let lake_source = (matches!(
                         old.name.as_str(),
                         "minecraft:stone"
@@ -8103,7 +8107,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || pile_light_update
                                 || jigsaw_light_update
                                 || vine_write
-                                || water_lichen_write
+                                || lichen_write
                                 || lake_light_update
                                 || room_light_update
                                 || magma_light_update
@@ -8128,7 +8132,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || fresh_water_dripleaf
                             || fresh_waterlog_dripleaf
                             || vine_write
-                            || water_lichen_write
+                            || lichen_write
                             || lake_light_update
                             || room_light_update
                             || magma_light_update
@@ -8171,7 +8175,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || vine_write
                                 || pile_light_update
                                 || jigsaw_light_update
-                                || vegetation_allocation);
+                                || vegetation_allocation
+                                || lichen_write);
                         ensure!(
                             if old_air {
                                 count > 0 || new_section
@@ -8208,7 +8213,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         if vine_write
                             || (pile_light_update && guard.require_unchanged_light)
                             || (jigsaw_light_update && guard.require_unchanged_light)
-                            || water_lichen_write
+                            || lichen_write
                             || lake_light_update
                             || room_light_update
                             || magma_light_update
@@ -12359,6 +12364,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_lichen_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lichen",
+            "vine_active_self_lichen",
+            "vine_active_dry_lichen",
+            "vine_active_self_dry_lichen",
+            "vine_active_empty_dry_lichen",
+            "vine_active_self_empty_dry_lichen",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_deepslate_lake_light_matches_java_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_lake_deepslate_x_air",
@@ -12886,7 +12904,7 @@ mod tests {
                 let id = world.intern_state(plain);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
-            if mode.ends_with("_lichen") {
+            if mode.ends_with("_lichen") && !mode.contains("_dry_lichen") {
                 let mut water = state("water");
                 water.properties.insert("level".into(), "0".into());
                 let id = world.intern_state(water);
@@ -13301,7 +13319,9 @@ mod tests {
                     ] {
                         lichen.properties.insert(
                             property.into(),
-                            (property == "up" || property == "waterlogged").to_string(),
+                            (property == "up"
+                                || (property == "waterlogged" && !mode.contains("_dry_lichen")))
+                            .to_string(),
                         );
                     }
                     assert!(

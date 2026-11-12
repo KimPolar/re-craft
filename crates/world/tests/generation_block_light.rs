@@ -20,6 +20,14 @@ fn state(name: &str) -> BlockState {
     let (block, properties) = match name {
         "air" => ("air", vec![]),
         "stone" => ("stone", vec![]),
+        "bee_nest" => (
+            "bee_nest",
+            vec![("facing", "south"), ("honey_level", "0")],
+        ),
+        "beehive" => (
+            "beehive",
+            vec![("facing", "north"), ("honey_level", "5")],
+        ),
         "glass" => ("glass", vec![]),
         "torch" => ("torch", vec![]),
         "firefly_bush" => ("firefly_bush", vec![]),
@@ -821,6 +829,8 @@ fn generated_block_light_matches_java_from_complete_halo() {
         (8, 16, 8, "firefly_bush"),
         (9, 16, 8, "small_bud"),
         (1, 8, 8, "stone"),
+        (2, 8, 8, "bee_nest"),
+        (3, 8, 8, "beehive"),
         (0, 8, 7, "water"),
         (7, 30, 8, "slab_bottom"),
         (8, 29, 8, "slab_top"),

@@ -40,6 +40,8 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
         return switch (name) {
             case "air" -> Blocks.AIR.defaultBlockState();
             case "stone" -> Blocks.STONE.defaultBlockState();
+            case "bee_nest" -> Blocks.BEE_NEST.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH);
+            case "beehive" -> Blocks.BEEHIVE.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH).setValue(BeehiveBlock.HONEY_LEVEL, 5);
             case "torch" -> Blocks.TORCH.defaultBlockState();
             case "water" -> Blocks.WATER.defaultBlockState();
             case "wet_pane" -> Blocks.GLASS_PANE.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED, true);

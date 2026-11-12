@@ -191,6 +191,34 @@ pub(crate) struct RestoredSavedTerrain {
     >,
 }
 
+/// A captured schedule with its restored and newly generated biome volumes.
+/// Structure stages must already have been restored by the caller; this does
+/// not prove that the other data needed for terrain or saving is complete.
+pub(crate) struct CapturedBiomeSchedule {
+    identity: Arc<()>,
+    schedule: GenerationSchedule,
+    biomes: native_session::worldgen::BiomeNeighborhood,
+}
+
+impl CapturedBiomeSchedule {
+    pub fn schedule(&self) -> &GenerationSchedule {
+        &self.schedule
+    }
+
+    pub fn biomes(&self) -> &native_session::worldgen::BiomeNeighborhood {
+        &self.biomes
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        GenerationSchedule,
+        native_session::worldgen::BiomeNeighborhood,
+    ) {
+        (self.schedule, self.biomes)
+    }
+}
+
 /// Live terrain, POI and tracked entity evidence bound to one captured
 /// generator. Other live state and disk and pack dependencies remain separate.
 pub(crate) struct LiveGenerationInputs {
@@ -2456,6 +2484,99 @@ impl PreparedExistingGenerator {
             neighborhood.insert(chunk)?;
         }
         Ok(neighborhood)
+    }
+
+    /// Bind restored biome volumes to a schedule whose other saved stage data
+    /// has already been imported. Every current requirement must be captured.
+    pub fn begin_captured_biome_schedule(
+        &mut self,
+        schedule: GenerationSchedule,
+        saved_positions: impl IntoIterator<Item = native_persistence::world::ChunkPos>,
+    ) -> Result<CapturedBiomeSchedule> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let sources = self.context.inputs().sources().chunks();
+        for (pos, _) in schedule.requirements() {
+            ensure!(
+                sources.contains_key(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z }),
+                "generation schedule includes an uncaptured chunk"
+            );
+        }
+        ensure!(schedule.requested_chunks() > 0, "no generation requests");
+        let mut positions = Vec::new();
+        let mut seen = BTreeSet::new();
+        for position in saved_positions {
+            ensure!(seen.insert(position), "duplicate saved biome chunk");
+            let source = sources
+                .get(&position)
+                .context("saved biome chunk was not captured")?
+                .terrain
+                .as_ref()
+                .context("saved biome chunk is missing")?;
+            reject_saved_blending(&source.document)?;
+            let status = source
+                .status
+                .as_ref()
+                .context("saved chunk status is missing")?;
+            let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+            let saved_stage =
+                GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let completed = schedule
+                .completed(key)
+                .context("saved biome chunk is not requested")?;
+            ensure!(
+                completed >= GenerationStage::Biomes && completed <= saved_stage,
+                "saved biome stage is not restored in the schedule"
+            );
+            positions.push(position);
+        }
+        let restored = if positions.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.restore_saved_biomes(positions)?
+        };
+        let mut biomes = self.generator.biome_neighborhood()?;
+        for biome in restored.into_values() {
+            biomes.insert(biome)?;
+        }
+        Ok(CapturedBiomeSchedule {
+            identity: Arc::clone(&self.identity),
+            schedule,
+            biomes,
+        })
+    }
+
+    /// Generate only a captured absent chunk at the schedule's ready BIOMES
+    /// step. Discard the generator and evaluator after a generation error.
+    pub fn run_captured_biomes(
+        &mut self,
+        work: &mut CapturedBiomeSchedule,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &work.identity),
+            "biomes belong to another generation capture"
+        );
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            })
+            .context("biome chunk was not captured")?;
+        ensure!(
+            source.terrain.is_none(),
+            "saved biome chunk must be restored"
+        );
+        work.schedule
+            .run_biomes(&mut self.generator, evaluator, &mut work.biomes, position)
     }
 
     /// Restore the effective reference sets from one captured saved chunk.
@@ -5204,6 +5325,79 @@ mod tests {
             let live_inputs = narrow.capture_live_inputs(&live, &narrow_terrain)?;
             narrow.verify_live_inputs(&live, &live_inputs)?;
             assert!(actual.verify_live_inputs(&live, &live_inputs).is_err());
+
+            if name == "overworld" {
+                use native_session::worldgen::schedule::GenerationStage;
+                let missing_key = native_world::loaded::ChunkPos { x: -1, z: 0 };
+                let mut outside = GenerationSchedule::new();
+                outside.request(
+                    native_world::loaded::ChunkPos { x: 100, z: 100 },
+                    GenerationStage::Biomes,
+                )?;
+                assert!(actual.begin_captured_biome_schedule(outside, []).is_err());
+                let mut unrestored = GenerationSchedule::new();
+                unrestored.request(key, GenerationStage::Biomes)?;
+                assert!(
+                    actual
+                        .begin_captured_biome_schedule(unrestored, [position])
+                        .is_err()
+                );
+                let mut biome_schedule = GenerationSchedule::new();
+                biome_schedule.request(missing_key, GenerationStage::Biomes)?;
+                // Synthetic structure stages stand in for the separately
+                // restored structure data this API requires in production.
+                let imported: Vec<_> = biome_schedule
+                    .requirements()
+                    .map(|(pos, _)| {
+                        let stage = if pos == missing_key {
+                            GenerationStage::StructureReferences
+                        } else if pos == key {
+                            GenerationStage::Biomes
+                        } else {
+                            GenerationStage::StructureStarts
+                        };
+                        (pos, stage)
+                    })
+                    .collect();
+                biome_schedule.restore_imported(imported)?;
+                let mut work = actual.begin_captured_biome_schedule(biome_schedule, [position])?;
+                assert_eq!(
+                    work.biomes().chunk([0, 0]).unwrap().values(),
+                    chunk.values()
+                );
+                let mut evaluator = native_resources::density::DensityEvaluator::default();
+                assert!(
+                    narrow
+                        .run_captured_biomes(&mut work, &mut evaluator, missing_key)
+                        .is_err()
+                );
+                assert!(
+                    actual
+                        .run_captured_biomes(&mut work, &mut evaluator, key)
+                        .is_err()
+                );
+                assert_eq!(
+                    work.schedule().completed(missing_key),
+                    Some(GenerationStage::StructureReferences)
+                );
+                actual.run_captured_biomes(&mut work, &mut evaluator, missing_key)?;
+                assert_eq!(
+                    work.schedule().completed(missing_key),
+                    Some(GenerationStage::Biomes)
+                );
+                assert!(work.biomes().chunk([-1, 0]).is_some());
+                assert!(
+                    actual
+                        .run_captured_biomes(&mut work, &mut evaluator, missing_key)
+                        .is_err()
+                );
+                let (schedule, biomes) = work.into_parts();
+                assert_eq!(
+                    schedule.completed(missing_key),
+                    Some(GenerationStage::Biomes)
+                );
+                assert!(biomes.chunk([0, 0]).is_some());
+            }
 
             // A capture can include both a saved neighbor and a chunk that has
             // never been generated, or consist entirely of missing chunks.

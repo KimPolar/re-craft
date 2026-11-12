@@ -1618,6 +1618,12 @@ mod tests {
     #[ignore = "performance measurement requiring a GPU and the locally installed Minecraft assets"]
     fn measure_gpu_menu_frame_cost() {
         pollster::block_on(async {
+            let (width, height) = if std::env::var_os("NATIVE_MENU_TEST_1080").is_some() {
+                (1920, 1080)
+            } else {
+                (1280, 720)
+            };
+            let aspect = width as f32 / height as f32;
             let directory = std::env::var_os("MINECRAFT_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -1675,7 +1681,7 @@ mod tests {
             let faces_view = cube_view(&faces);
             let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("benchmark params"),
-                contents: bytemuck::cast_slice(&[1280.0_f32 / 720.0, 0.0, 0.0, 0.0]),
+                contents: bytemuck::cast_slice(&[aspect, 0.0, 0.0, 0.0]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
             let panorama_overlay = upload_rgba(
@@ -1703,7 +1709,7 @@ mod tests {
             let overlay_bind = image_binding(&device, &image_layout, &overlay_view, &sampler);
             let output = texture(
                 &device,
-                (1280, 720),
+                (width, height),
                 format,
                 wgpu::TextureUsages::RENDER_ATTACHMENT,
                 "benchmark frame",
@@ -1713,7 +1719,7 @@ mod tests {
             let mut times = Vec::new();
             for frame in 0..130 {
                 let started = std::time::Instant::now();
-                let values = [1280.0_f32 / 720.0, frame as f32 * 0.0003, 0.0, 0.0];
+                let values = [aspect, frame as f32 * 0.0003, 0.0, 0.0];
                 queue.write_buffer(&params, 0, bytemuck::cast_slice(&values));
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -1752,7 +1758,7 @@ mod tests {
             }
             times.sort_unstable();
             println!(
-                "offscreen 1280x720 GPU panorama + overlay on {adapter_name}: median {:?}, p95 {:?}; excludes window presentation",
+                "offscreen {width}x{height} GPU panorama + overlay on {adapter_name}: median {:?}, p95 {:?}; excludes window presentation",
                 times[times.len() / 2],
                 times[times.len() * 95 / 100]
             );

@@ -199,6 +199,10 @@ pub(crate) struct CapturedBiomeSchedule {
     schedule: GenerationSchedule,
     biomes: native_session::worldgen::BiomeNeighborhood,
     terrain: BTreeMap<native_persistence::world::ChunkPos, ResumedSavedTerrain>,
+    new_terrain: BTreeMap<
+        native_persistence::world::ChunkPos,
+        native_session::worldgen::MaterializedTerrain,
+    >,
 }
 
 impl CapturedBiomeSchedule {
@@ -217,14 +221,25 @@ impl CapturedBiomeSchedule {
         self.terrain.get(&position)
     }
 
+    pub fn new_terrain_chunk(
+        &self,
+        position: native_persistence::world::ChunkPos,
+    ) -> Option<&native_session::worldgen::MaterializedTerrain> {
+        self.new_terrain.get(&position)
+    }
+
     pub fn into_parts(
         self,
     ) -> (
         GenerationSchedule,
         native_session::worldgen::BiomeNeighborhood,
         BTreeMap<native_persistence::world::ChunkPos, ResumedSavedTerrain>,
+        BTreeMap<
+            native_persistence::world::ChunkPos,
+            native_session::worldgen::MaterializedTerrain,
+        >,
     ) {
-        (self.schedule, self.biomes, self.terrain)
+        (self.schedule, self.biomes, self.terrain, self.new_terrain)
     }
 }
 
@@ -2556,6 +2571,7 @@ impl PreparedExistingGenerator {
             schedule,
             biomes,
             terrain: BTreeMap::new(),
+            new_terrain: BTreeMap::new(),
         })
     }
 
@@ -2643,6 +2659,87 @@ impl PreparedExistingGenerator {
         work.terrain.insert(target, terrain);
         if let Err(error) = work.schedule.complete(position, GenerationStage::Terrain) {
             work.terrain.remove(&target);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Generate terrain for an absent chunk in a world with structures
+    /// disabled. The retained result is intermediate and does not authorize
+    /// writing the captured terrain or sidecars.
+    pub fn run_captured_new_terrain(
+        &mut self,
+        work: &mut CapturedBiomeSchedule,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &work.identity),
+            "terrain belongs to another generation capture"
+        );
+        ensure!(
+            !self.generate_structures,
+            "new terrain requires generated structure references"
+        );
+        ensure!(
+            work.schedule.ready(position, GenerationStage::Terrain),
+            "terrain dependencies are incomplete"
+        );
+        let target = native_persistence::world::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target)
+            .context("terrain target was not captured")?;
+        ensure!(source.terrain.is_none(), "saved terrain must be resumed");
+        ensure!(
+            !work.new_terrain.contains_key(&target),
+            "terrain chunk already exists"
+        );
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let x = position
+                    .x
+                    .checked_add(dx)
+                    .context("neighbor chunk X overflow")?;
+                let z = position
+                    .z
+                    .checked_add(dz)
+                    .context("neighbor chunk Z overflow")?;
+                ensure!(
+                    work.biomes.chunk([x, z]).is_some(),
+                    "terrain biome neighbor is missing"
+                );
+            }
+        }
+        let biome = Arc::clone(
+            work.biomes
+                .chunk([position.x, position.z])
+                .context("terrain biome is missing")?,
+        );
+        let terrain = self.generate_terrain_from_biomes(target, evaluator, &work.biomes, None)?;
+        let dimension = self.context.inputs().sources().dimension();
+        let dimension = format!("{}:{}", dimension.namespace, dimension.path);
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let terrain = native_session::worldgen::materialize_carved_terrain(
+            terrain,
+            &biome,
+            &dimension,
+            |value| resolve_generated_terrain_state(value, registry),
+        )?;
+        work.new_terrain.insert(target, terrain);
+        if let Err(error) = work.schedule.complete(position, GenerationStage::Terrain) {
+            work.new_terrain.remove(&target);
             return Err(error);
         }
         Ok(())
@@ -3228,6 +3325,18 @@ impl PreparedExistingGenerator {
             ensure!(structure_order.is_empty(), "structures are disabled");
             None
         };
+        let terrain =
+            self.generate_terrain_from_biomes(target, evaluator, neighborhood, structure)?;
+        Ok((terrain, biome))
+    }
+
+    fn generate_terrain_from_biomes(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        neighborhood: &native_session::worldgen::BiomeNeighborhood,
+        structure: Option<Arc<native_core::beardifier::Beardifier>>,
+    ) -> Result<native_resources::surface_pass::SurfaceStageChunk> {
         self.ensure_terrain_assets()?;
         let assets = self
             .terrain_assets
@@ -3245,7 +3354,7 @@ impl PreparedExistingGenerator {
                     .is_some(),
             })
         };
-        let terrain = if let Some(structure) = structure {
+        if let Some(structure) = structure {
             self.generator
                 .generate_carved_surface_with_structure_context(
                     &mut self.resources,
@@ -3270,8 +3379,7 @@ impl PreparedExistingGenerator {
             );
             evaluator.replace_structure_terrain_context(previous);
             result
-        }?;
-        Ok((terrain, biome))
+        }
     }
 
     /// Restore every terrain chunk present in the capture. Missing chunks stay
@@ -3949,6 +4057,185 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn captured_empty_chunk_generates_scheduled_terrain_without_structures() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::worldgen_settings::{
+            NewWorldOptions, draft_baked_worldgen_settings,
+        };
+        use native_session::worldgen::schedule::GenerationStage;
+        use std::io::Write;
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let mut resources = ResourceStack::open(&game)?;
+        let settings = draft_baked_worldgen_settings(
+            &mut resources,
+            "minecraft:normal",
+            NewWorldOptions {
+                seed: 42,
+                generate_structures: false,
+                bonus_chest: false,
+            },
+        )?;
+        std::fs::create_dir_all(root.join("data/minecraft"))?;
+        std::fs::write(
+            root.join("data/minecraft/world_gen_settings.dat"),
+            native_persistence::nbt::write(&settings)?,
+        )?;
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            )]),
+        };
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&native_persistence::nbt::write(&level)?)?;
+        std::fs::write(root.join("level.dat"), gzip.finish()?)?;
+        let mut reader = WorldReader::open_for_session(root, DimensionId::parse("overworld")?)?;
+        let target = native_world::loaded::ChunkPos { x: -1, z: 2 };
+        let saved_target = native_persistence::world::ChunkPos {
+            x: target.x,
+            z: target.z,
+        };
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(target, GenerationStage::Terrain)?;
+        let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
+        assert!(!actual.generate_structures);
+        // With structures disabled these stages produce no starts or references.
+        let completed: Vec<_> = schedule
+            .requirements()
+            .map(|(pos, required)| {
+                (
+                    pos,
+                    if required >= GenerationStage::Biomes {
+                        GenerationStage::StructureReferences
+                    } else {
+                        GenerationStage::StructureStarts
+                    },
+                )
+            })
+            .collect();
+        schedule.restore_imported(completed)?;
+        let mut work = actual.begin_captured_biome_schedule(schedule, [])?;
+        let mut evaluator = native_resources::density::DensityEvaluator::default();
+        assert!(
+            actual
+                .run_captured_new_terrain(&mut work, &mut evaluator, target)
+                .is_err()
+        );
+        assert!(work.new_terrain_chunk(saved_target).is_none());
+        assert_eq!(
+            work.schedule().completed(target),
+            Some(GenerationStage::StructureReferences)
+        );
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                actual.run_captured_biomes(
+                    &mut work,
+                    &mut evaluator,
+                    native_world::loaded::ChunkPos {
+                        x: target.x + dx,
+                        z: target.z + dz,
+                    },
+                )?;
+            }
+        }
+        assert!(work.schedule().ready(target, GenerationStage::Terrain));
+        actual.run_captured_new_terrain(&mut work, &mut evaluator, target)?;
+        assert_eq!(
+            work.schedule().completed(target),
+            Some(GenerationStage::Terrain)
+        );
+        assert!(
+            actual
+                .run_captured_new_terrain(&mut work, &mut evaluator, target)
+                .is_err()
+        );
+
+        let (lighting, definition, _) = GeneratedDimensionLighting::load_preset_with_definition(
+            &mut resources,
+            "minecraft:normal",
+            "minecraft:overworld",
+        )?;
+        let mut reference = TerrainGenerator::without_terrain_adjustments(
+            &mut resources,
+            &definition,
+            42,
+            lighting.min_y,
+            lighting.height,
+        )?;
+        let mut reference_biomes = reference.biome_neighborhood()?;
+        let mut reference_evaluator = native_resources::density::DensityEvaluator::default();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                reference_biomes.insert(Arc::new(reference.generate_biomes(
+                    [target.x + dx, target.z + dz],
+                    &mut reference_evaluator,
+                )?))?;
+            }
+        }
+        let block_ids = resources.vanilla_block_ids()?;
+        let tags = CarverBlockTags::load(&mut resources, &block_ids)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let expected = reference.generate_carved_surface(
+            &mut resources,
+            &mut reference_evaluator,
+            &mut native_resources::carver::schedule::CarverCache::default(),
+            [target.x, target.z],
+            &reference_biomes,
+            &tags,
+            |value| {
+                let state = resolve_generated_terrain_state(value, &registry)?;
+                Ok(CarverBlockState {
+                    is_air: matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ),
+                    has_fluid: FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some(),
+                })
+            },
+        )?;
+        let terrain = work
+            .new_terrain_chunk(saved_target)
+            .context("new terrain missing")?;
+        assert_eq!(terrain.fluid_postprocessing(), expected.fluid_updates);
+        assert_eq!(
+            terrain.carver_postprocessing(),
+            expected.carver_postprocessing.as_ref()
+        );
+        for z in [0usize, 15] {
+            for x in [0usize, 15] {
+                for y in 0..lighting.height as usize {
+                    let index = (z * 16 + x) * lighting.height as usize + y;
+                    let expected =
+                        resolve_generated_terrain_state(&expected.states[index], &registry)?;
+                    assert_eq!(
+                        terrain.world().block(
+                            target.x * 16 + x as i32,
+                            lighting.min_y + y as i32,
+                            target.z * 16 + z as i32
+                        ),
+                        Some(&expected)
+                    );
+                }
+            }
+        }
+        let (schedule, _, saved, new) = work.into_parts();
+        assert_eq!(schedule.completed(target), Some(GenerationStage::Terrain));
+        assert!(saved.is_empty());
+        assert!(new.contains_key(&saved_target));
+        Ok(())
+    }
 
     #[test]
     fn known_entity_ids_include_proto_sidecar_and_nested_passengers() {
@@ -5493,13 +5780,14 @@ mod tests {
                         .run_captured_biomes(&mut work, &mut evaluator, missing_key)
                         .is_err()
                 );
-                let (schedule, biomes, terrain) = work.into_parts();
+                let (schedule, biomes, terrain, new_terrain) = work.into_parts();
                 assert_eq!(
                     schedule.completed(missing_key),
                     Some(GenerationStage::Biomes)
                 );
                 assert!(biomes.chunk([0, 0]).is_some());
                 assert!(terrain.is_empty());
+                assert!(new_terrain.is_empty());
             }
 
             // A capture can include both a saved neighbor and a chunk that has
@@ -5705,9 +5993,10 @@ mod tests {
                         .run_captured_saved_terrain(&mut work, &mut evaluator, target, &[])
                         .is_err()
                 );
-                let (plan, _, terrain) = work.into_parts();
+                let (plan, _, terrain, new_terrain) = work.into_parts();
                 assert_eq!(plan.completed(target), Some(GenerationStage::Terrain));
                 assert!(terrain.contains_key(&boundary));
+                assert!(new_terrain.is_empty());
             }
             let positions = (2..=4).flat_map(|z| (2..=4).map(move |x| ChunkPos { x, z }));
             let saved_neighbors = actual.restore_saved_biomes(positions)?;

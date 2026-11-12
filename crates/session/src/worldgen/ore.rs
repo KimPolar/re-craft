@@ -1360,6 +1360,9 @@ impl ConfiguredDecoration {
                 tags.insert(ResourceId::parse("minecraft:supports_azalea").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
                 tags.insert(
+                    ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap(),
+                );
+                tags.insert(
                     ResourceId::parse("minecraft:enables_bubble_column_drag_down").unwrap(),
                 );
                 tags.insert(ResourceId::parse("minecraft:enables_bubble_column_push_up").unwrap());
@@ -6027,6 +6030,17 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                 updated.properties.insert("snowy".into(), snowy.to_string());
                 return Ok(updated);
             }
+        } else if matches!(
+            state.name.as_str(),
+            "minecraft:brown_mushroom" | "minecraft:red_mushroom"
+        ) {
+            ensure!(state.properties.is_empty(), "invalid mushroom state");
+            if !self.mushroom_survival(pos)? {
+                return Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: BTreeMap::new(),
+                });
+            }
         } else if tree_leaf_litter(state)? {
             let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
             if !tree_sturdy_up(&below)? {
@@ -8325,6 +8339,9 @@ mod tests {
                 }
                 "data/minecraft/tags/block/supports_azalea.json" => {
                     Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore"]}"#.to_vec())
+                }
+                "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" => {
+                    Some(br#"{"values":[]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/air.json" => Some(
                     br#"{"values":["minecraft:air","minecraft:cave_air","minecraft:void_air"]}"#
@@ -22363,6 +22380,170 @@ mod tests {
             }
         }
         assert_eq!(checked, 4 * 2 * 4 * 7 * 6);
+    }
+
+    fn small_mushroom_edge_results() -> Vec<bool> {
+        use native_resources::tree_leaf_update::ShapeEdgeWorld;
+
+        struct OverrideTag<'a> {
+            support: &'a str,
+            enabled: bool,
+        }
+        impl ResourceProvider for OverrideTag<'_> {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    let values = if self.enabled {
+                        vec![self.support]
+                    } else {
+                        vec![]
+                    };
+                    return Ok(Some(serde_json::to_vec(&json!({"values": values}))?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let registry = ["minecraft:air", "minecraft:stone"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let required =
+            BTreeSet::from([
+                ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap(),
+            ]);
+        let directions = [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ];
+        let mut results = Vec::new();
+        for mushroom in ["brown_mushroom", "red_mushroom"] {
+            for support in ["stone", "air"] {
+                for enabled in [false, true] {
+                    let tags = OreBlockTags::load(
+                        &mut OverrideTag {
+                            support: &format!("minecraft:{support}"),
+                            enabled,
+                        },
+                        &registry,
+                        &required,
+                    )
+                    .unwrap();
+                    for brightness in [0, 12, 13, 15] {
+                        let (mut terrain, _, motion, _) = fixture();
+                        let sampler = |_: &World, _: [i32; 3]| Ok(brightness);
+                        let mut region = terrain
+                            .decoration_region(
+                                &tags,
+                                &motion,
+                                BTreeSet::from([ChunkPos { x: 0, z: 0 }]),
+                            )
+                            .unwrap();
+                        region.raw_brightness = Some(&sampler);
+                        region
+                            .set_section_block([8, 7, 8], &state(support))
+                            .unwrap();
+                        let block = state(mushroom);
+                        for direction in directions {
+                            let updated = region
+                                .update_shape(
+                                    [8, 8, 8],
+                                    &block,
+                                    direction,
+                                    [0, 0, 0],
+                                    &state("stone"),
+                                )
+                                .unwrap();
+                            assert!(updated == block || updated == state("air"));
+                            results.push(updated == block);
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    #[test]
+    fn small_mushroom_tree_edges_check_light_and_support() {
+        let actual = small_mushroom_edge_results();
+        let mut expected = Vec::new();
+        for _ in 0..2 {
+            for support in [true, false] {
+                for overridden in [false, true] {
+                    for light in [0, 12, 13, 15] {
+                        expected.extend(std::iter::repeat_n(
+                            overridden || (support && light < 13),
+                            6,
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn small_mushroom_tree_edges_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeSmallMushroomOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeSmallMushroomOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeSmallMushroomOracle"));
+        let expected: Vec<bool> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("R "))
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(expected.len(), 2 * 2 * 2 * 4 * 6);
+        assert_eq!(small_mushroom_edge_results(), expected);
     }
 
     #[test]

@@ -176,6 +176,14 @@ pub struct GenerationPoiGuard {
     chunks: BTreeMap<ChunkPos, Option<SavedPoiData>>,
 }
 
+/// Captured entity sidecars and tracked simulated entities for generation.
+/// Other entity types and lifecycle effects still require independent checks.
+pub struct GenerationEntityGuard {
+    session: Arc<()>,
+    sources: BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
+    chunks: BTreeMap<ChunkPos, Option<SavedEntityData>>,
+}
+
 fn matching_terrain_chunks(
     first: &World,
     a: &native_world::loaded::Chunk,
@@ -5797,6 +5805,85 @@ impl LoadedSession {
                 _ => false,
             };
             anyhow::ensure!(same, "live generation POI changed at {position:?}");
+        }
+        Ok(())
+    }
+
+    /// Check that disk entity sidecars agree with the live session and that
+    /// tracked item, orb and falling-block changes do not alter the inputs.
+    /// This does not establish coverage for other simulated entity types.
+    pub fn capture_generation_entities(
+        &self,
+        sources: &BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
+    ) -> anyhow::Result<GenerationEntityGuard> {
+        anyhow::ensure!(!sources.is_empty(), "no generation entity inputs");
+        let chunks = self.generation_entity_chunks(sources)?;
+        Ok(GenerationEntityGuard {
+            session: Arc::clone(&self.generation_identity),
+            sources: sources.clone(),
+            chunks,
+        })
+    }
+
+    fn generation_entity_chunks(
+        &self,
+        sources: &BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
+    ) -> anyhow::Result<BTreeMap<ChunkPos, Option<SavedEntityData>>> {
+        let tracked = self.draft_tracked_entity_chunks()?;
+        let mut chunks = BTreeMap::new();
+        for (&pos, source) in sources {
+            anyhow::ensure!(
+                !self.incoming.iter().any(|incoming| incoming.pos == pos),
+                "generation entity data is pending at {pos:?}"
+            );
+            let live = self.entity_chunks.get(&pos).cloned();
+            match (&live, source) {
+                (Some(SavedEntityData::Empty), None) => {}
+                (Some(SavedEntityData::Present(actual)), Some(expected)) => {
+                    anyhow::ensure!(
+                        native_persistence::nbt::write(&actual.document)?
+                            == native_persistence::nbt::write(expected)?,
+                        "live entities differ from captured input at {pos:?}"
+                    );
+                }
+                (None, _) if !self.has_resident_or_parked_chunk(pos) => {}
+                _ => anyhow::bail!(
+                    "live entities are unavailable or differ from captured input at {pos:?}"
+                ),
+            }
+            if let Some(draft) = tracked.get(&pos) {
+                let expected = source.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("tracked entities changed an absent input at {pos:?}")
+                })?;
+                anyhow::ensure!(
+                    draft.matches_source(expected)?
+                        && native_persistence::nbt::write(draft.document())?
+                            == native_persistence::nbt::write(expected)?,
+                    "tracked entities differ from captured input at {pos:?}"
+                );
+            }
+            chunks.insert(pos, live);
+        }
+        Ok(chunks)
+    }
+
+    /// Recheck on the simulation thread while retaining exclusive access to
+    /// the session through the operation that installs a generated result.
+    pub fn verify_generation_entities(&self, guard: &GenerationEntityGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.generation_identity, &guard.session),
+            "generation entities belong to another session"
+        );
+        let current = self.generation_entity_chunks(&guard.sources)?;
+        for (&pos, expected) in &guard.chunks {
+            let same = match (expected, &current[&pos]) {
+                (None, None) | (Some(SavedEntityData::Empty), Some(SavedEntityData::Empty)) => true,
+                (Some(SavedEntityData::Present(a)), Some(SavedEntityData::Present(b))) => {
+                    Arc::ptr_eq(a, b)
+                }
+                _ => false,
+            };
+            anyhow::ensure!(same, "live generation entities changed at {pos:?}");
         }
         Ok(())
     }
@@ -28021,6 +28108,70 @@ pub(crate) mod tests {
         assert!(session.verify_generation_poi(&present).is_err());
         session.poi_chunks.insert(pos, SavedPoiData::Unavailable);
         assert!(session.capture_generation_poi(&captured).is_err());
+    }
+
+    #[test]
+    fn generation_entity_guard_rejects_unavailable_or_changed_live_data() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let other = session();
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let absent = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let sources = BTreeMap::from([(home, None), (absent, None)]);
+        assert!(
+            session
+                .capture_generation_entities(&BTreeMap::new())
+                .is_err()
+        );
+        assert!(session.capture_generation_entities(&sources).is_err());
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let guard = session.capture_generation_entities(&sources).unwrap();
+        session.verify_generation_entities(&guard).unwrap();
+        assert!(other.verify_generation_entities(&guard).is_err());
+
+        session.queue_entity_chunk(home, SavedEntityData::Empty);
+        assert!(session.verify_generation_entities(&guard).is_err());
+        session.incoming.clear();
+        session.verify_generation_entities(&guard).unwrap();
+        session
+            .entity_chunks
+            .insert(home, SavedEntityData::Unavailable);
+        assert!(session.verify_generation_entities(&guard).is_err());
+
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("unknown".into(), Tag::Int(5))]),
+        });
+        let saved = Arc::new(native_persistence::world::SavedEntityChunk {
+            position: native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            document: Arc::clone(&document),
+        });
+        session
+            .entity_chunks
+            .insert(home, SavedEntityData::Present(Arc::clone(&saved)));
+        let with_entity = BTreeMap::from([(home, Some(Arc::clone(&document)))]);
+        let present = session.capture_generation_entities(&with_entity).unwrap();
+        session.verify_generation_entities(&present).unwrap();
+        session
+            .entity_chunks
+            .insert(home, SavedEntityData::Present(Arc::new((*saved).clone())));
+        assert!(session.verify_generation_entities(&present).is_err());
+
+        session.entity_chunks.insert(home, SavedEntityData::Empty);
+        let guard = session.capture_generation_entities(&sources).unwrap();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(8.5, 2.0, 8.5);
+        session.dropped_items.spawn_from_entity(position, stack);
+        assert!(session.verify_generation_entities(&guard).is_err());
+        assert!(session.capture_generation_entities(&sources).is_err());
     }
 
     fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {

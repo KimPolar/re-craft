@@ -90,6 +90,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     }
     if native_world::collision::copper_bulb_state(state).is_some()
         || native_world::collision::full_copper(state)
+        || native_world::collision::full_tuff(state)
         || native_world::collision::copper_grate_waterlogged(state).is_some()
     {
         return Ok(true);
@@ -325,6 +326,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_terracotta(state)
                 || native_world::collision::copper_bulb_state(state).is_some()
                 || native_world::collision::full_copper(state)
+                || native_world::collision::full_tuff(state)
                 || native_world::collision::copper_grate_waterlogged(state).is_some()
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state)

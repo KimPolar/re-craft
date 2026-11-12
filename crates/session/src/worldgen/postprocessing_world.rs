@@ -1560,13 +1560,17 @@ impl GeneratedBlockView<'_> {
         if native_world::collision::fence_waterlogged(&state) == Some(false) {
             return Cell::FenceDry;
         }
-        if super::ore::valid_lichen(&state) && state.properties["waterlogged"] == "true" {
-            return Cell::OpenWater(native_world::fluid::FluidState {
-                kind: native_world::fluid::FluidKind::Water,
-                amount: 8,
-                source: true,
-                falling: false,
-            });
+        if super::ore::valid_lichen(&state) {
+            return if state.properties["waterlogged"] == "true" {
+                Cell::OpenWater(native_world::fluid::FluidState {
+                    kind: native_world::fluid::FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                })
+            } else {
+                Cell::OpenDry
+            };
         }
         if let Some((top, waterlogged)) = self.slab(&state) {
             return Cell::Slab { top, waterlogged };
@@ -1774,6 +1778,9 @@ impl GeneratedBlockView<'_> {
                 ChangedBlock::WaterloggedFence => {
                     matches!(self.fluid_cell_for_spread(change.position), Cell::FenceDry)
                 }
+                ChangedBlock::WaterloggedOpen => {
+                    matches!(self.fluid_cell_for_spread(change.position), Cell::OpenDry)
+                }
                 ChangedBlock::WaterloggedLadder { facing } => matches!(
                     self.fluid_cell_for_spread(change.position),
                     Cell::Ladder { facing: actual, waterlogged: false } if actual == facing
@@ -1883,6 +1890,7 @@ impl GeneratedBlockView<'_> {
                 waterlogged: false,
                 ..
             } | Cell::FenceDry
+                | Cell::OpenDry
                 | Cell::Ladder {
                     waterlogged: false,
                     ..
@@ -1957,10 +1965,13 @@ impl GeneratedBlockView<'_> {
         let next_stair = self.stair(next);
         let next_fence = native_world::collision::fence_waterlogged(next);
         let next_ladder = ladder_state(next);
+        let next_lichen =
+            super::ore::valid_lichen(next) && next.properties["waterlogged"] == "true";
         let contained_source = next_slab.is_some_and(|(_, wet)| wet)
             || next_stair.is_some_and(|(_, wet)| wet)
             || next_fence == Some(true)
-            || next_ladder.is_some_and(|(_, wet)| wet);
+            || next_ladder.is_some_and(|(_, wet)| wet)
+            || next_lichen;
         ensure!(
             next_fluid.is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
                 || (next.name == "minecraft:air" && next.properties.is_empty())
@@ -1985,6 +1996,16 @@ impl GeneratedBlockView<'_> {
                 || (ladder_state(old)
                     .is_some_and(|(facing, wet)| !wet && next_ladder == Some((facing, true)))
                     && old.name == next.name)
+                || (super::ore::valid_lichen(old)
+                    && old.properties["waterlogged"] == "false"
+                    && next_lichen
+                    && {
+                        let mut expected = old.clone();
+                        expected
+                            .properties
+                            .insert("waterlogged".into(), "true".into());
+                        *next == expected
+                    })
                 || ladder_state(old).is_some_and(|(_, wet)| {
                     if wet {
                         next.name == "minecraft:water"
@@ -2059,6 +2080,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::FenceWater(_)
                         | Cell::Ladder { .. }
                         | Cell::OpenWater(_)
+                        | Cell::OpenDry
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
                 ),
@@ -2281,6 +2303,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::FenceWater(_)
                         | Cell::Ladder { .. }
                         | Cell::OpenWater(_)
+                        | Cell::OpenDry
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
                 ),
@@ -2802,6 +2825,7 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                 waterlogged: false,
                 ..
             } | Cell::FenceDry
+                | Cell::OpenDry
                 | Cell::Ladder {
                     waterlogged: false,
                     ..
@@ -7063,6 +7087,41 @@ mod tests {
         }
         world.set_block_id(origin_x, 8, 8, water).unwrap();
         match case {
+            "dry_lichen_on" | "dry_lichen_off" | "dry_lichen_down" | "dry_lichen_support" => {
+                let lichen = world.intern_state(BlockState {
+                    name: "minecraft:glow_lichen".into(),
+                    properties: [
+                        "down",
+                        "up",
+                        "north",
+                        "south",
+                        "west",
+                        "east",
+                        "waterlogged",
+                    ]
+                    .into_iter()
+                    .map(|key| (key.into(), (key == "east").to_string()))
+                    .collect(),
+                });
+                if case == "dry_lichen_down" || case == "dry_lichen_support" {
+                    world.set_block_id(8, 7, 8, lichen).unwrap();
+                    if case == "dry_lichen_down" {
+                        world.set_block_id(8, 7, 7, water).unwrap();
+                        world.set_block_id(8, 7, 9, water).unwrap();
+                    } else {
+                        let flowing = world.intern_state(BlockState {
+                            name: "minecraft:water".into(),
+                            properties: BTreeMap::from([("level".into(), "4".into())]),
+                        });
+                        world.set_block_id(8, 8, 8, flowing).unwrap();
+                        world.set_block_id(7, 8, 8, water).unwrap();
+                        world.set_block_id(8, 8, 7, water).unwrap();
+                    }
+                } else {
+                    world.set_block_id(9, 8, 8, lichen).unwrap();
+                    world.set_block_id(9, 8, 7, water).unwrap();
+                }
+            }
             case if case.starts_with("snow_water_") || case.starts_with("snow_fence_") => {
                 let is_water = case.starts_with("snow_water_");
                 let suffix = case
@@ -7760,7 +7819,11 @@ mod tests {
         if case.starts_with("down_container_")
             || matches!(
                 case,
-                "convert_on"
+                "dry_lichen_on"
+                    | "dry_lichen_off"
+                    | "dry_lichen_down"
+                    | "dry_lichen_support"
+                    | "convert_on"
                     | "convert_off"
                     | "convert_bubble"
                     | "origin_source_on"
@@ -7786,7 +7849,8 @@ mod tests {
                     !case.ends_with("_false")
                         && !matches!(
                             case,
-                            "convert_off"
+                            "dry_lichen_off"
+                                | "convert_off"
                                 | "origin_source_off"
                                 | "slab_bottom_off"
                                 | "stair_bottom_off"
@@ -8075,16 +8139,18 @@ mod tests {
             result.water_source_conversion(),
             match case {
                 case if case.starts_with("down_container_") => Some(case.ends_with("_true")),
-                "convert_off"
+                "dry_lichen_off"
+                | "convert_off"
                 | "origin_source_off"
                 | "slab_bottom_off"
                 | "stair_bottom_off"
                 | "fence_off"
                 | "ladder_off"
                 | "ladder_down_source_off" => Some(false),
-                "convert_on" | "convert_bubble" | "origin_source_on" | "slab_bottom"
-                | "slab_top" | "slab_oak" | "stair_bottom" | "stair_top" | "fence_on"
-                | "fence_on_neighbor" | "ladder_on" | "ladder_down_source" => Some(true),
+                "dry_lichen_on" | "dry_lichen_down" | "dry_lichen_support" | "convert_on"
+                | "convert_bubble" | "origin_source_on" | "slab_bottom" | "slab_top"
+                | "slab_oak" | "stair_bottom" | "stair_top" | "fence_on" | "fence_on_neighbor"
+                | "ladder_on" | "ladder_down_source" => Some(true),
                 _ => None,
             }
         );
@@ -8976,6 +9042,42 @@ mod tests {
             .flat_map(water_spread_trace)
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn dry_lichen_waterlogging_matches_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["dry_lichen"],
+        );
+        let expected: Vec<_> = [
+            "dry_lichen_on",
+            "dry_lichen_off",
+            "dry_lichen_down",
+            "dry_lichen_support",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dry_lichen_requires_source_water_and_does_not_support_sources_above() {
+        for (case, expected) in [
+            ("dry_lichen_on", "state 9,8,8 minecraft:glow_lichen true"),
+            ("dry_lichen_off", "state 9,8,8 minecraft:glow_lichen false"),
+            ("dry_lichen_down", "state 8,7,8 minecraft:glow_lichen true"),
+            ("dry_lichen_support", "state 8,8,8 minecraft:water 1"),
+        ] {
+            let trace = water_spread_trace(case);
+            assert!(
+                trace.iter().any(|line| line == expected),
+                "{case}: {trace:?}"
+            );
+        }
     }
 
     #[test]

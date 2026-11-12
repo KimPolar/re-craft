@@ -128,6 +128,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lichen"))scenarios.removeIf(s -> !s.startsWith("marked_lichen_"));
         if(args.length>0 && args[0].equals("lichen_transition")){scenarios.clear();scenarios.add("marked_lichen_lose_east");}
         if(args.length>0 && args[0].equals("lichen_destroy")){scenarios.clear();scenarios.addAll(List.of("marked_lichen_destroy_on","marked_lichen_destroy_off"));}
+        if(args.length>0 && args[0].equals("dry_lichen")){scenarios.clear();scenarios.addAll(List.of("dry_lichen_on","dry_lichen_off","dry_lichen_down","dry_lichen_support"));}
+        if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
+            if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("down_containers")){
@@ -157,8 +160,15 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             bind.invoke(Blocks.WATER.builtInRegistryHolder(),snowyWater && tagged?List.of(BlockTags.WASHED_AWAY_BY_FLUIDS,BlockTags.SNOW):List.of(BlockTags.WASHED_AWAY_BY_FLUIDS));
             bind.invoke(Blocks.OAK_FENCE.builtInRegistryHolder(),snowyFence && tagged?List.of(BlockTags.FENCES,BlockTags.WOODEN_FENCES,BlockTags.SNOW):List.of(BlockTags.FENCES,BlockTags.WOODEN_FENCES));
             pos=new BlockPos(scenario.startsWith("edge")?15:8,8,8);
-            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off")&&!scenario.equals("ladder_off")&&!scenario.equals("ladder_down_source_off")&&!(scenario.startsWith("down_container_")&&scenario.endsWith("_false")),null);
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("dry_lichen_off")&&!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off")&&!scenario.equals("ladder_off")&&!scenario.equals("ladder_down_source_off")&&!(scenario.startsWith("down_container_")&&scenario.endsWith("_false")),null);
             blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
+            if(scenario.startsWith("dry_lichen_")) {
+                var target=(scenario.equals("dry_lichen_down") || scenario.equals("dry_lichen_support"))?pos.below():pos.east();
+                blocks.put(target,Blocks.GLOW_LICHEN.defaultBlockState().setValue(MultifaceBlock.getFaceProperty(Direction.EAST),true));
+                if(scenario.equals("dry_lichen_down")){blocks.put(target.north(),Blocks.WATER.defaultBlockState());blocks.put(target.south(),Blocks.WATER.defaultBlockState());}
+                else if(scenario.equals("dry_lichen_support")){blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,4));blocks.put(pos.west(),Blocks.WATER.defaultBlockState());blocks.put(pos.north(),Blocks.WATER.defaultBlockState());}
+                else blocks.put(target.north(),Blocks.WATER.defaultBlockState());
+            }
             if(snowyWater || snowyFence) {
                 var parts=scenario.split("_");
                 var name=scenario.contains("grass_block")?Blocks.GRASS_BLOCK:scenario.contains("podzol")?Blocks.PODZOL:Blocks.MYCELIUM;

@@ -218,6 +218,19 @@ pub(crate) struct CapturedTerrainBatch {
     revision: Arc<()>,
 }
 
+/// Caller-verified initial visible light for one frozen mixed terrain revision.
+pub(crate) struct CapturedFeatureLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    light: native_world::generation_light::VisibleLightSnapshot,
+}
+
+impl CapturedFeatureLight {
+    pub fn matches_batch(&self, batch: &CapturedTerrainBatch) -> bool {
+        Arc::ptr_eq(&self.identity, &batch.identity) && Arc::ptr_eq(&self.revision, &batch.revision)
+    }
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -2484,6 +2497,29 @@ impl PreparedExistingGenerator {
         self.prepare_decoration_with_biomes(target, biomes)
     }
 
+    /// Bind a caller-verified, fixed initial light revision. The caller must
+    /// establish its provenance and completeness, including that no light
+    /// sections were registered or propagated before the feature pass.
+    pub fn bind_captured_initial_feature_light(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<CapturedFeatureLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "terrain belongs to another generation capture"
+        );
+        ensure!(
+            light.has_block_channel() && light.has_sky_channel() == self.lighting.has_skylight,
+            "light channels differ from dimension"
+        );
+        Ok(CapturedFeatureLight {
+            identity: Arc::clone(&batch.identity),
+            revision: Arc::clone(&batch.revision),
+            light,
+        })
+    }
+
     /// Run FEATURES for a mixed captured batch with structures disabled.
     /// A light-dependent feature fails until an appropriate light view exists.
     /// Results remain intermediate and do not authorize saving the world.
@@ -2491,6 +2527,26 @@ impl PreparedExistingGenerator {
         &mut self,
         batch: &mut CapturedTerrainBatch,
         context: &SavedDecorationContext,
+    ) -> Result<Vec<bool>> {
+        self.run_captured_features_inner(batch, context, None)
+    }
+
+    /// Run features against a caller-verified initial light revision. Any
+    /// successful feature pass invalidates that light for this batch.
+    pub fn run_captured_features_with_initial_light(
+        &mut self,
+        batch: &mut CapturedTerrainBatch,
+        context: &SavedDecorationContext,
+        light: &CapturedFeatureLight,
+    ) -> Result<Vec<bool>> {
+        self.run_captured_features_inner(batch, context, Some(light))
+    }
+
+    fn run_captured_features_inner(
+        &mut self,
+        batch: &mut CapturedTerrainBatch,
+        context: &SavedDecorationContext,
+        light: Option<&CapturedFeatureLight>,
     ) -> Result<Vec<bool>> {
         use native_session::worldgen::schedule::GenerationStage;
         ensure!(
@@ -2501,6 +2557,10 @@ impl PreparedExistingGenerator {
         ensure!(
             !self.generate_structures,
             "captured structure decoration is not prepared"
+        );
+        ensure!(
+            light.is_none_or(|light| light.matches_batch(batch)),
+            "feature light belongs to another terrain revision"
         );
         let center = native_world::loaded::ChunkPos {
             x: context.position.x,
@@ -2577,10 +2637,16 @@ impl PreparedExistingGenerator {
                     .initialize_worldgen_heightmaps(position, tags)?;
             }
         }
-        let result = self.with_saved_prepared_decoration(context, |prepared| {
-            batch
+        let result = self.with_saved_prepared_decoration(context, |prepared| match light {
+            Some(light) => batch.schedule.run_features_with_visible_light(
+                &mut batch.terrain,
+                prepared,
+                false,
+                &light.light,
+            ),
+            None => batch
                 .schedule
-                .run_features(&mut batch.terrain, prepared, false, None)
+                .run_features(&mut batch.terrain, prepared, false, None),
         })?;
         batch.feature_entity_sources.complete(center, entity_free);
         batch.revision = Arc::new(());
@@ -4382,7 +4448,8 @@ mod tests {
         )?;
         plains["features"] = json!([[{
             "feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
-            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]
+            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8},
+                {"type":"minecraft:block_predicate_filter", "predicate":{"type":"minecraft:not", "predicate":{"type":"minecraft:would_survive", "state":"minecraft:brown_mushroom"}}}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&plains)?)?;
         let level = NamedTag {
@@ -4698,10 +4765,51 @@ mod tests {
             world.block(marker[0], marker[1], marker[2]).unwrap().name,
             "minecraft:melon"
         );
+        assert!(actual.run_captured_features(&mut batch, &context).is_err());
         assert_eq!(
-            actual.run_captured_features(&mut batch, &context)?,
+            batch.schedule().completed(target),
+            Some(GenerationStage::Terrain)
+        );
+        assert!(Arc::ptr_eq(&world, &batch.terrain().snapshot()));
+        assert!(
+            actual
+                .bind_captured_initial_feature_light(
+                    &batch,
+                    native_world::generation_light::VisibleLightSnapshot::new(false, true),
+                )
+                .is_err()
+        );
+        let incomplete = actual.bind_captured_initial_feature_light(
+            &batch,
+            native_world::generation_light::VisibleLightSnapshot::new(true, true),
+        )?;
+        assert!(
+            actual
+                .run_captured_features_with_initial_light(&mut batch, &context, &incomplete)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&world, &batch.terrain().snapshot()));
+        let columns = (-1..=1).flat_map(|dz| {
+            (-1..=1).map(move |dx| native_world::loaded::ChunkPos {
+                x: target.x + dx,
+                z: target.z + dz,
+            })
+        });
+        let visible =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                columns,
+            )
+            .context("initial light snapshot unavailable")?;
+        let light = actual.bind_captured_initial_feature_light(&batch, visible)?;
+        assert!(light.matches_batch(&batch));
+        assert_eq!(
+            actual.run_captured_features_with_initial_light(&mut batch, &context, &light)?,
             vec![true]
         );
+        assert!(!light.matches_batch(&batch));
         assert_eq!(
             batch.schedule().completed(target),
             Some(GenerationStage::Features)
@@ -4716,7 +4824,11 @@ mod tests {
             "minecraft:melon"
         );
         assert!(!batch.has_entity_free_feature_coverage(target));
-        assert!(actual.run_captured_features(&mut batch, &context).is_err());
+        assert!(
+            actual
+                .run_captured_features_with_initial_light(&mut batch, &context, &light)
+                .is_err()
+        );
         Ok(())
     }
 

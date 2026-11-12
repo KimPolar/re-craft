@@ -2407,6 +2407,57 @@ impl PreparedExistingGenerator {
         Ok(restored)
     }
 
+    /// Build one captured biome neighborhood in the caller's generation order.
+    /// Existing palettes are preserved and only absent chunks are generated.
+    /// This is an intermediate input, not a completed or writable chunk. On a
+    /// generation error the generator and evaluator must be discarded.
+    pub fn prepare_captured_biomes(
+        &mut self,
+        positions: impl IntoIterator<Item = native_persistence::world::ChunkPos>,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+    ) -> Result<native_session::worldgen::BiomeNeighborhood> {
+        let mut requested = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut saved_positions = Vec::new();
+        for position in positions {
+            ensure!(seen.insert(position), "duplicate captured biome chunk");
+            let source = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&position)
+                .context("biome neighbor was not captured")?;
+            if let Some(saved) = &source.terrain {
+                reject_saved_blending(&saved.document)?;
+                saved_positions.push(position);
+            }
+            requested.push(position);
+        }
+        ensure!(!requested.is_empty(), "no captured biome chunks requested");
+        let saved = if saved_positions.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.restore_saved_biomes(saved_positions)?
+        };
+        let mut neighborhood = self.generator.biome_neighborhood()?;
+        for position in requested {
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let chunk = match saved.get(&key) {
+                Some(chunk) => Arc::clone(chunk),
+                None => Arc::new(
+                    self.generator
+                        .generate_biomes([position.x, position.z], evaluator)?,
+                ),
+            };
+            neighborhood.insert(chunk)?;
+        }
+        Ok(neighborhood)
+    }
+
     /// Restore the effective reference sets from one captured saved chunk.
     /// The returned report identifies data Java would discard on loading.
     pub fn restore_saved_structure_references(
@@ -2657,7 +2708,21 @@ impl PreparedExistingGenerator {
         structure_order: &[ResourceId],
         evaluator: &mut native_resources::density::DensityEvaluator,
     ) -> Result<native_resources::surface_pass::SurfaceStageChunk> {
-        self.generate_saved_terrain_parts(target, structure_order, evaluator)
+        self.generate_saved_terrain_parts(target, structure_order, evaluator, None)
+            .map(|(terrain, _)| terrain)
+    }
+
+    /// Resume terrain with a mixed saved and absent biome neighborhood. The
+    /// caller supplies the actual generation order and matching evaluator
+    /// history; this does not establish schedule or world-save completeness.
+    pub fn generate_saved_terrain_with_biome_order(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        structure_order: &[ResourceId],
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        biome_order: &[native_persistence::world::ChunkPos],
+    ) -> Result<native_resources::surface_pass::SurfaceStageChunk> {
+        self.generate_saved_terrain_parts(target, structure_order, evaluator, Some(biome_order))
             .map(|(terrain, _)| terrain)
     }
 
@@ -2670,7 +2735,7 @@ impl PreparedExistingGenerator {
         evaluator: &mut native_resources::density::DensityEvaluator,
     ) -> Result<ResumedSavedTerrain> {
         let (terrain, biome) =
-            self.generate_saved_terrain_parts(target, structure_order, evaluator)?;
+            self.generate_saved_terrain_parts(target, structure_order, evaluator, None)?;
         let dimension = self.context.inputs().sources().dimension();
         let dimension = format!("{}:{}", dimension.namespace, dimension.path);
         let registry = &self
@@ -2869,6 +2934,7 @@ impl PreparedExistingGenerator {
         target: native_persistence::world::ChunkPos,
         structure_order: &[ResourceId],
         evaluator: &mut native_resources::density::DensityEvaluator,
+        biome_order: Option<&[native_persistence::world::ChunkPos]>,
     ) -> Result<(
         native_resources::surface_pass::SurfaceStageChunk,
         Arc<native_session::worldgen::QuartBiomeChunk>,
@@ -2898,33 +2964,39 @@ impl PreparedExistingGenerator {
                         .checked_add(dz)
                         .context("neighbor chunk Z overflow")?,
                 };
-                let saved = self
+                positions.push(pos);
+            }
+        }
+        let order = if let Some(order) = biome_order {
+            let expected: BTreeSet<_> = positions.iter().copied().collect();
+            let actual: BTreeSet<_> = order.iter().copied().collect();
+            ensure!(
+                order.len() == expected.len() && actual == expected,
+                "biome generation order does not match terrain neighbors"
+            );
+            order
+        } else {
+            for position in &positions {
+                let source = self
                     .context
                     .inputs()
                     .sources()
                     .chunks()
-                    .get(&pos)
-                    .context("biome neighbor was not captured")?
-                    .terrain
-                    .as_ref()
-                    .context("saved biome neighbor is missing")?;
-                reject_saved_blending(&saved.document)?;
-                positions.push(pos);
+                    .get(position)
+                    .context("biome neighbor was not captured")?;
+                ensure!(
+                    source.terrain.is_some(),
+                    "missing biome neighbor requires a generation order"
+                );
             }
-        }
-        let biomes = self.restore_saved_biomes(positions)?;
+            &positions
+        };
+        let neighborhood = self.prepare_captured_biomes(order.iter().copied(), evaluator)?;
         let biome = Arc::clone(
-            biomes
-                .get(&native_world::loaded::ChunkPos {
-                    x: target.x,
-                    z: target.z,
-                })
+            neighborhood
+                .chunk([target.x, target.z])
                 .context("target biome is missing")?,
         );
-        let mut neighborhood = self.generator.biome_neighborhood()?;
-        for biome in biomes.into_values() {
-            neighborhood.insert(biome)?;
-        }
         let structure = if self.generate_structures {
             Some(Arc::new(
                 self.restore_saved_beardifier(target, structure_order)?,
@@ -5184,6 +5256,69 @@ mod tests {
                 lighting.min_y,
                 lighting.height,
             )?;
+            let mut biome_evaluator = native_resources::density::DensityEvaluator::default();
+            let mixed_biomes =
+                mixed.prepare_captured_biomes([position, missing], &mut biome_evaluator)?;
+            assert_eq!(mixed_biomes.chunk([0, 0]).unwrap().values(), chunk.values());
+            let expected_missing = reference.generate_biomes(
+                [missing.x, missing.z],
+                &mut native_resources::density::DensityEvaluator::default(),
+            )?;
+            assert_eq!(
+                mixed_biomes.chunk([missing.x, missing.z]).unwrap().values(),
+                expected_missing.values()
+            );
+            assert!(
+                mixed
+                    .prepare_captured_biomes([], &mut biome_evaluator)
+                    .is_err()
+            );
+            assert!(
+                mixed
+                    .prepare_captured_biomes([missing, missing], &mut biome_evaluator)
+                    .is_err()
+            );
+            assert!(
+                mixed
+                    .prepare_captured_biomes([ChunkPos { x: 100, z: 100 }], &mut biome_evaluator)
+                    .is_err()
+            );
+
+            // This captured protochunk borders an absent column. Existing
+            // palettes and new biome volumes must both feed the terrain pass.
+            let boundary = ChunkPos { x: 6, z: 3 };
+            let positions: Vec<_> = (2..=4)
+                .flat_map(|z| (5..=7).map(move |x| ChunkPos { x, z }))
+                .collect();
+            let context = reader.capture_generation_context(positions.iter().copied())?;
+            let mut boundary_generator = prepare_existing_generator(context, &game)?;
+            let mut evaluator = native_resources::density::DensityEvaluator::default();
+            assert!(
+                boundary_generator
+                    .generate_saved_terrain(boundary, &[], &mut evaluator)
+                    .is_err()
+            );
+            assert!(
+                boundary_generator
+                    .generate_saved_terrain_with_biome_order(
+                        boundary,
+                        &[],
+                        &mut evaluator,
+                        &positions[..8]
+                    )
+                    .is_err()
+            );
+            let boundary_terrain = boundary_generator.generate_saved_terrain_with_biome_order(
+                boundary,
+                &[],
+                &mut evaluator,
+                &positions,
+            )?;
+            assert_eq!(boundary_terrain.chunk_position, [boundary.x, boundary.z]);
+            assert_eq!(
+                boundary_terrain.states.len(),
+                lighting.height as usize * 256
+            );
             let positions = (2..=4).flat_map(|z| (2..=4).map(move |x| ChunkPos { x, z }));
             let saved_neighbors = actual.restore_saved_biomes(positions)?;
             let mut expected_biomes = reference.biome_neighborhood()?;

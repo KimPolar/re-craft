@@ -10934,26 +10934,25 @@ impl LoadedSession {
             .into_iter()
     }
 
-    /// Resident chunks required for the earliest deferred shape updates.
-    /// The lichen queue is ordered, so later entries must not overtake it.
+    /// Resident chunks required for deferred shape updates. The lichen queue
+    /// is ordered, so later entries must not overtake it. Fence updates are
+    /// retried independently for each available chunk.
     pub fn required_shape_update_chunks(&self) -> BTreeSet<ChunkPos> {
         let mut required = BTreeSet::new();
         if let Some((target, source, _)) = self.pending_lichen_updates.front() {
             required.insert(target.chunk());
             required.insert(source.chunk());
-            return required;
         }
-        if let Some((waiting, updates)) = self.pending_fence_updates.first_key_value() {
+        for (waiting, updates) in &self.pending_fence_updates {
             required.insert(*waiting);
-            if let Some((fence, source)) = updates.first() {
+            for (fence, source) in updates {
                 required.insert(fence.chunk());
                 required.insert(source.chunk());
             }
-            return required;
         }
-        if let Some((waiting, stairs)) = self.pending_stair_updates.first_key_value() {
+        for (waiting, stairs) in &self.pending_stair_updates {
             required.insert(*waiting);
-            if let Some(stair) = stairs.first() {
+            for stair in stairs {
                 required.insert(stair.chunk());
             }
         }
@@ -72759,6 +72758,80 @@ pub(crate) mod tests {
             .block(session.origin.x + 16, 3, session.origin.z + 8)
             .unwrap();
         assert_eq!(block.properties["west"], "true");
+    }
+
+    #[test]
+    fn missing_fence_neighbor_does_not_hide_other_required_chunks() {
+        let mut session = session();
+        session.set_fence_connection_tags(fixture_fence_tags(false));
+        assert!(session.set(IVec3::new(0, 3, 8), session.states[3]));
+        assert!(session.set(IVec3::new(15, 3, 8), session.states[3]));
+        let home = ChunkPos {
+            x: session.origin.x.div_euclid(16),
+            z: session.origin.z.div_euclid(16),
+        };
+        let west = ChunkPos {
+            x: home.x - 1,
+            z: home.z,
+        };
+        let east = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        assert_eq!(
+            session.pending_fence_update_chunks().collect::<Vec<_>>(),
+            vec![west, east]
+        );
+        assert_eq!(
+            session.required_shape_update_chunks(),
+            BTreeSet::from([west, home, east])
+        );
+
+        let mut incoming = World::new("minecraft:overworld");
+        let air = incoming.intern_state(state("minecraft:air", &[]));
+        let fence = incoming.intern_state(state(
+            "minecraft:oak_fence",
+            &[
+                ("north", "false"),
+                ("east", "false"),
+                ("south", "false"),
+                ("west", "false"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 * 16 + 3 * 256] = fence;
+        incoming.chunks.insert(
+            east,
+            Arc::new(Chunk {
+                position: east,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        session.queue_loaded_chunk(east, incoming);
+        session.apply_streaming();
+        assert_eq!(
+            session.pending_fence_update_chunks().collect::<Vec<_>>(),
+            vec![west]
+        );
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 16, 3, session.origin.z + 8)
+                .unwrap()
+                .properties["west"],
+            "true"
+        );
     }
 
     #[test]

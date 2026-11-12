@@ -823,6 +823,19 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        // The saved chunks can already be resident before this loop starts.
+        // Still service tick boundaries so parked shape dependencies get a
+        // chance to run while other neighbors remain unavailable.
+        for _ in 0..10 {
+            streamer.service(session)?;
+            session.update(Duration::from_millis(50));
+            let errors = session.take_stream_errors();
+            ensure!(
+                errors.is_empty(),
+                "generated session streaming errors: {errors:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         eprintln!(
             "Fence updates still waiting after streaming: {:?}",
             session.pending_fence_update_chunks().collect::<Vec<_>>()

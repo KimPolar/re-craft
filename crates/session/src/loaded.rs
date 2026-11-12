@@ -10959,6 +10959,42 @@ impl LoadedSession {
         required
     }
 
+    /// Select complete dependency groups so one absent chunk does not hold
+    /// unrelated updates back or repeatedly reactivate their parked chunks.
+    fn ready_shape_update_chunks(&self) -> BTreeSet<ChunkPos> {
+        let ready = |pos: &ChunkPos| {
+            self.world
+                .chunks
+                .get(pos)
+                .or_else(|| self.parked_chunks.get(pos))
+                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+        };
+        let mut chunks = BTreeSet::new();
+        if let Some((target, source, _)) = self.pending_lichen_updates.front() {
+            let group = [target.chunk(), source.chunk()];
+            if group.iter().all(&ready) {
+                chunks.extend(group);
+            }
+        }
+        for (waiting, updates) in &self.pending_fence_updates {
+            for (fence, source) in updates {
+                let group = [*waiting, fence.chunk(), source.chunk()];
+                if group.iter().all(&ready) {
+                    chunks.extend(group);
+                }
+            }
+        }
+        for (waiting, stairs) in &self.pending_stair_updates {
+            for stair in stairs {
+                let group = [*waiting, stair.chunk()];
+                if group.iter().all(&ready) {
+                    chunks.extend(group);
+                }
+            }
+        }
+        chunks
+    }
+
     /// A committed chunk cannot disappear without a chunk-window change.
     pub fn has_resident_or_parked_chunk(&self, pos: ChunkPos) -> bool {
         self.world.chunks.contains_key(&pos) || self.parked_chunks.contains_key(&pos)
@@ -12250,16 +12286,9 @@ impl LoadedSession {
         // Shape-only chunks are exposed to the updater only at this tick
         // boundary. They are parked again before scheduled/random ticks run.
         let mut temporary_shapes = Vec::new();
-        if !required_shapes.is_empty()
-            && required_shapes.iter().all(|pos| {
-                self.world
-                    .chunks
-                    .get(pos)
-                    .or_else(|| self.parked_chunks.get(pos))
-                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
-            })
-        {
-            for &pos in &required_shapes {
+        let ready_shapes = self.ready_shape_update_chunks();
+        if !ready_shapes.is_empty() {
+            for &pos in &ready_shapes {
                 let Some(chunk) = self.parked_chunks.remove(&pos) else {
                     continue;
                 };
@@ -72818,19 +72847,27 @@ pub(crate) mod tests {
                 )]),
             }),
         );
+        // The east chunk is outside the active window; the unavailable west
+        // chunk must not prevent its independent update from being applied.
+        session.queue_chunk_window(home, 0);
         session.queue_loaded_chunk(east, incoming);
         session.apply_streaming();
         assert_eq!(
             session.pending_fence_update_chunks().collect::<Vec<_>>(),
             vec![west]
         );
+        assert!(!session.world.chunks.contains_key(&east));
+        let chunk = session.parked_chunks.get(&east).unwrap();
+        let block = chunk.sections[&0].blocks.as_ref().unwrap()[8 * 16 + 3 * 256];
         assert_eq!(
-            session
-                .world
-                .block(session.origin.x + 16, 3, session.origin.z + 8)
-                .unwrap()
-                .properties["west"],
+            session.world.state(block).unwrap().properties["west"],
             "true"
+        );
+        let revision = session.revision;
+        session.apply_streaming();
+        assert_eq!(
+            session.revision, revision,
+            "blocked updates must not repeatedly reactivate chunks"
         );
     }
 

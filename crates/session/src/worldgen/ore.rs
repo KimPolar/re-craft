@@ -12785,6 +12785,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_copper_shapes_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_copper_stairs",
+            "vine_active_self_jigsaw_wet_copper_stairs",
+            "vine_active_jigsaw_copper_trapdoor",
+            "vine_active_self_jigsaw_wet_copper_trapdoor",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13194,7 +13205,11 @@ mod tests {
                     } else if mode.ends_with("_slab") {
                         "oak_slab"
                     } else if mode.ends_with("_stairs") {
-                        "oak_stairs"
+                        if mode.contains("_copper_") {
+                            "waxed_oxidized_cut_copper_stairs"
+                        } else {
+                            "oak_stairs"
+                        }
                     } else if mode.ends_with("_fence") {
                         "oak_fence"
                     } else if mode.ends_with("_gate") {
@@ -13202,7 +13217,11 @@ mod tests {
                     } else if mode.ends_with("_door") {
                         "oak_door"
                     } else if mode.ends_with("_trapdoor") {
-                        "dark_oak_trapdoor"
+                        if mode.contains("_copper_") {
+                            "waxed_oxidized_copper_trapdoor"
+                        } else {
+                            "dark_oak_trapdoor"
+                        }
                     } else if mode.ends_with("_bed") {
                         "white_bed"
                     } else if mode.ends_with("_terracotta") {
@@ -13460,6 +13479,7 @@ mod tests {
             } else if mode.ends_with("_jigsaw_gate")
                 || mode.ends_with("_jigsaw_door")
                 || mode.ends_with("_jigsaw_trapdoor")
+                || mode.ends_with("_jigsaw_copper_trapdoor")
                 || mode.ends_with("_jigsaw_bed")
             {
                 0

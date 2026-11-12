@@ -740,8 +740,15 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         let prior_errors = session.take_stream_errors();
         ensure!(prior_errors.is_empty(), "initial session errors: {prior_errors:?}");
         let initial_tick = session.snapshot().tick;
+        let initial_position = native_session::player_data::read_saved_position(&player)?
+            .context("initial player position missing")?;
         session.submit_command(PlayerCommand::QueryWorldSeed);
         session.submit_command(PlayerCommand::ToggleInventory);
+        session.submit_command(PlayerCommand::Move {
+            forward: 1.0,
+            strafe: 0.0,
+            jump: false,
+        });
         session.update(Duration::from_millis(50));
         let opened = session.snapshot();
         assert_eq!(opened.tick, initial_tick + 1);
@@ -750,6 +757,11 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             message.kind, SystemMessageKind::WorldSeed(value) if value == seed
         )));
         session.submit_command(PlayerCommand::ToggleInventory);
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: false,
+        });
         for _ in 0..19 {
             session.update(Duration::from_millis(50));
         }
@@ -759,7 +771,45 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         assert!(after.player.position.is_finite());
         let errors = session.take_stream_errors();
         ensure!(errors.is_empty(), "generated session tick errors: {errors:?}");
-        eprintln!("Generated seed 1 session advanced 20 ticks and handled inventory and seed commands");
+        let actual_position = after.origin.as_dvec3() + after.player.position.as_dvec3();
+        ensure!(actual_position != initial_position, "player position did not change");
+        match session.draft_new_player_state() {
+            Ok(draft) => {
+                let ticked_player_file = oracle.path().join("ticked-player.nbt");
+                std::fs::write(
+                    &ticked_player_file,
+                    native_persistence::nbt::write(draft.document())?,
+                )?;
+                let checked = Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&classpath)
+                    .arg("GeneratedWorldJavaOracle")
+                    .arg("--player")
+                    .arg(&ticked_player_file)
+                    .output()?;
+                ensure!(
+                    checked.status.success()
+                        && String::from_utf8_lossy(&checked.stdout)
+                            .lines()
+                            .any(|line| line == "PLAYER_OK"),
+                    "Java ticked player check failed: {} {}",
+                    String::from_utf8_lossy(&checked.stdout),
+                    String::from_utf8_lossy(&checked.stderr)
+                );
+                eprintln!("Java round-tripped the ticked generated player");
+            }
+            Err(error) => {
+                let message = error.to_string();
+                ensure!(
+                    message.contains("fence shape updates")
+                        && message.contains("unresolved: false")
+                        && message.contains("waiting for chunks: [ChunkPos"),
+                    "unexpected generated player save refusal: {error:#}"
+                );
+                eprintln!("Ticked player save correctly refused: {error:#}");
+            }
+        }
+        eprintln!("Generated seed 1 session advanced 20 ticks and handled movement, inventory and seed commands");
     }
     eprintln!(
         "Java round-tripped {} terrain, {} entity and {} POI chunks; loaded and saved {} entities",

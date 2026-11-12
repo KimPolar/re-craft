@@ -615,6 +615,22 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
     None
 }
 
+/// Whether a multiface block can attach to this outward-facing support side.
+/// Java accepts either a full support shape or a full collision shape.
+pub fn multiface_support_face(state: &BlockState, direction: IVec3) -> Option<bool> {
+    if !matches!(
+        direction,
+        IVec3::X | IVec3::NEG_X | IVec3::Y | IVec3::NEG_Y | IVec3::Z | IVec3::NEG_Z
+    ) {
+        return None;
+    }
+    let shape = block_shape(state)?;
+    if covers_full_face(&shape, direction) {
+        return Some(true);
+    }
+    button_support_face(state, direction)
+}
+
 /// Whether the two collision shapes jointly cover their shared boundary.
 pub fn merged_face_occludes(from: &[Aabb], to: &[Aabb], direction: IVec3) -> bool {
     let (axis, positive) = if direction.x != 0 {
@@ -678,6 +694,40 @@ pub fn merged_face_occludes(from: &[Aabb], to: &[Aabb], direction: IVec3) -> boo
 #[cfg(test)]
 mod face_tests {
     use super::*;
+
+    #[test]
+    fn multiface_support_uses_collision_as_well_as_sturdy_faces() {
+        let slab = BlockState {
+            name: "minecraft:stone_slab".into(),
+            properties: [
+                ("type".into(), "bottom".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(multiface_support_face(&slab, IVec3::NEG_Y), Some(true));
+        assert_eq!(multiface_support_face(&slab, IVec3::Y), Some(false));
+        assert_eq!(multiface_support_face(&slab, IVec3::X), Some(false));
+        assert_eq!(multiface_support_face(&slab, IVec3::ZERO), None);
+        let leaves = BlockState {
+            name: "minecraft:oak_leaves".into(),
+            properties: [
+                ("distance".into(), "1".into()),
+                ("persistent".into(), "false".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(button_support_face(&leaves, IVec3::Y), Some(false));
+        assert_eq!(multiface_support_face(&leaves, IVec3::Y), Some(true));
+        let unknown = BlockState {
+            name: "example:unknown".into(),
+            properties: Default::default(),
+        };
+        assert_eq!(multiface_support_face(&unknown, IVec3::Y), None);
+    }
 
     #[test]
     fn glow_lichen_shapes_validate_all_properties() {

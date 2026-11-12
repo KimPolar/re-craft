@@ -6375,6 +6375,43 @@ pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
     bail!("unsupported multiface support shape for {}", state.name)
 }
 
+/// `direction` points from the multiface block toward its support.
+pub(super) fn directional_multiface_support(
+    state: &BlockState,
+    direction: [i32; 3],
+) -> Result<bool> {
+    ensure!(
+        matches!(
+            direction,
+            [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1] | [-1, 0, 0] | [1, 0, 0]
+        ),
+        "invalid multiface support direction"
+    );
+    if let Ok(supported) = multiface_support(state) {
+        return Ok(supported);
+    }
+    let wet_flag = matches!(
+        state.properties.get("waterlogged").map(String::as_str),
+        Some("true" | "false")
+    );
+    let known_partial = (crate::slab_mining::material(&state.name).is_some()
+        && state.properties.len() == 2
+        && wet_flag)
+        || (crate::stair_items::is_stair_item(&state.name)
+            && state.properties.len() == 4
+            && wet_flag)
+        || (state.name == "minecraft:snow" && state.properties.len() == 1)
+        || native_world::collision::ladder_state(state).is_some()
+        || native_world::collision::simple_carpet(state);
+    ensure!(
+        known_partial,
+        "unsupported multiface support state {}",
+        state.name
+    );
+    native_world::collision::multiface_support_face(state, -glam::IVec3::from_array(direction))
+        .with_context(|| format!("unsupported multiface support shape for {}", state.name))
+}
+
 fn valid_vine(state: &BlockState) -> bool {
     state.name == "minecraft:vine"
         && state.properties.len() == 5
@@ -6393,11 +6430,9 @@ impl VinesWorld for DecorationRegion<'_> {
     fn vines_empty(&mut self, pos: [i32; 3]) -> Result<bool> {
         Ok(is_air(&OreWorld::block(self, pos)?))
     }
-    fn vines_can_attach(&mut self, neighbor: [i32; 3], _: MultifaceFace) -> Result<bool> {
+    fn vines_can_attach(&mut self, neighbor: [i32; 3], face: MultifaceFace) -> Result<bool> {
         let state = OreWorld::block(self, neighbor)?;
-        // This helper accepts only blocks whose support and collision shapes
-        // are known to be full or empty in all six directions.
-        multiface_support(&state)
+        directional_multiface_support(&state, face.offset([0, 0, 0]))
     }
     fn vine_with_face(
         &mut self,
@@ -6478,7 +6513,7 @@ impl native_resources::multiface_growth::MultifaceWorld for DecorationRegion<'_>
             }
         }
         let support = OreWorld::block(self, face.offset(pos))?;
-        if !multiface_support(&support)? {
+        if !directional_multiface_support(&support, face.offset([0, 0, 0]))? {
             return Ok(None);
         }
         let mut result = if existing.name == "minecraft:glow_lichen" {
@@ -15833,6 +15868,13 @@ mod tests {
             ("big_dripleaf_stem", 8),
             ("small_dripleaf", 16),
             ("glow_lichen", 128),
+            ("oak_slab", 6),
+            ("stone_slab", 6),
+            ("oak_stairs", 80),
+            ("stone_stairs", 80),
+            ("snow", 8),
+            ("ladder", 8),
+            ("white_carpet", 1),
             ("coal_ore", 1),
             ("deepslate_coal_ore", 1),
             ("redstone_ore", 2),
@@ -16171,7 +16213,11 @@ mod tests {
                 _ => panic!("{line}"),
             };
             let expected = p[3] == "true";
-            assert_eq!(multiface_support(&support).unwrap(), expected, "{line}");
+            assert_eq!(
+                directional_multiface_support(&support, face.offset([0, 0, 0])).unwrap(),
+                expected,
+                "{line}"
+            );
             let pos = face.offset(origin);
             region.set_section_block(pos, &support).unwrap();
             assert_eq!(
@@ -16403,6 +16449,27 @@ mod tests {
         assert!(!multiface_support(&rail).unwrap());
         rail.properties.insert("shape".into(), "invalid".into());
         assert!(multiface_support(&rail).is_err());
+    }
+
+    #[test]
+    fn directional_multiface_support_uses_the_side_facing_the_growth() {
+        let mut slab = state("stone_slab");
+        slab.properties = BTreeMap::from([
+            ("type".into(), "bottom".into()),
+            ("waterlogged".into(), "false".into()),
+        ]);
+        assert!(directional_multiface_support(&slab, [0, 1, 0]).unwrap());
+        assert!(!directional_multiface_support(&slab, [0, -1, 0]).unwrap());
+        assert!(!directional_multiface_support(&slab, [1, 0, 0]).unwrap());
+        assert!(directional_multiface_support(&slab, [0, 0, 0]).is_err());
+        slab.properties.insert("type".into(), "invalid".into());
+        assert!(directional_multiface_support(&slab, [0, 1, 0]).is_err());
+        slab.properties.insert("type".into(), "bottom".into());
+        slab.properties.remove("waterlogged");
+        assert!(directional_multiface_support(&slab, [0, 1, 0]).is_err());
+        slab.name = "minecraft:unknown_slab".into();
+        slab.properties.insert("waterlogged".into(), "false".into());
+        assert!(directional_multiface_support(&slab, [0, 1, 0]).is_err());
     }
 
     #[test]

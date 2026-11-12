@@ -2906,7 +2906,9 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                 [0, 1, 0] => "up",
                 _ => anyhow::bail!("invalid lichen update direction"),
             };
-            if state.properties[face] == "false" || super::ore::multiface_support(neighbor)? {
+            if state.properties[face] == "false"
+                || super::ore::directional_multiface_support(neighbor, direction)?
+            {
                 return Ok(state.clone());
             }
             let mut updated = state.clone();
@@ -4147,7 +4149,7 @@ mod tests {
                 }
             }
         }
-        let registry = ["air", "stone", "glow_lichen"]
+        let registry = ["air", "stone", "stone_slab", "glow_lichen"]
             .into_iter()
             .map(|name| format!("minecraft:{name}"))
             .collect();
@@ -4175,7 +4177,9 @@ mod tests {
         for face in faces {
             let present = mode == "all"
                 || mode.starts_with("lose_")
-                || (face == "west" && mode != "empty")
+                || (face == "west" && mode != "empty" && !mode.starts_with("slab_"))
+                || (face == "up" && mode == "slab_above")
+                || (face == "down" && mode == "slab_below")
                 || (face == "east" && mode == "lost_one");
             lichen.properties.insert(face.into(), present.to_string());
         }
@@ -4184,6 +4188,17 @@ mod tests {
             .insert("waterlogged".into(), (mode == "wet").to_string());
         let id = world.intern_state(lichen);
         world.set_block_id(8, 8, 8, id).unwrap();
+        if mode.starts_with("slab_") {
+            let slab = world.intern_state(BlockState {
+                name: "minecraft:stone_slab".into(),
+                properties: BTreeMap::from([
+                    ("type".into(), "bottom".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            });
+            let y = if mode == "slab_above" { 9 } else { 7 };
+            world.set_block_id(8, y, 8, slab).unwrap();
+        }
         if mode.starts_with("lost_") {
             let air = world.intern_state(BlockState {
                 name: "minecraft:air".into(),
@@ -4278,6 +4293,8 @@ mod tests {
             "lose_south",
             "lose_west",
             "lose_east",
+            "slab_above",
+            "slab_below",
         ]
         .into_iter()
         .map(lichen_postprocessing_trace)
@@ -4293,6 +4310,8 @@ mod tests {
             ("lost_one", "minecraft:glow_lichen 000001 0 0 -1 0 1 0"),
             ("empty", "minecraft:air - 0 0 -1 0 1 0"),
             ("wet", "minecraft:glow_lichen 000010 0 1 5 6 0 0"),
+            ("slab_above", "minecraft:glow_lichen 010000 0 0 -1 0 0 0"),
+            ("slab_below", "minecraft:air - 0 0 -1 0 1 1"),
         ] {
             assert_eq!(
                 lichen_postprocessing_trace(mode),

@@ -19,6 +19,7 @@ public class GenerationMultifaceSupportOracle {
     names.addAll(List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore"));
     names.addAll(List.of("oak_fence","spruce_fence","birch_fence","jungle_fence","acacia_fence","dark_oak_fence","mangrove_fence","cherry_fence","pale_oak_fence","bamboo_fence","crimson_fence","warped_fence","poplar_fence","nether_brick_fence"));
     names.addAll(List.of("oak_planks","spruce_planks","birch_planks","jungle_planks","acacia_planks","dark_oak_planks","mangrove_planks","cherry_planks","pale_oak_planks","bamboo_planks","crimson_planks","warped_planks","poplar_planks","torch","soul_torch","wall_torch","soul_wall_torch","rail","powered_rail","detector_rail","activator_rail"));
+    names.addAll(List.of("oak_slab","stone_slab","oak_stairs","stone_stairs","snow","ladder","white_carpet"));
     for(var family:List.of("oak","spruce","birch","jungle","acacia","dark_oak","mangrove","cherry","pale_oak","poplar"))
       for(var suffix:List.of("_log","_wood"))for(var prefix:List.of("","stripped_")) {
         var name=prefix+family+suffix;if(!names.contains(name))names.add(name);

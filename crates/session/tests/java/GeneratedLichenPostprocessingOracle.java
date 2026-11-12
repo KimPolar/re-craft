@@ -67,13 +67,17 @@ public class GeneratedLichenPostprocessingOracle {
             FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
             FluidTags.LAVA,List.of(Fluids.LAVA.builtInRegistryHolder(),Fluids.FLOWING_LAVA.builtInRegistryHolder())))).apply();
         out.println("BEGIN_RESULT");
-        for(var mode:List.of("supported","lost_west","lost_one","empty","wet","all","lose_down","lose_up","lose_north","lose_south","lose_west","lose_east")) {
+        for(var mode:List.of("supported","lost_west","lost_one","empty","wet","all","lose_down","lose_up","lose_north","lose_south","lose_west","lose_east","slab_above","slab_below")) {
             blocks.clear(); var state=Blocks.GLOW_LICHEN.defaultBlockState();
-            if(!mode.equals("empty")) state=state.setValue(MultifaceBlock.getFaceProperty(Direction.WEST),true);
+            if(!mode.equals("empty") && !mode.startsWith("slab_")) state=state.setValue(MultifaceBlock.getFaceProperty(Direction.WEST),true);
+            if(mode.equals("slab_above")) state=state.setValue(MultifaceBlock.getFaceProperty(Direction.UP),true);
+            if(mode.equals("slab_below")) state=state.setValue(MultifaceBlock.getFaceProperty(Direction.DOWN),true);
             if(mode.equals("lost_one") || mode.equals("all")) state=state.setValue(MultifaceBlock.getFaceProperty(Direction.EAST),true);
             if(mode.equals("all") || mode.startsWith("lose_")) for(var dir:Direction.values()) state=state.setValue(MultifaceBlock.getFaceProperty(dir),true);
             if(mode.equals("wet")) state=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true);
             blocks.put(POS,state);
+            if(mode.equals("slab_above"))blocks.put(POS.above(),Blocks.STONE_SLAB.defaultBlockState());
+            if(mode.equals("slab_below"))blocks.put(POS.below(),Blocks.STONE_SLAB.defaultBlockState());
             if(mode.startsWith("lost_"))blocks.put(POS.west(),Blocks.AIR.defaultBlockState());
             if(mode.startsWith("lose_"))blocks.put(POS.relative(Direction.byName(mode.substring(5))),Blocks.AIR.defaultBlockState());
             ShortList[] marks={new ShortArrayList()}; marks[0].add(ProtoChunk.packOffsetCoordinates(POS));

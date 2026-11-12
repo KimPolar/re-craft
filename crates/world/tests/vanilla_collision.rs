@@ -105,9 +105,14 @@ public class CollisionOracle {
                 }
                 {
                     JsonArray sturdy = new JsonArray();
+                    JsonArray multiface = new JsonArray();
                     for (var direction : new Direction[]{Direction.DOWN,Direction.UP,Direction.NORTH,Direction.SOUTH,Direction.WEST,Direction.EAST})
+                    {
                         sturdy.add(state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
+                        multiface.add(net.minecraft.world.level.block.MultifaceBlock.canAttachTo(EmptyBlockGetter.INSTANCE,direction.getOpposite(),BlockPos.ZERO,state));
+                    }
                     record.add("sturdy", sturdy);
+                    record.add("multiface", multiface);
                 }
                 JsonArray boxes = new JsonArray();
                 for (var box : collision.toAabbs()) {
@@ -373,6 +378,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut anvil_states_checked = 0usize;
     let mut anvil_grid_checked = 0usize;
     let mut sturdy_checked = 0usize;
+    let mut multiface_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
     let mut crop_checked = 0usize;
@@ -629,6 +635,32 @@ fn implemented_collision_shapes_match_vanilla_states() {
                 sturdy_checked += 1;
             }
         }
+        if let Some(multiface) = entry["multiface"].as_array() {
+            for (direction, expected) in [
+                glam::IVec3::NEG_Y,
+                glam::IVec3::Y,
+                glam::IVec3::NEG_Z,
+                glam::IVec3::Z,
+                glam::IVec3::NEG_X,
+                glam::IVec3::X,
+            ]
+            .into_iter()
+            .zip(multiface)
+            {
+                let Some(actual) =
+                    native_world::collision::multiface_support_face(&state, direction)
+                else {
+                    continue;
+                };
+                if actual != expected.as_bool().unwrap() && failures.len() < 20 {
+                    failures.push(format!(
+                        "{id} {:?} multiface {direction:?}: {actual} vs {expected}",
+                        state.properties
+                    ));
+                }
+                multiface_checked += 1;
+            }
+        }
         if !same_volume(&actual, expected) && failures.len() < 20 {
             failures.push(format!(
                 "{id} {:?}: native {actual:?}, Java {expected:?}",
@@ -654,6 +686,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     }
     assert!(checked > 1000, "only {checked} states were checked");
     assert_eq!(glow_lichen_checked, 128, "glow lichen states missing");
+    assert!(
+        multiface_checked > 1_000,
+        "multiface support states missing"
+    );
     assert_eq!(snow_checked, 8);
     assert_eq!(crop_checked, 28, "crop states missing from Java oracle");
     assert!(

@@ -30,6 +30,7 @@ enum StateSchema {
     SnowLayers,
     Dusted,
     Lit,
+    CopperBulb,
     PotentSulfur,
     SulfurSpike,
     Liquid,
@@ -78,6 +79,12 @@ impl StateSchema {
     fn default_properties(self) -> BTreeMap<String, String> {
         let value = match self {
             Self::Stateless => return BTreeMap::new(),
+            Self::CopperBulb => {
+                return BTreeMap::from([
+                    ("lit".into(), "false".into()),
+                    ("powered".into(), "false".into()),
+                ]);
+            }
             Self::Beehive => {
                 return BTreeMap::from([
                     ("facing".into(), "north".into()),
@@ -305,6 +312,11 @@ impl StateSchema {
                 Some(value.to_owned())
             }
             Self::Waterlogged if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
+            Self::CopperBulb
+                if matches!(name, "lit" | "powered") && matches!(value, "true" | "false") =>
+            {
                 Some(value.to_owned())
             }
             Self::Lantern
@@ -698,8 +710,10 @@ impl GeneratedBlockRegistry {
             {
                 copper_factory = true;
             } else if ins.op == 0xb3 && owner == BLOCKS {
-                if matches!(member, "CUT_COPPER_SLAB" | "COPPER_DOOR" | "COPPER_BARS")
-                    && copper_factory
+                if matches!(
+                    member,
+                    "CUT_COPPER_SLAB" | "COPPER_DOOR" | "COPPER_BARS" | "COPPER_BULB"
+                ) && copper_factory
                     && registration.is_none()
                     && candidates.len() == 1
                     && candidates
@@ -739,6 +753,14 @@ impl GeneratedBlockRegistry {
                             ("COPPER_BARS", false) => (
                                 "copper_bars",
                                 "net/minecraft/world/level/block/IronBarsBlock",
+                            ),
+                            ("COPPER_BULB", true) => (
+                                "copper_bulb",
+                                "net/minecraft/world/level/block/WeatheringCopperBulbBlock",
+                            ),
+                            ("COPPER_BULB", false) => (
+                                "copper_bulb",
+                                "net/minecraft/world/level/block/CopperBulbBlock",
                             ),
                             _ => unreachable!(),
                         };
@@ -888,6 +910,10 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
                 "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
+                "net/minecraft/world/level/block/CopperBulbBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperBulbBlock" => {
+                    Some(StateSchema::CopperBulb)
+                }
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
@@ -1091,6 +1117,7 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Waterlogged
                 | StateSchema::Lantern
                 | StateSchema::Candle
+                | StateSchema::CopperBulb
                 | StateSchema::Liquid
                 | StateSchema::PotentSulfur
                 | StateSchema::SulfurSpike

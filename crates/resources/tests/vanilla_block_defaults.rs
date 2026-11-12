@@ -261,6 +261,24 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for prefix in [
+        "",
+        "exposed_",
+        "weathered_",
+        "oxidized_",
+        "waxed_",
+        "waxed_exposed_",
+        "waxed_weathered_",
+        "waxed_oxidized_",
+    ] {
+        let id = format!("minecraft:{prefix}copper_bulb");
+        assert!(registry.contains(&id), "missing copper bulb schema: {id}");
+        for lit in ["true", "false", "invalid"] {
+            for powered in ["true", "false", "invalid"] {
+                cases.push(serde_json::json!({"id":id,"properties":{"lit":lit,"powered":powered}}));
+            }
+        }
+    }
     for age in 0..=25 {
         cases.push(serde_json::json!({"id":"minecraft:kelp","properties":{"age":age.to_string()}}));
     }

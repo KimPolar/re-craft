@@ -2979,6 +2979,32 @@ impl PreparedExistingGenerator {
         Ok((terrain, biome))
     }
 
+    /// Restore every terrain chunk present in the capture. Missing chunks stay
+    /// absent and can be checked against the same live-session guard as the
+    /// restored neighbors. Saved protochunks without terrain are still rejected.
+    pub fn restore_captured_terrain(&mut self) -> Result<RestoredSavedTerrain> {
+        let sources = self.context.inputs().sources();
+        let positions: Vec<_> = sources
+            .chunks()
+            .iter()
+            .filter_map(|(position, source)| source.terrain.as_ref().map(|_| *position))
+            .collect();
+        if positions.is_empty() {
+            let dimension = sources.dimension();
+            return Ok(RestoredSavedTerrain {
+                identity: Arc::clone(&self.identity),
+                world: native_world::loaded::World::new(format!(
+                    "{}:{}",
+                    dimension.namespace, dimension.path
+                )),
+                biomes: BTreeMap::new(),
+                heightmaps: BTreeMap::new(),
+                postprocessing: BTreeMap::new(),
+            });
+        }
+        self.restore_saved_terrain(positions)
+    }
+
     /// Restore captured terrain and recorded generation metadata without
     /// replacing unknown blocks, priming heightmaps or consuming marks.
     pub fn restore_saved_terrain(
@@ -5106,6 +5132,34 @@ mod tests {
             let live_inputs = narrow.capture_live_inputs(&live, &narrow_terrain)?;
             narrow.verify_live_inputs(&live, &live_inputs)?;
             assert!(actual.verify_live_inputs(&live, &live_inputs).is_err());
+
+            // A capture can include both a saved neighbor and a chunk that has
+            // never been generated, or consist entirely of missing chunks.
+            let missing = ChunkPos { x: 8, z: 0 };
+            let missing_key = native_world::loaded::ChunkPos { x: 8, z: 0 };
+            let context = reader.capture_generation_context([position, missing])?;
+            let mut mixed = prepare_existing_generator(context, &game)?;
+            let mixed_terrain = mixed.restore_captured_terrain()?;
+            assert_eq!(mixed_terrain.world().chunks.len(), 1);
+            assert!(mixed_terrain.world().chunks.contains_key(&key));
+            assert!(!mixed_terrain.world().chunks.contains_key(&missing_key));
+            let mixed_inputs = mixed.capture_live_inputs(&live, &mixed_terrain)?;
+            mixed.verify_live_inputs(&live, &mixed_inputs)?;
+            assert!(narrow.capture_live_terrain(&live, &mixed_terrain).is_err());
+
+            let context = reader.capture_generation_context([missing])?;
+            let mut empty = prepare_existing_generator(context, &game)?;
+            let empty_terrain = empty.restore_captured_terrain()?;
+            assert_eq!(empty_terrain.world().dimension, terrain.world().dimension);
+            assert!(empty_terrain.world().chunks.is_empty());
+            assert!(empty_terrain.biomes.is_empty());
+            assert!(empty_terrain.heightmaps.is_empty());
+            assert!(empty_terrain.postprocessing.is_empty());
+            let empty_inputs = empty.capture_live_inputs(&live, &empty_terrain)?;
+            empty.verify_live_inputs(&live, &empty_inputs)?;
+            live.queue_streamed_chunk(missing_key, None, None, None, None, None);
+            assert!(mixed.verify_live_inputs(&live, &mixed_inputs).is_err());
+            assert!(empty.verify_live_inputs(&live, &empty_inputs).is_err());
             live.queue_streamed_chunk(key, None, None, None, None, None);
             assert!(live.verify_generation_terrain(&guard).is_err());
             assert!(live.verify_generation_poi(&poi_guard).is_err());

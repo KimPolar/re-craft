@@ -203,6 +203,11 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
         }
         "minecraft:jigsaw" if crate::collision::jigsaw_state(state) => (15, 0),
+        "minecraft:bee_nest" | "minecraft:beehive"
+            if state.properties.len() == 2 && facing() && bounded("honey_level", 5).is_some() =>
+        {
+            (15, 0)
+        }
         "minecraft:barrier" => (u8::from(crate::collision::barrier_waterlogged(state)?), 0),
         name if name.ends_with("_fence") => {
             (u8::from(crate::collision::fence_waterlogged(state)?), 0)
@@ -1934,6 +1939,33 @@ mod tests {
     }
 
     #[test]
+    fn bee_hive_light_requires_valid_facing_and_honey_level() {
+        for name in ["bee_nest", "beehive"] {
+            for facing in ["north", "south", "west", "east"] {
+                for honey in 0..=5 {
+                    let mut block = state(name, None);
+                    block.properties.insert("facing".into(), facing.into());
+                    block
+                        .properties
+                        .insert("honey_level".into(), honey.to_string());
+                    assert_eq!(
+                        same_light_behavior(&block, &state("stone", None)),
+                        Some(true)
+                    );
+                    block.properties.insert("honey_level".into(), "06".into());
+                    assert!(light_properties(&block).is_none());
+                }
+            }
+            let mut invalid = state(name, None);
+            invalid.properties.insert("facing".into(), "up".into());
+            invalid.properties.insert("honey_level".into(), "0".into());
+            assert!(light_properties(&invalid).is_none());
+            invalid.properties.remove("facing");
+            assert!(light_properties(&invalid).is_none());
+        }
+    }
+
+    #[test]
     fn deepslate_light_properties_require_a_valid_axis() {
         for axis in ["x", "y", "z"] {
             let block = BlockState {
@@ -2347,6 +2379,8 @@ mod tests {
             .arg(&cp)
             .arg(&source));
         let names = [
+            "bee_nest",
+            "beehive",
             "red_mushroom_block",
             "brown_mushroom_block",
             "mushroom_stem",

@@ -4,7 +4,11 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -302,6 +306,36 @@ enum LoadedWorlds {
 struct PendingWorldLoad {
     directory: PathBuf,
     result: mpsc::Receiver<LoadedWorlds>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for PendingWorldLoad {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
+/// Stop before opening the next world once a list request is abandoned.
+fn collect_world_entries(
+    paths: impl IntoIterator<Item = PathBuf>,
+    cancelled: &AtomicBool,
+    mut read: impl FnMut(PathBuf) -> Option<WorldEntry>,
+) -> Option<Vec<WorldEntry>> {
+    let mut worlds = Vec::new();
+    for path in paths {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(world) = read(path) {
+            worlds.push(world);
+        }
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    worlds.sort_by(WorldEntry::compare);
+    Some(worlds)
 }
 
 struct PendingPackLoad {
@@ -560,6 +594,9 @@ impl State {
                     self.video = video;
                     self.video_dirty = false;
                 }
+                if self.minecraft_dir != load.directory {
+                    self.world_load = None;
+                }
                 self.minecraft_dir = load.directory;
                 self.packs = load.packs;
                 self.assets = Some(Arc::new(assets));
@@ -615,35 +652,52 @@ impl State {
         let directory = self.minecraft_dir.clone();
         let load_directory = directory.clone();
         let (sender, result) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         std::thread::spawn(move || {
-            let mut worlds: Vec<_> = std::fs::read_dir(load_directory.join("saves"))
+            let paths = std::fs::read_dir(load_directory.join("saves"))
                 .into_iter()
                 .flatten()
                 .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir() && path.join("level.dat").is_file())
-                .map(WorldEntry::read)
-                .collect();
-            worlds.sort_by(WorldEntry::compare);
-            let _ = sender.send(LoadedWorlds::List(worlds));
+                .map(|entry| entry.path());
+            if let Some(worlds) = collect_world_entries(paths, &worker_cancelled, |path| {
+                (path.is_dir() && path.join("level.dat").is_file()).then(|| WorldEntry::read(path))
+            }) {
+                let _ = sender.send(LoadedWorlds::List(worlds));
+            }
         });
         self.worlds.clear();
         self.selected_world = None;
         self.world_scroll = 0;
-        self.world_load = Some(PendingWorldLoad { directory, result });
+        self.world_load = Some(PendingWorldLoad {
+            directory,
+            result,
+            cancelled,
+        });
     }
 
     fn browse_world(&mut self, path: PathBuf) {
         let directory = self.minecraft_dir.clone();
         let (sender, result) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         std::thread::spawn(move || {
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
             let world = path
                 .join("level.dat")
                 .is_file()
                 .then(|| WorldEntry::read(path));
-            let _ = sender.send(LoadedWorlds::Chosen(world));
+            if !worker_cancelled.load(Ordering::Acquire) {
+                let _ = sender.send(LoadedWorlds::Chosen(world));
+            }
         });
-        self.world_load = Some(PendingWorldLoad { directory, result });
+        self.world_load = Some(PendingWorldLoad {
+            directory,
+            result,
+            cancelled,
+        });
     }
 
     fn poll_world_load(&mut self) -> bool {
@@ -2610,7 +2664,11 @@ impl<'a> Menu<'a> {
                 self.mouse_ui.release();
                 self.fov_ui.keyboard_adjust = false;
                 self.state.screen = match self.state.screen {
-                    Screen::Worlds | Screen::Options => Screen::Title,
+                    Screen::Worlds => {
+                        self.state.world_load = None;
+                        Screen::Title
+                    }
+                    Screen::Options => Screen::Title,
                     Screen::CreateWorld => {
                         self.state.creation_folder = None;
                         Screen::Worlds
@@ -6951,6 +7009,7 @@ public class GuiScaleOracle {
         state.world_load = Some(PendingWorldLoad {
             directory: tmp.path().join("old-installation"),
             result,
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
         sender
             .send(LoadedWorlds::List(vec![WorldEntry {
@@ -6963,6 +7022,52 @@ public class GuiScaleOracle {
             .unwrap();
         assert!(state.poll_world_load());
         assert!(state.worlds.is_empty());
+    }
+
+    #[test]
+    fn abandoned_world_scan_stops_before_reading_more_worlds() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let (result_tx, result) = mpsc::channel();
+        let pending = PendingWorldLoad {
+            directory: PathBuf::from("old"),
+            result,
+            cancelled,
+        };
+        std::thread::spawn(move || {
+            let mut reads = 0;
+            let result = collect_world_entries(
+                [PathBuf::from("first"), PathBuf::from("second")],
+                &worker_cancelled,
+                |path| {
+                    reads += 1;
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Some(WorldEntry {
+                        path,
+                        name: "World".into(),
+                        data_version: None,
+                        last_played: None,
+                        icon: None,
+                    })
+                },
+            );
+            let was_cancelled = result.is_none();
+            if let Some(worlds) = result {
+                let _ = result_tx.send(LoadedWorlds::List(worlds));
+            }
+            finished_tx.send((was_cancelled, reads)).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(pending);
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            (true, 1)
+        );
     }
 
     #[test]

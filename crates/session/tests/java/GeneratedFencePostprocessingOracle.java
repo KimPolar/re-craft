@@ -13,6 +13,8 @@ import net.minecraft.world.flag.*;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.RailShape;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.material.*;
@@ -67,7 +69,7 @@ public class GeneratedFencePostprocessingOracle {
             FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
             FluidTags.LAVA,List.of(Fluids.LAVA.builtInRegistryHolder(),Fluids.FLOWING_LAVA.builtInRegistryHolder())))).apply();
         out.println("BEGIN_RESULT");
-        for(var mode:List.of("mixed","same_fence","other_fence","tag_air","wet_enclosed","gate_north","gate_east")) {
+        for(var mode:List.of("mixed","same_fence","other_fence","tag_air","wet_enclosed","gate_north","gate_east","rail","rail_ascending","powered_rail")) {
             boolean airTagged=mode.equals("tag_air");
             var fences=new ArrayList<net.minecraft.core.Holder<Block>>(List.of(Blocks.OAK_FENCE.builtInRegistryHolder(),Blocks.NETHER_BRICK_FENCE.builtInRegistryHolder()));
             var wooden=new ArrayList<net.minecraft.core.Holder<Block>>(List.of(Blocks.OAK_FENCE.builtInRegistryHolder()));
@@ -82,6 +84,9 @@ public class GeneratedFencePostprocessingOracle {
                 if(mode.equals("same_fence"))blocks.put(POS.west(),Blocks.OAK_FENCE.defaultBlockState());
                 if(mode.equals("other_fence"))blocks.put(POS.west(),Blocks.NETHER_BRICK_FENCE.defaultBlockState());
                 if(mode.startsWith("gate_"))blocks.put(POS.west(),Blocks.OAK_FENCE_GATE.defaultBlockState().setValue(FenceGateBlock.FACING,mode.equals("gate_north")?Direction.NORTH:Direction.EAST));
+                if(mode.equals("rail"))blocks.put(POS.west(),Blocks.RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE,RailShape.NORTH_SOUTH));
+                if(mode.equals("rail_ascending"))blocks.put(POS.west(),Blocks.RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE,RailShape.ASCENDING_EAST));
+                if(mode.equals("powered_rail"))blocks.put(POS.west(),Blocks.POWERED_RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE_STRAIGHT,RailShape.NORTH_SOUTH).setValue(BlockStateProperties.POWERED,true));
             }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(POS));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());

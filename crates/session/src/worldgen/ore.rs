@@ -4553,7 +4553,7 @@ fn geode_crystal(state: &BlockState) -> Result<bool> {
     Ok(false)
 }
 
-fn generation_rail_state(state: &BlockState) -> bool {
+pub(super) fn generation_rail_state(state: &BlockState) -> bool {
     let name = state.name.as_str();
     if !matches!(
         name,

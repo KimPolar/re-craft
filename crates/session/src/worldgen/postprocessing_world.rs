@@ -1461,6 +1461,9 @@ pub(crate) fn fence_connection(
         };
         return Ok(gate_x != (direction[0] != 0));
     }
+    if super::ore::generation_rail_state(neighbor) {
+        return Ok(false);
+    }
     let except = leaf_distance(neighbor)?.is_some()
         || matches!(
             neighbor.name.as_str(),
@@ -3807,6 +3810,8 @@ mod tests {
             "oak_fence_gate",
             "spruce_planks",
             "oak_log",
+            "rail",
+            "powered_rail",
         ]
         .into_iter()
         .map(|name| format!("minecraft:{name}"))
@@ -3902,6 +3907,31 @@ mod tests {
                     .collect(),
                 });
                 world.set_block_id(7, 8, 8, gate).unwrap();
+            }
+            if matches!(mode, "rail" | "rail_ascending" | "powered_rail") {
+                let mut properties = BTreeMap::from([
+                    (
+                        "shape".into(),
+                        if mode == "rail_ascending" {
+                            "ascending_east"
+                        } else {
+                            "north_south"
+                        }
+                        .into(),
+                    ),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+                let name = if mode == "powered_rail" {
+                    properties.insert("powered".into(), "true".into());
+                    "powered_rail"
+                } else {
+                    "rail"
+                };
+                let rail = world.intern_state(BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties,
+                });
+                world.set_block_id(7, 8, 8, rail).unwrap();
             }
         }
         stage.source = Arc::clone(&stage.world);
@@ -4179,6 +4209,9 @@ mod tests {
             ("wet_enclosed", "true true true true true 0 1 5 6 1 0"),
             ("gate_north", "true true false true false 0 0 -1 0 1 0"),
             ("gate_east", "true true false false false 0 0 -1 0 1 0"),
+            ("rail", "true true false false false 0 0 -1 0 1 0"),
+            ("rail_ascending", "true true false false false 0 0 -1 0 1 0"),
+            ("powered_rail", "true true false false false 0 0 -1 0 1 0"),
         ] {
             assert_eq!(
                 fence_postprocessing_trace(mode),
@@ -9198,6 +9231,9 @@ mod tests {
             "wet_enclosed",
             "gate_north",
             "gate_east",
+            "rail",
+            "rail_ascending",
+            "powered_rail",
         ]
         .into_iter()
         .map(fence_postprocessing_trace)

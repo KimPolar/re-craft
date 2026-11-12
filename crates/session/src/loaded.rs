@@ -10892,6 +10892,25 @@ impl LoadedSession {
             .into_iter()
     }
 
+    /// Resident chunks required for the earliest deferred shape updates.
+    /// The lichen queue is ordered, so later entries must not overtake it.
+    pub fn required_shape_update_chunks(&self) -> BTreeSet<ChunkPos> {
+        let mut required = BTreeSet::new();
+        if let Some((target, source, _)) = self.pending_lichen_updates.front() {
+            required.insert(target.chunk());
+            required.insert(source.chunk());
+            return required;
+        }
+        if let Some((waiting, updates)) = self.pending_fence_updates.first_key_value() {
+            required.insert(*waiting);
+            if let Some((fence, source)) = updates.first() {
+                required.insert(fence.chunk());
+                required.insert(source.chunk());
+            }
+        }
+        required
+    }
+
     /// A committed chunk cannot disappear without a chunk-window change.
     pub fn has_resident_or_parked_chunk(&self, pos: ChunkPos) -> bool {
         self.world.chunks.contains_key(&pos) || self.parked_chunks.contains_key(&pos)
@@ -11777,6 +11796,7 @@ impl LoadedSession {
     fn apply_streaming(&mut self) {
         let mut changed = false;
         let mut respawn_changed = false;
+        let required_shapes = self.required_shape_update_chunks();
         if let Some(window) = self.pending_respawn_window.take()
             && self.respawn_window != window
         {
@@ -11937,6 +11957,7 @@ impl LoadedSession {
             .copied()
             .filter(|pos| {
                 !self.has_unsaved_chunk_changes(*pos)
+                    && !required_shapes.contains(pos)
                     && !self
                         .respawn_window
                         .is_some_and(|window| within_window(*pos, window))
@@ -12004,7 +12025,7 @@ impl LoadedSession {
             let respawn = self
                 .respawn_window
                 .is_some_and(|window| within_window(pos, window));
-            if !primary && !respawn {
+            if !primary && !respawn && !required_shapes.contains(&pos) {
                 continue;
             }
             match source {
@@ -12178,6 +12199,45 @@ impl LoadedSession {
                 }
             }
         }
+        // Shape-only chunks are exposed to the updater only at this tick
+        // boundary. They are parked again before scheduled/random ticks run.
+        let mut temporary_shapes = Vec::new();
+        if !required_shapes.is_empty()
+            && required_shapes.iter().all(|pos| {
+                self.world
+                    .chunks
+                    .get(pos)
+                    .or_else(|| self.parked_chunks.get(pos))
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            })
+        {
+            for &pos in &required_shapes {
+                let Some(chunk) = self.parked_chunks.remove(&pos) else {
+                    continue;
+                };
+                Arc::make_mut(&mut self.world).chunks.insert(pos, chunk);
+                if self.fluid_chunks_seen.insert(pos) {
+                    let fluids = self
+                        .world
+                        .saved_fluid_ticks
+                        .get(&pos)
+                        .cloned()
+                        .unwrap_or_default();
+                    let blocks = self
+                        .world
+                        .saved_block_ticks
+                        .get(&pos)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.enqueue_streamed_ticks(pos, &fluids, &blocks);
+                } else {
+                    self.restore_streamed_tick_orders(pos);
+                }
+                self.register_saved_sculk_chunk(pos);
+                temporary_shapes.push(pos);
+                changed = true;
+            }
+        }
         if changed {
             self.retry_stair_updates();
             self.retry_fence_updates();
@@ -12185,6 +12245,27 @@ impl LoadedSession {
             self.revision += 1;
             self.light_generation = self.light_generation.wrapping_add(1);
             self.sky_lighting.streaming_changed();
+        }
+        for pos in temporary_shapes {
+            if self
+                .stream_window
+                .is_none_or(|window| within_window(pos, window))
+            {
+                continue;
+            }
+            for order in [
+                &mut self.generated_fluid_order,
+                &mut self.generated_block_order,
+            ] {
+                if order.as_mut().is_some_and(|order| !order.park(pos)) {
+                    *order = None;
+                }
+            }
+            let chunk = Arc::make_mut(&mut self.world)
+                .chunks
+                .remove(&pos)
+                .expect("temporary shape chunk is resident");
+            self.parked_chunks.insert(pos, chunk);
         }
         if changed || self.tick == 0 {
             self.dropped_items
@@ -19658,13 +19739,28 @@ impl LoadedSession {
                 self.unresolved_lichen_shape = true;
                 continue;
             };
-            let Cell::State(id) = cell(
-                &self.world,
-                self.origin,
-                self.bounds,
-                target,
-                self.states[0],
-            ) else {
+            let source_loaded = matches!(
+                cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    source,
+                    self.states[0]
+                ),
+                Cell::State(_)
+            );
+            let target_state = if source_loaded {
+                cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    target,
+                    self.states[0],
+                )
+            } else {
+                Cell::Missing
+            };
+            let Cell::State(id) = target_state else {
                 let target = add(self.origin, target).expect("previously checked target");
                 let source = add(self.origin, source).expect("previously checked source");
                 self.pending_lichen_updates.push_front((
@@ -29046,6 +29142,142 @@ pub(crate) mod tests {
             "minecraft:air"
         );
         assert_eq!(session.dropped_items.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn shape_update_temporarily_activates_and_parks_outside_chunk() {
+        for has_lichen in [false, true] {
+            let mut session = session();
+            session.set_block_loot(test_lichen_neighbor_loot());
+            let source = IVec3::new(15, 3, 8);
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            assert!(session.set(source, stone));
+            assert!(session.set(source, session.states[0]));
+            let center = session.player_chunk().unwrap();
+            let east = ChunkPos {
+                x: center.x + 1,
+                z: center.z,
+            };
+            session.queue_chunk_window(center, 0);
+            session.apply_streaming();
+            assert!(session.required_shape_update_chunks().contains(&east));
+            let mut incoming = World::new("minecraft:overworld");
+            let air = incoming.intern_state(state("minecraft:air", &[]));
+            let lichen = incoming.intern_state(test_lichen(&["west"], false));
+            let water = incoming.intern_state(state("minecraft:water", &[("level", "0")]));
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            if has_lichen {
+                blocks[8 * 16 + 3 * 256] = lichen;
+                blocks[8 * 16 + 4 * 256] = water;
+                incoming.saved_fluid_ticks.insert(
+                    east,
+                    vec![SavedFluidTick {
+                        fluid: "minecraft:water".into(),
+                        position: [east.x * 16, 4, east.z * 16 + 8],
+                        delay: 0,
+                        priority: 0,
+                    }],
+                );
+            }
+            incoming.chunks.insert(
+                east,
+                Arc::new(Chunk {
+                    position: east,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+            session.queue_loaded_chunk(east, incoming);
+            session.apply_streaming();
+            assert!(!session.world.chunks.contains_key(&east));
+            assert!(session.parked_chunks.contains_key(&east));
+            assert!(session.pending_lichen_updates.is_empty());
+            assert_eq!(session.dropped_items.has_in_chunk(east), has_lichen);
+            assert!(session.dropped_items.snapshot().is_empty());
+            session.apply_streaming();
+            assert!(!session.world.chunks.contains_key(&east));
+            assert_eq!(session.parked_chunks.contains_key(&east), has_lichen);
+            if has_lichen {
+                assert!(session.dirty_chunk_positions().contains(&east));
+                let tick = FluidTickKey {
+                    x: east.x * 16,
+                    y: 4,
+                    z: east.z * 16 + 8,
+                    kind: FluidKind::Water,
+                    source: true,
+                };
+                assert!(session.fluid_pending.contains(&tick));
+                session.update(TICK);
+                assert!(
+                    session.fluid_pending.contains(&tick),
+                    "parked chunk tick was consumed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shape_update_restores_parked_source_after_player_moves() {
+        let mut session = session();
+        session.set_block_loot(test_lichen_neighbor_loot());
+        let source = IVec3::new(15, 3, 8);
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(source, stone));
+        assert!(session.set(source, session.states[0]));
+        let home = session.player_chunk().unwrap();
+        let east = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        session.queue_chunk_window(
+            ChunkPos {
+                x: home.x + 4,
+                z: home.z,
+            },
+            0,
+        );
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&home));
+        let mut incoming = World::new("minecraft:overworld");
+        let air = incoming.intern_state(state("minecraft:air", &[]));
+        let lichen = incoming.intern_state(test_lichen(&["west"], false));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 * 16 + 3 * 256] = lichen;
+        incoming.chunks.insert(
+            east,
+            Arc::new(Chunk {
+                position: east,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        session.queue_loaded_chunk(east, incoming);
+        session.apply_streaming();
+        assert!(session.pending_lichen_updates.is_empty());
+        assert!(session.parked_chunks.contains_key(&home));
+        assert!(session.parked_chunks.contains_key(&east));
+        assert!(!session.world.chunks.contains_key(&home));
+        assert!(!session.world.chunks.contains_key(&east));
+        assert!(session.dropped_items.has_in_chunk(east));
+        assert!(session.dropped_items.snapshot().is_empty());
     }
 
     #[test]

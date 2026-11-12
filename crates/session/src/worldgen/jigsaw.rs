@@ -986,21 +986,39 @@ mod tests {
         seed: i64,
         chunk: [i32; 2],
     ) -> Result<VecDeque<String>> {
+        Ok(configured_lines(resources, "ancient_city", Some(2), seed, chunk)?.0)
+    }
+
+    fn configured_lines(
+        resources: &mut native_resources::packs::ResourceStack,
+        structure: &str,
+        size: Option<i32>,
+        seed: i64,
+        chunk: [i32; 2],
+    ) -> Result<(
+        VecDeque<String>,
+        native_persistence::jigsaw_piece::SavedJigsawStart,
+    )> {
         use native_resources::structure_transform::Rotation;
         let bytes = resources
-            .read_data("data/minecraft/worldgen/structure/ancient_city.json")?
-            .context("missing city definition")?;
+            .read_data(&format!(
+                "data/minecraft/worldgen/structure/{structure}.json"
+            ))?
+            .context("missing structure definition")?;
         let mut definition: Value = serde_json::from_slice(&bytes)?;
-        definition["size"] = serde_json::json!(2);
+        if let Some(size) = size {
+            definition["size"] = serde_json::json!(size);
+        }
         let mut terrain = Terrain {
             allow: true,
             queries: vec![],
             heights: 0,
         };
         let start = PreparedStart::generate(resources, &definition, &mut terrain, seed, chunk)?
-            .context("missing city")?;
+            .context("missing structure")?;
+        let structure_id = ResourceId::parse(&format!("minecraft:{structure}"))?;
         let saved = native_persistence::jigsaw_piece::SavedJigsawStart::from_tag(
-            &start.to_tag(&ResourceId::parse("minecraft:ancient_city")?)?,
+            &start.to_tag(&structure_id)?,
         )?;
         assert_eq!(saved.chunk, chunk);
         assert_eq!(saved.pieces.len(), start.pieces.len());
@@ -1014,7 +1032,7 @@ mod tests {
         );
         let terrain_pieces = start.terrain_pieces()?;
         assert_eq!(terrain_pieces.len(), start.pieces.len());
-        let bounds = start.reference_bounds(ResourceId::parse("minecraft:ancient_city")?)?;
+        let bounds = start.reference_bounds(structure_id)?;
         assert!(start.pieces.iter().all(|p| {
             (0..3).all(|i| {
                 bounds.bounds.min[i] <= p.bounds.min[i] && bounds.bounds.max[i] >= p.bounds.max[i]
@@ -1065,7 +1083,7 @@ mod tests {
                 ));
             }
         }
-        Ok(result)
+        Ok((result, saved))
     }
 
     #[test]
@@ -1177,6 +1195,121 @@ mod tests {
             }
         }
         assert_eq!(cases, 6);
+        assert!(expected.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn session_trial_chamber_graph_matches_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let shared = temp.path().join("JigsawPlacementOracle.java");
+        let source = temp.path().join("JigsawConfiguredTrialOracle.java");
+        std::fs::write(
+            &shared,
+            include_str!("../../../resources/tests/java/JigsawPlacementOracle.java"),
+        )?;
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/JigsawConfiguredTrialOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&shared)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("JigsawConfiguredTrialOracle")
+            .arg(version.join("26.3.jar"))
+            .arg(temp.path())
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let mut expected = VecDeque::new();
+        let mut cases = 0;
+        let mut pieces = 0;
+        let mut saved_start = None;
+        let mut checked_starts = 0;
+        for line in String::from_utf8(output.stdout)?.lines() {
+            if let Some(rest) = line.strip_prefix("C\t") {
+                ensure!(expected.is_empty(), "previous graph incomplete");
+                let fields: Vec<_> = rest.split('\t').collect();
+                ensure!(fields.len() == 8, "invalid graph header");
+                let (lines, saved) = configured_lines(
+                    &mut resources,
+                    "trial_chambers",
+                    None,
+                    fields[0].parse()?,
+                    [fields[1].parse()?, fields[2].parse()?],
+                )?;
+                expected = lines;
+                saved_start = Some(saved);
+                let header = line.rsplit_once('\t').context("missing random state")?.0;
+                assert_eq!(expected.pop_front().context("missing header")?, header);
+                cases += 1;
+            } else if let Some(rest) = line.strip_prefix("S\t") {
+                let fields: Vec<_> = rest.split('\t').collect();
+                ensure!(fields.len() == 4, "invalid Java start output");
+                let java =
+                    native_persistence::nbt::read(&std::fs::read(temp.path().join(fields[3]))?)?;
+                let java =
+                    native_persistence::jigsaw_piece::SavedJigsawStart::from_tag(&java.value)?;
+                assert_eq!(
+                    saved_start.take().context("unexpected Java start")?,
+                    java,
+                    "case {cases}: start data"
+                );
+                checked_starts += 1;
+            } else if line.starts_with("P\t") || line.starts_with("J\t") {
+                pieces += usize::from(line.starts_with("P\t"));
+                assert_eq!(
+                    expected.pop_front().context("extra graph entry")?,
+                    line,
+                    "case {cases}"
+                );
+            }
+        }
+        assert_eq!(cases, 2);
+        assert_eq!(checked_starts, cases);
+        assert!(pieces > 100, "trial chamber graph unexpectedly small");
         assert!(expected.is_empty());
         Ok(())
     }

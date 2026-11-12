@@ -51,6 +51,7 @@ struct Response {
 struct Request {
     pos: ChunkPos,
     entities_only: bool,
+    shape_required: bool,
     stamp: Option<WorldReadStamp>,
 }
 
@@ -78,6 +79,7 @@ pub struct ChunkStreamer {
     missing: BTreeSet<ChunkPos>,
     failed: BTreeMap<ChunkPos, (Instant, u32)>,
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
+    shape_required: BTreeSet<ChunkPos>,
     _world_guard: Option<native_persistence::save::WorldSessionGuard>,
     observed_epoch: Option<u64>,
 }
@@ -201,7 +203,8 @@ impl ChunkStreamer {
                     let current = *worker_window
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let stale = current.is_some_and(|windows| !windows.contains(pos));
+                    let stale = !request.shape_required
+                        && current.is_some_and(|windows| !windows.contains(pos));
                     let result = if stale {
                         Ok(None)
                     } else {
@@ -239,6 +242,7 @@ impl ChunkStreamer {
             missing,
             failed: BTreeMap::new(),
             entity_retry: BTreeMap::new(),
+            shape_required: BTreeSet::new(),
             _world_guard: None,
             observed_epoch: None,
         })
@@ -281,6 +285,14 @@ impl ChunkStreamer {
             primary: (center, self.radius),
             respawn,
         };
+        let shape_required = session.required_shape_update_chunks();
+        if self.shape_required != shape_required {
+            self.shape_required = shape_required;
+            self.missing
+                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
+            self.failed
+                .retain(|pos, _| windows.contains(*pos) || self.shape_required.contains(pos));
+        }
         if windows_changed {
             self.settled_prefix = 0;
             self.center = Some(center);
@@ -299,9 +311,11 @@ impl ChunkStreamer {
             // Missing entries are only useful in an active window. Keeping
             // every absent chunk ever visited grows without bound and can
             // suppress a fresh disk read when a distant area is revisited.
-            self.missing.retain(|pos| windows.contains(*pos));
+            self.missing
+                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
             self.entity_retry.retain(|pos, _| windows.contains(*pos));
-            self.failed.retain(|pos, _| windows.contains(*pos));
+            self.failed
+                .retain(|pos, _| windows.contains(*pos) || self.shape_required.contains(pos));
             for &pos in &self.targets {
                 if matches!(
                     session.saved_entity_chunk(pos),
@@ -353,7 +367,8 @@ impl ChunkStreamer {
                     // Do not let an obsolete missing/error result poison a
                     // future visit to that chunk.
                     if response.stale
-                        || !windows.contains(response.pos)
+                        || (!windows.contains(response.pos)
+                            && !self.shape_required.contains(&response.pos))
                         || response
                             .stamp
                             .as_ref()
@@ -430,7 +445,7 @@ impl ChunkStreamer {
         };
         for pos in attached {
             self.awaiting_attachment.remove(&pos);
-            if !windows.contains(pos) {
+            if !windows.contains(pos) && !self.shape_required.contains(&pos) {
                 continue;
             }
             if !session.has_resident_or_parked_chunk(pos) {
@@ -472,6 +487,36 @@ impl ChunkStreamer {
                 && !session.has_chunk_or_pending(*pos)
         });
         let retry_due = entity_retry_due || terrain_retry_due;
+        // Shape updates can depend on saved chunks outside the render window.
+        // Recheck every service call, including after a full request queue.
+        for &pos in &self.shape_required {
+            if self.missing.contains(&pos)
+                || self.pending.contains(&pos)
+                || self.awaiting_attachment.contains(&pos)
+                || session.has_chunk_or_pending(pos)
+                || self.failed.get(&pos).is_some_and(|(at, _)| *at > now)
+            {
+                continue;
+            }
+            match self
+                .requests
+                .as_ref()
+                .context("chunk reader is closed")?
+                .try_send(Request {
+                    pos,
+                    entities_only: false,
+                    shape_required: true,
+                    stamp: active_stamp.clone(),
+                }) {
+                Ok(()) => {
+                    self.pending.insert(pos);
+                }
+                Err(TrySendError::Full(_)) => break,
+                Err(TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("chunk reader stopped unexpectedly")
+                }
+            }
+        }
         if windows_changed || received || retry_due || stale_received {
             if stale_received {
                 self.settled_prefix = 0;
@@ -513,6 +558,7 @@ impl ChunkStreamer {
                     .try_send(Request {
                         pos,
                         entities_only: retry && session.has_chunk_or_pending(pos),
+                        shape_required: false,
                         stamp: active_stamp.clone(),
                     }) {
                     Ok(()) => {
@@ -1359,6 +1405,109 @@ mod tests {
             }),
         );
         world
+    }
+
+    #[test]
+    fn requests_outside_chunk_needed_by_live_shape_update() {
+        use native_world::loaded::SavedFluidTick;
+        for exists in [true, false] {
+            let home = ChunkPos { x: 0, z: 0 };
+            let source_chunk = ChunkPos { x: 1, z: 0 };
+            let target = ChunkPos { x: 2, z: 0 };
+            let mut source = chunk_world(source_chunk);
+            let water = source.intern_state(BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), "0".into())]),
+            });
+            let stone = source.intern_state(BlockState {
+                name: "minecraft:stone".into(),
+                properties: BTreeMap::new(),
+            });
+            source.set_block_id(30, 3, 8, water).unwrap();
+            for (x, y, z) in [(30, 2, 8), (31, 2, 8), (29, 3, 8), (30, 3, 7), (30, 3, 9)] {
+                source.set_block_id(x, y, z, stone).unwrap();
+            }
+            source.saved_fluid_ticks.insert(
+                source_chunk,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: [30, 3, 8],
+                    delay: 0,
+                    priority: 0,
+                }],
+            );
+            let mut world = chunk_world(home);
+            assert!(world.import_chunk(&source, source_chunk).unwrap());
+            let player = PlayerState {
+                position: Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let mut session = LoadedSession::new(
+                world,
+                IVec3::ZERO,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            let missing = targets(home, 1)
+                .into_iter()
+                .filter(|pos| *pos != home && *pos != source_chunk)
+                .collect();
+            let (sent, received) = mpsc::channel();
+            let mut streamer = ChunkStreamer::with_source(1, missing, move |pos| {
+                sent.send(pos).unwrap();
+                Ok((pos == target && exists).then(|| chunk_world(pos)))
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = 0;
+            loop {
+                streamer.service(&mut session).unwrap();
+                session.update(Duration::from_millis(50));
+                requests += received.try_iter().filter(|pos| *pos == target).count();
+                if requests > 0
+                    && ((exists && session.pending_lichen_update_chunks().next().is_none())
+                        || (!exists && streamer.missing.contains(&target)))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "outside chunk was not read and applied"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            if !exists {
+                for _ in 0..10 {
+                    streamer.service(&mut session).unwrap();
+                    session.update(Duration::from_millis(50));
+                    requests += received.try_iter().filter(|pos| *pos == target).count();
+                }
+                assert_eq!(requests, 1, "missing target was requested repeatedly");
+                assert!(
+                    session
+                        .pending_lichen_update_chunks()
+                        .any(|pos| pos == target)
+                );
+            }
+            assert!(requests > 0);
+            assert!(
+                !session
+                    .snapshot()
+                    .world
+                    .loaded()
+                    .unwrap()
+                    .chunks
+                    .contains_key(&target)
+            );
+        }
     }
 
     #[test]

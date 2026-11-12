@@ -2142,10 +2142,9 @@ impl GeneratedBlockView<'_> {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
                     self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
-                ensure!(
-                    updated == state,
-                    "water-triggered lichen shape changes are not yet supported"
-                );
+                if updated != state {
+                    self.update_water_lichen(p.to_array(), &updated, depth - 1)?;
+                }
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
             {
@@ -2270,8 +2269,10 @@ impl GeneratedBlockView<'_> {
                 );
                 // LiquidBlock schedules a shape tick only when either the
                 // liquid or the changed neighbor contains source water.
-                if fluid.source || native_world::collision::fence_waterlogged(changed) == Some(true)
-                {
+                let neighbor_source = self.fluid(changed)?.is_some_and(|fluid| {
+                    fluid.kind == native_world::fluid::FluidKind::Water && fluid.source
+                });
+                if fluid.source || neighbor_source {
                     self.schedule_water(neighbor, &state)?;
                 }
                 if fluid.source && d == [0, 1, 0] {
@@ -2308,6 +2309,12 @@ impl GeneratedBlockView<'_> {
                     self.write_postprocessed_state(neighbor, &state, &next)?;
                     self.update_water_shape_neighbors(neighbor, &next, depth - 1)?;
                 }
+            } else if super::ore::valid_lichen(&state) {
+                let next =
+                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
+                if next != state {
+                    self.update_water_lichen(neighbor, &next, depth - 1)?;
+                }
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
             {
@@ -2325,6 +2332,22 @@ impl GeneratedBlockView<'_> {
             }
         }
         Ok(())
+    }
+
+    fn update_water_lichen(
+        &mut self,
+        pos: [i32; 3],
+        next: &BlockState,
+        depth: usize,
+    ) -> Result<()> {
+        // Removing the final face destroys the block and has loot and event
+        // side effects that this path cannot yet represent.
+        ensure!(
+            super::ore::valid_lichen(next),
+            "water-triggered lichen destruction is not yet supported"
+        );
+        self.replace_postprocessed_shape(pos, next, 276)?;
+        self.update_water_shape_neighbors(pos, next, depth)
     }
 
     fn mushroom_survives(&self, pos: [i32; 3]) -> Result<bool> {
@@ -2390,6 +2413,11 @@ impl GeneratedBlockView<'_> {
         flags: i32,
     ) -> Result<()> {
         let old = self.read(pos)?;
+        // The fluid tick can already have applied the shape computed from the
+        // original marked state. Java's setBlock accepts this as a no-op.
+        if flags == 276 && old == *next {
+            return Ok(());
+        }
         if ladder_state(&old).is_some() {
             ensure!(
                 flags == 276 && next.name == "minecraft:air" && next.properties.is_empty(),
@@ -7391,7 +7419,9 @@ mod tests {
             | "marked_lichen_side"
             | "marked_lichen_down"
             | "marked_lichen_sides"
-            | "marked_lichen_mixed" => {
+            | "marked_lichen_mixed"
+            | "marked_lichen_lose_east"
+            | "marked_lichen_lose_last" => {
                 let lichen = world.intern_state(BlockState {
                     name: "minecraft:glow_lichen".into(),
                     properties: [
@@ -7407,7 +7437,14 @@ mod tests {
                     .map(|key| {
                         (
                             key.into(),
-                            matches!(key, "west" | "waterlogged").to_string(),
+                            ((key == "west" && case != "marked_lichen_lose_last")
+                                || key == "waterlogged"
+                                || (key == "east"
+                                    && matches!(
+                                        case,
+                                        "marked_lichen_lose_east" | "marked_lichen_lose_last"
+                                    )))
+                            .to_string(),
                         )
                     })
                     .collect(),
@@ -7415,7 +7452,11 @@ mod tests {
                 world.set_block_id(8, 8, 8, lichen).unwrap();
                 if matches!(
                     case,
-                    "marked_lichen_side" | "marked_lichen_sides" | "marked_lichen_mixed"
+                    "marked_lichen_side"
+                        | "marked_lichen_sides"
+                        | "marked_lichen_mixed"
+                        | "marked_lichen_lose_east"
+                        | "marked_lichen_lose_last"
                 ) {
                     world.set_block_id(9, 8, 8, air).unwrap();
                 }
@@ -7662,6 +7703,15 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if case == "marked_lichen_lose_last" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert!(format!("{error:#}").contains("lichen destruction"));
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(9, 8, 8).unwrap().name, "minecraft:air");
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            return vec!["rolled back".into()];
+        }
         if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
             struct InvalidLoot;
             impl ResourceProvider for InvalidLoot {
@@ -8759,6 +8809,27 @@ mod tests {
             down.iter()
                 .any(|line| line == "fluid minecraft:flowing_water 8,7,8 5")
         );
+        let changed = water_spread_trace("marked_lichen_lose_east");
+        assert!(
+            changed
+                .iter()
+                .any(|line| line == "lichen 8,8,8 false false false false true false")
+        );
+        assert_eq!(
+            water_spread_trace("marked_lichen_lose_last"),
+            ["rolled back"]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn water_neighbor_removes_lichen_face_like_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lichen_transition"],
+        );
+        assert_eq!(actual, water_spread_trace("marked_lichen_lose_east"));
     }
 
     #[test]

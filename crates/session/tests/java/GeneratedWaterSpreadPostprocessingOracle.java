@@ -126,6 +126,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     for(var wet:List.of(false,true))
                         for(var side:List.of("front","back")) scenarios.add("marked_stair_corner_"+facing+"_"+neighbor+"_"+half+"_"+wet+"_"+side);
         if(args.length>0 && args[0].equals("lichen"))scenarios.removeIf(s -> !s.startsWith("marked_lichen_"));
+        if(args.length>0 && args[0].equals("lichen_transition")){scenarios.clear();scenarios.add("marked_lichen_lose_east");}
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("down_containers")){
@@ -247,8 +248,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             }
             if(scenario.startsWith("marked_lichen_")) {
                 blocks.put(pos,Blocks.GLOW_LICHEN.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true)
-                    .setValue(MultifaceBlock.getFaceProperty(Direction.WEST),true));
-                if(scenario.equals("marked_lichen_side") || scenario.equals("marked_lichen_sides") || scenario.equals("marked_lichen_mixed"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                    .setValue(MultifaceBlock.getFaceProperty(Direction.WEST),true)
+                    .setValue(MultifaceBlock.getFaceProperty(Direction.EAST),scenario.equals("marked_lichen_lose_east")));
+                if(scenario.equals("marked_lichen_side") || scenario.equals("marked_lichen_sides") || scenario.equals("marked_lichen_mixed") || scenario.equals("marked_lichen_lose_east"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
                 if(scenario.equals("marked_lichen_down") || scenario.equals("marked_lichen_mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
                 if(scenario.equals("marked_lichen_sides") || scenario.equals("marked_lichen_mixed"))for(var p:List.of(pos.north(),pos.south()))blocks.put(p,Blocks.AIR.defaultBlockState());
             }

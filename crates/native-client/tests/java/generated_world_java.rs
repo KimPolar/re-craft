@@ -733,6 +733,34 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             }
         }
     }
+    if seed == 1 {
+        use native_session::{GameSession, PlayerCommand, SystemMessageKind};
+
+        let session = &mut stage.initial.session;
+        let prior_errors = session.take_stream_errors();
+        ensure!(prior_errors.is_empty(), "initial session errors: {prior_errors:?}");
+        let initial_tick = session.snapshot().tick;
+        session.submit_command(PlayerCommand::QueryWorldSeed);
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(Duration::from_millis(50));
+        let opened = session.snapshot();
+        assert_eq!(opened.tick, initial_tick + 1);
+        assert!(opened.inventory.is_open());
+        assert!(opened.system_messages.iter().any(|message| matches!(
+            message.kind, SystemMessageKind::WorldSeed(value) if value == seed
+        )));
+        session.submit_command(PlayerCommand::ToggleInventory);
+        for _ in 0..19 {
+            session.update(Duration::from_millis(50));
+        }
+        let after = session.snapshot();
+        assert_eq!(after.tick, initial_tick + 20);
+        assert!(!after.inventory.is_open());
+        assert!(after.player.position.is_finite());
+        let errors = session.take_stream_errors();
+        ensure!(errors.is_empty(), "generated session tick errors: {errors:?}");
+        eprintln!("Generated seed 1 session advanced 20 ticks and handled inventory and seed commands");
+    }
     eprintln!(
         "Java round-tripped {} terrain, {} entity and {} POI chunks; loaded and saved {} entities",
         positions.len(),

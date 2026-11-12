@@ -4246,7 +4246,9 @@ impl LoadedSession {
         );
         anyhow::ensure!(
             !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
-            "fence shape updates are not yet fully tracked for saving"
+            "fence shape updates are not yet fully tracked for saving (unresolved: {}, waiting for chunks: {:?})",
+            self.unresolved_fence_shape,
+            self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
         anyhow::ensure!(
             !self.unresolved_leaf_decay,
@@ -4498,7 +4500,9 @@ impl LoadedSession {
         );
         anyhow::ensure!(
             !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
-            "fence shape updates are not yet fully tracked for saving"
+            "fence shape updates are not yet fully tracked for saving (unresolved: {}, waiting for chunks: {:?})",
+            self.unresolved_fence_shape,
+            self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
         anyhow::ensure!(
             self.commands.is_empty(),
@@ -10366,7 +10370,9 @@ impl LoadedSession {
         );
         ensure!(
             !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
-            "fence shape updates are not yet fully tracked for saving"
+            "fence shape updates are not yet fully tracked for saving (unresolved: {}, waiting for chunks: {:?})",
+            self.unresolved_fence_shape,
+            self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
         ensure!(
             !self.unresolved_leaf_decay,
@@ -71225,13 +71231,13 @@ pub(crate) mod tests {
             name: "".into(),
             value: native_persistence::nbt::Tag::Compound(vec![]),
         };
-        assert!(
-            session
-                .draft_changed_chunk(east, &original)
-                .unwrap_err()
-                .to_string()
-                .contains("fence shape updates")
-        );
+        let error = session
+            .draft_changed_chunk(east, &original)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fence shape updates"));
+        assert!(error.contains("unresolved: false"));
+        assert!(error.contains(&format!("{east:?}")));
         let mut incoming = World::new("minecraft:overworld");
         let air = incoming.intern_state(state("minecraft:air", &[]));
         let fence = incoming.intern_state(state(

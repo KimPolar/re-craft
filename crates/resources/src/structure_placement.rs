@@ -314,6 +314,18 @@ impl ConcentricRingsPlacement {
         seed: i64,
         mut search: impl FnMut([i32; 2], &mut LegacyRandom) -> Result<Option<[i32; 2]>>,
     ) -> Result<Vec<[i32; 2]>> {
+        self.ring_search_inputs(seed)
+            .into_iter()
+            .map(|(initial, child_seed)| {
+                let mut child = LegacyRandom::new(child_seed);
+                Ok(search(initial, &mut child)?.unwrap_or(initial))
+            })
+            .collect()
+    }
+
+    /// Parent RNG supplies independent search seeds in fixed Java ring order.
+    /// Callers may evaluate the searches independently and restore this order.
+    pub fn ring_search_inputs(&self, seed: i64) -> Vec<([i32; 2], i64)> {
         let mut random = LegacyRandom::new(seed);
         let mut angle = random.next_double() * std::f64::consts::PI * 2.0;
         let mut spread = self.spread;
@@ -328,8 +340,7 @@ impl ConcentricRingsPlacement {
                 f64::from(base) + (random.next_double() - 0.5) * f64::from(self.distance) * 2.5;
             let round = |v: f64| -> i32 { (v + 0.5).floor() as i64 as i32 };
             let initial = [round(angle.cos() * distance), round(angle.sin() * distance)];
-            let mut child = LegacyRandom::new(random.next_long());
-            result.push(search(initial, &mut child)?.unwrap_or(initial));
+            result.push((initial, random.next_long()));
             angle += std::f64::consts::PI * 2.0 / f64::from(spread);
             in_circle += 1;
             if in_circle == spread {
@@ -340,7 +351,7 @@ impl ConcentricRingsPlacement {
                 angle += random.next_double() * std::f64::consts::PI * 2.0;
             }
         }
-        Ok(result)
+        result
     }
     /// Apply the inherited frequency and exclusion rules to precomputed rings.
     pub fn is_structure_chunk(

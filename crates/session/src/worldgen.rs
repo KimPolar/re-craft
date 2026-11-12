@@ -64,8 +64,8 @@ pub mod postprocessing_drops;
 mod postprocessing_world;
 pub(crate) use postprocessing_world::fence_connection;
 pub mod ruined_portal;
-pub mod schedule;
 pub mod saved_structure_starts;
+pub mod schedule;
 pub mod shipwreck;
 pub mod structure_batch;
 mod structure_data;
@@ -3595,6 +3595,12 @@ impl TerrainGenerator {
             }
         }
         let all_preferred = preferred.len() == possible.len();
+        if !preferred.is_empty()
+            && !all_preferred
+            && let Some(positions) = self.parallel_ring_positions(placement, &preferred)
+        {
+            return Ok(positions);
+        }
         let mut source = self.source.fresh_sampler();
         placement.positions_with_search(self.seed, |initial, random| {
             // Empty and universal holder sets do not require climate sampling;
@@ -3610,6 +3616,66 @@ impl TerrainGenerator {
                 let biome = source.sample_quart(self.noise.router(), evaluator, quart);
                 Ok(preferred.contains(biome))
             })
+        })
+    }
+
+    /// Each Java ring search has a separate RNG and a fresh biome search
+    /// history. Keep those boundaries and concatenate results in ring order.
+    /// If workers cannot start or fail, the caller uses the serial path.
+    fn parallel_ring_positions(
+        &self,
+        placement: &native_resources::structure_placement::ConcentricRingsPlacement,
+        preferred: &BTreeSet<ResourceId>,
+    ) -> Option<Vec<[i32; 2]>> {
+        use native_resources::structure_placement::find_ring_biome;
+        let requests = placement.ring_search_inputs(self.seed);
+        let workers = std::thread::available_parallelism().ok()?.get().min(4);
+        if workers < 2 || requests.len() < 8 {
+            return None;
+        }
+        let chunk_size = requests.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut spawn_failed = false;
+            for chunk in requests.chunks(chunk_size) {
+                let mut source = self.source.fresh_sampler();
+                let router = self.noise.router();
+                match std::thread::Builder::new()
+                    .name("worldgen-ring-search".into())
+                    .spawn_scoped(scope, move || -> Result<Vec<[i32; 2]>> {
+                        let mut evaluator = DensityEvaluator::default();
+                        let mut result = Vec::with_capacity(chunk.len());
+                        for &(initial, seed) in chunk {
+                            source.reset_search_history();
+                            let mut random = native_core::random::LegacyRandom::new(seed);
+                            let position = find_ring_biome(initial, &mut random, |quart| {
+                                Ok(preferred.contains(source.sample_quart(
+                                    router,
+                                    &mut evaluator,
+                                    quart,
+                                )))
+                            })?
+                            .unwrap_or(initial);
+                            result.push(position);
+                        }
+                        Ok(result)
+                    }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(_) => {
+                        spawn_failed = true;
+                        break;
+                    }
+                }
+            }
+            let mut result = Vec::with_capacity(requests.len());
+            let mut failed = spawn_failed;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(chunk)) => result.extend(chunk),
+                    _ => failed = true,
+                }
+            }
+            (!failed && result.len() == requests.len()).then_some(result)
         })
     }
     /// Call in the same chunk order as the world generator; equal-distance
@@ -6051,7 +6117,9 @@ mod tests {
             .begin_generated_postprocessing_with_neighbors([center], [center], 42, 10)
             .unwrap();
         assert_eq!(
-            generated.entity_candidates[&center].as_deref().map(Vec::as_slice),
+            generated.entity_candidates[&center]
+                .as_deref()
+                .map(Vec::as_slice),
             Some(batch.recorded_generated_entities(center).unwrap())
         );
         while !generated.poll(center, 4).unwrap() {}
@@ -6099,7 +6167,12 @@ mod tests {
                 .prepare_converted_structure_region_drafts(&disabled_drops, 0)
                 .err(),
         ] {
-            assert!(error.unwrap().to_string().contains("random-stream save integration"));
+            assert!(
+                error
+                    .unwrap()
+                    .to_string()
+                    .contains("random-stream save integration")
+            );
         }
         let mut enabled_drops = generated.finish().unwrap();
         enabled_drops
@@ -7201,9 +7274,7 @@ mod tests {
         assert_eq!(entities.entities().len(), 2);
         assert_eq!(&entities.entities()[0], &cow);
         assert_eq!(&entities.entities()[1..], drops.records(center));
-        let terrain = reader
-            .read_chunk(0, 0)?
-            .context("terrain chunk missing")?;
+        let terrain = reader.read_chunk(0, 0)?.context("terrain chunk missing")?;
         let Some(Tag::List { values, .. }) = terrain.document.value.get("block_entities") else {
             anyhow::bail!("saved chest is missing")
         };
@@ -9353,11 +9424,11 @@ mod tests {
                                 "pos".into(),
                                 list(
                                     TagType::Double,
-                                        vec![
-                                            Tag::Double(f64::from(x) + 0.5),
-                                            Tag::Double(0.5),
-                                            Tag::Double(0.5),
-                                        ],
+                                    vec![
+                                        Tag::Double(f64::from(x) + 0.5),
+                                        Tag::Double(0.5),
+                                        Tag::Double(0.5),
+                                    ],
                                 ),
                             ),
                             (
@@ -9973,7 +10044,11 @@ mod tests {
                         )
                     };
                     java_rewrite_generated_entity_region(
-                        &game, directory.path(), target, class, code,
+                        &game,
+                        directory.path(),
+                        target,
+                        class,
+                        code,
                     )?;
                     let saved = native_persistence::anvil::RegionReader::open(&path)?
                         .read_chunk(target.x, target.z)?
@@ -12134,6 +12209,76 @@ mod tests {
                 .unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn parallel_stronghold_ring_search_matches_point_sampling() -> Result<()> {
+        use native_resources::{
+            packs::ResourceStack,
+            structure_placement::{ConcentricRingsPlacement, find_ring_biome},
+            surface_biomes::SurfaceBiomes,
+        };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let preset: Value = serde_json::from_slice(
+            &resources
+                .read_builtin_data("data/minecraft/worldgen/world_preset/normal.json")?
+                .context("normal preset missing")?,
+        )?;
+        let placement = ConcentricRingsPlacement::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:strongholds")?,
+        )?;
+        for seed in [1, 42] {
+            let generator = TerrainGenerator::with_structure_context(
+                &mut resources,
+                &preset["dimensions"]["minecraft:overworld"]["generator"],
+                seed,
+                -64,
+                384,
+            )?;
+            let actual = generator.concentric_structure_positions(
+                &mut resources,
+                &mut DensityEvaluator::default(),
+                &placement,
+            )?;
+            let selector = placement.preferred_biomes();
+            let allowed = SurfaceBiomes::load(&mut resources, std::slice::from_ref(selector))?;
+            let mut preferred = BTreeSet::new();
+            for biome in &generator.possible_biomes {
+                if allowed.matches(selector, biome)? {
+                    preferred.insert(biome.clone());
+                }
+            }
+            if seed == 1
+                && std::thread::available_parallelism().is_ok_and(|workers| workers.get() > 1)
+            {
+                let parallel = generator
+                    .parallel_ring_positions(&placement, &preferred)
+                    .context("parallel ring workers did not complete")?;
+                assert_eq!(actual, parallel);
+            }
+            let mut source = generator.source.fresh_sampler();
+            let mut evaluator = DensityEvaluator::default();
+            let expected = placement.positions_with_search(seed, |initial, random| {
+                source.reset_search_history();
+                find_ring_biome(initial, random, |quart| {
+                    Ok(preferred.contains(source.sample_quart(
+                        generator.noise.router(),
+                        &mut evaluator,
+                        quart,
+                    )))
+                })
+            })?;
+            assert_eq!(
+                actual, expected,
+                "stronghold ring positions differ for seed {seed}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

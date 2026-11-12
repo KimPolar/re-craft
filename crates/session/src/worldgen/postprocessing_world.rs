@@ -3771,7 +3771,10 @@ mod tests {
             ore_feature::OreBlockTags,
             packs::{ResourceId, ResourceProvider},
         };
-        struct Tags(bool);
+        struct Tags {
+            air: bool,
+            rail: bool,
+        }
         impl ResourceProvider for Tags {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
                 Ok(None)
@@ -3779,15 +3782,19 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 let value = match path {
                     "data/minecraft/tags/block/fences.json" => {
-                        if self.0 {
+                        if self.air {
                             r#"{"values":["minecraft:oak_fence","minecraft:nether_brick_fence","minecraft:air"]}"#
+                        } else if self.rail {
+                            r#"{"values":["minecraft:oak_fence","minecraft:nether_brick_fence","minecraft:rail"]}"#
                         } else {
                             r#"{"values":["minecraft:oak_fence","minecraft:nether_brick_fence"]}"#
                         }
                     }
                     "data/minecraft/tags/block/wooden_fences.json" => {
-                        if self.0 {
+                        if self.air {
                             r#"{"values":["minecraft:oak_fence","minecraft:air"]}"#
+                        } else if self.rail {
+                            r#"{"values":["minecraft:oak_fence","minecraft:rail"]}"#
                         } else {
                             r#"{"values":["minecraft:oak_fence"]}"#
                         }
@@ -3826,11 +3833,25 @@ mod tests {
         .collect();
         let (mut stage, _, chunk) = fixture(false);
         stage.set_fence_tags(Some(Arc::new(
-            OreBlockTags::load(&mut Tags(mode == "tag_air"), &registry, &ids).unwrap(),
+            OreBlockTags::load(
+                &mut Tags {
+                    air: mode == "tag_air",
+                    rail: mode == "tag_rail",
+                },
+                &registry,
+                &ids,
+            )
+            .unwrap(),
         )));
         stage.heightmap_tags = Some(Arc::new(
-            native_resources::heightmap_tags::HeightmapTags::load(&mut Tags(false), &registry)
-                .unwrap(),
+            native_resources::heightmap_tags::HeightmapTags::load(
+                &mut Tags {
+                    air: false,
+                    rail: false,
+                },
+                &registry,
+            )
+            .unwrap(),
         ));
         let world = Arc::make_mut(&mut stage.world);
         let stone = world.block_id(0, 0, 0).unwrap();
@@ -3908,7 +3929,10 @@ mod tests {
                 });
                 world.set_block_id(7, 8, 8, gate).unwrap();
             }
-            if matches!(mode, "rail" | "rail_ascending" | "powered_rail") {
+            if matches!(
+                mode,
+                "rail" | "rail_ascending" | "powered_rail" | "tag_rail"
+            ) {
                 let mut properties = BTreeMap::from([
                     (
                         "shape".into(),
@@ -4212,6 +4236,7 @@ mod tests {
             ("rail", "true true false false false 0 0 -1 0 1 0"),
             ("rail_ascending", "true true false false false 0 0 -1 0 1 0"),
             ("powered_rail", "true true false false false 0 0 -1 0 1 0"),
+            ("tag_rail", "true true false true false 0 0 -1 0 1 0"),
         ] {
             assert_eq!(
                 fence_postprocessing_trace(mode),
@@ -9234,6 +9259,7 @@ mod tests {
             "rail",
             "rail_ascending",
             "powered_rail",
+            "tag_rail",
         ]
         .into_iter()
         .map(fence_postprocessing_trace)

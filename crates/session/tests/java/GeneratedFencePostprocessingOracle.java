@@ -69,11 +69,12 @@ public class GeneratedFencePostprocessingOracle {
             FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
             FluidTags.LAVA,List.of(Fluids.LAVA.builtInRegistryHolder(),Fluids.FLOWING_LAVA.builtInRegistryHolder())))).apply();
         out.println("BEGIN_RESULT");
-        for(var mode:List.of("mixed","same_fence","other_fence","tag_air","wet_enclosed","gate_north","gate_east","rail","rail_ascending","powered_rail")) {
+        for(var mode:List.of("mixed","same_fence","other_fence","tag_air","wet_enclosed","gate_north","gate_east","rail","rail_ascending","powered_rail","tag_rail")) {
             boolean airTagged=mode.equals("tag_air");
             var fences=new ArrayList<net.minecraft.core.Holder<Block>>(List.of(Blocks.OAK_FENCE.builtInRegistryHolder(),Blocks.NETHER_BRICK_FENCE.builtInRegistryHolder()));
             var wooden=new ArrayList<net.minecraft.core.Holder<Block>>(List.of(Blocks.OAK_FENCE.builtInRegistryHolder()));
             if(airTagged){fences.add(Blocks.AIR.builtInRegistryHolder());wooden.add(Blocks.AIR.builtInRegistryHolder());}
+            if(mode.equals("tag_rail")){fences.add(Blocks.RAIL.builtInRegistryHolder());wooden.add(Blocks.RAIL.builtInRegistryHolder());}
             BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK,Map.of(
                 BlockTags.FENCES,fences,BlockTags.WOODEN_FENCES,wooden,BlockTags.SHULKER_BOXES,List.of()))).apply();
             blocks.clear();boolean wet=mode.equals("wet_enclosed");
@@ -84,7 +85,7 @@ public class GeneratedFencePostprocessingOracle {
                 if(mode.equals("same_fence"))blocks.put(POS.west(),Blocks.OAK_FENCE.defaultBlockState());
                 if(mode.equals("other_fence"))blocks.put(POS.west(),Blocks.NETHER_BRICK_FENCE.defaultBlockState());
                 if(mode.startsWith("gate_"))blocks.put(POS.west(),Blocks.OAK_FENCE_GATE.defaultBlockState().setValue(FenceGateBlock.FACING,mode.equals("gate_north")?Direction.NORTH:Direction.EAST));
-                if(mode.equals("rail"))blocks.put(POS.west(),Blocks.RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE,RailShape.NORTH_SOUTH));
+                if(mode.equals("rail")||mode.equals("tag_rail"))blocks.put(POS.west(),Blocks.RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE,RailShape.NORTH_SOUTH));
                 if(mode.equals("rail_ascending"))blocks.put(POS.west(),Blocks.RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE,RailShape.ASCENDING_EAST));
                 if(mode.equals("powered_rail"))blocks.put(POS.west(),Blocks.POWERED_RAIL.defaultBlockState().setValue(BlockStateProperties.RAIL_SHAPE_STRAIGHT,RailShape.NORTH_SOUTH).setValue(BlockStateProperties.POWERED,true));
             }

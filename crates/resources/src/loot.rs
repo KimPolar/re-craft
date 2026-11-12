@@ -711,40 +711,56 @@ impl BlockLootTables {
                 _ => true,
             }
         }
-        fn entry_valid(entry: &Entry, tool: BasicTool<'_>) -> bool {
-            entry
-                .modifiers
-                .iter()
-                .all(|modifier| modifier_valid(modifier, tool))
-                && match &entry.kind {
-                    EntryKind::Alternatives(children) => {
-                        children.iter().all(|child| entry_valid(child, tool))
-                    }
-                    _ => true,
-                }
+        fn entry_valid(entry: &Entry, tool: BasicTool<'_>, components: bool) -> bool {
+            if !entry.condition.fully_supported_in_player_block(true) {
+                return false;
+            }
+            // A supported tool predicate is deterministic. An entry that can
+            // never be selected by this tool cannot reach its modifiers.
+            if matches!(&entry.condition, Condition::Tool(_))
+                && matches!(
+                    entry
+                        .condition
+                        .test(tool, &mut None, LootContext::default()),
+                    Ok(false)
+                )
+            {
+                return true;
+            }
+            entry.modifiers.iter().all(|modifier| {
+                modifier.fully_supported_in_player_block_with_components(components)
+                    && modifier_valid(modifier, tool)
+            }) && match &entry.kind {
+                EntryKind::Unsupported(_) => false,
+                EntryKind::Alternatives(children) => children
+                    .iter()
+                    .all(|child| entry_valid(child, tool, components)),
+                _ => true,
+            }
         }
         let Ok(block) = ResourceId::parse(block) else {
             return false;
         };
-        let name = format!("{}:{}", block.namespace, block.path);
-        if !self.fully_supported_player_block_inner(&name, components) {
-            return false;
-        }
         let id = ResourceId {
             namespace: block.namespace,
             path: format!("blocks/{}", block.path),
         };
         self.tables.get(&id).is_some_and(|table| {
-            table
-                .modifiers
-                .iter()
-                .all(|modifier| modifier_valid(modifier, tool))
-                && table.pools.iter().all(|pool| {
-                    pool.modifiers
+            table.modifiers.iter().all(|modifier| {
+                modifier.fully_supported_in_player_block_with_components(components)
+                    && modifier_valid(modifier, tool)
+            }) && table.pools.iter().all(|pool| {
+                pool.condition.fully_supported_in_player_block(true)
+                    && pool.weights_fit()
+                    && pool.modifiers.iter().all(|modifier| {
+                        modifier.fully_supported_in_player_block_with_components(components)
+                            && modifier_valid(modifier, tool)
+                    })
+                    && pool
+                        .entries
                         .iter()
-                        .all(|modifier| modifier_valid(modifier, tool))
-                        && pool.entries.iter().all(|entry| entry_valid(entry, tool))
-                })
+                        .all(|entry| entry_valid(entry, tool, components))
+            })
         })
     }
     pub fn fully_supported_player_block_with_components(&self, block: &str) -> bool {
@@ -1860,6 +1876,28 @@ mod tests {
         fn put(&mut self, path: &str, json: &str) {
             self.data.insert(path.into(), json.as_bytes().to_vec());
         }
+    }
+
+    #[test]
+    fn tool_specific_support_ignores_only_unreachable_loot_entries() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/glow_lichen.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:glow_lichen","condition":{"type":"minecraft:match_tool","predicate":{"items":"minecraft:shears"}},"modifier":{"type":"example:unsupported"}}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let empty = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        let shears = BasicTool {
+            item: Some("minecraft:shears"),
+            count: 1,
+            enchantments: &[],
+        };
+        assert!(tables.fully_supported_player_block_for_tool("minecraft:glow_lichen", empty));
+        assert!(!tables.fully_supported_player_block_for_tool("minecraft:glow_lichen", shears));
+        source.put("data/minecraft/loot_table/blocks/glow_lichen.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:glow_lichen","condition":{"type":"minecraft:random_chance","chance":0.5},"modifier":{"type":"example:unsupported"}}]}]}"#);
+        let dynamic = BlockLootTables::load(&mut source).unwrap();
+        assert!(!dynamic.fully_supported_player_block_for_tool("minecraft:glow_lichen", empty));
     }
 
     #[test]

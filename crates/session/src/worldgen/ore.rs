@@ -7971,6 +7971,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::full_glass(state)
                             || native_world::collision::full_terracotta(state)
                             || native_world::collision::copper_bulb_state(state).is_some()
+                            || native_world::collision::full_copper(state)
                             || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state)
                             || jigsaw::jigsaw_lantern(state)
@@ -12761,6 +12762,16 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_copper_blocks_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_copperblock",
+            "vine_active_self_empty_jigsaw_copperblock",
+            "vine_active_jigsaw_water_copperblock",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13195,6 +13206,8 @@ mod tests {
                         "candle"
                     } else if mode.ends_with("_bulb") {
                         "waxed_oxidized_copper_bulb"
+                    } else if mode.ends_with("_copperblock") {
+                        "waxed_oxidized_copper"
                     } else if mode.ends_with("_carpet") {
                         "blue_carpet"
                     } else if mode.ends_with("_ladder") {

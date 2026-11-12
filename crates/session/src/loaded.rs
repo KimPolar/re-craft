@@ -10765,6 +10765,12 @@ impl LoadedSession {
             .collect()
     }
 
+    /// Chunks whose arrival is needed before queued fence neighbor updates can
+    /// be resolved. Their absence does not imply that they exist on disk.
+    pub fn pending_fence_update_chunks(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.pending_fence_updates.keys().copied()
+    }
+
     /// A committed chunk cannot disappear without a chunk-window change.
     pub fn has_resident_or_parked_chunk(&self, pos: ChunkPos) -> bool {
         self.world.chunks.contains_key(&pos) || self.parked_chunks.contains_key(&pos)
@@ -71227,6 +71233,10 @@ pub(crate) mod tests {
             z: session.origin.z.div_euclid(16),
         };
         assert!(session.pending_fence_updates.contains_key(&east));
+        assert_eq!(
+            session.pending_fence_update_chunks().collect::<Vec<_>>(),
+            vec![east]
+        );
         let original = native_persistence::nbt::NamedTag {
             name: "".into(),
             value: native_persistence::nbt::Tag::Compound(vec![]),
@@ -71272,6 +71282,7 @@ pub(crate) mod tests {
         session.queue_loaded_chunk(east, incoming);
         session.apply_streaming();
         assert!(session.pending_fence_updates.is_empty());
+        assert_eq!(session.pending_fence_update_chunks().count(), 0);
         let block = session
             .world
             .block(session.origin.x + 16, 3, session.origin.z + 8)

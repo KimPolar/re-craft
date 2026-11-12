@@ -531,7 +531,10 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     let player = reader.read_player()?.context("player data missing")?;
     let clocks = reader.world_clocks()?;
     let game_rules = reader.fluid_game_rules()?;
-    assert_eq!(game_rules, native_persistence::world::FluidGameRules::default());
+    assert_eq!(
+        game_rules,
+        native_persistence::world::FluidGameRules::default()
+    );
     drop(reader);
     let version = game.join("versions/26.3");
     let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
@@ -736,9 +739,21 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     if seed == 1 {
         use native_session::{GameSession, PlayerCommand, SystemMessageKind};
 
+        let stream_reader =
+            native_persistence::world::WorldReader::open(stage.path(), dimension.clone())?;
+        let mut streamer = crate::chunk_stream::ChunkStreamer::start(
+            stream_reader,
+            defaults.clone(),
+            4,
+            BTreeSet::new(),
+            None,
+        )?;
         let session = &mut stage.initial.session;
         let prior_errors = session.take_stream_errors();
-        ensure!(prior_errors.is_empty(), "initial session errors: {prior_errors:?}");
+        ensure!(
+            prior_errors.is_empty(),
+            "initial session errors: {prior_errors:?}"
+        );
         let initial_tick = session.snapshot().tick;
         let initial_position = native_session::player_data::read_saved_position(&player)?
             .context("initial player position missing")?;
@@ -770,9 +785,48 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         assert!(!after.inventory.is_open());
         assert!(after.player.position.is_finite());
         let errors = session.take_stream_errors();
-        ensure!(errors.is_empty(), "generated session tick errors: {errors:?}");
+        ensure!(
+            errors.is_empty(),
+            "generated session tick errors: {errors:?}"
+        );
         let actual_position = after.origin.as_dvec3() + after.player.position.as_dvec3();
-        ensure!(actual_position != initial_position, "player position did not change");
+        ensure!(
+            actual_position != initial_position,
+            "player position did not change"
+        );
+        let waiting: Vec<_> = session.pending_fence_update_chunks().collect();
+        let available: Vec<_> = waiting
+            .iter()
+            .copied()
+            .filter(|pos| positions.contains(&ChunkPos { x: pos.x, z: pos.z }))
+            .collect();
+        ensure!(
+            !available.is_empty(),
+            "seed 1 did not exercise streaming a saved pending chunk"
+        );
+        eprintln!("Fence updates await {waiting:?}; saved terrain is available for {available:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while available
+            .iter()
+            .any(|&pos| !session.has_resident_or_parked_chunk(pos))
+        {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "streaming pending fence chunks timed out"
+            );
+            streamer.service(session)?;
+            session.update(Duration::from_millis(50));
+            let errors = session.take_stream_errors();
+            ensure!(
+                errors.is_empty(),
+                "generated session streaming errors: {errors:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!(
+            "Fence updates still waiting after streaming: {:?}",
+            session.pending_fence_update_chunks().collect::<Vec<_>>()
+        );
         match session.draft_new_player_state() {
             Ok(draft) => {
                 let ticked_player_file = oracle.path().join("ticked-player.nbt");
@@ -809,7 +863,9 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
                 eprintln!("Ticked player save correctly refused: {error:#}");
             }
         }
-        eprintln!("Generated seed 1 session advanced 20 ticks and handled movement, inventory and seed commands");
+        eprintln!(
+            "Generated seed 1 session advanced at least 20 ticks and handled movement, inventory and seed commands"
+        );
     }
     eprintln!(
         "Java round-tripped {} terrain, {} entity and {} POI chunks; loaded and saved {} entities",

@@ -1511,6 +1511,112 @@ mod tests {
     }
 
     #[test]
+    fn requests_outside_chunk_needed_by_a_stair_update() {
+        use native_world::loaded::SavedFluidTick;
+        let home = ChunkPos { x: 0, z: 0 };
+        let source_chunk = ChunkPos { x: 1, z: 0 };
+        let target = ChunkPos { x: 2, z: 0 };
+        let mut source = chunk_world(source_chunk);
+        let water = source.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "4".into())]),
+        });
+        let stone = source.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        });
+        let stair = source.intern_state(BlockState {
+            name: "minecraft:oak_stairs".into(),
+            properties: [
+                ("facing", "east"),
+                ("half", "bottom"),
+                ("shape", "inner_right"),
+                ("waterlogged", "false"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        });
+        source.set_block_id(30, 3, 8, water).unwrap();
+        source.set_block_id(31, 3, 8, stair).unwrap();
+        for (x, y, z) in [(30, 2, 8), (29, 3, 8), (30, 3, 7), (30, 3, 9)] {
+            source.set_block_id(x, y, z, stone).unwrap();
+        }
+        source.saved_fluid_ticks.insert(
+            source_chunk,
+            vec![SavedFluidTick {
+                fluid: "minecraft:flowing_water".into(),
+                position: [30, 3, 8],
+                delay: 0,
+                priority: 0,
+            }],
+        );
+        let mut world = chunk_world(home);
+        assert!(world.import_chunk(&source, source_chunk).unwrap());
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            world,
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_vanilla_block_ids(Arc::new(
+            [
+                "minecraft:air",
+                "minecraft:stone",
+                "minecraft:oak_stairs",
+                "minecraft:water",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ));
+        let missing = targets(home, 1)
+            .into_iter()
+            .filter(|pos| *pos != home && *pos != source_chunk)
+            .collect();
+        let (sent, received) = mpsc::channel();
+        let mut streamer = ChunkStreamer::with_source(1, missing, move |pos| {
+            sent.send(pos).unwrap();
+            Ok((pos == target).then(|| chunk_world(pos)))
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requested = false;
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            requested |= received.try_iter().any(|pos| pos == target);
+            if requested && session.required_shape_update_chunks().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stair neighbor was not read and applied"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let snapshot = session.snapshot();
+        let world = snapshot.world.loaded().unwrap();
+        assert_eq!(
+            world.block(31, 3, 8).unwrap().properties["shape"],
+            "straight"
+        );
+        assert!(!world.chunks.contains_key(&target));
+    }
+
+    #[test]
     fn changing_radius_without_moving_loads_and_unloads_chunks() {
         let home = ChunkPos { x: 0, z: 0 };
         let far = ChunkPos { x: 2, z: 0 };

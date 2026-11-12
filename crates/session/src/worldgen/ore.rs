@@ -6376,7 +6376,7 @@ pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
 }
 
 /// `direction` points from the multiface block toward its support.
-pub(super) fn directional_multiface_support(
+pub(crate) fn directional_multiface_support(
     state: &BlockState,
     direction: [i32; 3],
 ) -> Result<bool> {

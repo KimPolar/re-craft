@@ -960,6 +960,7 @@ pub struct LoadedSession {
     unresolved_leaf_decay: bool,
     unresolved_crop_tick: bool,
     unresolved_crop_shape: bool,
+    unresolved_lichen_shape: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -1034,6 +1035,9 @@ pub struct LoadedSession {
     block_notifications: VecDeque<(IVec3, BlockStateId, BlockStateId)>,
     pending_stair_updates: BTreeMap<ChunkPos, BTreeSet<BlockPosition>>,
     pending_fence_updates: BTreeMap<ChunkPos, BTreeSet<(BlockPosition, BlockPosition)>>,
+    pending_lichen_updates: VecDeque<(BlockPosition, BlockPosition, BlockStateId)>,
+    replaying_lichen_updates: bool,
+    lichen_replay_generated: VecDeque<(BlockPosition, BlockPosition, BlockStateId)>,
     notifying_blocks: bool,
 }
 
@@ -4270,6 +4274,7 @@ impl LoadedSession {
             !self.unresolved_crop_shape,
             "a crop neighbor update could not be resolved for saving"
         );
+        self.validate_lichen_updates()?;
         anyhow::ensure!(
             !self.unresolved_player_damage,
             "player damage could not be resolved during this session"
@@ -4512,6 +4517,7 @@ impl LoadedSession {
             self.unresolved_fence_shape,
             self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
+        self.validate_lichen_updates()?;
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
@@ -5625,6 +5631,11 @@ impl LoadedSession {
             .iter()
             .map(|pending| pending.pos)
             .chain(self.pending_light.keys().map(|block| block.chunk()))
+            .chain(
+                self.pending_lichen_updates
+                    .iter()
+                    .flat_map(|(target, source, _)| [target.chunk(), source.chunk()]),
+            )
             .collect()
     }
 
@@ -5651,6 +5662,10 @@ impl LoadedSession {
         source: &World,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> anyhow::Result<GenerationTerrainGuard> {
+        anyhow::ensure!(
+            !self.unresolved_lichen_shape,
+            "a lichen update could not be resolved"
+        );
         anyhow::ensure!(
             source.dimension == self.world.dimension,
             "generation terrain dimension differs"
@@ -5711,6 +5726,10 @@ impl LoadedSession {
     /// Recheck immediately before applying work, while holding the mutable
     /// session through the corresponding commit or publication operation.
     pub fn verify_generation_terrain(&self, guard: &GenerationTerrainGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.unresolved_lichen_shape,
+            "a lichen update could not be resolved"
+        );
         anyhow::ensure!(
             Arc::ptr_eq(&self.generation_identity, &guard.session),
             "generation terrain belongs to another session"
@@ -7443,6 +7462,7 @@ impl LoadedSession {
             unresolved_leaf_decay: false,
             unresolved_crop_tick: false,
             unresolved_crop_shape: false,
+            unresolved_lichen_shape: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -7515,6 +7535,9 @@ impl LoadedSession {
             block_notifications: VecDeque::new(),
             pending_stair_updates: BTreeMap::new(),
             pending_fence_updates: BTreeMap::new(),
+            pending_lichen_updates: VecDeque::new(),
+            replaying_lichen_updates: false,
+            lichen_replay_generated: VecDeque::new(),
             notifying_blocks: false,
         };
         for (pos, ticks) in saved_ticks {
@@ -10461,6 +10484,7 @@ impl LoadedSession {
             self.unresolved_fence_shape,
             self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
+        self.validate_lichen_updates()?;
         ensure!(
             !self.unresolved_leaf_decay,
             "a leaf decay could not be resolved for saving"
@@ -10716,6 +10740,7 @@ impl LoadedSession {
     /// The returned data is only one part of a safe world save.
     pub fn draft_fluid_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedFluidTick>> {
         use anyhow::{Context, ensure};
+        self.validate_lichen_updates()?;
         ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
@@ -10856,6 +10881,15 @@ impl LoadedSession {
     /// be resolved. Their absence does not imply that they exist on disk.
     pub fn pending_fence_update_chunks(&self) -> impl Iterator<Item = ChunkPos> + '_ {
         self.pending_fence_updates.keys().copied()
+    }
+
+    /// Chunks required to resolve queued glow lichen neighbor updates.
+    pub fn pending_lichen_update_chunks(&self) -> impl Iterator<Item = ChunkPos> {
+        self.pending_lichen_updates
+            .iter()
+            .map(|(target, _, _)| target.chunk())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
     }
 
     /// A committed chunk cannot disappear without a chunk-window change.
@@ -12147,6 +12181,7 @@ impl LoadedSession {
         if changed {
             self.retry_stair_updates();
             self.retry_fence_updates();
+            self.retry_lichen_updates();
             self.revision += 1;
             self.light_generation = self.light_generation.wrapping_add(1);
             self.sky_lighting.streaming_changed();
@@ -16389,6 +16424,54 @@ impl LoadedSession {
                 }
             }
         }
+        for offset in [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ] {
+            let Some(neighbor) = add(relative, offset) else {
+                return None;
+            };
+            let Cell::State(other) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                neighbor,
+                self.states[0],
+            ) else {
+                continue;
+            };
+            let Some(lichen) = self
+                .world
+                .state(other)
+                .filter(|state| state.name == "minecraft:glow_lichen")
+            else {
+                continue;
+            };
+            let faces = native_world::collision::glow_lichen_faces(lichen)?;
+            let (_, bit) = lichen_face(-offset)?;
+            let loses_face = if faces == 0 {
+                true
+            } else if faces & bit == 0 {
+                false
+            } else {
+                !crate::worldgen::directional_multiface_support(
+                    &replacement_state,
+                    (-offset).to_array(),
+                )
+                .ok()?
+            };
+            if loses_face
+                && (!notify
+                    || ((faces == 0 || faces == bit)
+                        && !self.can_stage_block_loot_without_entity(lichen)))
+            {
+                return None;
+            }
+        }
         Some(BlockSetCheck {
             pos,
             chunk_pos,
@@ -19535,6 +19618,178 @@ impl LoadedSession {
         }
     }
 
+    fn validate_lichen_updates(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.unresolved_lichen_shape && self.pending_lichen_updates.is_empty(),
+            "lichen shape updates are not yet fully tracked for saving (unresolved: {}, waiting for chunks: {:?})",
+            self.unresolved_lichen_shape,
+            self.pending_lichen_update_chunks().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn queue_lichen_update(&mut self, target: IVec3, source: IVec3, support: BlockStateId) {
+        let (Some(target), Some(source)) = (add(self.origin, target), add(self.origin, source))
+        else {
+            self.unresolved_lichen_shape = true;
+            return;
+        };
+        let position = |p: IVec3| BlockPosition {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+        };
+        let queue = if self.replaying_lichen_updates {
+            &mut self.lichen_replay_generated
+        } else {
+            &mut self.pending_lichen_updates
+        };
+        queue.push_back((position(target), position(source), support));
+    }
+
+    fn retry_lichen_updates(&mut self) {
+        self.replaying_lichen_updates = true;
+        while let Some((target, source, support)) = self.pending_lichen_updates.pop_front() {
+            let target = IVec3::new(target.x, target.y, target.z);
+            let source = IVec3::new(source.x, source.y, source.z);
+            let (Some(target), Some(source)) =
+                (subtract(target, self.origin), subtract(source, self.origin))
+            else {
+                self.unresolved_lichen_shape = true;
+                continue;
+            };
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                target,
+                self.states[0],
+            ) else {
+                let target = add(self.origin, target).expect("previously checked target");
+                let source = add(self.origin, source).expect("previously checked source");
+                self.pending_lichen_updates.push_front((
+                    BlockPosition {
+                        x: target.x,
+                        y: target.y,
+                        z: target.z,
+                    },
+                    BlockPosition {
+                        x: source.x,
+                        y: source.y,
+                        z: source.z,
+                    },
+                    support,
+                ));
+                break;
+            };
+            let Some(direction) = subtract(source, target) else {
+                self.unresolved_lichen_shape = true;
+                continue;
+            };
+            self.update_lichen_neighbor(target, id, direction, support);
+            while let Some(generated) = self.lichen_replay_generated.pop_back() {
+                self.pending_lichen_updates.push_front(generated);
+            }
+        }
+        self.replaying_lichen_updates = false;
+    }
+
+    fn update_lichen_neighbor(
+        &mut self,
+        position: IVec3,
+        id: BlockStateId,
+        direction: IVec3,
+        support: BlockStateId,
+    ) -> bool {
+        let Some(block) = self
+            .world
+            .state(id)
+            .filter(|state| state.name == "minecraft:glow_lichen")
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(faces) = native_world::collision::glow_lichen_faces(&block) else {
+            self.unresolved_lichen_shape = true;
+            return true;
+        };
+        if block.properties["waterlogged"] == "true" {
+            if let Some(fluid) = self.simulated_fluid(id) {
+                self.schedule_fluid(position, fluid, self.fluid_settings().delay(fluid.kind));
+            } else {
+                self.unresolved_lichen_shape = true;
+                return true;
+            }
+        }
+        let Some((face, bit)) = lichen_face(direction) else {
+            self.unresolved_lichen_shape = true;
+            return true;
+        };
+        if faces != 0 {
+            if faces & bit == 0 {
+                return true;
+            }
+            let supported = self.world.state(support).and_then(|state| {
+                crate::worldgen::directional_multiface_support(state, direction.to_array()).ok()
+            });
+            match supported {
+                Some(true) => return true,
+                Some(false) => {}
+                None => {
+                    self.unresolved_lichen_shape = true;
+                    return true;
+                }
+            }
+        }
+        if faces != 0 && faces != bit {
+            let mut next = block;
+            next.properties.insert(face.into(), "false".into());
+            let next = self.intern_block(next);
+            if !self.set(position, next) {
+                self.unresolved_lichen_shape = true;
+            }
+            return true;
+        }
+        let Some(absolute) = add(self.origin, position) else {
+            self.unresolved_lichen_shape = true;
+            return true;
+        };
+        let replacement = if block.properties["waterlogged"] == "true" {
+            self.intern_liquid(FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            })
+        } else {
+            self.states[0]
+        };
+        let Some(checked) = self.check_block_set(position, replacement, true, false) else {
+            self.unresolved_lichen_shape = true;
+            return true;
+        };
+        let Ok((drops, _)) = self.stage_block_loot_without_entity(&block) else {
+            self.unresolved_lichen_shape = true;
+            return true;
+        };
+        self.dropped_items.drop_block_resources(
+            absolute,
+            drops,
+            None,
+            self.block_drops,
+            &mut self.level_random,
+        );
+        assert!(self.apply_block_set(position, replacement, true, checked));
+        self.dispatch_vibration(
+            "minecraft:block_destroy",
+            absolute.as_dvec3() + DVec3::splat(0.5),
+            None,
+            None,
+            Some(&block.name),
+        );
+        true
+    }
+
     /// Apply VegetationBlock's shape update for a crop. Unknown light, support,
     /// or loot cannot be guessed without risking an incorrect world save.
     fn update_crop_neighbor(&mut self, position: IVec3, id: BlockStateId) -> bool {
@@ -19669,6 +19924,20 @@ impl LoadedSession {
                 if direction.y == 0 && self.fence_tags.is_some() {
                     self.queue_fence_update(neighbor, position, neighbor);
                 }
+                if direction.y == 0 {
+                    match cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        position,
+                        self.states[0],
+                    ) {
+                        Cell::State(current) => {
+                            self.queue_lichen_update(neighbor, position, current)
+                        }
+                        Cell::Missing => self.unresolved_lichen_shape = true,
+                    }
+                }
                 continue;
             };
             if direction == IVec3::NEG_Y {
@@ -19685,6 +19954,19 @@ impl LoadedSession {
                 self.states[0],
             ) {
                 if self.update_fence_neighbor(neighbor, id, -direction, current) {
+                    continue;
+                }
+                if !self.replaying_lichen_updates
+                    && !self.pending_lichen_updates.is_empty()
+                    && self
+                        .world
+                        .state(id)
+                        .is_some_and(|state| state.name == "minecraft:glow_lichen")
+                {
+                    self.queue_lichen_update(neighbor, position, current);
+                    continue;
+                }
+                if self.update_lichen_neighbor(neighbor, id, -direction, current) {
                     continue;
                 }
             }
@@ -24364,6 +24646,18 @@ fn banner_placement(
     None
 }
 
+fn lichen_face(direction: IVec3) -> Option<(&'static str, u8)> {
+    match direction {
+        IVec3::NEG_Y => Some(("down", 1)),
+        IVec3::Y => Some(("up", 2)),
+        IVec3::NEG_Z => Some(("north", 4)),
+        IVec3::Z => Some(("south", 8)),
+        IVec3::NEG_X => Some(("west", 16)),
+        IVec3::X => Some(("east", 32)),
+        _ => None,
+    }
+}
+
 fn ladder_support_direction(state: &BlockState) -> Option<IVec3> {
     let (facing, _) = native_world::collision::ladder_state(state)?;
     Some(match facing {
@@ -27708,6 +28002,160 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn lichen_support_drops_match_java_loot_and_random_streams() {
+        use native_resources::packs::{ResourceProvider, ResourceStack};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("LadderDropLootOracle.java");
+        let input = temp.path().join("ladder.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/LadderDropLootOracle.java"),
+        )
+        .unwrap();
+        let mut resources = ResourceStack::open(&game).unwrap();
+        std::fs::write(
+            &input,
+            resources
+                .read_builtin_data("data/minecraft/loot_table/blocks/glow_lichen.json")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("LadderDropLootOracle")
+            .arg(&input)
+            .arg(&output)
+            .arg("glow_lichen")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 40);
+        let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        for group in rows.chunks_exact(8) {
+            let seed = group[0]["seed"].as_i64().unwrap();
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session
+                .set_random_sequences(
+                    seed,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            session.level_random = native_core::random::LegacyRandom::new(9182);
+            let support = IVec3::new(8, 2, 6);
+            let pos = support - IVec3::X;
+            let absolute = session.origin + pos;
+            let support_absolute = session.origin + support;
+            let stone = session.states[3];
+            for (step, row) in group.iter().enumerate() {
+                assert_eq!(row["step"].as_u64().unwrap() as usize, step);
+                let wet = step % 2 == 0;
+                let enabled = step % 3 != 0;
+                session.set_block_drops(enabled);
+                let ladder = session.intern_block(test_lichen(&["east"], wet));
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(
+                        support_absolute.x,
+                        support_absolute.y,
+                        support_absolute.z,
+                        stone,
+                    )
+                    .unwrap();
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(absolute.x, absolute.y, absolute.z, ladder)
+                    .unwrap();
+                let previous = session.dropped_items.snapshot().len();
+                assert!(
+                    session.set(support, session.states[0]),
+                    "seed {seed} step {step}"
+                );
+                let actual: Vec<_> = session.dropped_items.snapshot()[previous..]
+                    .iter()
+                    .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
+                    .collect();
+                let expected = if enabled {
+                    row["drops"].as_array().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(actual, expected, "seed {seed} step {step}");
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    if wet {
+                        "minecraft:water"
+                    } else {
+                        "minecraft:air"
+                    }
+                );
+                assert_eq!(
+                    session.level_random.clone().next_double().to_bits(),
+                    row["levelNext"].as_f64().unwrap().to_bits(),
+                    "seed {seed} step {step}"
+                );
+                let mut random = session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("minecraft:blocks/glow_lichen", seed)
+                    .unwrap();
+                assert_eq!(
+                    random.next_long(),
+                    row["next"].as_i64().unwrap(),
+                    "seed {seed} step {step}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ladder_support_change_waits_for_loot_and_schedules_water_on_other_updates() {
         let mut session = session();
@@ -28339,6 +28787,265 @@ pub(crate) mod tests {
             }
         }
         Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    fn test_lichen_neighbor_loot() -> Arc<BlockLootTables> {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/blocks/glow_lichen.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:glow_lichen"}]}]}"#.to_vec()))
+            }
+        }
+        Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    fn test_lichen(faces: &[&str], wet: bool) -> BlockState {
+        let mut block = state("minecraft:glow_lichen", &[]);
+        for face in ["down", "up", "north", "south", "west", "east"] {
+            block
+                .properties
+                .insert(face.into(), faces.contains(&face).to_string());
+        }
+        block
+            .properties
+            .insert("waterlogged".into(), wet.to_string());
+        block
+    }
+
+    #[test]
+    fn lichen_neighbor_updates_remove_faces_and_preserve_water_and_drops() {
+        for (direction, face) in [
+            (IVec3::NEG_Y, "down"),
+            (IVec3::Y, "up"),
+            (IVec3::NEG_Z, "north"),
+            (IVec3::Z, "south"),
+            (IVec3::NEG_X, "west"),
+            (IVec3::X, "east"),
+        ] {
+            for wet in [false, true] {
+                for partial in [false, true] {
+                    let mut session = session();
+                    session.set_block_loot(test_lichen_neighbor_loot());
+                    let position = IVec3::new(8, 4, 8);
+                    let support = position + direction;
+                    let stone = session.intern_block(state("minecraft:stone", &[]));
+                    assert!(session.set_with_notify(support, stone, false));
+                    let second = if face == "up" { "down" } else { "up" };
+                    let faces = if partial {
+                        vec![face, second]
+                    } else {
+                        vec![face]
+                    };
+                    let lichen = session.intern_block(test_lichen(&faces, wet));
+                    assert!(session.set_with_notify(position, lichen, false));
+                    assert!(
+                        session.set(support, session.states[0]),
+                        "{face} {wet} {partial}"
+                    );
+                    let absolute = session.origin + position;
+                    let result = session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap();
+                    if partial {
+                        assert_eq!(result.name, "minecraft:glow_lichen");
+                        assert_eq!(result.properties[face], "false");
+                        assert_eq!(result.properties[second], "true");
+                        assert_eq!(result.properties["waterlogged"], wet.to_string());
+                    } else {
+                        assert_eq!(
+                            result.name,
+                            if wet {
+                                "minecraft:water"
+                            } else {
+                                "minecraft:air"
+                            }
+                        );
+                    }
+                    assert_eq!(
+                        session.dropped_items.snapshot().len(),
+                        usize::from(!partial)
+                    );
+                    assert!(!session.unresolved_lichen_shape);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lichen_support_change_refuses_unknown_loot_and_shapes() {
+        let mut session = session();
+        let pos = IVec3::new(8, 4, 8);
+        let support = pos + IVec3::X;
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set_with_notify(support, stone, false));
+        let lichen = session.intern_block(test_lichen(&["east"], false));
+        assert!(session.set_with_notify(pos, lichen, false));
+        assert!(!session.set(support, session.states[0]));
+        session.set_block_loot(test_lichen_neighbor_loot());
+        let unknown = session.intern_block(state("example:unknown", &[]));
+        assert!(!session.set(support, unknown));
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, support, session.states[0]), Cell::State(id) if id == stone)
+        );
+    }
+
+    #[test]
+    fn lichen_boundary_updates_wait_and_replay_in_original_order() {
+        let mut session = session();
+        session.set_block_loot(test_lichen_neighbor_loot());
+        let source = IVec3::new(15, 3, 8);
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(source, stone));
+        assert!(session.set(source, session.states[0]));
+        assert!(session.set(source, stone));
+        let east = ChunkPos {
+            x: session.origin.x.div_euclid(16) + 1,
+            z: session.origin.z.div_euclid(16),
+        };
+        assert_eq!(
+            session.pending_lichen_update_chunks().collect::<Vec<_>>(),
+            vec![east]
+        );
+        assert_eq!(session.pending_lichen_updates.len(), 3);
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![]),
+        };
+        assert!(
+            session
+                .draft_changed_chunk(east, &original)
+                .unwrap_err()
+                .to_string()
+                .contains("lichen shape updates")
+        );
+        let mut incoming = World::new("minecraft:overworld");
+        let air = incoming.intern_state(state("minecraft:air", &[]));
+        let lichen = incoming.intern_state(test_lichen(&["west"], false));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 * 16 + 3 * 256] = lichen;
+        incoming.chunks.insert(
+            east,
+            Arc::new(Chunk {
+                position: east,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        session.queue_loaded_chunk(east, incoming);
+        session.apply_streaming();
+        assert!(session.pending_lichen_updates.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 16, 3, session.origin.z + 8)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(session.dropped_items.snapshot().len(), 1);
+        assert!(!session.unresolved_lichen_shape);
+    }
+
+    #[test]
+    fn lichen_boundary_updates_preserve_order_across_chunks() {
+        let mut session = session();
+        session.set_block_loot(test_lichen_neighbor_loot());
+        let source = IVec3::new(15, 3, 15);
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(source, stone));
+        assert!(session.set(source, session.states[0]));
+        let center = session.player_chunk().unwrap();
+        let east = ChunkPos {
+            x: center.x + 1,
+            z: center.z,
+        };
+        let south = ChunkPos {
+            x: center.x,
+            z: center.z + 1,
+        };
+        let make_chunk = |pos: ChunkPos, index: usize, face: &str| {
+            let mut world = World::new("minecraft:overworld");
+            let air = world.intern_state(state("minecraft:air", &[]));
+            let lichen = world.intern_state(test_lichen(&[face], false));
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            blocks[index] = lichen;
+            world.chunks.insert(
+                pos,
+                Arc::new(Chunk {
+                    position: pos,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+            world
+        };
+        session.queue_loaded_chunk(south, make_chunk(south, 15 + 3 * 256, "north"));
+        session.apply_streaming();
+        assert_eq!(session.pending_lichen_updates.len(), 4);
+        let southeast = ChunkPos {
+            x: center.x + 1,
+            z: center.z + 1,
+        };
+        session.queue_loaded_chunk(east, make_chunk(east, 15 * 16 + 3 * 256, "west"));
+        session.apply_streaming();
+        assert_eq!(
+            session.pending_lichen_updates.front().unwrap().0.chunk(),
+            southeast
+        );
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 15, 3, session.origin.z + 16)
+                .unwrap()
+                .name,
+            "minecraft:glow_lichen"
+        );
+        session.queue_loaded_chunk(
+            southeast,
+            make_chunk(southeast, 8 + 8 * 16 + 3 * 256, "west"),
+        );
+        session.apply_streaming();
+        assert!(session.pending_lichen_updates.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 16, 3, session.origin.z + 15)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 15, 3, session.origin.z + 16)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(session.dropped_items.snapshot().len(), 2);
     }
 
     #[test]
@@ -50981,7 +51688,7 @@ pub(crate) mod tests {
             chest_only.document().value.get("block_entities"),
             draft.document().value.get("block_entities")
         );
-        let stone = IVec3::new(0, 0, 0);
+        let stone = IVec3::new(1, 0, 1);
         assert!(session.set(stone, session.states[0]));
         let fluid = session.origin + IVec3::new(5, 2, 5);
         session.insert_fluid_tick(

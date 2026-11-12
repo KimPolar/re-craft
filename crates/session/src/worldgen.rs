@@ -58,6 +58,7 @@ mod mob_placement;
 mod mob_spawner;
 pub mod ocean_ruin;
 mod ore;
+pub(crate) use ore::directional_multiface_support;
 pub mod postprocessing;
 pub mod postprocessing_drops;
 mod postprocessing_world;

@@ -1213,6 +1213,18 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn generated_ladder_loot_and_random_streams_match_java() {
+        generated_block_loot_and_random_streams_match_java("ladder");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn generated_lichen_loot_and_random_streams_match_java() {
+        generated_block_loot_and_random_streams_match_java("glow_lichen");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn generated_block_loot_and_random_streams_match_java(block_name: &str) {
         use native_resources::packs::ResourceStack;
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1236,7 +1248,7 @@ mod tests {
             .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
                 .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
         let source = temp.path().join("LadderDropLootOracle.java");
-        let input = temp.path().join("ladder.json");
+        let input = temp.path().join("loot.json");
         let output = temp.path().join("output.json");
         std::fs::write(
             &source,
@@ -1247,7 +1259,9 @@ mod tests {
         std::fs::write(
             &input,
             resources
-                .read_builtin_data("data/minecraft/loot_table/blocks/ladder.json")
+                .read_builtin_data(&format!(
+                    "data/minecraft/loot_table/blocks/{block_name}.json"
+                ))
                 .unwrap()
                 .unwrap(),
         )
@@ -1269,6 +1283,7 @@ mod tests {
             .arg("LadderDropLootOracle")
             .arg(&input)
             .arg(&output)
+            .arg(block_name)
             .output()
             .unwrap();
         assert!(
@@ -1294,7 +1309,17 @@ mod tests {
                 );
                 let chunk = ChunkPos { x: 0, z: 0 };
                 for (step, row) in group.iter().enumerate() {
-                    let mut block = ladder();
+                    let mut block = if block_name == "ladder" {
+                        ladder()
+                    } else {
+                        BlockState {
+                            name: "minecraft:glow_lichen".into(),
+                            properties: ["down", "up", "north", "south", "west", "east"]
+                                .into_iter()
+                                .map(|face| (face.into(), (face == "east").to_string()))
+                                .collect(),
+                        }
+                    };
                     block
                         .properties
                         .insert("waterlogged".into(), (step % 2 == 0).to_string());
@@ -1319,7 +1344,7 @@ mod tests {
                     );
                     let mut random = generated
                         .sequences
-                        .get("minecraft:blocks/ladder", seed)
+                        .get(&format!("minecraft:blocks/{block_name}"), seed)
                         .unwrap();
                     assert_eq!(random.next_long(), row["next"].as_i64().unwrap());
                 }

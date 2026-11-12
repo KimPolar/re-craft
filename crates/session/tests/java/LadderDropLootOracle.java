@@ -4,6 +4,7 @@ import java.nio.file.*;
 import java.util.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.*;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.resources.*;
@@ -31,13 +32,18 @@ public class LadderDropLootOracle {
         var ctor=LootContext.class.getDeclaredConstructors()[0]; ctor.setAccessible(true);
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var result=new JsonArray();
+        boolean lichen=args.length>2 && args[2].equals("glow_lichen");
+        if(lichen && Items.GLOW_LICHEN.getDefaultMaxStackSize()!=64)throw new AssertionError("lichen stack limit differs");
+        var sequence=Identifier.parse(lichen?"minecraft:blocks/glow_lichen":"minecraft:blocks/ladder");
         for(long seed:new long[]{0,1,42,-17,123456789}) for(int step=0;step<8;step++) {
-            var random=new RandomSequence(seed,Identifier.parse("minecraft:blocks/ladder")).random();
+            var random=new RandomSequence(seed,sequence).random();
             var world=(World)unsafe.allocateInstance(World.class);
             world.seeded=new net.minecraft.world.level.levelgen.LegacyRandomSource(9182);
             List<ItemStack> items=List.of();
             for(int n=0;n<=step;n++) {
-                var block=Blocks.LADDER.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,n%2==0);
+                var block=lichen
+                    ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,n%2==0).setValue(MultifaceBlock.getFaceProperty(Direction.EAST),true)
+                    : Blocks.LADDER.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,n%2==0);
                 var params=new LootParams(null,ContextMap.builder().set(LootContextParams.TOOL,ItemStack.EMPTY).set(LootContextParams.BLOCK_STATE,block).build(),Map.of(),0.0f);
                 var context=(LootContext)ctor.newInstance(params,random,registries);
                 var next=new ArrayList<ItemStack>(); table.getRandomItemsRaw(context,next::add); items=next;

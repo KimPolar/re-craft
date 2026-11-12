@@ -1104,6 +1104,17 @@ pub fn full_copper(state: &BlockState) -> bool {
     )
 }
 
+pub fn copper_grate_waterlogged(state: &BlockState) -> Option<bool> {
+    if !crate::fluid::is_copper_grate(&state.name) || state.properties.len() != 1 {
+        return None;
+    }
+    match state.properties.get("waterlogged")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
     if !matches!(
         state.name.as_str(),
@@ -1129,7 +1140,10 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
-    if copper_bulb_state(state).is_some() || full_copper(state) {
+    if copper_bulb_state(state).is_some()
+        || full_copper(state)
+        || copper_grate_waterlogged(state).is_some()
+    {
         return Some(FULL.to_vec());
     }
     if state.name == "minecraft:glow_lichen" {

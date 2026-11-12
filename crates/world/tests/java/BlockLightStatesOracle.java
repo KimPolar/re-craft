@@ -34,7 +34,7 @@ public class BlockLightStatesOracle {
                 entry.addProperty("opacity", state.getLightDampening());
                 entry.addProperty("emission", state.getLightEmission());
                 entry.addProperty("shaped", state.useShapeForLightOcclusion());
-                if (name.equals("minecraft:frosted_ice") || name.endsWith("copper_bulb") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?")) {
+                if (name.equals("minecraft:frosted_ice") || name.endsWith("copper_bulb") || name.endsWith("copper_grate") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?")) {
                     entry.addProperty("friction", block.getFriction());
                     var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
                     var pos = net.minecraft.core.BlockPos.ZERO;

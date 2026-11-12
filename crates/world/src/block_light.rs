@@ -263,6 +263,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
         _ if crate::collision::full_copper(state) => (15, 0),
+        _ if crate::collision::copper_grate_waterlogged(state).is_some() => (0, 0),
         name if crate::collision::copper_bulb_state(state).is_some() => {
             let (lit, _) = crate::collision::copper_bulb_state(state)?;
             let id = name.strip_prefix("minecraft:")?;
@@ -1439,6 +1440,24 @@ mod tests {
         let unknown = state("oxidized_copper_block", None);
         assert!(properties(&unknown).is_none());
         assert!(crate::collision::block_shape(&unknown).is_none());
+    }
+
+    #[test]
+    fn copper_grate_transmits_light_in_both_fluid_states() {
+        let mut grate = state("waxed_oxidized_copper_grate", None);
+        for wet in [false, true] {
+            grate
+                .properties
+                .insert("waterlogged".into(), wet.to_string());
+            assert_eq!(properties(&grate), Some((0, 0)));
+            assert_eq!(same_light_behavior(&grate, &state("air", None)), Some(true));
+            assert!(crate::collision::block_shape(&grate).is_some());
+        }
+        grate
+            .properties
+            .insert("waterlogged".into(), "invalid".into());
+        assert!(properties(&grate).is_none());
+        assert!(crate::collision::block_shape(&grate).is_none());
     }
 
     #[test]
@@ -2645,6 +2664,7 @@ mod tests {
             ));
             requested.push(format!("minecraft:{prefix}cut_copper"));
             requested.push(format!("minecraft:{prefix}chiseled_copper"));
+            requested.push(format!("minecraft:{prefix}copper_grate"));
         }
         requested.extend(
             native_core::wood::Planks::ALL
@@ -2687,6 +2707,7 @@ mod tests {
             if s.name == "minecraft:frosted_ice"
                 || s.name.ends_with("copper_bulb")
                 || crate::collision::full_copper(&s)
+                || crate::collision::copper_grate_waterlogged(&s).is_some()
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);

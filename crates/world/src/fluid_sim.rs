@@ -25,6 +25,8 @@ pub enum Cell {
     OpenWater(FluidState),
     /// A dry fence may accept a newly formed water source.
     FenceDry,
+    /// A dry, non-solid waterloggable block with no fully occluding face.
+    OpenDry,
     /// A ladder's facing determines its full collision face.
     Ladder {
         facing: IVec3,
@@ -143,6 +145,7 @@ pub enum ChangedBlock {
     WaterloggedStairs { voxels: u8 },
     WaterloggedChest,
     WaterloggedFence,
+    WaterloggedOpen,
     WaterloggedLadder { facing: IVec3 },
 }
 
@@ -263,6 +266,7 @@ fn face(cell: Cell, direction: IVec3) -> u8 {
         | Cell::FenceWater(_)
         | Cell::OpenWater(_)
         | Cell::FenceDry
+        | Cell::OpenDry
         | Cell::Chest { .. } => 0,
         Cell::Ladder { facing, .. } => {
             if direction == -facing {
@@ -411,6 +415,7 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
         | Cell::Stairs { .. }
         | Cell::Chest { .. }
         | Cell::FenceDry
+        | Cell::OpenDry
         | Cell::Ladder { .. } => !source(cell, kind),
         Cell::Solid
         | Cell::GrateWater(_)
@@ -461,7 +466,7 @@ fn can_replace(
         | Cell::Ladder {
             waterlogged: false, ..
         } => incoming.kind == FluidKind::Water && incoming.source,
-        Cell::FenceDry => incoming.kind == FluidKind::Water && incoming.source,
+        Cell::FenceDry | Cell::OpenDry => incoming.kind == FluidKind::Water && incoming.source,
         Cell::Fluid(state)
             if state.kind == FluidKind::Water && incoming.kind == FluidKind::Lava =>
         {
@@ -503,6 +508,7 @@ fn slope_distance(
                 | Cell::Stairs { .. }
                 | Cell::Chest { .. }
                 | Cell::FenceDry
+                | Cell::OpenDry
                 | Cell::Ladder { .. }
         ) || !can_search(candidate, kind)
             || !can_pass(current, candidate, direction)
@@ -569,6 +575,7 @@ fn side_changes_from(
                 | Cell::Stairs { .. }
                 | Cell::Chest { .. }
                 | Cell::FenceDry
+                | Cell::OpenDry
                 | Cell::Ladder { .. }
         ) && !(new.kind == FluidKind::Water && new.source)
         {
@@ -598,6 +605,7 @@ fn side_changes_from(
                         Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
                         Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
                         Cell::FenceDry => ChangedBlock::WaterloggedFence,
+                        Cell::OpenDry => ChangedBlock::WaterloggedOpen,
                         Cell::Ladder { facing, .. } => ChangedBlock::WaterloggedLadder { facing },
                         _ => ChangedBlock::Fluid(new),
                     },
@@ -680,6 +688,8 @@ pub fn tick(
                 ChangedBlock::WaterloggedChest
             } else if let Cell::FenceDry = below {
                 ChangedBlock::WaterloggedFence
+            } else if let Cell::OpenDry = below {
+                ChangedBlock::WaterloggedOpen
             } else if let Cell::Ladder { facing, .. } = below {
                 ChangedBlock::WaterloggedLadder { facing }
             } else {
@@ -709,6 +719,9 @@ pub fn tick(
                             ChangedBlock::WaterloggedChest => Cell::Chest { waterlogged: true },
                             ChangedBlock::WaterloggedFence => {
                                 Cell::FenceWater(flowing(FluidKind::Water, 8, false))
+                            }
+                            ChangedBlock::WaterloggedOpen => {
+                                Cell::OpenWater(flowing(FluidKind::Water, 8, false))
                             }
                             ChangedBlock::WaterloggedLadder { facing } => Cell::Ladder {
                                 facing,
@@ -939,6 +952,7 @@ pub fn tick_live<W: LiveFluidWorld>(
             | ChangedBlock::WaterloggedStairs { .. }
             | ChangedBlock::WaterloggedChest
             | ChangedBlock::WaterloggedFence
+            | ChangedBlock::WaterloggedOpen
             | ChangedBlock::WaterloggedLadder { .. } => flowing(FluidKind::Water, 8, false),
             ChangedBlock::Air | ChangedBlock::Solid(_) => {
                 unreachable!("side planning only emits fluid")

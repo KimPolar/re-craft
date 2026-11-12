@@ -20310,6 +20310,9 @@ impl LoadedSession {
             fluid_sim::ChangedBlock::Air => self.states[0],
             fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
             fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
+            // Live open-container callbacks are not wired yet; do not replace
+            // an unknown block if a caller supplies this generation-only plan.
+            fluid_sim::ChangedBlock::WaterloggedOpen => return false,
             fluid_sim::ChangedBlock::WaterloggedSlab { .. }
             | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
             | fluid_sim::ChangedBlock::WaterloggedChest
@@ -23373,6 +23376,7 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             FluidCell::FenceDry if fluid.kind == FluidKind::Water && fluid.source => {
                 ChangedBlock::WaterloggedFence
             }
+            FluidCell::OpenDry => return Ok(()),
             FluidCell::Ladder {
                 facing,
                 waterlogged: false,

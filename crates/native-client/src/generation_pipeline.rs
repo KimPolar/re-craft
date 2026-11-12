@@ -251,6 +251,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
+    fn structured_seed_one_reaches_initial_world_stage() -> Result<()> {
+        let game = match std::env::var_os("MINECRAFT_DIR") {
+            Some(path) => PathBuf::from(path),
+            None => native_resources::default_minecraft_dir()?,
+        };
+        let parent = tempfile::tempdir()?;
+        let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
+        settings.seed = crate::chat_input::ChatInput::field("1");
+        settings.generate_structures = true;
+        let mut pipeline = InitialWorldPipeline::start(
+            settings.freeze(game, None),
+            options(parent.path().to_path_buf()),
+        )?;
+        match wait(&mut pipeline) {
+            InitialWorldResult::Ready { world, .. } => {
+                let path = match &world {
+                    StagedWorld::Regular(world) => world.path(),
+                    StagedWorld::Structured(world) => world.path(),
+                };
+                let reader = native_persistence::world::WorldReader::open(
+                    path,
+                    native_persistence::world::DimensionId::parse("overworld")?,
+                )?;
+                assert_eq!(reader.saved_world_seed()?, Some(1));
+                assert!(reader.read_player()?.is_some());
+            }
+            InitialWorldResult::Failed { error, .. } => return Err(error),
+            InitialWorldResult::Cancelled { .. } => {
+                anyhow::bail!("initial generation was cancelled")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and complete initial neighbor postprocessing"]
     fn generated_world_can_cancel_staging_retry_and_report_failure() -> Result<()> {
         let game =

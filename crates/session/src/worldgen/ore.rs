@@ -22489,6 +22489,49 @@ mod tests {
     }
 
     #[test]
+    fn tree_generation_updates_mushrooms_and_rolls_back_without_light() {
+        let (schedule, neighborhood, mut registry) = prepare_tree_fixture();
+        registry.extend([
+            "minecraft:brown_mushroom".into(),
+            "minecraft:red_mushroom".into(),
+        ]);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared = PreparedDecoration::load(
+            &mut TreeData,
+            &plan,
+            &registry,
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        for name in ["brown_mushroom", "red_mushroom"] {
+            for brightness in [Some(0), Some(15), None] {
+                let (mut terrain, _, _, _) = fixture();
+                let world = Arc::make_mut(&mut terrain.world);
+                let id = world.intern_state(state(name));
+                let chunk =
+                    Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+                let before = terrain.snapshot();
+                if let Some(level) = brightness {
+                    let result = prepared
+                        .execute_with_raw_brightness(&mut terrain, false, &|_, _| Ok(level));
+                    assert_eq!(result.unwrap(), [true]);
+                    let expected = if level < 13 {
+                        state(name)
+                    } else {
+                        state("air")
+                    };
+                    assert_eq!(terrain.snapshot().block(8, 8, 9).unwrap(), &expected);
+                } else {
+                    assert!(prepared.execute(&mut terrain, false).is_err());
+                    assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn small_mushroom_tree_edges_match_java() {
         use std::{path::PathBuf, process::Command};

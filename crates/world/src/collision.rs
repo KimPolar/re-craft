@@ -1079,6 +1079,18 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
     Some(f32::from(2 + step * age) / 16.0)
 }
 
+pub fn full_tuff(state: &BlockState) -> bool {
+    state.properties.is_empty()
+        && matches!(
+            state.name.as_str(),
+            "minecraft:tuff"
+                | "minecraft:polished_tuff"
+                | "minecraft:tuff_bricks"
+                | "minecraft:chiseled_tuff"
+                | "minecraft:chiseled_tuff_bricks"
+        )
+}
+
 pub fn full_copper(state: &BlockState) -> bool {
     if !state.properties.is_empty() {
         return false;
@@ -1142,6 +1154,7 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if copper_bulb_state(state).is_some()
         || full_copper(state)
+        || full_tuff(state)
         || copper_grate_waterlogged(state).is_some()
     {
         return Some(FULL.to_vec());

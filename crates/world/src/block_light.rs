@@ -262,7 +262,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         "minecraft:redstone_lamp" if state.properties.len() == 1 => {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
-        _ if crate::collision::full_copper(state) => (15, 0),
+        _ if crate::collision::full_copper(state) || crate::collision::full_tuff(state) => (15, 0),
         _ if crate::collision::copper_grate_waterlogged(state).is_some() => (0, 0),
         name if crate::collision::copper_bulb_state(state).is_some() => {
             let (lit, _) = crate::collision::copper_bulb_state(state)?;
@@ -2540,6 +2540,8 @@ mod tests {
             "mossy_cobblestone",
             "tuff_bricks",
             "polished_tuff",
+            "chiseled_tuff",
+            "chiseled_tuff_bricks",
             "polished_andesite",
             "polished_granite",
             "polished_diorite",
@@ -2708,6 +2710,7 @@ mod tests {
                 || s.name.ends_with("copper_bulb")
                 || crate::collision::full_copper(&s)
                 || crate::collision::copper_grate_waterlogged(&s).is_some()
+                || crate::collision::full_tuff(&s)
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);

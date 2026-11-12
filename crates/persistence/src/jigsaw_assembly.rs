@@ -24,6 +24,7 @@ pub struct TemplateAssemblyContext<'a, P, H> {
     aliases: BTreeMap<ResourceId, ResourceId>,
     pools: BTreeMap<ResourceId, Option<Arc<TemplatePool>>>,
     templates: BTreeMap<ResourceId, Arc<StructureTemplate>>,
+    connectors: BTreeMap<(ResourceId, usize), Arc<[Connector]>>,
 }
 
 impl<'a, P: ResourceProvider, H> TemplateAssemblyContext<'a, P, H> {
@@ -34,6 +35,7 @@ impl<'a, P: ResourceProvider, H> TemplateAssemblyContext<'a, P, H> {
             aliases,
             pools: BTreeMap::new(),
             templates: BTreeMap::new(),
+            connectors: BTreeMap::new(),
         }
     }
 
@@ -91,7 +93,17 @@ where
     ) -> Result<Vec<Connector>> {
         match element {
             PoolElement::Single { location, .. } => {
-                self.template(location)?.jigsaws_at(origin, rotation)
+                let template = self.template(location)?;
+                let palette = template.jigsaw_palette_index(origin)?;
+                let key = (location.clone(), palette);
+                if !self.connectors.contains_key(&key) {
+                    let connectors = template.jigsaw_connectors(palette)?;
+                    self.connectors.insert(key.clone(), connectors.into());
+                }
+                Ok(self.connectors[&key]
+                    .iter()
+                    .map(|connector| connector.transformed(origin, rotation))
+                    .collect())
             }
             PoolElement::List { elements, .. } => self.connectors(
                 elements.first().context("empty jigsaw element list")?,
@@ -168,6 +180,103 @@ mod tests {
     use super::*;
     use native_resources::jigsaw_placement::{Piece, assemble};
     use std::collections::VecDeque;
+
+    #[test]
+    fn cached_connectors_preserve_palette_selection_and_rotation() -> Result<()> {
+        use crate::{
+            nbt::{NamedTag, Tag},
+            structure_template::TemplateBlock,
+        };
+        use native_resources::structure_pool::Projection;
+
+        struct EmptyProvider;
+        impl ResourceProvider for EmptyProvider {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+        }
+        let jigsaw = |orientation: &str| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:jigsaw".into())),
+                (
+                    "properties".into(),
+                    Tag::Compound(vec![(
+                        "orientation".into(),
+                        Tag::String(orientation.into()),
+                    )]),
+                ),
+            ])
+        };
+        let metadata = || {
+            Some(Tag::Compound(vec![
+                ("name".into(), Tag::String("example:door".into())),
+                ("target".into(), Tag::String("example:target".into())),
+                ("pool".into(), Tag::String("example:pool".into())),
+                ("selection_priority".into(), Tag::Int(2)),
+            ]))
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [4, 4, 4],
+            palettes: vec![
+                vec![jigsaw("north_up"), Tag::String("minecraft:stone".into())],
+                vec![Tag::String("minecraft:stone".into()), jigsaw("east_up")],
+            ],
+            blocks: vec![
+                TemplateBlock {
+                    position: [3, 2, 1],
+                    state: 0,
+                    nbt: metadata(),
+                },
+                TemplateBlock {
+                    position: [1, 0, 2],
+                    state: 1,
+                    nbt: metadata(),
+                },
+            ],
+            entities: vec![],
+        });
+        let id = ResourceId::parse("example:template")?;
+        let element = PoolElement::Single {
+            legacy: false,
+            location: id.clone(),
+            processors: native_resources::structure_pool::HolderValue::Reference(
+                ResourceId::parse("minecraft:empty")?,
+            ),
+            projection: Projection::Rigid,
+            override_liquid_settings: None,
+        };
+        let mut provider = EmptyProvider;
+        let mut context = TemplateAssemblyContext::new(&mut provider, |_| Ok(64), BTreeMap::new());
+        context.templates.insert(id, Arc::clone(&template));
+        for x in -16..=16 {
+            let origin = [x, 5, -7];
+            for rotation in [
+                Rotation::None,
+                Rotation::Clockwise90,
+                Rotation::Clockwise180,
+                Rotation::Counterclockwise90,
+            ] {
+                assert_eq!(
+                    context.connectors(&element, origin, rotation)?,
+                    template.jigsaws_at(origin, rotation)?
+                );
+            }
+        }
+        assert_eq!(
+            context.connectors.len(),
+            2,
+            "both palettes must be exercised"
+        );
+        Ok(())
+    }
 
     #[test]
     fn context_caches_missing_pools_and_models_feature_connector() -> Result<()> {

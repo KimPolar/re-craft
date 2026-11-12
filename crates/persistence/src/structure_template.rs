@@ -61,18 +61,23 @@ impl StructureTemplate {
         origin: [i32; 3],
         rotation: native_resources::structure_transform::Rotation,
     ) -> Result<Vec<native_resources::jigsaw::Connector>> {
-        let count = i32::try_from(self.palettes.len()).context("too many template palettes")?;
-        ensure!(count > 0, "template has no palettes");
-        let seed = native_resources::blockstates::positional_seed(origin[0], origin[1], origin[2]);
-        let mut random = native_core::random::LegacyRandom::new(seed);
-        let index = random
-            .next_int_bound(count)
-            .context("invalid template palette count")? as usize;
+        let index = self.jigsaw_palette_index(origin)?;
         Ok(self
             .jigsaw_connectors(index)?
             .into_iter()
             .map(|connector| connector.transformed(origin, rotation))
             .collect())
+    }
+
+    /// Select the same position-dependent palette as StructurePlaceSettings.
+    pub(crate) fn jigsaw_palette_index(&self, origin: [i32; 3]) -> Result<usize> {
+        let count = i32::try_from(self.palettes.len()).context("too many template palettes")?;
+        ensure!(count > 0, "template has no palettes");
+        let seed = native_resources::blockstates::positional_seed(origin[0], origin[1], origin[2]);
+        let mut random = native_core::random::LegacyRandom::new(seed);
+        Ok(random
+            .next_int_bound(count)
+            .context("invalid template palette count")? as usize)
     }
 
     /// Read the Java jigsaw records from one already-selected palette. The

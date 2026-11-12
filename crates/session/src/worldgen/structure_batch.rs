@@ -2011,6 +2011,76 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "diagnostic: requires installed Minecraft 26.3"]
+    fn measure_seed_one_structure_candidate_sets() -> Result<()> {
+        use native_resources::{heightmap_tags::HeightmapTags, packs::ResourceStack};
+        use std::{path::PathBuf, time::Instant};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut provider = ResourceStack::open(&game)?;
+        let preset: Value = serde_json::from_slice(
+            &provider
+                .read_builtin_data("data/minecraft/worldgen/world_preset/normal.json")?
+                .context("normal preset missing")?,
+        )?;
+        let generator = TerrainGenerator::with_structure_context(
+            &mut provider,
+            &preset["dimensions"]["minecraft:overworld"]["generator"],
+            1,
+            -64,
+            384,
+        )?;
+        let mut batch = StructureGenerationBatch::from_registry(generator, &mut provider)?;
+        let blocks = provider.vanilla_block_ids()?;
+        let tags = HeightmapTags::load(&mut provider, &blocks)?;
+        for set in &batch.sets {
+            let started = Instant::now();
+            eprintln!("starting {}:{}", set.namespace, set.path);
+            let result = batch.generator.try_generate_batch_structure_set(
+                &mut provider,
+                &mut batch.evaluator,
+                &mut batch.cache,
+                &batch.biome_rules,
+                set,
+                [18, 14],
+                |_| Ok(false),
+                |value| {
+                    let name = value
+                        .as_str()
+                        .or_else(|| value.get("id").and_then(Value::as_str))
+                        .context("block id missing")?;
+                    let motion = tags.for_block(name)?;
+                    Ok(BlockHeightFlags {
+                        is_air: matches!(
+                            name,
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        blocks_motion: motion.blocks_motion,
+                        blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                },
+            );
+            eprintln!(
+                "finished {}:{} in {:?}",
+                set.namespace,
+                set.path,
+                started.elapsed()
+            );
+            let result = result?;
+            if set.namespace == "minecraft" && set.path == "trial_chambers" {
+                ensure!(
+                    matches!(result, StructureSetStart::Generated { .. }),
+                    "trial chamber fixture did not generate a start"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mixed_plan_rejects_missing_or_inconsistent_starts() -> Result<()> {
         use native_core::beardifier::BoundingBox;
         use native_persistence::{

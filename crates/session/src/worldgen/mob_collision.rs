@@ -5,7 +5,7 @@ use native_resources::worldgen_mob_geometry::CreatureSpawnGeometry;
 use native_world::{
     collision::{Aabb, block_shape},
     loaded::BlockState,
-    mob_spawn_blocks::common_mob_spawn_block_facts,
+    mob_spawn_blocks::{common_mob_spawn_block_facts, mob_spawn_leaf_waterlogged},
 };
 
 const EPSILON: f64 = 1.0e-7;
@@ -40,21 +40,7 @@ fn shape(state: &BlockState) -> Result<Shape> {
             Some("true" | "false")
         )
     };
-    if matches!(
-        state.name.as_str(),
-        "minecraft:oak_leaves"
-            | "minecraft:dark_oak_leaves"
-            | "minecraft:birch_leaves"
-            | "minecraft:azalea_leaves"
-            | "minecraft:flowering_azalea_leaves"
-    ) && state.properties.len() == 3
-        && property("persistent")
-        && property("waterlogged")
-        && matches!(
-            state.properties.get("distance").map(String::as_str),
-            Some("1" | "2" | "3" | "4" | "5" | "6" | "7")
-        )
-    {
+    if mob_spawn_leaf_waterlogged(state).is_some() {
         return Ok(Shape {
             boxes: None,
             large: false,

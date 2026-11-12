@@ -22,6 +22,14 @@ pub trait MobPlacementWorld {
     fn pathfindable_land(&mut self, pos: IVec3) -> Result<bool>;
     fn within_border(&mut self, pos: IVec3) -> Result<bool>;
     fn valid_spawn_support(&mut self, pos: IVec3) -> Result<bool>;
+    /// Resolve support with the actual entity type when the block needs it.
+    fn valid_spawn_support_for_entity(
+        &mut self,
+        pos: IVec3,
+        _entity: &crate::packs::ResourceId,
+    ) -> Result<bool> {
+        self.valid_spawn_support(pos)
+    }
     fn full_collision(&mut self, pos: IVec3) -> Result<bool>;
     fn signal_source(&mut self, pos: IVec3) -> Result<bool>;
     fn fluid_empty(&mut self, pos: IVec3) -> Result<bool>;
@@ -133,10 +141,30 @@ pub fn valid_empty_spawn_block(world: &mut impl MobPlacementWorld, pos: IVec3) -
 
 /// `SpawnPlacementTypes.ON_GROUND.isSpawnPositionOk` for a known entity type.
 pub fn on_ground_spawn_position_ok(world: &mut impl MobPlacementWorld, pos: IVec3) -> Result<bool> {
+    on_ground_spawn_position_ok_inner(world, pos, None)
+}
+
+pub fn on_ground_spawn_position_ok_for_entity(
+    world: &mut impl MobPlacementWorld,
+    pos: IVec3,
+    entity: &crate::packs::ResourceId,
+) -> Result<bool> {
+    on_ground_spawn_position_ok_inner(world, pos, Some(entity))
+}
+
+fn on_ground_spawn_position_ok_inner(
+    world: &mut impl MobPlacementWorld,
+    pos: IVec3,
+    entity: Option<&crate::packs::ResourceId>,
+) -> Result<bool> {
     if !world.within_border(pos)? {
         return Ok(false);
     }
-    if !world.valid_spawn_support(below(pos)?)? {
+    let support = match entity {
+        Some(entity) => world.valid_spawn_support_for_entity(below(pos)?, entity)?,
+        None => world.valid_spawn_support(below(pos)?)?,
+    };
+    if !support {
         return Ok(false);
     }
     if !valid_empty_spawn_block(world, pos)? {
@@ -178,6 +206,13 @@ mod tests {
         }
         fn valid_spawn_support(&mut self, _: IVec3) -> Result<bool> {
             Ok(self.support)
+        }
+        fn valid_spawn_support_for_entity(
+            &mut self,
+            _: IVec3,
+            entity: &crate::packs::ResourceId,
+        ) -> Result<bool> {
+            Ok(self.support && entity.path == "parrot")
         }
         fn full_collision(&mut self, _: IVec3) -> Result<bool> {
             Ok(self.full)
@@ -235,5 +270,17 @@ mod tests {
         assert!(on_ground_spawn_position_ok(&mut world, IVec3::new(1, 10, 1)).is_err());
         world.border = false;
         assert!(!on_ground_spawn_position_ok(&mut world, IVec3::new(1, 10, 1)).unwrap());
+    }
+
+    #[test]
+    fn entity_specific_support_is_used_before_other_spawn_checks() {
+        let mut world = world();
+        let pos = IVec3::new(1, 10, 1);
+        let parrot = crate::packs::ResourceId::parse("minecraft:parrot").unwrap();
+        let pig = crate::packs::ResourceId::parse("minecraft:pig").unwrap();
+        assert!(on_ground_spawn_position_ok_for_entity(&mut world, pos, &parrot).unwrap());
+        world.later_unknown = true;
+        assert!(!on_ground_spawn_position_ok_for_entity(&mut world, pos, &pig).unwrap());
+        assert!(on_ground_spawn_position_ok_for_entity(&mut world, pos, &parrot).is_err());
     }
 }

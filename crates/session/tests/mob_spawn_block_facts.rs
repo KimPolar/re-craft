@@ -1,5 +1,10 @@
 //! Compare every selected vanilla block state with Java's spawn predicates.
-use native_world::{loaded::BlockState, mob_spawn_blocks::common_mob_spawn_block_facts};
+use native_world::{
+    loaded::BlockState,
+    mob_spawn_blocks::{
+        common_mob_spawn_block_facts, mob_spawn_leaf_support, mob_spawn_leaf_waterlogged,
+    },
+};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
@@ -58,7 +63,16 @@ fn supported_block_states_match_all_java_entity_types() {
         "seagrass",
         "tall_grass",
         "oak_leaves",
+        "spruce_leaves",
         "birch_leaves",
+        "jungle_leaves",
+        "acacia_leaves",
+        "dark_oak_leaves",
+        "mangrove_leaves",
+        "cherry_leaves",
+        "pale_oak_leaves",
+        "azalea_leaves",
+        "flowering_azalea_leaves",
         "oak_log",
         "birch_log",
         "brown_mushroom_block",
@@ -137,6 +151,7 @@ fn supported_block_states_match_all_java_entity_types() {
         .arg(&output));
     let results: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     let mut checked = 0;
+    let mut leaf_states = 0;
     let mut report = BTreeMap::<String, (usize, usize)>::new();
     for entry in results {
         let state = BlockState {
@@ -145,6 +160,40 @@ fn supported_block_states_match_all_java_entity_types() {
         };
         let counts = report.entry(state.name.clone()).or_default();
         counts.0 += 1;
+        if let Some(waterlogged) = mob_spawn_leaf_waterlogged(&state) {
+            assert_eq!(entry["context_independent"], true, "{state:?}");
+            assert_eq!(entry["canonical_full"], true, "{state:?}");
+            assert_eq!(entry["large"], false, "{state:?}");
+            assert_eq!(entry["facts"][0], false, "{state:?}");
+            assert_eq!(entry["facts"][1], false, "{state:?}");
+            assert_eq!(entry["facts"][3], true, "{state:?}");
+            assert_eq!(entry["facts"][4], false, "{state:?}");
+            assert_eq!(entry["facts"][5], !waterlogged, "{state:?}");
+            for entity in [
+                "ocelot",
+                "parrot",
+                "pig",
+                "cow",
+                "sheep",
+                "goat",
+                "chicken",
+                "horse",
+                "donkey",
+                "rabbit",
+                "slime",
+                "magma_cube",
+                "sulfur_cube",
+            ] {
+                assert_eq!(
+                    mob_spawn_leaf_support(&state, "minecraft", entity),
+                    entry["entity_support"][format!("minecraft:{entity}")].as_bool(),
+                    "{state:?} {entity}"
+                );
+            }
+            assert_eq!(mob_spawn_leaf_support(&state, "example", "pig"), None);
+            assert_eq!(mob_spawn_leaf_support(&state, "minecraft", "unknown"), None);
+            leaf_states += 1;
+        }
         if let Some(facts) = common_mob_spawn_block_facts(&state) {
             assert_eq!(entry["universal"], true, "{state:?}");
             assert_eq!(entry["context_independent"], true, "{state:?}");
@@ -179,7 +228,16 @@ fn supported_block_states_match_all_java_entity_types() {
         "ice",
         "lava",
         "oak_leaves",
+        "spruce_leaves",
         "birch_leaves",
+        "jungle_leaves",
+        "acacia_leaves",
+        "dark_oak_leaves",
+        "mangrove_leaves",
+        "cherry_leaves",
+        "pale_oak_leaves",
+        "azalea_leaves",
+        "flowering_azalea_leaves",
         "oak_slab",
         "stone_slab",
         "snow",
@@ -195,4 +253,5 @@ fn supported_block_states_match_all_java_entity_types() {
         }
     }
     assert!(checked > 75, "only {checked} block states checked");
+    assert_eq!(leaf_states, 11 * 7 * 2 * 2);
 }

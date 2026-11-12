@@ -37,6 +37,7 @@ public final class MobSpawnBlockFactsOracle {
                 entry.add("properties", properties);
                 boolean[] first = null;
                 boolean universal = true, contextIndependent = true;
+                var entitySupport = new JsonObject();
                 for (var neighbor : new BlockState[]{Blocks.AIR.defaultBlockState(), Blocks.STONE.defaultBlockState()}) {
                     var world = (LevelReader) Proxy.newProxyInstance(LevelReader.class.getClassLoader(), new Class<?>[]{LevelReader.class}, (obj, method, a) -> {
                         return switch (method.getName()) {
@@ -64,6 +65,8 @@ public final class MobSpawnBlockFactsOracle {
                     boolean[] facts = {state.isAir(), state.isPathfindable(PathComputationType.LAND), support,
                         state.isCollisionShapeFullBlock(world, pos), state.isSignalSource(), state.getFluidState().isEmpty(), dangerous};
                     for (var entity : BuiltInRegistries.ENTITY_TYPE) {
+                        if (first == null && id.getPath().endsWith("_leaves"))
+                            entitySupport.addProperty(BuiltInRegistries.ENTITY_TYPE.getKey(entity).toString(), state.isValidSpawn(world, pos, entity));
                         if (state.isValidSpawn(world, pos, entity) != support || entity.isBlockDangerous(state) != dangerous) universal = false;
                     }
                     if (first == null) first = facts;
@@ -74,6 +77,7 @@ public final class MobSpawnBlockFactsOracle {
                 entry.add("facts", facts);
                 entry.addProperty("universal", universal);
                 entry.addProperty("context_independent", contextIndependent);
+                if (entitySupport.size() > 0) entry.add("entity_support", entitySupport);
                 output.add(entry);
             }
         }

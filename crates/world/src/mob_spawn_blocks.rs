@@ -15,6 +15,56 @@ pub struct MobSpawnBlockFacts {
     pub dangerous: bool,
 }
 
+/// Valid leaves expose these entity-independent facts even though their
+/// spawn-support predicate depends on the entity type.
+pub fn mob_spawn_leaf_waterlogged(state: &BlockState) -> Option<bool> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:oak_leaves"
+            | "minecraft:spruce_leaves"
+            | "minecraft:birch_leaves"
+            | "minecraft:jungle_leaves"
+            | "minecraft:acacia_leaves"
+            | "minecraft:dark_oak_leaves"
+            | "minecraft:mangrove_leaves"
+            | "minecraft:cherry_leaves"
+            | "minecraft:pale_oak_leaves"
+            | "minecraft:azalea_leaves"
+            | "minecraft:flowering_azalea_leaves"
+    ) || state.properties.len() != 3
+        || !matches!(
+            state.properties.get("persistent").map(String::as_str),
+            Some("true" | "false")
+        )
+        || !matches!(
+            state.properties.get("distance").map(String::as_str),
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7")
+        )
+    {
+        return None;
+    }
+    match state.properties.get("waterlogged").map(String::as_str) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Spawn support for entity types whose leaf predicate has been compared
+/// with the built-in Java registry. Unknown types remain unresolved.
+pub fn mob_spawn_leaf_support(state: &BlockState, namespace: &str, entity: &str) -> Option<bool> {
+    mob_spawn_leaf_waterlogged(state)?;
+    if namespace != "minecraft" {
+        return None;
+    }
+    match entity {
+        "ocelot" | "parrot" => Some(true),
+        "pig" | "cow" | "sheep" | "goat" | "chicken" | "horse" | "donkey" | "rabbit" | "slime"
+        | "magma_cube" | "sulfur_cube" => Some(false),
+        _ => None,
+    }
+}
+
 /// Facts whose support and danger predicates are independent of entity type.
 pub fn common_mob_spawn_block_facts(state: &BlockState) -> Option<MobSpawnBlockFacts> {
     let empty = state.properties.is_empty();
@@ -180,6 +230,46 @@ mod tests {
         assert!(bedrock.full_collision && !bedrock.valid_support);
         let redstone = facts("redstone_block", None);
         assert!(redstone.signal_source && redstone.valid_support);
+    }
+
+    #[test]
+    fn leaves_expose_waterlogging_but_not_universal_spawn_support() {
+        let mut leaves = BlockState {
+            name: "minecraft:oak_leaves".into(),
+            properties: [
+                ("distance".into(), "3".into()),
+                ("persistent".into(), "false".into()),
+                ("waterlogged".into(), "true".into()),
+            ]
+            .into(),
+        };
+        assert_eq!(mob_spawn_leaf_waterlogged(&leaves), Some(true));
+        assert!(common_mob_spawn_block_facts(&leaves).is_none());
+        assert_eq!(
+            mob_spawn_leaf_support(&leaves, "minecraft", "ocelot"),
+            Some(true)
+        );
+        assert_eq!(
+            mob_spawn_leaf_support(&leaves, "minecraft", "pig"),
+            Some(false)
+        );
+        assert_eq!(mob_spawn_leaf_support(&leaves, "example", "pig"), None);
+        assert_eq!(
+            mob_spawn_leaf_support(&leaves, "minecraft", "unknown"),
+            None
+        );
+        leaves
+            .properties
+            .insert("waterlogged".into(), "false".into());
+        assert_eq!(mob_spawn_leaf_waterlogged(&leaves), Some(false));
+        leaves.properties.insert("distance".into(), "0".into());
+        assert!(mob_spawn_leaf_waterlogged(&leaves).is_none());
+        leaves.properties.insert("distance".into(), "7".into());
+        leaves.properties.insert("persistent".into(), "yes".into());
+        assert!(mob_spawn_leaf_waterlogged(&leaves).is_none());
+        leaves.properties.insert("persistent".into(), "true".into());
+        leaves.properties.insert("extra".into(), "true".into());
+        assert!(mob_spawn_leaf_waterlogged(&leaves).is_none());
     }
 
     #[test]

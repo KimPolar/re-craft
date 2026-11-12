@@ -2,12 +2,16 @@
 use anyhow::{Context, Result, ensure};
 use glam::IVec3;
 use native_resources::mob_spawn_placement::{MobPlacementWorld, MobSpawnHeightmap};
+use native_resources::packs::ResourceId;
 use native_resources::worldgen_mob_spawner::{
     AttemptRejection, ChunkCreatureSpawner, CreatureAttempt, CreatureSpawnProgress,
 };
 use native_world::{
     loaded::{BlockState, ChunkPos, World},
-    mob_spawn_blocks::{MobSpawnBlockFacts, common_mob_spawn_block_facts},
+    mob_spawn_blocks::{
+        MobSpawnBlockFacts, common_mob_spawn_block_facts, mob_spawn_leaf_support,
+        mob_spawn_leaf_waterlogged,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -700,7 +704,11 @@ impl GeneratedCreatureProbe {
         }
         let top = self.top.expect("top position was resolved");
         if !self.can_summon
-            || !native_resources::mob_spawn_placement::on_ground_spawn_position_ok(world, top)?
+            || !native_resources::mob_spawn_placement::on_ground_spawn_position_ok_for_entity(
+                world,
+                top,
+                &self.attempt.entity,
+            )?
         {
             planner.reject(AttemptRejection::Placement)?;
             self.rejected = true;
@@ -738,6 +746,12 @@ enum PlacementSource<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
+enum PlacementBlockFacts {
+    Common(MobSpawnBlockFacts),
+    Leaves { waterlogged: bool },
+}
+
 pub struct GeneratedMobPlacementView<'a> {
     source: PlacementSource<'a>,
     world: Arc<World>,
@@ -748,7 +762,7 @@ pub struct GeneratedMobPlacementView<'a> {
     min_y: i32,
     max_y: i32,
     void_air: BlockState,
-    last_facts: Option<(IVec3, MobSpawnBlockFacts)>,
+    last_facts: Option<(IVec3, PlacementBlockFacts)>,
     computed_heights: BTreeMap<(i32, i32), i32>,
     rule_light: BTreeMap<ChunkPos, native_world::generation_light::VisibleLightSnapshot>,
     fluid_states: BTreeMap<native_world::loaded::BlockStateId, bool>,
@@ -858,17 +872,35 @@ impl<'a> GeneratedMobPlacementView<'a> {
             .block(pos.x, pos.y, pos.z)
             .context("mob placement block is missing")
     }
-    fn facts(&mut self, pos: IVec3) -> Result<MobSpawnBlockFacts> {
+    fn block_facts(&mut self, pos: IVec3) -> Result<PlacementBlockFacts> {
         if let Some((cached_pos, facts)) = self.last_facts {
             if cached_pos == pos {
                 return Ok(facts);
             }
         }
         let state = self.block(pos)?;
-        let facts = common_mob_spawn_block_facts(state)
-            .with_context(|| format!("unsupported mob spawn block state {state:?}"))?;
+        let facts = if let Some(waterlogged) = mob_spawn_leaf_waterlogged(state) {
+            PlacementBlockFacts::Leaves { waterlogged }
+        } else {
+            PlacementBlockFacts::Common(
+                common_mob_spawn_block_facts(state)
+                    .with_context(|| format!("unsupported mob spawn block state {state:?}"))?,
+            )
+        };
         self.last_facts = Some((pos, facts));
         Ok(facts)
+    }
+
+    fn facts(&mut self, pos: IVec3) -> Result<MobSpawnBlockFacts> {
+        match self.block_facts(pos)? {
+            PlacementBlockFacts::Common(facts) => Ok(facts),
+            PlacementBlockFacts::Leaves { .. } => {
+                anyhow::bail!(
+                    "entity-dependent mob spawn block state {:?}",
+                    self.block(pos)?
+                )
+            }
+        }
     }
 
     fn rule_raw_brightness(&mut self, position: IVec3) -> Result<u8> {
@@ -1002,10 +1034,16 @@ impl MobPlacementWorld for GeneratedMobPlacementView<'_> {
         Ok(height)
     }
     fn is_air(&mut self, pos: IVec3) -> Result<bool> {
-        Ok(self.facts(pos)?.air)
+        Ok(match self.block_facts(pos)? {
+            PlacementBlockFacts::Common(facts) => facts.air,
+            PlacementBlockFacts::Leaves { .. } => false,
+        })
     }
     fn pathfindable_land(&mut self, pos: IVec3) -> Result<bool> {
-        Ok(self.facts(pos)?.pathfindable_land)
+        Ok(match self.block_facts(pos)? {
+            PlacementBlockFacts::Common(facts) => facts.pathfindable_land,
+            PlacementBlockFacts::Leaves { .. } => false,
+        })
     }
     fn within_border(&mut self, pos: IVec3) -> Result<bool> {
         Ok(f64::from(pos.x) >= self.border.min_x
@@ -1016,14 +1054,29 @@ impl MobPlacementWorld for GeneratedMobPlacementView<'_> {
     fn valid_spawn_support(&mut self, pos: IVec3) -> Result<bool> {
         Ok(self.facts(pos)?.valid_support)
     }
+    fn valid_spawn_support_for_entity(&mut self, pos: IVec3, entity: &ResourceId) -> Result<bool> {
+        match self.block_facts(pos)? {
+            PlacementBlockFacts::Common(facts) => Ok(facts.valid_support),
+            PlacementBlockFacts::Leaves { .. } => {
+                mob_spawn_leaf_support(self.block(pos)?, &entity.namespace, &entity.path)
+                    .context("unsupported entity-specific leaf spawn support")
+            }
+        }
+    }
     fn full_collision(&mut self, pos: IVec3) -> Result<bool> {
-        Ok(self.facts(pos)?.full_collision)
+        Ok(match self.block_facts(pos)? {
+            PlacementBlockFacts::Common(facts) => facts.full_collision,
+            PlacementBlockFacts::Leaves { .. } => true,
+        })
     }
     fn signal_source(&mut self, pos: IVec3) -> Result<bool> {
         Ok(self.facts(pos)?.signal_source)
     }
     fn fluid_empty(&mut self, pos: IVec3) -> Result<bool> {
-        Ok(self.facts(pos)?.fluid_empty)
+        Ok(match self.block_facts(pos)? {
+            PlacementBlockFacts::Common(facts) => facts.fluid_empty,
+            PlacementBlockFacts::Leaves { waterlogged } => !waterlogged,
+        })
     }
     fn prevents_mob_spawning(&mut self, pos: IVec3) -> Result<bool> {
         Ok(self.prevent_inside.contains(&self.block(pos)?.name))
@@ -1057,6 +1110,9 @@ fn unprimed_heightmap_matches(
     };
     if blocks_motion || kind == MobSpawnHeightmap::OceanFloor {
         return Ok(blocks_motion);
+    }
+    if let Some(waterlogged) = mob_spawn_leaf_waterlogged(state) {
+        return Ok(waterlogged);
     }
     let facts = common_mob_spawn_block_facts(state)
         .with_context(|| format!("unsupported fluid state in mob heightmap: {state:?}"))?;
@@ -1132,6 +1188,24 @@ mod tests {
             unprimed_heightmap_matches(&leaves, MobSpawnHeightmap::MotionBlockingNoLeaves, &tags)
                 .is_err()
         );
+        for waterlogged in ["false", "true"] {
+            let mut leaves = state("oak_leaves", None);
+            leaves.properties = [
+                ("distance".into(), "3".into()),
+                ("persistent".into(), "false".into()),
+                ("waterlogged".into(), waterlogged.into()),
+            ]
+            .into();
+            assert_eq!(
+                unprimed_heightmap_matches(
+                    &leaves,
+                    MobSpawnHeightmap::MotionBlockingNoLeaves,
+                    &tags
+                )
+                .unwrap(),
+                waterlogged == "true"
+            );
+        }
         assert!(
             unprimed_heightmap_matches(
                 &state("unknown", None),

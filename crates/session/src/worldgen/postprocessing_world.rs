@@ -946,6 +946,7 @@ impl GeneratedPostprocessing {
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
             heightmap_tags: self.heightmap_tags.as_deref(),
+            destroyed_lichen_during_mark: BTreeSet::new(),
         };
         let result = task.poll(&mut view, budget);
         self.block_entities.insert(pos, entities);
@@ -1034,6 +1035,7 @@ impl GeneratedPostprocessing {
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
             heightmap_tags: self.heightmap_tags.as_deref(),
+            destroyed_lichen_during_mark: BTreeSet::new(),
         };
         let result = feature.place(&mut view, &mut staged_random, origin);
         self.block_entities.insert(pos, entities);
@@ -1115,6 +1117,7 @@ struct GeneratedBlockView<'a> {
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<&'a native_resources::heightmap_tags::HeightmapTags>,
+    destroyed_lichen_during_mark: BTreeSet<[i32; 3]>,
 }
 
 /// Capture materialized block entities in the sections visited by Java's
@@ -1989,7 +1992,14 @@ impl GeneratedBlockView<'_> {
                     } else {
                         next.name == "minecraft:air" && next.properties.is_empty()
                     }
-                }),
+                })
+                || (super::ore::valid_lichen(old)
+                    && if old.properties["waterlogged"] == "true" {
+                        next.name == "minecraft:water"
+                            && next_fluid.is_some_and(|fluid| fluid.source)
+                    } else {
+                        next.name == "minecraft:air" && next.properties.is_empty()
+                    }),
             "unsupported original water state"
         );
         let next_air = next.name == "minecraft:air";
@@ -2166,9 +2176,24 @@ impl GeneratedBlockView<'_> {
 
     fn destroy_ladder(&mut self, pos: [i32; 3], state: &BlockState, depth: usize) -> Result<()> {
         let (_, wet) = ladder_state(state).context("invalid ladder state")?;
+        self.destroy_water_contained_block(pos, state, wet, depth)
+    }
+
+    fn destroy_water_contained_block(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        wet: bool,
+        depth: usize,
+    ) -> Result<()> {
+        let missing_drops = if ladder_state(state).is_some() {
+            "ladder destruction requires block drops"
+        } else {
+            "lichen destruction requires block drops"
+        };
         self.block_drops
             .as_mut()
-            .context("ladder destruction requires block drops")?
+            .context(missing_drops)?
             .drop_block(glam::IVec3::from_array(pos), state)?;
         let replacement = if wet {
             BlockState {
@@ -2208,7 +2233,7 @@ impl GeneratedBlockView<'_> {
             .collect::<Result<BTreeMap<_, _>>>()?;
         self.block_drops
             .as_mut()
-            .context("ladder destruction requires block drops")?
+            .context(missing_drops)?
             .record_destroy_event(
                 pos,
                 state,
@@ -2340,11 +2365,21 @@ impl GeneratedBlockView<'_> {
         next: &BlockState,
         depth: usize,
     ) -> Result<()> {
-        // Removing the final face destroys the block and has loot and event
-        // side effects that this path cannot yet represent.
+        if next.name == "minecraft:air" && next.properties.is_empty() {
+            let old = self.read(pos)?;
+            ensure!(super::ore::valid_lichen(&old), "invalid lichen state");
+            self.destroy_water_contained_block(
+                pos,
+                &old,
+                old.properties["waterlogged"] == "true",
+                depth,
+            )?;
+            self.destroyed_lichen_during_mark.insert(pos);
+            return Ok(());
+        }
         ensure!(
             super::ore::valid_lichen(next),
-            "water-triggered lichen destruction is not yet supported"
+            "invalid lichen shape update"
         );
         self.replace_postprocessed_shape(pos, next, 276)?;
         self.update_water_shape_neighbors(pos, next, depth)
@@ -2417,6 +2452,49 @@ impl GeneratedBlockView<'_> {
         // original marked state. Java's setBlock accepts this as a no-op.
         if flags == 276 && old == *next {
             return Ok(());
+        }
+        if flags == 276
+            && next.name == "minecraft:air"
+            && next.properties.is_empty()
+            && self.destroyed_lichen_during_mark.remove(&pos)
+            && liquid_state(&old)?.is_some_and(|fluid| {
+                fluid.kind == native_world::fluid::FluidKind::Water && fluid.source
+            })
+        {
+            let chunk = ChunkPos {
+                x: pos[0].div_euclid(16),
+                z: pos[2].div_euclid(16),
+            };
+            let section =
+                i8::try_from(pos[1].div_euclid(16)).context("water section out of range")?;
+            let blocks = self
+                .world
+                .chunks
+                .get(&chunk)
+                .and_then(|chunk| chunk.sections.get(&section))
+                .and_then(|section| section.blocks.as_ref())
+                .context("water section unavailable")?;
+            let mut nonempty = 0;
+            for id in blocks.iter() {
+                let state = self
+                    .world
+                    .state(*id)
+                    .context("water section state missing")?;
+                if !matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ) {
+                    nonempty += 1;
+                    if nonempty == 2 {
+                        break;
+                    }
+                }
+            }
+            ensure!(
+                nonempty >= 2,
+                "water removal requires light section allocation update"
+            );
+            return self.write_postprocessed_state(pos, &old, next);
         }
         if ladder_state(&old).is_some() {
             ensure!(
@@ -2949,6 +3027,7 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
     type Fluid = native_world::fluid::FluidState;
 
     fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
+        self.destroyed_lichen_during_mark.clear();
         self.read(pos)
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
@@ -6920,6 +6999,9 @@ mod tests {
                 if path == "data/minecraft/loot_table/blocks/ladder.json" {
                     return Ok(Some(br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder"}]}]}"#.to_vec()));
                 }
+                if path == "data/minecraft/loot_table/blocks/glow_lichen.json" {
+                    return Ok(Some(br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:glow_lichen"}]}]}"#.to_vec()));
+                }
                 if path.ends_with("blocks_motion_in_heightmap.json")
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
@@ -7421,7 +7503,9 @@ mod tests {
             | "marked_lichen_sides"
             | "marked_lichen_mixed"
             | "marked_lichen_lose_east"
-            | "marked_lichen_lose_last" => {
+            | "marked_lichen_lose_last"
+            | "marked_lichen_destroy_on"
+            | "marked_lichen_destroy_off" => {
                 let lichen = world.intern_state(BlockState {
                     name: "minecraft:glow_lichen".into(),
                     properties: [
@@ -7437,12 +7521,21 @@ mod tests {
                     .map(|key| {
                         (
                             key.into(),
-                            ((key == "west" && case != "marked_lichen_lose_last")
+                            ((key == "west"
+                                && !matches!(
+                                    case,
+                                    "marked_lichen_lose_last"
+                                        | "marked_lichen_destroy_on"
+                                        | "marked_lichen_destroy_off"
+                                ))
                                 || key == "waterlogged"
                                 || (key == "east"
                                     && matches!(
                                         case,
-                                        "marked_lichen_lose_east" | "marked_lichen_lose_last"
+                                        "marked_lichen_lose_east"
+                                            | "marked_lichen_lose_last"
+                                            | "marked_lichen_destroy_on"
+                                            | "marked_lichen_destroy_off"
                                     )))
                             .to_string(),
                         )
@@ -7457,6 +7550,8 @@ mod tests {
                         | "marked_lichen_mixed"
                         | "marked_lichen_lose_east"
                         | "marked_lichen_lose_last"
+                        | "marked_lichen_destroy_on"
+                        | "marked_lichen_destroy_off"
                 ) {
                     world.set_block_id(9, 8, 8, air).unwrap();
                 }
@@ -7706,13 +7801,15 @@ mod tests {
         if case == "marked_lichen_lose_last" {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let error = stage.try_poll(chunk, 1).unwrap_err();
-            assert!(format!("{error:#}").contains("lichen destruction"));
+            assert!(format!("{error:#}").contains("lichen destruction requires block drops"));
             assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
             assert_eq!(stage.world.block(9, 8, 8).unwrap().name, "minecraft:air");
             assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
             return vec!["rolled back".into()];
         }
-        if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
+        if (case.starts_with("ladder_break_") && case != "ladder_break_unsupported")
+            || case.starts_with("marked_lichen_destroy_")
+        {
             struct InvalidLoot;
             impl ResourceProvider for InvalidLoot {
                 fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -7806,6 +7903,34 @@ mod tests {
             while !stage.poll(east_chunk, 1).unwrap() {}
         }
         let result = stage.finish().unwrap();
+        if case.starts_with("marked_lichen_destroy_") {
+            let drops = result.block_drops().unwrap();
+            assert_eq!(drops.operations(), 1);
+            let [event] = drops.destroy_events() else {
+                panic!("unexpected destroy events")
+            };
+            assert_eq!(event.position, [8, 8, 8]);
+            assert_eq!(event.state, source.block(8, 8, 8).unwrap().clone());
+            assert_eq!(
+                event.world().block(8, 8, 8).unwrap().name,
+                "minecraft:water"
+            );
+            assert_eq!(
+                drops.records(chunk).len(),
+                usize::from(case.ends_with("_on"))
+            );
+            assert_eq!(event.registered_chunks(), &[chunk]);
+            assert_eq!(event.block_entities().get(&chunk), Some(&Vec::new()));
+            assert_eq!(event.entities().get(&chunk), Some(&None));
+            if case.ends_with("_on") {
+                let item = crate::saved_item::read(&drops.records(chunk)[0])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(item.stack.id(), "minecraft:glow_lichen");
+                assert_eq!(item.stack.count(), 1);
+                assert_eq!(item.stack.max_count(), Some(64));
+            }
+        }
         if case.starts_with("ladder_break_") && case != "ladder_break_unsupported" {
             let drops = result.block_drops().unwrap();
             assert_eq!(drops.operations(), 1);
@@ -8056,7 +8181,10 @@ mod tests {
                 state.properties["waterlogged"]
             ));
         }
-        if case.starts_with("marked_stair_corner_") || case == "fence_on_neighbor" {
+        if case.starts_with("marked_stair_corner_")
+            || case == "fence_on_neighbor"
+            || case.starts_with("marked_lichen_destroy_")
+        {
             for check in &result.light_checks {
                 trace.push(format!("light {},{},{}", check.x, check.y, check.z));
             }
@@ -8819,6 +8947,9 @@ mod tests {
             water_spread_trace("marked_lichen_lose_last"),
             ["rolled back"]
         );
+        for case in ["marked_lichen_destroy_on", "marked_lichen_destroy_off"] {
+            let _ = water_spread_trace(case);
+        }
     }
 
     #[test]
@@ -8830,6 +8961,21 @@ mod tests {
             &["lichen_transition"],
         );
         assert_eq!(actual, water_spread_trace("marked_lichen_lose_east"));
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn water_neighbor_destroys_lichen_like_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lichen_destroy"],
+        );
+        let expected: Vec<_> = ["marked_lichen_destroy_on", "marked_lichen_destroy_off"]
+            .into_iter()
+            .flat_map(water_spread_trace)
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

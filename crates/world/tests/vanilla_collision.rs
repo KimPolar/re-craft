@@ -359,6 +359,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     let mut checked = 0usize;
     let mut outlines_checked = 0usize;
+    let mut glow_lichen_checked = 0usize;
     let mut button_states_checked = 0usize;
     let mut lever_states_checked = 0usize;
     let mut single_chest_states_checked = 0usize;
@@ -426,6 +427,11 @@ fn implemented_collision_shapes_match_vanilla_states() {
             name: id.to_owned(),
             properties,
         };
+        if id == "minecraft:glow_lichen" {
+            assert_eq!(block_shape(&state), Some(Vec::new()), "{state:?}");
+            assert!(block_outline(&state).is_some(), "{state:?}");
+            glow_lichen_checked += 1;
+        }
         if matches!(
             id,
             "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots"
@@ -647,6 +653,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
         }
     }
     assert!(checked > 1000, "only {checked} states were checked");
+    assert_eq!(glow_lichen_checked, 128, "glow lichen states missing");
     assert_eq!(snow_checked, 8);
     assert_eq!(crop_checked, 28, "crop states missing from Java oracle");
     assert!(

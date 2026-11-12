@@ -45,6 +45,52 @@ pub fn barrier_waterlogged(state: &BlockState) -> Option<bool> {
     }
 }
 
+/// Return the face mask of a fully specified vanilla glow lichen state.
+fn glow_lichen_faces(state: &BlockState) -> Option<u8> {
+    if state.name != "minecraft:glow_lichen" || state.properties.len() != 7 {
+        return None;
+    }
+    let mut faces = 0;
+    for (index, key) in ["down", "up", "north", "south", "west", "east"]
+        .into_iter()
+        .enumerate()
+    {
+        match state.properties.get(key)?.as_str() {
+            "true" => faces |= 1 << index,
+            "false" => {}
+            _ => return None,
+        }
+    }
+    match state.properties.get("waterlogged")?.as_str() {
+        "true" | "false" => Some(faces),
+        _ => None,
+    }
+}
+
+fn glow_lichen_outline(faces: u8) -> Vec<Aabb> {
+    // MultifaceBlock uses the full block for its no-face default state.
+    if faces == 0 {
+        return FULL.to_vec();
+    }
+    let mut boxes = Vec::with_capacity(faces.count_ones() as usize);
+    for (index, bounds) in [
+        pixel_box(0.0, 0.0, 0.0, 16.0, 1.0, 16.0),
+        pixel_box(0.0, 15.0, 0.0, 16.0, 16.0, 16.0),
+        pixel_box(0.0, 0.0, 0.0, 16.0, 16.0, 1.0),
+        pixel_box(0.0, 0.0, 15.0, 16.0, 16.0, 16.0),
+        pixel_box(0.0, 0.0, 0.0, 1.0, 16.0, 16.0),
+        pixel_box(15.0, 0.0, 0.0, 16.0, 16.0, 16.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if faces & (1 << index) != 0 {
+            boxes.push(bounds);
+        }
+    }
+    boxes
+}
+
 const EMPTY: &[Aabb] = &[];
 const FULL: &[Aabb] = &[Aabb {
     min: Vec3::ZERO,
@@ -634,6 +680,40 @@ mod face_tests {
     use super::*;
 
     #[test]
+    fn glow_lichen_shapes_validate_all_properties() {
+        let mut state = BlockState {
+            name: "minecraft:glow_lichen".into(),
+            properties: [
+                "down",
+                "up",
+                "north",
+                "south",
+                "west",
+                "east",
+                "waterlogged",
+            ]
+            .into_iter()
+            .map(|name| (name.into(), "false".into()))
+            .collect(),
+        };
+        assert_eq!(block_shape(&state), Some(Vec::new()));
+        assert_eq!(block_outline(&state), Some(FULL.to_vec()));
+        state.properties.insert("north".into(), "true".into());
+        assert_eq!(
+            block_outline(&state),
+            Some(vec![pixel_box(0.0, 0.0, 0.0, 16.0, 16.0, 1.0)])
+        );
+        state.properties.insert("waterlogged".into(), "true".into());
+        assert_eq!(block_shape(&state), Some(Vec::new()));
+        state.properties.insert("down".into(), "invalid".into());
+        assert_eq!(block_shape(&state), None);
+        assert_eq!(block_outline(&state), None);
+        state.properties.remove("down");
+        assert_eq!(block_shape(&state), None);
+        assert_eq!(block_outline(&state), None);
+    }
+
+    #[test]
     fn crop_shapes_follow_age_and_reject_invalid_states() {
         for (id, age, height) in [
             ("wheat", "7", 16.0),
@@ -951,6 +1031,9 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if state.name == "minecraft:glow_lichen" {
+        return glow_lichen_faces(state).map(|_| Vec::new());
+    }
     if crop_outline_height(state).is_some() {
         return Some(EMPTY.to_vec());
     }
@@ -1430,6 +1513,9 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    if state.name == "minecraft:glow_lichen" {
+        return glow_lichen_faces(state).map(glow_lichen_outline);
+    }
     if let Some(height) = crop_outline_height(state) {
         return Some(vec![cuboid(0.0, 0.0, 0.0, 1.0, height, 1.0)]);
     }

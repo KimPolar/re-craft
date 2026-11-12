@@ -151,6 +151,7 @@ fn outline_segment_clipping_matches_vanilla() {
                 ("south", "true"),
                 ("east", "false"),
                 ("west", "false"),
+                ("waterlogged", "false"),
             ],
         ),
         state("minecraft:flower_pot", &[]),
@@ -158,6 +159,42 @@ fn outline_segment_clipping_matches_vanilla() {
         state("minecraft:oak_sapling", &[]),
         state("minecraft:torch", &[]),
         state("minecraft:wall_torch", &[("facing", "north")]),
+        state(
+            "minecraft:glow_lichen",
+            &[
+                ("down", "false"),
+                ("up", "false"),
+                ("north", "true"),
+                ("south", "false"),
+                ("west", "false"),
+                ("east", "false"),
+                ("waterlogged", "false"),
+            ],
+        ),
+        state(
+            "minecraft:glow_lichen",
+            &[
+                ("down", "true"),
+                ("up", "false"),
+                ("north", "true"),
+                ("south", "false"),
+                ("west", "true"),
+                ("east", "false"),
+                ("waterlogged", "true"),
+            ],
+        ),
+        state(
+            "minecraft:glow_lichen",
+            &[
+                ("down", "false"),
+                ("up", "false"),
+                ("north", "false"),
+                ("south", "false"),
+                ("west", "false"),
+                ("east", "false"),
+                ("waterlogged", "false"),
+            ],
+        ),
         state(
             "minecraft:stone_button",
             &[("face", "wall"), ("facing", "north"), ("powered", "false")],
@@ -240,7 +277,7 @@ fn outline_segment_clipping_matches_vanilla() {
         };
         let cell = arr("cell").as_ivec3();
         let actual = clip_shape(
-            &block_outline(state).unwrap(),
+            &block_outline(state).unwrap_or_else(|| panic!("missing outline: {state:?}")),
             cell,
             arr("start"),
             arr("end"),

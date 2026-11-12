@@ -4274,6 +4274,7 @@ impl LoadedSession {
             !self.unresolved_crop_shape,
             "a crop neighbor update could not be resolved for saving"
         );
+        self.validate_stair_updates()?;
         self.validate_lichen_updates()?;
         anyhow::ensure!(
             !self.unresolved_player_damage,
@@ -4517,6 +4518,7 @@ impl LoadedSession {
             self.unresolved_fence_shape,
             self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
+        self.validate_stair_updates()?;
         self.validate_lichen_updates()?;
         anyhow::ensure!(
             self.commands.is_empty(),
@@ -5630,13 +5632,57 @@ impl LoadedSession {
         self.incoming
             .iter()
             .map(|pending| pending.pos)
-            .chain(self.pending_light.keys().map(|block| block.chunk()))
+            .chain(self.pending_light.iter().flat_map(|(block, pending)| {
+                let radius = pending.change.radius();
+                let min_x = block.x.saturating_sub(radius).div_euclid(16);
+                let max_x = block.x.saturating_add(radius).div_euclid(16);
+                let min_z = block.z.saturating_sub(radius).div_euclid(16);
+                let max_z = block.z.saturating_add(radius).div_euclid(16);
+                (min_x..=max_x).flat_map(move |x| (min_z..=max_z).map(move |z| ChunkPos { x, z }))
+            }))
+            .chain(
+                self.pending_stair_updates
+                    .iter()
+                    .flat_map(|(waiting, stairs)| {
+                        std::iter::once(*waiting).chain(stairs.iter().map(|stair| stair.chunk()))
+                    }),
+            )
+            .chain(
+                self.pending_fence_updates
+                    .iter()
+                    .flat_map(|(waiting, updates)| {
+                        std::iter::once(*waiting).chain(
+                            updates
+                                .iter()
+                                .flat_map(|(fence, source)| [fence.chunk(), source.chunk()]),
+                        )
+                    }),
+            )
             .chain(
                 self.pending_lichen_updates
                     .iter()
                     .flat_map(|(target, source, _)| [target.chunk(), source.chunk()]),
             )
             .collect()
+    }
+
+    fn validate_generation_terrain_readiness(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.unresolved_lichen_shape
+                && !self.unresolved_fence_shape
+                && !self.unresolved_leaf_shape
+                && !self.unresolved_leaf_decay
+                && !self.unresolved_crop_shape
+                && !self.unresolved_crop_tick
+                && !self.unresolved_ice_tick
+                && !self.unresolved_bubble_tick,
+            "a block update could not be resolved before generation"
+        );
+        anyhow::ensure!(
+            self.sky_lighting.settled(),
+            "sky lighting is not settled before generation"
+        );
+        Ok(())
     }
 
     fn generation_terrain_chunk(&self, position: ChunkPos) -> GuardedTerrainChunk {
@@ -5662,10 +5708,7 @@ impl LoadedSession {
         source: &World,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> anyhow::Result<GenerationTerrainGuard> {
-        anyhow::ensure!(
-            !self.unresolved_lichen_shape,
-            "a lichen update could not be resolved"
-        );
+        self.validate_generation_terrain_readiness()?;
         anyhow::ensure!(
             source.dimension == self.world.dimension,
             "generation terrain dimension differs"
@@ -5726,10 +5769,7 @@ impl LoadedSession {
     /// Recheck immediately before applying work, while holding the mutable
     /// session through the corresponding commit or publication operation.
     pub fn verify_generation_terrain(&self, guard: &GenerationTerrainGuard) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.unresolved_lichen_shape,
-            "a lichen update could not be resolved"
-        );
+        self.validate_generation_terrain_readiness()?;
         anyhow::ensure!(
             Arc::ptr_eq(&self.generation_identity, &guard.session),
             "generation terrain belongs to another session"
@@ -10484,6 +10524,7 @@ impl LoadedSession {
             self.unresolved_fence_shape,
             self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
+        self.validate_stair_updates()?;
         self.validate_lichen_updates()?;
         ensure!(
             !self.unresolved_leaf_decay,
@@ -10740,6 +10781,7 @@ impl LoadedSession {
     /// The returned data is only one part of a safe world save.
     pub fn draft_fluid_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedFluidTick>> {
         use anyhow::{Context, ensure};
+        self.validate_stair_updates()?;
         self.validate_lichen_updates()?;
         ensure!(
             self.commands.is_empty(),
@@ -10906,6 +10948,13 @@ impl LoadedSession {
             if let Some((fence, source)) = updates.first() {
                 required.insert(fence.chunk());
                 required.insert(source.chunk());
+            }
+            return required;
+        }
+        if let Some((waiting, stairs)) = self.pending_stair_updates.first_key_value() {
+            required.insert(*waiting);
+            if let Some(stair) = stairs.first() {
+                required.insert(stair.chunk());
             }
         }
         required
@@ -19697,6 +19746,15 @@ impl LoadedSession {
                 self.update_fence_neighbor(fence, id, direction, other);
             }
         }
+    }
+
+    fn validate_stair_updates(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pending_stair_updates.is_empty(),
+            "stair shape updates are not yet fully tracked for saving (waiting for chunks: {:?})",
+            self.pending_stair_updates.keys().collect::<Vec<_>>()
+        );
+        Ok(())
     }
 
     fn validate_lichen_updates(&self) -> anyhow::Result<()> {
@@ -28587,6 +28645,75 @@ pub(crate) mod tests {
         assert!(live.verify_generation_terrain(&guard).is_err());
         live.pending_light.clear();
         live.verify_generation_terrain(&guard).unwrap();
+        // A pending light change in the adjacent chunk can still reach this
+        // captured chunk even when its own blocks have not changed.
+        live.pending_light.insert(
+            BlockPosition {
+                x: origin.x + 16,
+                y: 1,
+                z: origin.z + 8,
+            },
+            PendingLight {
+                change: native_world::block_light::LightChange::unknown(),
+                last_attempt: None,
+            },
+        );
+        assert!(live.generation_terrain_pending().contains(&pos));
+        assert!(live.capture_generation_terrain(&remapped, [pos]).is_err());
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        live.pending_light.clear();
+        live.verify_generation_terrain(&guard).unwrap();
+
+        let waiting = absent;
+        let source_pos = BlockPosition {
+            x: origin.x + 15,
+            y: 2,
+            z: origin.z + 8,
+        };
+        let target_pos = BlockPosition {
+            x: origin.x + 16,
+            y: 2,
+            z: origin.z + 8,
+        };
+        live.pending_stair_updates
+            .insert(waiting, BTreeSet::from([source_pos]));
+        assert!(live.generation_terrain_pending().contains(&pos));
+        assert!(live.generation_terrain_pending().contains(&waiting));
+        assert!(live.capture_generation_terrain(&remapped, [pos]).is_err());
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        live.pending_stair_updates.clear();
+        live.pending_fence_updates
+            .insert(waiting, BTreeSet::from([(target_pos, source_pos)]));
+        assert!(live.generation_terrain_pending().contains(&pos));
+        assert!(live.generation_terrain_pending().contains(&waiting));
+        assert!(live.capture_generation_terrain(&remapped, [pos]).is_err());
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        live.pending_fence_updates.clear();
+        live.verify_generation_terrain(&guard).unwrap();
+
+        macro_rules! unresolved_prevents_generation {
+            ($field:ident) => {{
+                live.$field = true;
+                assert!(
+                    live.capture_generation_terrain(&remapped, [pos]).is_err(),
+                    stringify!($field)
+                );
+                assert!(
+                    live.verify_generation_terrain(&guard).is_err(),
+                    stringify!($field)
+                );
+                live.$field = false;
+            }};
+        }
+        unresolved_prevents_generation!(unresolved_fence_shape);
+        unresolved_prevents_generation!(unresolved_lichen_shape);
+        unresolved_prevents_generation!(unresolved_leaf_shape);
+        unresolved_prevents_generation!(unresolved_leaf_decay);
+        unresolved_prevents_generation!(unresolved_crop_shape);
+        unresolved_prevents_generation!(unresolved_crop_tick);
+        unresolved_prevents_generation!(unresolved_ice_tick);
+        unresolved_prevents_generation!(unresolved_bubble_tick);
+        live.verify_generation_terrain(&guard).unwrap();
         live.dirty_chunks.insert(pos);
         assert!(live.verify_generation_terrain(&guard).is_err());
         live.dirty_chunks.remove(&pos);
@@ -28613,6 +28740,44 @@ pub(crate) mod tests {
             .set_block_id(origin.x, 0, origin.z, stone)
             .unwrap();
         assert!(live.verify_generation_terrain(&guard).is_err());
+    }
+
+    #[test]
+    fn generation_terrain_guard_rejects_unsettled_sky_light() {
+        let (mut source, origin, player) = fixture();
+        let pos = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        source
+            .saved_block_entities
+            .insert(pos, native_world::loaded::SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            source.clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_has_skylight(true).unwrap();
+        let guard = session.capture_generation_terrain(&source, [pos]).unwrap();
+        let original = Arc::clone(&session.world.chunks[&pos]);
+        session.sky_lighting.record(
+            BlockPosition {
+                x: origin.x,
+                y: 1,
+                z: origin.z,
+            },
+            Some(session.states[3]),
+            session.states[0],
+            &original,
+        );
+        assert!(!session.sky_lighting.settled());
+        assert!(session.capture_generation_terrain(&source, [pos]).is_err());
+        assert!(session.verify_generation_terrain(&guard).is_err());
     }
 
     #[test]
@@ -72711,6 +72876,38 @@ pub(crate) mod tests {
             z: session.origin.z.div_euclid(16),
         };
         assert!(session.pending_stair_updates.contains_key(&west));
+        let home = session.player_chunk().unwrap();
+        assert_eq!(
+            session.required_shape_update_chunks(),
+            BTreeSet::from([home, west])
+        );
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![]),
+        };
+        assert!(
+            session
+                .draft_changed_chunk(home, &original)
+                .unwrap_err()
+                .to_string()
+                .contains("stair shape updates")
+        );
+        assert!(
+            session
+                .draft_block_ticks(home)
+                .unwrap_err()
+                .to_string()
+                .contains("stair shape updates")
+        );
+        assert!(
+            session
+                .draft_fluid_ticks(home)
+                .unwrap_err()
+                .to_string()
+                .contains("stair shape updates")
+        );
+        session.queue_chunk_window(home, 0);
+        session.apply_streaming();
         let mut incoming = World::new("minecraft:overworld");
         let air = incoming.intern_state(state("minecraft:air", &[]));
         let front = incoming.intern_state(state(
@@ -72763,6 +72960,7 @@ pub(crate) mod tests {
             Some("outer_left")
         );
         assert!(!session.pending_stair_updates.contains_key(&west));
+        assert!(!session.world.chunks.contains_key(&west));
     }
 
     #[test]

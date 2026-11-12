@@ -191,12 +191,13 @@ pub(crate) struct RestoredSavedTerrain {
     >,
 }
 
-/// Live terrain and POI evidence bound to one captured generator. Other live
-/// state and the captured disk and pack dependencies still need verification.
+/// Live terrain, POI and tracked entity evidence bound to one captured
+/// generator. Other live state and disk and pack dependencies remain separate.
 pub(crate) struct LiveGenerationInputs {
     identity: Arc<()>,
     terrain: native_session::loaded::GenerationTerrainGuard,
     poi: native_session::loaded::GenerationPoiGuard,
+    entities: native_session::loaded::GenerationEntityGuard,
 }
 
 /// One regenerated TERRAIN-stage chunk, tied to the captured source and packs.
@@ -3138,8 +3139,8 @@ impl PreparedExistingGenerator {
         session.capture_generation_poi(&source)
     }
 
-    /// Capture both live dependencies without allowing a guard from a
-    /// different disk capture to be reused for this generator.
+    /// Capture live dependencies without allowing a guard from a different
+    /// disk capture to be reused for this generator.
     pub fn capture_live_inputs(
         &self,
         session: &native_session::loaded::LoadedSession,
@@ -3149,7 +3150,33 @@ impl PreparedExistingGenerator {
             identity: Arc::clone(&self.identity),
             terrain: self.capture_live_terrain(session, restored)?,
             poi: self.capture_live_poi(session)?,
+            entities: self.capture_live_entities(session)?,
         })
+    }
+
+    /// Compare entity sidecars and tracked live entities with the same disk
+    /// capture. Other entity types and effects still require validation.
+    pub fn capture_live_entities(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+    ) -> Result<native_session::loaded::GenerationEntityGuard> {
+        let sources = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .iter()
+            .map(|(pos, chunk)| {
+                (
+                    native_world::loaded::ChunkPos { x: pos.x, z: pos.z },
+                    chunk
+                        .entities
+                        .as_ref()
+                        .map(|entity| Arc::clone(&entity.document)),
+                )
+            })
+            .collect();
+        session.capture_generation_entities(&sources)
     }
 
     /// Verify while retaining exclusive access to the session until the
@@ -3164,7 +3191,8 @@ impl PreparedExistingGenerator {
             "live generation inputs belong to another capture"
         );
         session.verify_generation_terrain(&inputs.terrain)?;
-        session.verify_generation_poi(&inputs.poi)
+        session.verify_generation_poi(&inputs.poi)?;
+        session.verify_generation_entities(&inputs.entities)
     }
 
     /// Bind captured disk and pack inputs; live session state and generation
@@ -5071,12 +5099,17 @@ mod tests {
             live.set_initial_poi_chunk(key, native_session::loaded::SavedPoiData::Missing)?;
             let poi_guard = narrow.capture_live_poi(&live)?;
             live.verify_generation_poi(&poi_guard)?;
+            assert!(narrow.capture_live_entities(&live).is_err());
+            live.set_initial_entity_chunk(key, native_session::loaded::SavedEntityData::Empty)?;
+            let entity_guard = narrow.capture_live_entities(&live)?;
+            live.verify_generation_entities(&entity_guard)?;
             let live_inputs = narrow.capture_live_inputs(&live, &narrow_terrain)?;
             narrow.verify_live_inputs(&live, &live_inputs)?;
             assert!(actual.verify_live_inputs(&live, &live_inputs).is_err());
             live.queue_streamed_chunk(key, None, None, None, None, None);
             assert!(live.verify_generation_terrain(&guard).is_err());
             assert!(live.verify_generation_poi(&poi_guard).is_err());
+            assert!(live.verify_generation_entities(&entity_guard).is_err());
             assert!(narrow.verify_live_inputs(&live, &live_inputs).is_err());
             let mut plan = WorldSavePlan::new();
             actual.add_save_dependencies(&mut plan)?;

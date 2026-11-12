@@ -223,15 +223,23 @@ mod tests {
     }
 
     fn wait(pipeline: &mut InitialWorldPipeline) -> InitialWorldResult {
-        let deadline = Instant::now() + Duration::from_secs(900);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(900);
+        let mut next_report = started + Duration::from_secs(30);
         loop {
             if let Some(result) = pipeline.poll() {
                 return result;
             }
-            assert!(
-                Instant::now() < deadline,
-                "initial world pipeline timed out"
-            );
+            let now = Instant::now();
+            if now >= next_report {
+                eprintln!(
+                    "initial world after {:?}: {:?}",
+                    now - started,
+                    pipeline.progress()
+                );
+                next_report = now + Duration::from_secs(30);
+            }
+            assert!(now < deadline, "initial world pipeline timed out");
             std::thread::sleep(Duration::from_millis(20));
         }
     }

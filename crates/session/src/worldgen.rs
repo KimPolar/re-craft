@@ -31,12 +31,13 @@ mod carving;
 pub mod chunk_ticks;
 mod entity_order;
 mod generated_armor_stand;
+mod generated_barrel;
 mod generated_beehive;
 mod generated_brushable;
 mod generated_chest;
 mod generated_creature_random;
-mod generated_decorated_pot;
 mod generated_cushion;
+mod generated_decorated_pot;
 mod generated_donkey;
 mod generated_drowned;
 mod generated_farm_animal;
@@ -78,6 +79,7 @@ pub mod template_feature;
 mod terrain_batch;
 pub mod tick_index;
 pub use carving::CarverBlockState;
+pub use generated_barrel::GeneratedBarrel;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_brushable::GeneratedBrushable;
 pub use generated_chest::{GeneratedEmptyChest, GeneratedLootChest};
@@ -1771,7 +1773,10 @@ impl CarvedTerrainWorld {
                     (vault.state.clone(), vault.block_entity())
                 }
                 GeneratedMonsterRoomEntity::DecoratedPot(pot) => {
-                    ensure!(p == pot.position, "generated decorated pot position mismatch");
+                    ensure!(
+                        p == pot.position,
+                        "generated decorated pot position mismatch"
+                    );
                     (pot.state.clone(), pot.block_entity())
                 }
                 GeneratedMonsterRoomEntity::EmptyChest(chest) => {

@@ -233,6 +233,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || jigsaw_carpet(state)
         || jigsaw_ladder(state)
         || jigsaw_button(state)
+        || native_world::collision::pressure_plate_pressed(state).is_some()
         || native_world::collision::flower_pot(state)
         || native_world::collision::decorated_pot_waterlogged(state).is_some()
         || native_world::collision::hopper_facing(state).is_some()
@@ -614,6 +615,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || jigsaw_carpet(state)
                 || jigsaw_ladder(state)
                 || jigsaw_button(state)
+                || native_world::collision::pressure_plate_pressed(state).is_some()
                 || jigsaw_cobweb(state)
                 || jigsaw_chain(state)
                 || jigsaw_speleothem(state);

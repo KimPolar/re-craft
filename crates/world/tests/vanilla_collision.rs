@@ -366,6 +366,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut outlines_checked = 0usize;
     let mut glow_lichen_checked = 0usize;
     let mut button_states_checked = 0usize;
+    let mut pressure_plate_states_checked = 0usize;
     let mut lever_states_checked = 0usize;
     let mut single_chest_states_checked = 0usize;
     let mut double_chest_states_checked = 0usize;
@@ -588,6 +589,13 @@ fn implemented_collision_shapes_match_vanilla_states() {
             );
             button_states_checked += 1;
         }
+        if id.ends_with("_pressure_plate") {
+            assert!(
+                block_outline(&state).is_some(),
+                "missing pressure plate outline: {state:?}"
+            );
+            pressure_plate_states_checked += 1;
+        }
         checked += 1;
         if !actual.is_empty() && id != "minecraft:snow" {
             assert_eq!(
@@ -707,6 +715,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     assert!(
         button_states_checked >= 24,
         "button states missing from Java oracle"
+    );
+    assert_eq!(
+        pressure_plate_states_checked, 62,
+        "missing pressure plate states"
     );
     assert_eq!(
         lever_states_checked, 24,

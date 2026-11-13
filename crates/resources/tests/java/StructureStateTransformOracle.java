@@ -46,6 +46,9 @@ public class StructureStateTransformOracle {
         states.addAll(Blocks.OAK_BUTTON.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.STONE_BUTTON.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.DISPENSER.getStateDefinition().getPossibleStates());
+        for (var block : List.of(Blocks.OAK_PRESSURE_PLATE, Blocks.STONE_PRESSURE_PLATE,
+                Blocks.LIGHT_WEIGHTED_PRESSURE_PLATE, Blocks.HEAVY_WEIGHTED_PRESSURE_PLATE))
+            states.addAll(block.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.TRIAL_SPAWNER.getStateDefinition().getPossibleStates());
         for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL,
                 Blocks.COBBLESTONE_WALL, Blocks.MOSSY_COBBLESTONE_WALL,

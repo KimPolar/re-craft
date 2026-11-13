@@ -37,6 +37,8 @@ enum StateSchema {
     Hopper,
     Button,
     Dispenser,
+    PressurePlate,
+    WeightedPressurePlate,
     TrialSpawner,
     PotentSulfur,
     SulfurSpike,
@@ -131,6 +133,8 @@ impl StateSchema {
                     ("triggered".into(), "false".into()),
                 ]);
             }
+            Self::PressurePlate => return BTreeMap::from([("powered".into(), "false".into())]),
+            Self::WeightedPressurePlate => return BTreeMap::from([("power".into(), "0".into())]),
             Self::TrialSpawner => {
                 return BTreeMap::from([
                     ("ominous".into(), "false".into()),
@@ -415,6 +419,12 @@ impl StateSchema {
             {
                 Some(value.to_owned())
             }
+            Self::PressurePlate if name == "powered" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
+            Self::WeightedPressurePlate if name == "power" => java_decimal(value)
+                .filter(|power| (0..=15).contains(power))
+                .map(|power| power.to_string()),
             Self::TrialSpawner
                 if (name == "ominous" && matches!(value, "true" | "false"))
                     || (name == "trial_spawner_state"
@@ -1084,6 +1094,12 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/HopperBlock" => Some(StateSchema::Hopper),
                 "net/minecraft/world/level/block/ButtonBlock" => Some(StateSchema::Button),
                 "net/minecraft/world/level/block/DispenserBlock" => Some(StateSchema::Dispenser),
+                "net/minecraft/world/level/block/PressurePlateBlock" => {
+                    Some(StateSchema::PressurePlate)
+                }
+                "net/minecraft/world/level/block/WeightedPressurePlateBlock" => {
+                    Some(StateSchema::WeightedPressurePlate)
+                }
                 "net/minecraft/world/level/block/TrialSpawnerBlock" => {
                     Some(StateSchema::TrialSpawner)
                 }
@@ -1300,6 +1316,8 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Candle
                 | StateSchema::CopperBulb
                 | StateSchema::TrialSpawner
+                | StateSchema::PressurePlate
+                | StateSchema::WeightedPressurePlate
                 | StateSchema::Liquid
                 | StateSchema::PotentSulfur
                 | StateSchema::SulfurSpike

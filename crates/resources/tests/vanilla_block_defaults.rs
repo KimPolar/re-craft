@@ -335,6 +335,29 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:barrel"));
     assert!(registry.contains("minecraft:hopper"));
     assert!(registry.contains("minecraft:dispenser"));
+    for button in native_core::button::Button::ALL {
+        let stem = button.id().strip_suffix("_button").unwrap();
+        let id = format!("{stem}_pressure_plate");
+        assert!(registry.contains(&id), "missing pressure plate {id}");
+    }
+    for id in [
+        "minecraft:oak_pressure_plate",
+        "minecraft:stone_pressure_plate",
+    ] {
+        assert!(registry.contains(id));
+        for powered in ["true", "false", "invalid"] {
+            cases.push(serde_json::json!({"id":id,"properties":{"powered":powered}}));
+        }
+    }
+    for id in [
+        "minecraft:light_weighted_pressure_plate",
+        "minecraft:heavy_weighted_pressure_plate",
+    ] {
+        assert!(registry.contains(id));
+        for power in ["0", "1", "15", "16", "-1", "invalid"] {
+            cases.push(serde_json::json!({"id":id,"properties":{"power":power}}));
+        }
+    }
     assert!(registry.contains("minecraft:trial_spawner"));
     for button in native_core::button::Button::ALL {
         assert!(

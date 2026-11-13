@@ -61,6 +61,46 @@ pub fn dispenser_state(state: &BlockState) -> bool {
         )
 }
 
+/// Validate a vanilla pressure plate and return whether it is pressed.
+pub fn pressure_plate_pressed(state: &BlockState) -> Option<bool> {
+    if state.properties.len() != 1 {
+        return None;
+    }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:light_weighted_pressure_plate" | "minecraft:heavy_weighted_pressure_plate"
+    ) {
+        let value = state.properties.get("power")?;
+        let power = value.parse::<u8>().ok()?;
+        return (power <= 15 && power.to_string() == *value).then_some(power != 0);
+    }
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:stone_pressure_plate"
+            | "minecraft:polished_blackstone_pressure_plate"
+            | "minecraft:oak_pressure_plate"
+            | "minecraft:spruce_pressure_plate"
+            | "minecraft:birch_pressure_plate"
+            | "minecraft:jungle_pressure_plate"
+            | "minecraft:acacia_pressure_plate"
+            | "minecraft:cherry_pressure_plate"
+            | "minecraft:dark_oak_pressure_plate"
+            | "minecraft:pale_oak_pressure_plate"
+            | "minecraft:mangrove_pressure_plate"
+            | "minecraft:poplar_pressure_plate"
+            | "minecraft:bamboo_pressure_plate"
+            | "minecraft:crimson_pressure_plate"
+            | "minecraft:warped_pressure_plate"
+    ) {
+        return None;
+    }
+    match state.properties.get("powered")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Validate a hopper and return its output direction.
 pub fn hopper_facing(state: &BlockState) -> Option<&str> {
     if state.name != "minecraft:hopper"
@@ -630,6 +670,28 @@ fn full_cube_checks_union_and_outside_volume() {
     assert!(!is_full_cube(BOTTOM_SLAB));
     assert!(!is_full_cube(&[cuboid(-0.1, 0.0, 0.0, 1.0, 1.0, 1.0)]));
     assert!(!is_full_cube(EMPTY));
+}
+
+#[cfg(test)]
+#[test]
+fn pressure_plate_validates_state_and_pressed_outline() {
+    use std::collections::BTreeMap;
+    let mut plate = BlockState {
+        name: "minecraft:oak_pressure_plate".into(),
+        properties: BTreeMap::from([("powered".into(), "false".into())]),
+    };
+    assert_eq!(pressure_plate_pressed(&plate), Some(false));
+    assert_eq!(block_outline(&plate).unwrap()[0].max.y, 1.0 / 16.0);
+    assert!(block_shape(&plate).unwrap().is_empty());
+    plate.properties.insert("powered".into(), "true".into());
+    assert_eq!(block_outline(&plate).unwrap()[0].max.y, 1.0 / 32.0);
+    plate.name = "minecraft:light_weighted_pressure_plate".into();
+    plate.properties = BTreeMap::from([("power".into(), "15".into())]);
+    assert_eq!(pressure_plate_pressed(&plate), Some(true));
+    plate.properties.insert("power".into(), "16".into());
+    assert_eq!(pressure_plate_pressed(&plate), None);
+    plate.properties.insert("power".into(), "01".into());
+    assert_eq!(pressure_plate_pressed(&plate), None);
 }
 
 /// Full-face support for the currently verified block families. Some blocks
@@ -1329,6 +1391,9 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if pressure_plate_pressed(state).is_some() {
+        return Some(EMPTY.to_vec());
+    }
     if let Some(facing) = hopper_facing(state) {
         let mut boxes = vec![
             pixel_box(4.0, 4.0, 4.0, 12.0, 11.0, 12.0),
@@ -1847,6 +1912,16 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    if let Some(pressed) = pressure_plate_pressed(state) {
+        return Some(vec![pixel_box(
+            1.0,
+            0.0,
+            1.0,
+            15.0,
+            if pressed { 0.5 } else { 1.0 },
+            15.0,
+        )]);
+    }
     if state.name == "minecraft:glow_lichen" {
         return glow_lichen_faces(state).map(glow_lichen_outline);
     }

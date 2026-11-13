@@ -628,6 +628,265 @@ impl Drop for MissingGenerationBiomeWorker {
     }
 }
 
+/// A bounded terrain pass. Saved terrain remains separate and needs its own
+/// restoration and live-state validation before later stages can use it.
+pub(crate) struct TerrainBatchMissingGeneration {
+    state: BiomedMissingGeneration,
+    generated: Vec<ChunkPos>,
+    saved: Vec<(
+        ChunkPos,
+        native_session::worldgen::schedule::GenerationStage,
+    )>,
+    remaining: usize,
+}
+
+impl TerrainBatchMissingGeneration {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.state.is_current(streamer, session)
+    }
+    pub fn generated(&self) -> &[ChunkPos] {
+        &self.generated
+    }
+    pub fn saved(
+        &self,
+    ) -> &[(
+        ChunkPos,
+        native_session::worldgen::schedule::GenerationStage,
+    )] {
+        &self.saved
+    }
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Continue with the same generator and evaluator after rechecking the
+    /// observed targets. This does not establish live or save safety.
+    pub fn into_checked_state(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<BiomedMissingGeneration> {
+        if !self.state.is_current(streamer, session) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("terrain generation is stale");
+        }
+        Ok(self.state)
+    }
+}
+
+pub(crate) struct MissingGenerationTerrainStartError {
+    pub biomed: BiomedMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationTerrainWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<TerrainBatchMissingGeneration>>,
+    finished: bool,
+}
+
+impl MissingGenerationTerrainWorker {
+    /// For multiple structure keys the caller must supply the corresponding
+    /// Java iteration order. Single-key and empty sets have a unique order.
+    pub fn start(
+        biomed: BiomedMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        limit: usize,
+        structure_orders: BTreeMap<ChunkPos, Vec<native_resources::packs::ResourceId>>,
+    ) -> std::result::Result<Self, MissingGenerationTerrainStartError> {
+        if !biomed.is_current(streamer, session) || limit == 0 {
+            let error = if limit == 0 {
+                "terrain generation limit must be positive"
+            } else {
+                "biome generation is stale"
+            };
+            return Err(MissingGenerationTerrainStartError {
+                biomed,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = biomed.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            biomed,
+            move |mut state| {
+                let result = (|| -> Result<TerrainBatchMissingGeneration> {
+                    use crate::fresh_generation::existing::CapturedTerrainInput;
+                    use native_session::worldgen::schedule::GenerationStage;
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "terrain generation cancelled"
+                    );
+                    anyhow::ensure!(
+                        state.observed.stamp.is_current(),
+                        "biome generation is stale"
+                    );
+                    let mut seen = BTreeSet::new();
+                    let positions: Vec<_> = state
+                        .observed
+                        .targets()
+                        .iter()
+                        .copied()
+                        .chain(state.work.schedule().requirements().filter_map(
+                            |(pos, required)| (required >= GenerationStage::Terrain).then_some(pos),
+                        ))
+                        .filter(|pos| seen.insert(*pos))
+                        .collect();
+                    let mut generated = Vec::new();
+                    let mut saved = Vec::new();
+                    let mut remaining = 0;
+                    for position in positions {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "terrain generation cancelled"
+                        );
+                        anyhow::ensure!(
+                            state.observed.stamp.is_current(),
+                            "biome generation is stale"
+                        );
+                        if state
+                            .work
+                            .schedule()
+                            .completed(position)
+                            .is_some_and(|stage| stage >= GenerationStage::Terrain)
+                        {
+                            continue;
+                        }
+                        let input = state
+                            .generator
+                            .captured_terrain_input(&state.work, position)?;
+                        let (resume, keys) = match input {
+                            CapturedTerrainInput::Saved { stage } => {
+                                anyhow::ensure!(
+                                    state.terrain.world().chunks.contains_key(&position),
+                                    "saved terrain was not restored"
+                                );
+                                saved.push((position, stage));
+                                continue;
+                            }
+                            CapturedTerrainInput::New { structure_keys } => (false, structure_keys),
+                            CapturedTerrainInput::Resume { structure_keys } => {
+                                (true, structure_keys)
+                            }
+                        };
+                        if generated.len() == limit {
+                            remaining += 1;
+                            continue;
+                        }
+                        let order = if let Some(order) = structure_orders.get(&position) {
+                            let actual: BTreeSet<_> = order.iter().cloned().collect();
+                            let expected: BTreeSet<_> = keys.iter().cloned().collect();
+                            anyhow::ensure!(
+                                order.len() == actual.len() && actual == expected,
+                                "structure order does not cover references exactly"
+                            );
+                            order.as_slice()
+                        } else {
+                            anyhow::ensure!(
+                                keys.len() <= 1,
+                                "Java structure order is required for terrain {},{}",
+                                position.x,
+                                position.z
+                            );
+                            keys.as_slice()
+                        };
+                        if resume {
+                            state.generator.run_captured_saved_terrain(
+                                &mut state.work,
+                                &mut state.evaluator,
+                                position,
+                                order,
+                            )?;
+                        } else {
+                            state
+                                .generator
+                                .run_captured_new_terrain_with_structure_order(
+                                    &mut state.work,
+                                    &mut state.evaluator,
+                                    position,
+                                    order,
+                                )?;
+                        }
+                        generated.push(position);
+                    }
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "terrain generation cancelled"
+                    );
+                    anyhow::ensure!(
+                        state.observed.stamp.is_current(),
+                        "biome generation is stale"
+                    );
+                    Ok(TerrainBatchMissingGeneration {
+                        state,
+                        generated,
+                        saved,
+                        remaining,
+                    })
+                })();
+                let _ = sender.send(result);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-terrain".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(biomed, error)| MissingGenerationTerrainStartError {
+            biomed,
+            error: anyhow::Error::new(error).context("cannot start terrain generation"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<TerrainBatchMissingGeneration>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("terrain generation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(work) = result {
+                crate::generation_staging::discard_async(work);
+            }
+            anyhow::bail!("terrain generation was cancelled or became stale");
+        }
+        Ok(Some(result?))
+    }
+}
+
+impl Drop for MissingGenerationTerrainWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 impl MissingGenerationTargets {
     pub fn targets(&self) -> &[ChunkPos] {
         &self.targets
@@ -1851,6 +2110,79 @@ mod tests {
             evaluator,
             observed,
         };
+        let failure = match MissingGenerationTerrainWorker::start(
+            biomed,
+            &streamer,
+            &session,
+            0,
+            BTreeMap::new(),
+        ) {
+            Ok(_) => anyhow::bail!("zero terrain budget was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("positive"));
+        let mut terrain_worker = MissingGenerationTerrainWorker::start(
+            failure.biomed,
+            &streamer,
+            &session,
+            1,
+            BTreeMap::new(),
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let first_terrain = loop {
+            if let Some(result) = terrain_worker.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "terrain generation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(first_terrain.generated(), &[target]);
+        assert!(first_terrain.saved().is_empty());
+        assert!(first_terrain.remaining() > 0);
+        let first_remaining = first_terrain.remaining();
+        assert_eq!(
+            first_terrain.state.work.schedule().completed(target),
+            Some(GenerationStage::Terrain)
+        );
+        assert!(
+            first_terrain
+                .state
+                .work
+                .new_terrain_chunk(SavedChunkPos {
+                    x: target.x,
+                    z: target.z
+                })
+                .is_some()
+        );
+        let biomed = first_terrain.into_checked_state(&streamer, &session)?;
+        let mut second_terrain_worker =
+            MissingGenerationTerrainWorker::start(biomed, &streamer, &session, 1, BTreeMap::new())
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let second_terrain = loop {
+            if let Some(result) = second_terrain_worker.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "second terrain generation timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(second_terrain.generated().len(), 1);
+        assert_ne!(second_terrain.generated()[0], target);
+        assert_eq!(second_terrain.remaining() + 1, first_remaining);
+        assert!(
+            second_terrain
+                .state
+                .work
+                .new_terrain_chunk(SavedChunkPos {
+                    x: target.x,
+                    z: target.z
+                })
+                .is_some()
+        );
         let captured = capture_again()?;
         let mut prepare_cancelled_biomes =
             MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
@@ -1913,9 +2245,10 @@ mod tests {
         let stale_capture = capture_again()?;
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!prepared.is_current(&streamer, &session));
-        assert!(!biomed.is_current(&streamer, &session));
+        assert!(!second_terrain.is_current(&streamer, &session));
         assert!(
-            biomed
+            second_terrain
+                .state
                 .generator
                 .verify_live_inputs(&session, &biome_live)
                 .is_err()
@@ -1945,12 +2278,256 @@ mod tests {
                 .into_checked_parts(&streamer, &session)
                 .is_err()
         );
-        assert!(biomed.into_checked_parts(&streamer, &session).is_err());
+        assert!(
+            second_terrain
+                .into_checked_state(&streamer, &session)
+                .is_err()
+        );
+        drop(second_terrain_worker);
+        drop(terrain_worker);
         drop(cancelled_biomes);
         drop(prepare_cancelled_biomes);
         drop(biome_worker);
         drop(prepare_biomes);
         drop(cancelled);
+        drop(prepare);
+        drop(capture);
+        drop(streamer);
+        drop(guard);
+        wait_for_world_unlock(world.path());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn missing_generation_preserves_saved_terrain_neighbor() -> Result<()> {
+        use native_persistence::{
+            nbt::{self, NamedTag, Tag, TagType},
+            world::DimensionId,
+            worldgen_settings::{NewWorldOptions, draft_baked_worldgen_settings},
+        };
+        use native_session::worldgen::schedule::GenerationStage;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let (world, reader) = locked_world_fixture();
+        let guard = reader.session_guard().context("session guard missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let settings = draft_baked_worldgen_settings(
+            &mut resources,
+            "minecraft:normal",
+            NewWorldOptions {
+                seed: 42,
+                generate_structures: false,
+                bonus_chest: false,
+            },
+        )?;
+        std::fs::create_dir_all(world.path().join("data/minecraft"))?;
+        std::fs::create_dir_all(world.path().join("datapacks"))?;
+        std::fs::write(
+            world.path().join("data/minecraft/world_gen_settings.dat"),
+            nbt::write(&settings)?,
+        )?;
+        let saved_pos = ChunkPos { x: 1, z: 0 };
+        let sections = (-4i8..20)
+            .map(|y| {
+                Tag::Compound(vec![
+                    ("Y".into(), Tag::Byte(y)),
+                    (
+                        "block_states".into(),
+                        Tag::Compound(vec![(
+                            "palette".into(),
+                            Tag::List {
+                                element_type: TagType::String,
+                                values: vec![Tag::String("minecraft:air".into())],
+                            },
+                        )]),
+                    ),
+                    (
+                        "biomes".into(),
+                        Tag::Compound(vec![(
+                            "palette".into(),
+                            Tag::List {
+                                element_type: TagType::String,
+                                values: vec![Tag::String("minecraft:plains".into())],
+                            },
+                        )]),
+                    ),
+                ])
+            })
+            .collect();
+        let saved = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("xPos".into(), Tag::Int(saved_pos.x)),
+                ("zPos".into(), Tag::Int(saved_pos.z)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+                ("custom".into(), Tag::Int(73)),
+                (
+                    "sections".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: sections,
+                    },
+                ),
+                (
+                    "structures".into(),
+                    Tag::Compound(vec![
+                        ("starts".into(), Tag::Compound(vec![])),
+                        ("References".into(), Tag::Compound(vec![])),
+                    ]),
+                ),
+            ]),
+        };
+        let bytes = nbt::write(&saved)?;
+        let sectors = (bytes.len() + 5).div_ceil(4096);
+        anyhow::ensure!(sectors < 256, "saved terrain fixture is too large");
+        let mut region = vec![0; 8192 + sectors * 4096];
+        region[4..8].copy_from_slice(&((2u32 << 8) | sectors as u32).to_be_bytes());
+        region[8192..8196].copy_from_slice(&u32::try_from(bytes.len() + 1)?.to_be_bytes());
+        region[8196] = 3;
+        region[8197..8197 + bytes.len()].copy_from_slice(&bytes);
+        let region_dir = world.path().join("dimensions/minecraft/overworld/region");
+        std::fs::create_dir_all(&region_dir)?;
+        let region_path = region_dir.join("r.0.0.mca");
+        std::fs::write(&region_path, &region)?;
+        let player = PlayerState {
+            position: Vec3::new(8.5, 80.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            World::new("minecraft:overworld"),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: -64,
+                max_y: 320,
+            },
+            player,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut streamer = ChunkStreamer::start(reader, BTreeMap::new(), 1, BTreeSet::new(), None)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            streamer.service(&mut session)?;
+            session.update(Duration::from_millis(50));
+            if streamer.pending.is_empty()
+                && streamer.missing.len() == 8
+                && session.has_chunk_or_pending(saved_pos)
+            {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "saved terrain streaming timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let targets = streamer
+            .missing_generation_targets(&session, 1)
+            .context("targets missing")?;
+        let target = targets.targets()[0];
+        let reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld")?,
+            guard.clone(),
+        )?;
+        let mut capture =
+            MissingGenerationCaptureWorker::start(targets, &streamer, &session, reader)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let captured = loop {
+            if let Some(result) = capture.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "capture timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut prepare =
+            MissingGenerationPrepareWorker::start(captured, &streamer, &session, game)
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared = loop {
+            if let Some(result) = prepare.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "preparation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(prepared.terrain.world().chunks.contains_key(&saved_pos));
+        let mut biome = MissingGenerationBiomeWorker::start(prepared, &streamer, &session)
+            .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let biomed = loop {
+            if let Some(result) = biome.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "biome generation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut terrain =
+            MissingGenerationTerrainWorker::start(biomed, &streamer, &session, 1, BTreeMap::new())
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let result = loop {
+            if let Some(result) = terrain.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "terrain generation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(result.generated(), &[target]);
+        assert!(result.saved().contains(&(saved_pos, GenerationStage::Full)));
+        assert_eq!(
+            result.state.work.schedule().completed(saved_pos),
+            Some(GenerationStage::Biomes)
+        );
+        assert!(
+            result
+                .state
+                .work
+                .new_terrain_chunk(SavedChunkPos {
+                    x: saved_pos.x,
+                    z: saved_pos.z
+                })
+                .is_none()
+        );
+        assert_eq!(
+            result
+                .state
+                .terrain
+                .world()
+                .block(16, 0, 0)
+                .map(|state| state.name.as_str()),
+            Some("minecraft:air")
+        );
+        assert_eq!(std::fs::read(&region_path)?, region);
+        let state = result.into_checked_state(&streamer, &session)?;
+        let mut cancelled =
+            MissingGenerationTerrainWorker::start(state, &streamer, &session, 1, BTreeMap::new())
+                .map_err(|failure| failure.error)?;
+        cancelled.cancel();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match cancelled.try_result(&streamer, &session) {
+                Err(error) => {
+                    assert!(error.to_string().contains("cancelled"));
+                    break;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("cancelled terrain was published"),
+            }
+            anyhow::ensure!(Instant::now() < deadline, "terrain cancellation timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(std::fs::read(&region_path)?, region);
+        drop(cancelled);
+        drop(terrain);
+        drop(biome);
         drop(prepare);
         drop(capture);
         drop(streamer);

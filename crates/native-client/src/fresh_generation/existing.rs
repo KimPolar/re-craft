@@ -221,6 +221,18 @@ struct CapturedGeneratedReferences {
     references: native_session::worldgen::structure_references::OrderedStructureReferences,
 }
 
+pub(crate) enum CapturedTerrainInput {
+    New {
+        structure_keys: Vec<ResourceId>,
+    },
+    Resume {
+        structure_keys: Vec<ResourceId>,
+    },
+    Saved {
+        stage: native_session::worldgen::schedule::GenerationStage,
+    },
+}
+
 /// Intermediate terrain assembled from one capture. `None` in `sources`
 /// means terrain was absent at capture; entity and POI sidecars are separate.
 /// Features, lighting, live-state validation and saving remain unfinished.
@@ -4729,6 +4741,79 @@ impl PreparedExistingGenerator {
         }
         work.schedule
             .run_biomes(&mut self.generator, evaluator, &mut work.biomes, position)
+    }
+
+    /// Identify which terrain work can be generated from this capture. Saved
+    /// terrain is reported separately and must never be regenerated in place.
+    pub fn captured_terrain_input(
+        &mut self,
+        work: &CapturedBiomeSchedule,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<CapturedTerrainInput> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &work.identity),
+            "terrain belongs to another generation capture"
+        );
+        ensure!(
+            work.schedule
+                .required(position)
+                .is_some_and(|stage| stage >= GenerationStage::Terrain),
+            "terrain chunk is not required"
+        );
+        let key = native_persistence::world::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&key)
+            .context("terrain source was not captured")?;
+        let status = source
+            .terrain
+            .as_ref()
+            .map(|saved| {
+                ensure!(
+                    saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
+                    "unsupported saved terrain data version"
+                );
+                let status = saved
+                    .status
+                    .as_ref()
+                    .context("saved chunk status is missing")?;
+                let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+                GenerationStage::from_id(&status).context("unknown saved chunk status")
+            })
+            .transpose()?;
+        if let Some(stage) = status.filter(|stage| *stage >= GenerationStage::Terrain) {
+            return Ok(CapturedTerrainInput::Saved { stage });
+        }
+        let keys = if status.is_some_and(|stage| stage >= GenerationStage::StructureReferences) {
+            let references = self.restore_saved_structure_references(key)?;
+            validate_saved_decoration_references(&references)?;
+            references.references.membership().keys().cloned().collect()
+        } else {
+            work.generated_references
+                .get(&position)
+                .context("generated structure references are missing")?
+                .references
+                .membership()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        Ok(if status.is_some() {
+            CapturedTerrainInput::Resume {
+                structure_keys: keys,
+            }
+        } else {
+            CapturedTerrainInput::New {
+                structure_keys: keys,
+            }
+        })
     }
 
     /// Resume a captured protochunk using the schedule's already restored or

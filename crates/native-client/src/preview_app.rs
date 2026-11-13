@@ -25,7 +25,7 @@ use winit::{
 use crate::{
     chunk_stream::ChunkStreamer,
     frame_pacer::FramePacer,
-    game_ui::{GameUi, PauseAction, hotbar_key, inventory_swap_key},
+    game_ui::{GameUi, PauseAction, inventory_swap_key},
     menu_assets::MenuAssets,
     menu_settings::VideoSettings,
     mesh_worker::{MeshJob, MeshWorker},
@@ -2156,17 +2156,14 @@ impl ApplicationHandler for Viewer {
                         }
                         return;
                     }
-                    if pressed && code == KeyCode::KeyQ && self.captured {
+                    if let Some(command) = crate::gameplay_key_command(
+                        code,
+                        pressed,
+                        self.captured,
+                        self.inventory_control,
+                    ) {
                         if let Some(play) = &mut self.play {
-                            play.session.submit_command(PlayerCommand::DropSelected {
-                                all: self.inventory_control,
-                            });
-                        }
-                        return;
-                    }
-                    if pressed && !event.repeat && code == KeyCode::KeyF && self.captured {
-                        if let Some(play) = &mut self.play {
-                            play.session.submit_command(PlayerCommand::SwapHands);
+                            play.session.submit_command(command);
                         }
                         return;
                     }
@@ -2200,13 +2197,6 @@ impl ApplicationHandler for Viewer {
                             event.repeat,
                             self.play.is_some() && self.video.toggle_sprint,
                         ),
-                        code if pressed && !event.repeat && hotbar_key(code).is_some() => {
-                            if let Some(play) = &mut self.play {
-                                play.session.submit_command(PlayerCommand::SelectSlot(
-                                    hotbar_key(code).unwrap(),
-                                ));
-                            }
-                        }
                         _ => {}
                     }
                     self.submit_movement();

@@ -156,16 +156,15 @@ impl ToggleKey {
         self.down
     }
 
-    pub fn set(&mut self, left: bool, pressed: bool, repeat: bool, toggle: bool) {
+    pub fn set(&mut self, left: bool, pressed: bool, _repeat: bool, toggle: bool) {
         let side = if left {
             &mut self.left
         } else {
             &mut self.right
         };
-        let was_pressed = *side;
         *side = pressed;
         if toggle {
-            if pressed && !repeat && !was_pressed {
+            if pressed {
                 self.down = !self.down;
             }
         } else {
@@ -262,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_supports_both_keys_and_toggle_ignores_release_and_repeats() {
+    fn hold_supports_both_keys_and_toggle_repeats_match_java() {
         let mut key = ToggleKey::default();
         key.set(true, true, false, false);
         key.set(false, true, false, false);
@@ -271,6 +270,9 @@ mod tests {
         key.set(false, false, false, false);
         assert!(!key.down());
         key.set(true, true, false, true);
+        assert!(key.down());
+        key.set(true, true, true, true);
+        assert!(!key.down());
         key.set(true, true, true, true);
         key.set(true, false, false, true);
         assert!(key.down());
@@ -409,7 +411,7 @@ public class ToggleOracle {
                 case "hold" -> toggle.set(false);
                 case "down" -> key.setDown(true);
                 case "up" -> key.setDown(false);
-                case "repeat" -> { }
+                case "repeat" -> key.setDown(true);
                 case "mouse_attack" -> key = new Key(toggle, true);
                 case "mouse_use" -> key = new Key(toggle, false);
                 case "screen" -> key.screen();

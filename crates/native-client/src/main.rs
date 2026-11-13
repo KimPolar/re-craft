@@ -2117,6 +2117,22 @@ fn screenshot_shortcut(key: PhysicalKey, state: ElementState, repeat: bool) -> b
     key == PhysicalKey::Code(KeyCode::F2) && state == ElementState::Pressed && !repeat
 }
 
+fn gameplay_key_command(
+    code: KeyCode,
+    pressed: bool,
+    captured: bool,
+    control: bool,
+) -> Option<PlayerCommand> {
+    if !pressed {
+        return None;
+    }
+    match code {
+        KeyCode::KeyQ if captured => Some(PlayerCommand::DropSelected { all: control }),
+        KeyCode::KeyF if captured => Some(PlayerCommand::SwapHands),
+        code => hotbar_key(code).map(PlayerCommand::SelectSlot),
+    }
+}
+
 fn request_game_screenshot(ui: &Option<GameUi>, renderer: &mut Option<Renderer>) {
     if let (Some(ui), Some(renderer)) = (ui, renderer) {
         renderer.request_screenshot(ui.minecraft_dir().to_owned());
@@ -2665,14 +2681,10 @@ impl App {
             }
             return;
         }
-        if pressed && code == KeyCode::KeyQ && self.captured {
-            self.session.submit_command(PlayerCommand::DropSelected {
-                all: self.inventory_control,
-            });
-            return;
-        }
-        if pressed && !repeat && code == KeyCode::KeyF && self.captured {
-            self.session.submit_command(PlayerCommand::SwapHands);
+        if let Some(command) =
+            gameplay_key_command(code, pressed, self.captured, self.inventory_control)
+        {
+            self.session.submit_command(command);
             return;
         }
         match code {
@@ -2701,9 +2713,6 @@ impl App {
                     .sneak
                     .set(false, pressed, repeat, self.video.toggle_sneak)
             }
-            code if pressed && !repeat && hotbar_key(code).is_some() => self
-                .session
-                .submit_command(PlayerCommand::SelectSlot(hotbar_key(code).unwrap())),
             _ => return,
         }
         self.input.submit(&mut self.session);
@@ -3416,6 +3425,52 @@ impl ApplicationHandler for App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gameplay_key_tests {
+    use super::*;
+    use native_session::{GameSession, inventory::PlayerSlot};
+
+    #[test]
+    fn repeated_gameplay_keys_submit_each_click_on_a_tick() {
+        let mut session = LocalSession::demo();
+        let original = session
+            .snapshot()
+            .inventory
+            .slot(PlayerSlot::Storage(0))
+            .cloned();
+        assert!(original.is_some());
+        for expected_offhand in [true, false, true] {
+            // The second and third presses represent OS repeat events.
+            let command = gameplay_key_command(KeyCode::KeyF, true, true, false).unwrap();
+            session.submit_command(command);
+            session.update(Duration::from_millis(50));
+            assert_eq!(
+                session
+                    .snapshot()
+                    .inventory
+                    .slot(PlayerSlot::Offhand)
+                    .is_some(),
+                expected_offhand
+            );
+        }
+        for (code, selected) in [
+            (KeyCode::Digit1, 0),
+            (KeyCode::Digit2, 1),
+            (KeyCode::Digit1, 0),
+        ] {
+            session.submit_command(gameplay_key_command(code, true, true, false).unwrap());
+            session.update(Duration::from_millis(50));
+            assert_eq!(session.snapshot().inventory.selected(), selected);
+        }
+        assert!(gameplay_key_command(KeyCode::KeyF, false, true, false).is_none());
+        assert!(gameplay_key_command(KeyCode::KeyF, true, false, false).is_none());
+        assert!(matches!(
+            gameplay_key_command(KeyCode::KeyQ, true, true, true),
+            Some(PlayerCommand::DropSelected { all: true })
+        ));
     }
 }
 

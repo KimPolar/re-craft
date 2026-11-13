@@ -520,6 +520,40 @@ impl CapturedPostprocessingStage {
         self.waiting_neighbor
     }
 
+    /// Request a deferred converted chunk at a callback boundary. The caller
+    /// controls the order in which Java would start the chunk passes.
+    pub fn request_converted_chunk(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        ensure!(
+            self.matches_state(
+                batch,
+                light,
+                spawn_mobs,
+                game_time,
+                next_sub_tick,
+                water_source_conversion
+            ),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            self.waiting_neighbor.is_none() && self.retry_target.is_none(),
+            "finish the interrupted callback before requesting another chunk"
+        );
+        ensure!(
+            self.proofs.contains_key(&position),
+            "postprocessing chunk was not captured"
+        );
+        self.stage.request_converted_chunk(position)
+    }
+
     pub fn matches_state(
         &self,
         batch: &CapturedTerrainBatch,
@@ -1928,6 +1962,41 @@ impl PreparedExistingGenerator {
             waiting_neighbor: None,
             retry_target: None,
         })
+    }
+
+    /// Start only selected chunks while retaining the other converted chunks
+    /// as deferred neighbors for later, explicitly ordered requests.
+    pub fn run_captured_postprocessing_for_targets(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        region: CapturedConvertedRegion,
+        targets: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<CapturedPostprocessingStage> {
+        let mut selected = BTreeSet::new();
+        for position in targets {
+            ensure!(selected.insert(position), "duplicate postprocessing target");
+            ensure!(
+                region.proofs.contains_key(&position),
+                "postprocessing target is not converted"
+            );
+        }
+        ensure!(!selected.is_empty(), "no postprocessing targets");
+        let mut stage = self.run_captured_postprocessing(
+            batch,
+            light,
+            region,
+            spawn_mobs,
+            game_time,
+            next_sub_tick,
+            water_source_conversion,
+        )?;
+        stage.stage.select_initial_targets(selected)?;
+        Ok(stage)
     }
 
     /// Supply exactly the converted neighbor requested by the most recent
@@ -6997,6 +7066,38 @@ mod tests {
                 .run_captured_postprocessing(&batch, &staged, invalid_region, false, 42, 9, true,)
                 .is_err()
         );
+        let invalid_targets =
+            actual.begin_captured_postprocessing_region(&batch, &staged, [&new_spawn], 42, 9)?;
+        assert!(
+            actual
+                .run_captured_postprocessing_for_targets(
+                    &batch,
+                    &staged,
+                    invalid_targets,
+                    [target, target],
+                    false,
+                    42,
+                    9,
+                    true,
+                )
+                .is_err()
+        );
+        let invalid_targets =
+            actual.begin_captured_postprocessing_region(&batch, &staged, [&new_spawn], 42, 9)?;
+        assert!(
+            actual
+                .run_captured_postprocessing_for_targets(
+                    &batch,
+                    &staged,
+                    invalid_targets,
+                    [second],
+                    false,
+                    42,
+                    9,
+                    true,
+                )
+                .is_err()
+        );
         let pass_region = actual.begin_captured_postprocessing_region(
             &batch,
             &staged,
@@ -7004,8 +7105,16 @@ mod tests {
             42,
             9,
         )?;
-        let mut pass =
-            actual.run_captured_postprocessing(&batch, &staged, pass_region, false, 42, 9, true)?;
+        let mut pass = actual.run_captured_postprocessing_for_targets(
+            &batch,
+            &staged,
+            pass_region,
+            [target],
+            false,
+            42,
+            9,
+            true,
+        )?;
         assert!(pass.matches_state(&batch, &staged, false, 42, 9, true));
         assert!(!pass.matches_state(&batch, &staged, false, 43, 9, true));
         assert!(!pass.matches_state(&batch, &staged, false, 42, 9, false));
@@ -7013,12 +7122,34 @@ mod tests {
             pass.try_poll(&batch, &staged, false, 43, 9, true, target, 1)
                 .is_err()
         );
+        assert!(
+            pass.try_poll(&batch, &staged, false, 42, 9, true, second, 1)
+                .is_err()
+        );
+        assert!(
+            pass.request_converted_chunk(&batch, &staged, false, 43, 9, true, second)
+                .is_err()
+        );
+        assert!(
+            pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, neighbor)
+                .is_err()
+        );
+        pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, second)?;
+        assert!(
+            pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, second)
+                .is_err()
+        );
+        pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, third)?;
         let before_pass = batch.terrain.snapshot();
         assert_eq!(
             pass.try_poll(&batch, &staged, false, 42, 9, true, target, 1)?,
             native_session::worldgen::PostprocessingAttempt::NeedsChunk(neighbor),
         );
         assert_eq!(pass.waiting_neighbor(), Some(neighbor));
+        assert!(
+            pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, third)
+                .is_err()
+        );
         assert!(
             pass.try_poll(&batch, &staged, false, 42, 9, true, target, 1)
                 .is_err()
@@ -7064,6 +7195,10 @@ mod tests {
         )?;
         assert_eq!(pass.waiting_neighbor(), None);
         assert!(pass.proofs.contains_key(&neighbor));
+        assert!(
+            pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, neighbor)
+                .is_err()
+        );
         assert!(
             actual
                 .add_captured_postprocessing_neighbor(

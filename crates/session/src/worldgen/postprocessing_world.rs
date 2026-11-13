@@ -828,7 +828,9 @@ impl GeneratedPostprocessing {
         Ok(())
     }
 
-    pub(super) fn select_initial_targets(&mut self, targets: BTreeSet<ChunkPos>) -> Result<()> {
+    /// Choose which converted chunks run now; other registered chunks remain
+    /// available as deferred neighbors until explicitly requested.
+    pub fn select_initial_targets(&mut self, targets: BTreeSet<ChunkPos>) -> Result<()> {
         ensure!(
             !self.failed && self.active.is_none() && self.completed.is_empty(),
             "postprocessing already started"

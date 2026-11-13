@@ -5316,6 +5316,8 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if jigsaw::jigsaw_torch(state)
         || jigsaw::jigsaw_candle(state)
         || jigsaw::jigsaw_button(state)
+        || native_world::collision::tripwire_attached(state).is_some()
+        || native_world::collision::tripwire_hook_facing(state).is_some()
         || native_world::collision::flower_pot(state)
     {
         return Ok((false, false));
@@ -8092,6 +8094,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || jigsaw::jigsaw_ladder(state)
                             || jigsaw::jigsaw_button(state)
                             || native_world::collision::pressure_plate_pressed(state).is_some()
+                            || native_world::collision::tripwire_attached(state).is_some()
+                            || native_world::collision::tripwire_hook_facing(state).is_some()
                             || jigsaw::jigsaw_cobweb(state)
                             || jigsaw::jigsaw_chain(state)
                             || jigsaw::jigsaw_speleothem(state))
@@ -8126,7 +8130,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                             || native_world::collision::hopper_facing(state).is_some()
                                             || native_world::collision::trial_spawner_state(state).is_some()
                                             || native_world::collision::decorated_pot_waterlogged(state).is_some()))
-                                    || ((jigsaw::jigsaw_carpet(state) || jigsaw::jigsaw_ladder(state) || jigsaw::jigsaw_button(state) || native_world::collision::pressure_plate_pressed(state).is_some())
+                                    || ((jigsaw::jigsaw_carpet(state) || jigsaw::jigsaw_ladder(state) || jigsaw::jigsaw_button(state) || native_world::collision::pressure_plate_pressed(state).is_some() || native_world::collision::tripwire_attached(state).is_some() || native_world::collision::tripwire_hook_facing(state).is_some())
                                         && (disk_safe_solid(&old.name).is_some()
                                             || jigsaw::jigsaw_static_full(&old).is_ok()))
                                     || (native_world::wall::Wall::from_state(state).is_some()
@@ -8152,6 +8156,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && !jigsaw::jigsaw_ladder(state)
                             && !jigsaw::jigsaw_button(state)
                             && native_world::collision::pressure_plate_pressed(state).is_none()
+                            && native_world::collision::tripwire_attached(state).is_none()
+                            && native_world::collision::tripwire_hook_facing(state).is_none()
                             && !jigsaw::jigsaw_chain(state)
                             && !jigsaw::jigsaw_speleothem(state)
                             && native_world::collision::pane_waterlogged(state).is_none())
@@ -13077,6 +13083,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_tripwires_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_tripwire",
+            "vine_active_self_empty_jigsaw_tripwire",
+            "vine_active_self_jigsaw_stone_tripwire",
+            "vine_active_jigsaw_tripwirehook",
+            "vine_active_self_empty_jigsaw_tripwirehook",
+            "vine_active_self_jigsaw_stone_tripwirehook",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13559,6 +13578,10 @@ mod tests {
                         "oak_button"
                     } else if mode.ends_with("_pressureplate") {
                         "oak_pressure_plate"
+                    } else if mode.ends_with("_tripwire") {
+                        "tripwire"
+                    } else if mode.ends_with("_tripwirehook") {
+                        "tripwire_hook"
                     } else if mode.ends_with("_grate") {
                         "waxed_copper_grate"
                     } else if mode.ends_with("_carpet") {
@@ -13606,6 +13629,15 @@ mod tests {
                         ]);
                     } else if mode.ends_with("_pressureplate") {
                         block.properties = BTreeMap::from([("powered".into(), "false".into())]);
+                    } else if mode.ends_with("_tripwire") {
+                        block.properties = ["attached", "disarmed", "east", "north", "powered", "south", "west"]
+                            .into_iter().map(|name| (name.into(), "false".into())).collect();
+                    } else if mode.ends_with("_tripwirehook") {
+                        block.properties = BTreeMap::from([
+                            ("attached".into(), "false".into()),
+                            ("facing".into(), "north".into()),
+                            ("powered".into(), "false".into()),
+                        ]);
                     } else if mode.ends_with("_slab") {
                         block.properties = BTreeMap::from([
                             ("type".into(), "bottom".into()),
@@ -13857,6 +13889,8 @@ mod tests {
             } else if mode.ends_with("_button") && !mode.contains("_jigsaw_stone_") {
                 0
             } else if mode.ends_with("_pressureplate") && !mode.contains("_jigsaw_stone_") {
+                0
+            } else if (mode.ends_with("_tripwire") || mode.ends_with("_tripwirehook")) && !mode.contains("_jigsaw_stone_") {
                 0
             } else if mode.ends_with("_candle") && !mode.contains("_lit_") {
                 0

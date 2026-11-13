@@ -71,6 +71,7 @@ fn installed_trial_templates_match_java_blocks_entities_and_random() -> Result<(
     ));
     let mut entities_checked = 0;
     for template in [
+        "corridor/addon/arrow_dispenser",
         "dispensers/floor_dispenser",
         "dispensers/wall_dispenser",
         "chests/supply",

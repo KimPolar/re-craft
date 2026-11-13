@@ -211,6 +211,11 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         "minecraft:barrel" if crate::collision::barrel_state(state) => (15, 0),
         "minecraft:dispenser" if crate::collision::dispenser_state(state) => (15, 0),
         _ if crate::collision::pressure_plate_pressed(state).is_some() => (0, 0),
+        _ if crate::collision::tripwire_attached(state).is_some()
+            || crate::collision::tripwire_hook_facing(state).is_some() =>
+        {
+            (0, 0)
+        }
         "minecraft:hopper" if crate::collision::hopper_facing(state).is_some() => (0, 0),
         "minecraft:trial_spawner" if crate::collision::trial_spawner_state(state).is_some() => (
             1,
@@ -2727,6 +2732,8 @@ mod tests {
             "poplar_pressure_plate",
             "light_weighted_pressure_plate",
             "heavy_weighted_pressure_plate",
+            "tripwire",
+            "tripwire_hook",
             "lantern",
             "soul_lantern",
             "glowstone",

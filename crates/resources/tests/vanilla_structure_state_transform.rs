@@ -67,6 +67,7 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     let mut button_count = 0;
     let mut dispenser_count = 0;
     let mut plate_count = 0;
+    let mut tripwire_count = 0;
     let mut trial_spawner_count = 0;
     let mut dripstone_count = 0;
     for line in text.lines().filter_map(|line| line.strip_prefix("STATE\t")) {
@@ -75,6 +76,10 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
         barrel_count += usize::from(id == "minecraft:barrel");
         hopper_count += usize::from(id == "minecraft:hopper");
         dispenser_count += usize::from(id == "minecraft:dispenser");
+        tripwire_count += usize::from(matches!(
+            id,
+            "minecraft:tripwire" | "minecraft:tripwire_hook"
+        ));
         plate_count += usize::from(matches!(
             id,
             "minecraft:oak_pressure_plate"
@@ -141,6 +146,11 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     assert_eq!(barrel_count, 12 * 12, "missing barrel state transforms");
     assert_eq!(hopper_count, 10 * 12, "missing hopper state transforms");
     assert_eq!(button_count, 2 * 24 * 12, "missing button state transforms");
+    assert_eq!(
+        tripwire_count,
+        (128 + 16) * 12,
+        "missing tripwire state transforms"
+    );
     assert_eq!(
         plate_count,
         (2 * 2 + 2 * 16) * 12,

@@ -367,6 +367,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut glow_lichen_checked = 0usize;
     let mut button_states_checked = 0usize;
     let mut pressure_plate_states_checked = 0usize;
+    let mut tripwire_states_checked = 0usize;
     let mut lever_states_checked = 0usize;
     let mut single_chest_states_checked = 0usize;
     let mut double_chest_states_checked = 0usize;
@@ -596,6 +597,13 @@ fn implemented_collision_shapes_match_vanilla_states() {
             );
             pressure_plate_states_checked += 1;
         }
+        if matches!(id, "minecraft:tripwire" | "minecraft:tripwire_hook") {
+            assert!(
+                block_outline(&state).is_some(),
+                "missing tripwire outline: {state:?}"
+            );
+            tripwire_states_checked += 1;
+        }
         checked += 1;
         if !actual.is_empty() && id != "minecraft:snow" {
             assert_eq!(
@@ -720,6 +728,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
         pressure_plate_states_checked, 62,
         "missing pressure plate states"
     );
+    assert_eq!(tripwire_states_checked, 144, "missing tripwire states");
     assert_eq!(
         lever_states_checked, 24,
         "lever states missing from Java oracle"

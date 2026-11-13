@@ -335,6 +335,13 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:barrel"));
     assert!(registry.contains("minecraft:hopper"));
     assert!(registry.contains("minecraft:dispenser"));
+    assert!(registry.contains("minecraft:tripwire"));
+    assert!(registry.contains("minecraft:tripwire_hook"));
+    for id in ["minecraft:tripwire", "minecraft:tripwire_hook"] {
+        cases.push(serde_json::json!({"id":id}));
+        cases.push(serde_json::json!({"id":id,"properties":{"attached":"true","powered":"true"}}));
+        cases.push(serde_json::json!({"id":id,"properties":{"attached":"invalid","powered":"invalid","facing":"up"}}));
+    }
     for button in native_core::button::Button::ALL {
         let stem = button.id().strip_suffix("_button").unwrap();
         let id = format!("{stem}_pressure_plate");

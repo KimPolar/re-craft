@@ -39,6 +39,8 @@ enum StateSchema {
     Dispenser,
     PressurePlate,
     WeightedPressurePlate,
+    TripWire,
+    TripWireHook,
     TrialSpawner,
     PotentSulfur,
     SulfurSpike,
@@ -135,6 +137,21 @@ impl StateSchema {
             }
             Self::PressurePlate => return BTreeMap::from([("powered".into(), "false".into())]),
             Self::WeightedPressurePlate => return BTreeMap::from([("power".into(), "0".into())]),
+            Self::TripWire => {
+                return [
+                    "attached", "disarmed", "east", "north", "powered", "south", "west",
+                ]
+                .into_iter()
+                .map(|name| (name.into(), "false".into()))
+                .collect();
+            }
+            Self::TripWireHook => {
+                return BTreeMap::from([
+                    ("attached".into(), "false".into()),
+                    ("facing".into(), "north".into()),
+                    ("powered".into(), "false".into()),
+                ]);
+            }
             Self::TrialSpawner => {
                 return BTreeMap::from([
                     ("ominous".into(), "false".into()),
@@ -425,6 +442,21 @@ impl StateSchema {
             Self::WeightedPressurePlate if name == "power" => java_decimal(value)
                 .filter(|power| (0..=15).contains(power))
                 .map(|power| power.to_string()),
+            Self::TripWire
+                if matches!(
+                    name,
+                    "attached" | "disarmed" | "east" | "north" | "powered" | "south" | "west"
+                ) && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::TripWireHook
+                if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
+                    || (matches!(name, "attached" | "powered")
+                        && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
             Self::TrialSpawner
                 if (name == "ominous" && matches!(value, "true" | "false"))
                     || (name == "trial_spawner_state"
@@ -1100,6 +1132,10 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/WeightedPressurePlateBlock" => {
                     Some(StateSchema::WeightedPressurePlate)
                 }
+                "net/minecraft/world/level/block/TripWireBlock" => Some(StateSchema::TripWire),
+                "net/minecraft/world/level/block/TripWireHookBlock" => {
+                    Some(StateSchema::TripWireHook)
+                }
                 "net/minecraft/world/level/block/TrialSpawnerBlock" => {
                     Some(StateSchema::TrialSpawner)
                 }
@@ -1349,7 +1385,10 @@ impl GeneratedBlockRegistry {
             );
             return Ok(result);
         }
-        if matches!(schema, StateSchema::Fence | StateSchema::Wall) {
+        if matches!(
+            schema,
+            StateSchema::Fence | StateSchema::Wall | StateSchema::TripWire
+        ) {
             let directions = ["north", "east", "south", "west"];
             let mut result = properties.clone();
             for (index, name) in directions.iter().enumerate() {
@@ -1380,6 +1419,7 @@ impl GeneratedBlockRegistry {
                     | StateSchema::Barrel
                     | StateSchema::Hopper
                     | StateSchema::Button
+                    | StateSchema::TripWireHook
                     | StateSchema::Dispenser
                     | StateSchema::Ladder
                     | StateSchema::Stairs

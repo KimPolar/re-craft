@@ -101,6 +101,43 @@ pub fn pressure_plate_pressed(state: &BlockState) -> Option<bool> {
     }
 }
 
+/// Validate a tripwire state and return its attachment flag.
+pub fn tripwire_attached(state: &BlockState) -> Option<bool> {
+    if state.name != "minecraft:tripwire" || state.properties.len() != 7 {
+        return None;
+    }
+    for name in [
+        "attached", "disarmed", "east", "north", "powered", "south", "west",
+    ] {
+        if !matches!(
+            state.properties.get(name).map(String::as_str),
+            Some("true" | "false")
+        ) {
+            return None;
+        }
+    }
+    Some(state.properties.get("attached")?.as_str() == "true")
+}
+
+/// Validate a tripwire hook state and return its facing.
+pub fn tripwire_hook_facing(state: &BlockState) -> Option<&str> {
+    if state.name != "minecraft:tripwire_hook"
+        || state.properties.len() != 3
+        || ["attached", "powered"].iter().any(|name| {
+            !matches!(
+                state.properties.get(*name).map(String::as_str),
+                Some("true" | "false")
+            )
+        })
+    {
+        return None;
+    }
+    match state.properties.get("facing")?.as_str() {
+        facing @ ("north" | "south" | "east" | "west") => Some(facing),
+        _ => None,
+    }
+}
+
 /// Validate a hopper and return its output direction.
 pub fn hopper_facing(state: &BlockState) -> Option<&str> {
     if state.name != "minecraft:hopper"
@@ -1391,6 +1428,9 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if tripwire_attached(state).is_some() || tripwire_hook_facing(state).is_some() {
+        return Some(EMPTY.to_vec());
+    }
     if pressure_plate_pressed(state).is_some() {
         return Some(EMPTY.to_vec());
     }
@@ -1912,6 +1952,22 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    if let Some(attached) = tripwire_attached(state) {
+        return Some(vec![if attached {
+            pixel_box(0.0, 1.0, 0.0, 16.0, 2.5, 16.0)
+        } else {
+            pixel_box(0.0, 0.0, 0.0, 16.0, 8.0, 16.0)
+        }]);
+    }
+    if let Some(facing) = tripwire_hook_facing(state) {
+        return Some(vec![match facing {
+            "north" => pixel_box(5.0, 0.0, 10.0, 11.0, 10.0, 16.0),
+            "south" => pixel_box(5.0, 0.0, 0.0, 11.0, 10.0, 6.0),
+            "west" => pixel_box(10.0, 0.0, 5.0, 16.0, 10.0, 11.0),
+            "east" => pixel_box(0.0, 0.0, 5.0, 6.0, 10.0, 11.0),
+            _ => unreachable!("validated tripwire hook facing"),
+        }]);
+    }
     if let Some(pressed) = pressure_plate_pressed(state) {
         return Some(vec![pixel_box(
             1.0,

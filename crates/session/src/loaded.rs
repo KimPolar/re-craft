@@ -879,6 +879,7 @@ pub struct LoadedSession {
     attack_charge: crate::combat::AttackCharge,
     first_person: crate::animation::FirstPersonState,
     commands: VecDeque<PlayerCommand>,
+    gameplay_keys: crate::gameplay_keys::GameplayKeys,
     movement: (f32, f32, bool),
     sprint: crate::physics::SprintState,
     sprint_window: u8,
@@ -7422,6 +7423,7 @@ impl LoadedSession {
             attack_charge: crate::combat::AttackCharge::default(),
             first_person: crate::animation::FirstPersonState::default(),
             commands: VecDeque::new(),
+            gameplay_keys: crate::gameplay_keys::GameplayKeys::default(),
             movement: (0.0, 0.0, false),
             sprint: crate::physics::SprintState::default(),
             sprint_window: 7,
@@ -21174,6 +21176,7 @@ impl LoadedSession {
         self.advance_random_block_ticks();
         self.advance_falling_sand();
         if self.death.is_some() {
+            self.gameplay_keys = crate::gameplay_keys::GameplayKeys::default();
             let requested = self
                 .commands
                 .drain(..)
@@ -21315,6 +21318,7 @@ impl LoadedSession {
         self.damage_cooldown.tick();
         self.player_effect_tick = self.player_effect_tick.wrapping_add(1);
         self.use_repeat.advance_tick();
+        self.gameplay_keys.prepare(&mut self.commands);
         let mut repeated_use = false;
         loop {
             let command = if let Some(command) = self.commands.pop_front() {
@@ -21331,6 +21335,11 @@ impl LoadedSession {
             };
             let before_inventory = Arc::clone(&self.inventory);
             match command {
+                PlayerCommand::GameplayKey(_)
+                | PlayerCommand::GameplayControl(_)
+                | PlayerCommand::ClearGameplayKeys => {
+                    unreachable!("gameplay key events are prepared before the tick")
+                }
                 PlayerCommand::Respawn => {}
                 PlayerCommand::SetGameMode(mode) => {
                     if !self.game_master_permission {
@@ -70972,6 +70981,30 @@ pub(crate) mod tests {
                 .count(),
             63
         );
+    }
+
+    #[test]
+    fn gameplay_key_queue_is_applied_in_loaded_world() {
+        use crate::{GameplayKey, inventory::PlayerSlot};
+        let mut session = session();
+        let before = session.snapshot();
+        let selected_item = before.inventory.slot(PlayerSlot::Storage(1)).cloned();
+        assert!(selected_item.is_some());
+        for key in [
+            GameplayKey::Drop,
+            GameplayKey::SwapHands,
+            GameplayKey::Hotbar(1),
+        ] {
+            session.submit_command(PlayerCommand::GameplayKey(key));
+        }
+        session.update(TICK);
+        let after = session.snapshot();
+        assert_eq!(after.inventory.selected(), 1);
+        assert_eq!(
+            after.inventory.slot(PlayerSlot::Offhand),
+            selected_item.as_ref()
+        );
+        assert!(after.dropped_items.is_empty());
     }
 
     #[test]

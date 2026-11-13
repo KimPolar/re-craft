@@ -28,6 +28,7 @@ mod custom_tool;
 mod equipment_attributes;
 mod fire_contact;
 mod frosted_ice;
+mod gameplay_keys;
 mod honey;
 pub use equipment_attributes::ArmorValues;
 pub mod crop;
@@ -333,8 +334,19 @@ impl GameMode {
     }
 }
 
+/// A gameplay key-mapping click, consumed in Java's keybind order at a tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GameplayKey {
+    Hotbar(u8),
+    SwapHands,
+    Drop,
+}
+
 #[derive(Clone, Debug)]
 pub enum PlayerCommand {
+    GameplayKey(GameplayKey),
+    GameplayControl(bool),
+    ClearGameplayKeys,
     SetGameMode(GameMode),
     Weather(weather_command::WeatherCommand),
     WorldTime(Arc<time_command::TimeCommand>),
@@ -752,6 +764,7 @@ pub struct LocalSession {
     attack_charge: combat::AttackCharge,
     first_person: animation::FirstPersonState,
     commands: VecDeque<PlayerCommand>,
+    gameplay_keys: gameplay_keys::GameplayKeys,
     movement: (f32, f32, bool),
     sprint: physics::SprintState,
     sprint_window: u8,
@@ -1115,6 +1128,7 @@ impl LocalSession {
             attack_charge: combat::AttackCharge::default(),
             first_person: animation::FirstPersonState::default(),
             commands: VecDeque::new(),
+            gameplay_keys: gameplay_keys::GameplayKeys::default(),
             movement: (0.0, 0.0, false),
             sprint: physics::SprintState::default(),
             sprint_window: 7,
@@ -1470,6 +1484,7 @@ impl LocalSession {
         let camera_speeds = self.movement_effect_speeds();
         self.advance_soil_ticks();
         if self.death.is_some() {
+            self.gameplay_keys = gameplay_keys::GameplayKeys::default();
             self.process_death();
             let respawn = self
                 .commands
@@ -1507,6 +1522,7 @@ impl LocalSession {
         self.damage_cooldown.tick();
         self.player_effect_tick = self.player_effect_tick.wrapping_add(1);
         self.use_repeat.advance_tick();
+        self.gameplay_keys.prepare(&mut self.commands);
         let mut repeated_use = false;
         loop {
             let command = if let Some(command) = self.commands.pop_front() {
@@ -1523,6 +1539,11 @@ impl LocalSession {
             };
             let before_inventory = Arc::clone(&self.inventory);
             match command {
+                PlayerCommand::GameplayKey(_)
+                | PlayerCommand::GameplayControl(_)
+                | PlayerCommand::ClearGameplayKeys => {
+                    unreachable!("gameplay key events are prepared before the tick")
+                }
                 PlayerCommand::Respawn => {}
                 PlayerCommand::QueryWorldSeed => {
                     push_system_message(

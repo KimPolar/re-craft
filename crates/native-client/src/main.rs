@@ -2117,20 +2117,16 @@ fn screenshot_shortcut(key: PhysicalKey, state: ElementState, repeat: bool) -> b
     key == PhysicalKey::Code(KeyCode::F2) && state == ElementState::Pressed && !repeat
 }
 
-fn gameplay_key_command(
-    code: KeyCode,
-    pressed: bool,
-    captured: bool,
-    control: bool,
-) -> Option<PlayerCommand> {
+fn gameplay_key_command(code: KeyCode, pressed: bool, captured: bool) -> Option<PlayerCommand> {
     if !pressed {
         return None;
     }
-    match code {
-        KeyCode::KeyQ if captured => Some(PlayerCommand::DropSelected { all: control }),
-        KeyCode::KeyF if captured => Some(PlayerCommand::SwapHands),
-        code => hotbar_key(code).map(PlayerCommand::SelectSlot),
-    }
+    let key = match code {
+        KeyCode::KeyQ if captured => native_session::GameplayKey::Drop,
+        KeyCode::KeyF if captured => native_session::GameplayKey::SwapHands,
+        code => native_session::GameplayKey::Hotbar(hotbar_key(code)?),
+    };
+    Some(PlayerCommand::GameplayKey(key))
 }
 
 fn request_game_screenshot(ui: &Option<GameUi>, renderer: &mut Option<Renderer>) {
@@ -2451,6 +2447,8 @@ impl App {
     fn capture(&mut self, enabled: bool) {
         if !enabled {
             self.mouse_bindings.reset();
+            self.session
+                .submit_command(PlayerCommand::ClearGameplayKeys);
             self.session.submit_command(PlayerCommand::StopBreak);
             self.session.submit_command(PlayerCommand::StopUse);
         }
@@ -2479,6 +2477,8 @@ impl App {
         if restored {
             self.held_keys.refresh_system_state(focused);
             self.input.restore_held_keys(&self.held_keys, self.video);
+            self.session
+                .submit_command(PlayerCommand::GameplayControl(self.inventory_control));
             self.input.submit(&mut self.session);
         }
     }
@@ -2681,9 +2681,7 @@ impl App {
             }
             return;
         }
-        if let Some(command) =
-            gameplay_key_command(code, pressed, self.captured, self.inventory_control)
-        {
+        if let Some(command) = gameplay_key_command(code, pressed, self.captured) {
             self.session.submit_command(command);
             return;
         }
@@ -2919,6 +2917,8 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.inventory_shift = modifiers.state().shift_key();
                 self.inventory_control = modifiers.state().control_key();
+                self.session
+                    .submit_command(PlayerCommand::GameplayControl(self.inventory_control));
                 self.inventory_alt = modifiers.state().alt_key();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -2975,6 +2975,8 @@ impl ApplicationHandler for App {
                 self.held_keys = toggle_key::HeldMovementKeys::default();
                 self.inventory_shift = false;
                 self.inventory_control = false;
+                self.session
+                    .submit_command(PlayerCommand::GameplayControl(false));
                 self.inventory_alt = false;
                 self.input.release_for_screen(self.video);
                 self.input.submit(&mut self.session);
@@ -3444,7 +3446,7 @@ mod gameplay_key_tests {
         assert!(original.is_some());
         for expected_offhand in [true, false, true] {
             // The second and third presses represent OS repeat events.
-            let command = gameplay_key_command(KeyCode::KeyF, true, true, false).unwrap();
+            let command = gameplay_key_command(KeyCode::KeyF, true, true).unwrap();
             session.submit_command(command);
             session.update(Duration::from_millis(50));
             assert_eq!(
@@ -3461,15 +3463,17 @@ mod gameplay_key_tests {
             (KeyCode::Digit2, 1),
             (KeyCode::Digit1, 0),
         ] {
-            session.submit_command(gameplay_key_command(code, true, true, false).unwrap());
+            session.submit_command(gameplay_key_command(code, true, true).unwrap());
             session.update(Duration::from_millis(50));
             assert_eq!(session.snapshot().inventory.selected(), selected);
         }
-        assert!(gameplay_key_command(KeyCode::KeyF, false, true, false).is_none());
-        assert!(gameplay_key_command(KeyCode::KeyF, true, false, false).is_none());
+        assert!(gameplay_key_command(KeyCode::KeyF, false, true).is_none());
+        assert!(gameplay_key_command(KeyCode::KeyF, true, false).is_none());
         assert!(matches!(
-            gameplay_key_command(KeyCode::KeyQ, true, true, true),
-            Some(PlayerCommand::DropSelected { all: true })
+            gameplay_key_command(KeyCode::KeyQ, true, true),
+            Some(PlayerCommand::GameplayKey(
+                native_session::GameplayKey::Drop
+            ))
         ));
     }
 }

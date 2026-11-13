@@ -706,6 +706,8 @@ impl Viewer {
         if !enabled {
             self.mouse_bindings.reset();
             if let Some(play) = &mut self.play {
+                play.session
+                    .submit_command(PlayerCommand::ClearGameplayKeys);
                 play.session.submit_command(PlayerCommand::StopBreak);
                 play.session.submit_command(PlayerCommand::StopUse);
             }
@@ -735,6 +737,10 @@ impl Viewer {
         if restored {
             self.held_keys.refresh_system_state(focused);
             self.input.restore_held_keys(&self.held_keys, self.video);
+            if let Some(play) = &mut self.play {
+                play.session
+                    .submit_command(PlayerCommand::GameplayControl(self.inventory_control));
+            }
             self.submit_movement();
         }
     }
@@ -1794,6 +1800,10 @@ impl ApplicationHandler for Viewer {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.inventory_shift = modifiers.state().shift_key();
                 self.inventory_control = modifiers.state().control_key();
+                if let Some(play) = &mut self.play {
+                    play.session
+                        .submit_command(PlayerCommand::GameplayControl(self.inventory_control));
+                }
                 self.inventory_alt = modifiers.state().alt_key();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1861,6 +1871,10 @@ impl ApplicationHandler for Viewer {
                 self.held_keys = crate::toggle_key::HeldMovementKeys::default();
                 self.inventory_shift = false;
                 self.inventory_control = false;
+                if let Some(play) = &mut self.play {
+                    play.session
+                        .submit_command(PlayerCommand::GameplayControl(false));
+                }
                 self.inventory_alt = false;
                 self.input.release_for_screen(self.video);
                 self.submit_movement();
@@ -2156,12 +2170,8 @@ impl ApplicationHandler for Viewer {
                         }
                         return;
                     }
-                    if let Some(command) = crate::gameplay_key_command(
-                        code,
-                        pressed,
-                        self.captured,
-                        self.inventory_control,
-                    ) {
+                    if let Some(command) = crate::gameplay_key_command(code, pressed, self.captured)
+                    {
                         if let Some(play) = &mut self.play {
                             play.session.submit_command(command);
                         }

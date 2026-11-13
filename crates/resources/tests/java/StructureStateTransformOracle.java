@@ -41,6 +41,7 @@ public class StructureStateTransformOracle {
                 Blocks.BEETROOTS, Blocks.FARMLAND, Blocks.SWEET_BERRY_BUSH))
             states.addAll(block.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.DARK_OAK_TRAPDOOR.getStateDefinition().getPossibleStates());
+        states.addAll(Blocks.BARREL.getStateDefinition().getPossibleStates());
         for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL,
                 Blocks.COBBLESTONE_WALL, Blocks.MOSSY_COBBLESTONE_WALL,
                 Blocks.BLACKSTONE_WALL, Blocks.POLISHED_BLACKSTONE_BRICK_WALL))

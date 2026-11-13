@@ -62,9 +62,11 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     let mut sulfur_count = 0;
     let mut trapdoor_count = 0;
     let mut crop_count = 0;
+    let mut barrel_count = 0;
     for line in text.lines().filter_map(|line| line.strip_prefix("STATE\t")) {
         let row: Value = serde_json::from_str(line)?;
         let id = row["id"].as_str().unwrap();
+        barrel_count += usize::from(id == "minecraft:barrel");
         chain_count += usize::from(id == "minecraft:iron_chain");
         sulfur_count += usize::from(matches!(
             id,
@@ -115,6 +117,7 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     assert_eq!(sulfur_count, 25 * 12, "missing sulfur state transforms");
     assert_eq!(trapdoor_count, 64 * 12, "missing trapdoor state transforms");
     assert_eq!(crop_count, 40 * 12, "missing crop or farmland transforms");
+    assert_eq!(barrel_count, 12 * 12, "missing barrel state transforms");
     assert_eq!(
         wall_count,
         6 * 324 * 12,

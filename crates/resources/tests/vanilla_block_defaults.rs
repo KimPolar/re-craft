@@ -332,6 +332,12 @@ fn generated_block_defaults_match_java() {
     }
     assert!(registry.contains("minecraft:vault"));
     assert!(registry.contains("minecraft:decorated_pot"));
+    assert!(registry.contains("minecraft:barrel"));
+    for facing in ["north", "south", "east", "west", "up", "down", "invalid"] {
+        for open in ["false", "true", "invalid"] {
+            cases.push(serde_json::json!({"id":"minecraft:barrel","properties":{"facing":facing,"open":open}}));
+        }
+    }
     for facing in ["north", "south", "east", "west", "invalid"] {
         for cracked in ["false", "true", "invalid"] {
             for waterlogged in ["false", "true", "invalid"] {

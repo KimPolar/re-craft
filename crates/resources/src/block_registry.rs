@@ -33,6 +33,7 @@ enum StateSchema {
     CopperBulb,
     Vault,
     DecoratedPot,
+    Barrel,
     PotentSulfur,
     SulfurSpike,
     Liquid,
@@ -99,6 +100,12 @@ impl StateSchema {
                     ("cracked".into(), "false".into()),
                     ("facing".into(), "north".into()),
                     ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::Barrel => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("open".into(), "false".into()),
                 ]);
             }
             Self::Beehive => {
@@ -347,6 +354,13 @@ impl StateSchema {
                 if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
                     || (matches!(name, "cracked" | "waterlogged")
                         && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Barrel
+                if (name == "facing"
+                    && matches!(value, "north" | "south" | "east" | "west" | "up" | "down"))
+                    || (name == "open" && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -999,6 +1013,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/DecoratedPotBlock" => {
                     Some(StateSchema::DecoratedPot)
                 }
+                "net/minecraft/world/level/block/BarrelBlock" => Some(StateSchema::Barrel),
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
@@ -1269,6 +1284,7 @@ impl GeneratedBlockRegistry {
                 StateSchema::HorizontalFacing
                     | StateSchema::Vault
                     | StateSchema::DecoratedPot
+                    | StateSchema::Barrel
                     | StateSchema::Ladder
                     | StateSchema::Stairs
                     | StateSchema::Chest
@@ -1292,6 +1308,9 @@ impl GeneratedBlockRegistry {
             );
         }
         let facing = properties["facing"].as_str();
+        if matches!(schema, StateSchema::Barrel) && matches!(facing, "up" | "down") {
+            return Ok(result);
+        }
         let affected = match mirror {
             Mirror::None => false,
             Mirror::LeftRight => matches!(facing, "north" | "south"),

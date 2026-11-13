@@ -1057,7 +1057,8 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
-                "net/minecraft/world/level/block/SulfurSpikeBlock" => {
+                "net/minecraft/world/level/block/SulfurSpikeBlock"
+                | "net/minecraft/world/level/block/PointedDripstoneBlock" => {
                     Some(StateSchema::SulfurSpike)
                 }
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),

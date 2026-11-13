@@ -699,7 +699,12 @@ impl Class {
                         return Ok(None);
                     }
                 }
-                0xb6 if class == "net/minecraft/world/level/block/SulfurSpikeBlock" => {
+                0xb6 if matches!(
+                    class.as_str(),
+                    "net/minecraft/world/level/block/SulfurSpikeBlock"
+                        | "net/minecraft/world/level/block/PointedDripstoneBlock"
+                ) =>
+                {
                     let (owner, method, descriptor) = self.member(r.u16()?)?;
                     if owner != "net/minecraft/world/level/block/Block"
                         || method != "defaultBlockState"

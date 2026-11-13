@@ -378,10 +378,13 @@ fn generated_block_defaults_match_java() {
     for state in ["dry", "wet", "dormant", "erupting", "continuous"] {
         cases.push(serde_json::json!({"id":"minecraft:potent_sulfur","properties":{"potent_sulfur_state":state}}));
     }
-    for thickness in ["tip_merge", "tip", "frustum", "middle", "base"] {
-        for direction in ["up", "down"] {
-            for waterlogged in ["true", "false"] {
-                cases.push(serde_json::json!({"id":"minecraft:sulfur_spike","properties":{"thickness":thickness,"vertical_direction":direction,"waterlogged":waterlogged}}));
+    for id in ["minecraft:sulfur_spike", "minecraft:pointed_dripstone"] {
+        assert!(registry.contains(id));
+        for thickness in ["tip_merge", "tip", "frustum", "middle", "base", "invalid"] {
+            for direction in ["up", "down", "invalid"] {
+                for waterlogged in ["true", "false", "invalid"] {
+                    cases.push(serde_json::json!({"id":id,"properties":{"thickness":thickness,"vertical_direction":direction,"waterlogged":waterlogged}}));
+                }
             }
         }
     }

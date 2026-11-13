@@ -35,7 +35,7 @@ public class StructureStateTransformOracle {
             if (block instanceof GlazedTerracottaBlock || block==Blocks.SANDSTONE_STAIRS || block==Blocks.STONE_BRICK_STAIRS || block==Blocks.IRON_CHAIN)
                 states.addAll(block.getStateDefinition().getPossibleStates());
         }
-        for (var block : List.of(Blocks.POTENT_SULFUR, Blocks.SULFUR_SPIKE))
+        for (var block : List.of(Blocks.POTENT_SULFUR, Blocks.SULFUR_SPIKE, Blocks.POINTED_DRIPSTONE))
             states.addAll(block.getStateDefinition().getPossibleStates());
         for (var block : List.of(Blocks.WHEAT, Blocks.CARROTS, Blocks.POTATOES,
                 Blocks.BEETROOTS, Blocks.FARMLAND, Blocks.SWEET_BERRY_BUSH))

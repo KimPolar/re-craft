@@ -641,6 +641,7 @@ impl CapturedPostprocessingStage {
             "postprocessing still needs a retry"
         );
         Ok(CapturedPostprocessedRegion {
+            identity: Arc::new(()),
             proofs: self.proofs,
             region: self.stage.finish()?,
             game_time,
@@ -653,11 +654,45 @@ impl CapturedPostprocessingStage {
 /// Isolated callback output. Disk, live entities, lighting updates, clocks and
 /// all other save dependencies still need validation before publication.
 pub(crate) struct CapturedPostprocessedRegion {
+    identity: Arc<()>,
     proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedConvertedHeightmaps>,
     region: native_session::worldgen::PostprocessedGeneratedRegion,
     game_time: i64,
     next_sub_tick: i64,
     water_source_conversion: bool,
+}
+
+/// Non-writable sections from one completed captured postprocessing result.
+pub(crate) struct CapturedPostprocessedSections {
+    result_identity: Arc<()>,
+    sections: BTreeMap<native_world::loaded::ChunkPos, Tag>,
+}
+
+impl CapturedPostprocessedSections {
+    pub fn sections(&self) -> &BTreeMap<native_world::loaded::ChunkPos, Tag> {
+        &self.sections
+    }
+
+    pub fn matches_state(
+        &self,
+        completed: &CapturedPostprocessedRegion,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> bool {
+        Arc::ptr_eq(&self.result_identity, &completed.identity)
+            && completed.matches_state(
+                batch,
+                light,
+                spawn_mobs,
+                game_time,
+                next_sub_tick,
+                water_source_conversion,
+            )
+    }
 }
 
 impl CapturedPostprocessedRegion {
@@ -2041,6 +2076,100 @@ impl PreparedExistingGenerator {
             water_source_conversion,
             waiting_neighbor: None,
             retry_target: None,
+        })
+    }
+
+    /// Encode completed blocks, biomes and a privately drained light snapshot.
+    /// Other chunk components and live world state still require validation.
+    pub fn captured_postprocessed_sections(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedPostprocessedRegion,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<CapturedPostprocessedSections> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && completed.matches_state(
+                    batch,
+                    light,
+                    spawn_mobs,
+                    game_time,
+                    next_sub_tick,
+                    water_source_conversion
+                ),
+            "captured postprocessing inputs changed"
+        );
+        let mut selected = BTreeSet::new();
+        for pos in positions {
+            ensure!(selected.insert(pos), "duplicate postprocessed chunk");
+            ensure!(
+                completed.proofs.contains_key(&pos) && completed.region.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+        }
+        ensure!(!selected.is_empty(), "no postprocessed chunks selected");
+        let biomes: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/biome")?
+            .into_iter()
+            .collect();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let visible = batch.terrain.captured_postprocessed_light_snapshot(
+            &completed.region,
+            &light.engine,
+            &assets.blocks,
+            selected.iter().copied(),
+        )?;
+        let mut sections = BTreeMap::new();
+        for pos in selected {
+            let proof = &completed.proofs[&pos];
+            let source = batch
+                .sources
+                .get(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+                .context("terrain source was not captured")?;
+            ensure!(
+                proof.matches_source(source.as_deref())?,
+                "postprocessing source differs"
+            );
+            let generated = native_persistence::generated_section::encode_generated_sections(
+                &completed.region.world,
+                pos,
+                self.lighting.min_y,
+                self.lighting.height,
+                self.lighting.has_skylight,
+                |state| {
+                    assets
+                        .blocks
+                        .is_canonical_state(&state.name, &state.properties)
+                },
+                |name| {
+                    ResourceId::parse(name)
+                        .ok()
+                        .is_some_and(|id| biomes.contains(&id))
+                },
+            )?;
+            let merged = merge_captured_postprocessed_sections(source.as_deref(), &generated)?;
+            let merged = native_persistence::generated_section::merge_generated_light_sections(
+                &merged,
+                &visible,
+                pos,
+                self.lighting.min_y,
+                self.lighting.height,
+                self.lighting.has_skylight,
+            )?;
+            sections.insert(pos, merged);
+        }
+        Ok(CapturedPostprocessedSections {
+            result_identity: Arc::clone(&completed.identity),
+            sections,
         })
     }
 
@@ -5487,6 +5616,34 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
+fn merge_captured_postprocessed_sections(
+    source: Option<&NamedTag>,
+    generated: &Tag,
+) -> Result<Tag> {
+    use native_session::worldgen::schedule::GenerationStage;
+    let Some(source) = source else {
+        return Ok(generated.clone());
+    };
+    let status = match unique_root_field(source, "Status")? {
+        Some(Tag::String(status)) => String::from_utf16(&status.0)?,
+        _ => bail!("saved chunk status is missing or invalid"),
+    };
+    let stage = GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+    ensure!(
+        stage <= GenerationStage::Biomes,
+        "saved chunk is past the supported biome stage"
+    );
+    let original = unique_root_field(source, "sections")?;
+    if stage < GenerationStage::Biomes {
+        native_persistence::generated_section::merge_prebiome_stage_sections(original, generated)
+    } else {
+        native_persistence::generated_section::merge_biome_stage_blocks(
+            original.context("saved sections missing")?,
+            generated,
+        )
+    }
+}
+
 fn preserved_heightmap_fields(
     document: &NamedTag,
 ) -> Result<Vec<(native_persistence::nbt::JavaString, Tag)>> {
@@ -5867,6 +6024,83 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn captured_postprocessed_sections_preserve_saved_metadata() -> Result<()> {
+        let section = |block: &str, biome: &str| {
+            Tag::Compound(vec![
+                ("Y".into(), Tag::Byte(0)),
+                (
+                    "block_states".into(),
+                    Tag::Compound(vec![(
+                        "palette".into(),
+                        Tag::List {
+                            element_type: TagType::String,
+                            values: vec![Tag::String(block.into())],
+                        },
+                    )]),
+                ),
+                (
+                    "biomes".into(),
+                    Tag::Compound(vec![(
+                        "palette".into(),
+                        Tag::List {
+                            element_type: TagType::String,
+                            values: vec![Tag::String(biome.into())],
+                        },
+                    )]),
+                ),
+                ("example:section_data".into(), Tag::Int(42)),
+            ])
+        };
+        let list = |value| Tag::List {
+            element_type: TagType::Compound,
+            values: vec![value],
+        };
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("Status".into(), Tag::String("minecraft:biomes".into())),
+                (
+                    "sections".into(),
+                    list(section("minecraft:air", "minecraft:plains")),
+                ),
+            ]),
+        };
+        let generated = list(section("minecraft:stone", "minecraft:plains"));
+        let merged = merge_captured_postprocessed_sections(Some(&source), &generated)?;
+        let Tag::List { values, .. } = merged else {
+            unreachable!()
+        };
+        assert_eq!(values[0].get("example:section_data"), Some(&Tag::Int(42)));
+        assert_eq!(
+            values[0].get("block_states"),
+            match &generated {
+                Tag::List { values, .. } => values[0].get("block_states"),
+                _ => unreachable!(),
+            }
+        );
+        assert_eq!(
+            merge_captured_postprocessed_sections(None, &generated)?,
+            generated
+        );
+        let wrong_biome = list(section("minecraft:stone", "minecraft:desert"));
+        assert!(merge_captured_postprocessed_sections(Some(&source), &wrong_biome).is_err());
+        let mut unsupported = source.clone();
+        replace_unique_root_field(
+            &mut unsupported,
+            "Status",
+            Tag::String("minecraft:noise".into()),
+        )?;
+        assert!(merge_captured_postprocessed_sections(Some(&unsupported), &generated).is_err());
+        let mut ambiguous = source.clone();
+        let Tag::Compound(fields) = &mut ambiguous.value else {
+            unreachable!()
+        };
+        fields.push(("Status".into(), Tag::String("minecraft:biomes".into())));
+        assert!(merge_captured_postprocessed_sections(Some(&ambiguous), &generated).is_err());
+        Ok(())
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

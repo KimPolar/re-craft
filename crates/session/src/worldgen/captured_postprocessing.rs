@@ -166,6 +166,35 @@ impl CarvedTerrainWorld {
         engine: &StagedGenerationLightEngine,
         completed: &super::PostprocessedGeneratedRegion,
     ) -> Result<GeneratedPostprocessing> {
+        self.validate_captured_postprocessing(completed)?;
+        let covered = completed
+            .chunks
+            .iter()
+            .copied()
+            .chain(completed.deferred_chunks())
+            .collect();
+        let light = self.captured_postprocessing_light_input(
+            engine,
+            registry,
+            completed.light_checkpoint.as_ref(),
+            covered,
+        )?;
+        let heightmap_tags = completed
+            .heightmap_tags
+            .as_ref()
+            .context("postprocessing heightmap tags are missing")?;
+        GeneratedPostprocessing::from_completed(
+            completed,
+            Some(light),
+            completed.mushroom_tags.clone(),
+            Arc::clone(heightmap_tags),
+        )
+    }
+
+    fn validate_captured_postprocessing(
+        &self,
+        completed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<()> {
         ensure!(
             Arc::ptr_eq(&self.world, &completed.source),
             "postprocessing terrain revision differs"
@@ -188,27 +217,62 @@ impl CarvedTerrainWorld {
             (self.min_y, max_y) == (completed.min_y, completed.max_y),
             "postprocessing bounds differ"
         );
-        let covered = completed
-            .chunks
-            .iter()
-            .copied()
-            .chain(completed.deferred_chunks())
-            .collect();
-        let light = self.captured_postprocessing_light_input(
-            engine,
-            registry,
-            completed.light_checkpoint.as_ref(),
-            covered,
-        )?;
-        let heightmap_tags = completed
-            .heightmap_tags
-            .as_ref()
-            .context("postprocessing heightmap tags are missing")?;
-        GeneratedPostprocessing::from_completed(
-            completed,
-            Some(light),
-            completed.mushroom_tags.clone(),
-            Arc::clone(heightmap_tags),
+        Ok(())
+    }
+
+    /// Preview the light after pending postprocessing checks at a caller-chosen
+    /// drain boundary. The result and the staged engine remain unchanged.
+    pub fn captured_postprocessed_light_snapshot(
+        &self,
+        completed: &super::PostprocessedGeneratedRegion,
+        engine: &StagedGenerationLightEngine,
+        registry: &GeneratedBlockRegistry,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<VisibleLightSnapshot> {
+        self.validate_captured_postprocessing(completed)?;
+        let mut covered = BTreeSet::new();
+        for pos in positions {
+            ensure!(covered.insert(pos), "duplicate postprocessed light chunk");
+            ensure!(
+                completed.chunks.contains(&pos),
+                "light chunk was not postprocessed"
+            );
+        }
+        ensure!(!covered.is_empty(), "no postprocessed light chunks");
+        let bounds = native_world::block_light::LightBounds::new(completed.min_y, completed.max_y)
+            .context("unsupported postprocessing light bounds")?;
+        let checkpoint = completed.light_checkpoint.as_ref();
+        let drained = checkpoint.map_or(0, |saved| saved.drained_checks);
+        let pending = completed
+            .sealed_checks
+            .get(drained..)
+            .context("invalid postprocessing light checkpoint")?;
+        super::terrain_batch::extend_postprocessing_light_coverage(&mut covered, pending)?;
+        let before =
+            self.captured_postprocessing_light_input(engine, registry, checkpoint, covered)?;
+        let previous_world =
+            checkpoint.map_or(completed.source.as_ref(), |saved| saved.world.as_ref());
+        let previous_sources =
+            checkpoint.map_or(&engine.fresh.sky_sources, |saved| &saved.sky_sources);
+        let updated_sources = if before.has_sky_channel() {
+            super::terrain_batch::updated_postprocessing_sky_sources(
+                previous_world,
+                &completed.world,
+                pending,
+                bounds,
+                previous_sources,
+            )?
+        } else {
+            None
+        };
+        let checks: Vec<_> = pending.iter().map(|pos| [pos.x, pos.y, pos.z]).collect();
+        super::postprocessing_world::drain_postprocessing_light(
+            &completed.world,
+            bounds,
+            &before,
+            &engine.active,
+            updated_sources.as_ref().unwrap_or(previous_sources),
+            &checks,
         )
     }
 
@@ -524,12 +588,13 @@ mod tests {
             initial.try_poll(first, 64)?,
             PostprocessingAttempt::Progress { complete: true }
         );
+        let mut expected_light = None;
         for drain in [false, true] {
             let mut original = initial.clone();
+            original
+                .light_checks
+                .push(BlockPosition { x: 8, y: 8, z: 8 });
             if drain {
-                original
-                    .light_checks
-                    .push(BlockPosition { x: 8, y: 8, z: 8 });
                 assert!(terrain.drain_captured_postprocessing_light(
                     &mut original,
                     &engine,
@@ -537,6 +602,32 @@ mod tests {
                 )?);
             }
             let mut completed = original.finish()?;
+            let preview = terrain.captured_postprocessed_light_snapshot(
+                &completed,
+                &engine,
+                &registry,
+                [first],
+            )?;
+            if let Some(previous) = &expected_light {
+                assert_eq!(preview.same_complete_column(previous, first), Some(true));
+            } else {
+                expected_light = Some(preview);
+            }
+            assert!(
+                terrain
+                    .captured_postprocessed_light_snapshot(&completed, &engine, &registry, [second])
+                    .is_err()
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_light_snapshot(
+                        &completed,
+                        &engine,
+                        &registry,
+                        [first, first]
+                    )
+                    .is_err()
+            );
             let prior_ticks = completed.ticks().chunk(first).unwrap().blocks.pack(100);
             assert_eq!(prior_ticks.len(), 1);
             assert_eq!(prior_ticks[0].kind, "minecraft:sand");
@@ -567,6 +658,11 @@ mod tests {
                 vec![second]
             );
             completed.edits.push(BlockPosition { x: 8, y: 8, z: 8 });
+            assert!(
+                terrain
+                    .captured_postprocessed_light_snapshot(&completed, &engine, &registry, [first])
+                    .is_err()
+            );
             assert!(
                 terrain
                     .resume_captured_postprocessing(&registry, &engine, &completed)

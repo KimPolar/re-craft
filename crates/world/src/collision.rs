@@ -47,6 +47,23 @@ pub fn barrel_state(state: &BlockState) -> bool {
         )
 }
 
+/// Validate a hopper and return its output direction.
+pub fn hopper_facing(state: &BlockState) -> Option<&str> {
+    if state.name != "minecraft:hopper"
+        || state.properties.len() != 2
+        || !matches!(
+            state.properties.get("enabled").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    match state.properties.get("facing")?.as_str() {
+        facing @ ("down" | "north" | "south" | "west" | "east") => Some(facing),
+        _ => None,
+    }
+}
+
 /// Validate a barrier state and return its contained-water flag.
 pub fn barrier_waterlogged(state: &BlockState) -> Option<bool> {
     if state.name != "minecraft:barrier" || state.properties.len() != 1 {
@@ -610,6 +627,7 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
         || id == "flower_pot"
         || id.starts_with("potted_")
         || decorated_pot_waterlogged(state).is_some()
+        || hopper_facing(state).is_some()
         || id == "glass_pane"
         || id == "iron_bars"
         || matches!(id, "lantern" | "soul_lantern")
@@ -1265,6 +1283,28 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if let Some(facing) = hopper_facing(state) {
+        let mut boxes = vec![
+            pixel_box(4.0, 4.0, 4.0, 12.0, 11.0, 12.0),
+            pixel_box(0.0, 10.0, 0.0, 4.0, 11.0, 16.0),
+            pixel_box(4.0, 10.0, 0.0, 16.0, 11.0, 4.0),
+            pixel_box(4.0, 10.0, 12.0, 16.0, 11.0, 16.0),
+            pixel_box(12.0, 10.0, 4.0, 16.0, 11.0, 12.0),
+            pixel_box(0.0, 11.0, 0.0, 2.0, 16.0, 16.0),
+            pixel_box(2.0, 11.0, 0.0, 16.0, 16.0, 2.0),
+            pixel_box(2.0, 11.0, 14.0, 16.0, 16.0, 16.0),
+            pixel_box(14.0, 11.0, 2.0, 16.0, 16.0, 14.0),
+        ];
+        boxes.push(match facing {
+            "down" => pixel_box(6.0, 0.0, 6.0, 10.0, 4.0, 10.0),
+            "north" => pixel_box(6.0, 4.0, 0.0, 10.0, 8.0, 4.0),
+            "south" => pixel_box(6.0, 4.0, 12.0, 10.0, 8.0, 16.0),
+            "west" => pixel_box(0.0, 4.0, 6.0, 4.0, 8.0, 10.0),
+            "east" => pixel_box(12.0, 4.0, 6.0, 16.0, 8.0, 10.0),
+            _ => unreachable!("validated hopper facing"),
+        });
+        return Some(boxes);
+    }
     if decorated_pot_waterlogged(state).is_some() {
         return Some(vec![pixel_box(1.0, 0.0, 1.0, 15.0, 16.0, 15.0)]);
     }

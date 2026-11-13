@@ -209,6 +209,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         }
         "minecraft:jigsaw" if crate::collision::jigsaw_state(state) => (15, 0),
         "minecraft:barrel" if crate::collision::barrel_state(state) => (15, 0),
+        "minecraft:hopper" if crate::collision::hopper_facing(state).is_some() => (0, 0),
         "minecraft:bee_nest" | "minecraft:beehive"
             if state.properties.len() == 2 && facing() && bounded("honey_level", 5).is_some() =>
         {
@@ -1500,6 +1501,20 @@ mod tests {
     }
 
     #[test]
+    fn hopper_light_requires_all_valid_properties() {
+        let mut hopper = state("hopper", None);
+        hopper.properties = BTreeMap::from([
+            ("facing".into(), "down".into()),
+            ("enabled".into(), "true".into()),
+        ]);
+        assert_eq!(properties(&hopper), Some((0, 0)));
+        assert!(crate::collision::block_shape(&hopper).is_some());
+        hopper.properties.insert("facing".into(), "up".into());
+        assert!(properties(&hopper).is_none());
+        assert!(crate::collision::block_shape(&hopper).is_none());
+    }
+
+    #[test]
     fn copper_grate_transmits_light_in_both_fluid_states() {
         let mut grate = state("waxed_oxidized_copper_grate", None);
         for wet in [false, true] {
@@ -2632,6 +2647,7 @@ mod tests {
             "vault",
             "decorated_pot",
             "barrel",
+            "hopper",
             "copper_bulb",
             "exposed_copper_bulb",
             "weathered_copper_bulb",
@@ -2776,6 +2792,55 @@ mod tests {
                 assert_eq!(row["entity"], false, "{s:?}");
                 assert_eq!(row["postprocess"], false, "{s:?}");
                 pots_checked += 1;
+            }
+            if s.name == "minecraft:hopper" {
+                let collision = crate::collision::block_shape(&s).unwrap();
+                let outline = crate::collision::block_outline(&s).unwrap();
+                for (key, actual) in [
+                    ("hopper_collision", &collision),
+                    ("hopper_outline", &outline),
+                ] {
+                    let expected = row[key].as_array().unwrap();
+                    for x in 0..16 {
+                        for y in 0..16 {
+                            for z in 0..16 {
+                                let point = glam::Vec3::new(
+                                    (x as f32 + 0.5) / 16.0,
+                                    (y as f32 + 0.5) / 16.0,
+                                    (z as f32 + 0.5) / 16.0,
+                                );
+                                let native = actual
+                                    .iter()
+                                    .any(|b| point.cmpge(b.min).all() && point.cmplt(b.max).all());
+                                let java = expected.iter().any(|b| {
+                                    let b = b.as_array().unwrap();
+                                    (0..3).all(|axis| {
+                                        point[axis] >= b[axis].as_f64().unwrap() as f32
+                                            && point[axis] < b[axis + 3].as_f64().unwrap() as f32
+                                    })
+                                });
+                                assert_eq!(native, java, "{key} {s:?} at {point:?}");
+                            }
+                        }
+                    }
+                }
+                for (index, direction) in [
+                    glam::IVec3::NEG_Y,
+                    glam::IVec3::Y,
+                    glam::IVec3::NEG_Z,
+                    glam::IVec3::Z,
+                    glam::IVec3::NEG_X,
+                    glam::IVec3::X,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        row["sturdy"][index].as_bool(),
+                        crate::collision::button_support_face(&s, direction),
+                        "{s:?}"
+                    );
+                }
             }
             if matches!(s.name.as_str(), "minecraft:water" | "minecraft:lava") {
                 assert_eq!(row["postprocess"], false, "{s:?}");

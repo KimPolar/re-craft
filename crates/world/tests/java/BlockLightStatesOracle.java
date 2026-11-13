@@ -46,6 +46,22 @@ public class BlockLightStatesOracle {
                 if (name.equals("minecraft:water") || name.equals("minecraft:lava")) {
                     entry.addProperty("postprocess", state.getPostProcessPos(net.minecraft.world.level.EmptyBlockGetter.INSTANCE, net.minecraft.core.BlockPos.ZERO) != null);
                 }
+                if (name.equals("minecraft:hopper")) {
+                    var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
+                    var pos = net.minecraft.core.BlockPos.ZERO;
+                    var sturdy = new JsonArray();
+                    for (var direction : Direction.values()) sturdy.add(state.isFaceSturdy(getter, pos, direction));
+                    entry.add("sturdy", sturdy);
+                    for (var shape : new Object[][] {{"hopper_collision", state.getCollisionShape(getter, pos)}, {"hopper_outline", state.getShape(getter, pos)}}) {
+                        var boxes = new JsonArray();
+                        for (var box : ((net.minecraft.world.phys.shapes.VoxelShape)shape[1]).toAabbs()) {
+                            var bounds = new JsonArray();
+                            for (double value : new double[]{box.minX,box.minY,box.minZ,box.maxX,box.maxY,box.maxZ}) bounds.add(value);
+                            boxes.add(bounds);
+                        }
+                        entry.add((String)shape[0], boxes);
+                    }
+                }
                 if (block instanceof net.minecraft.world.level.block.FlowerPotBlock || name.equals("minecraft:decorated_pot") || name.equals("minecraft:barrel") || name.equals("minecraft:frosted_ice") || name.equals("minecraft:vault") || name.endsWith("copper_bulb") || name.endsWith("copper_grate") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?") || name.matches("minecraft:(tuff|polished_tuff|tuff_bricks|chiseled_tuff|chiseled_tuff_bricks)")) {
                     entry.addProperty("friction", block.getFriction());
                     var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;

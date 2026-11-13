@@ -2043,21 +2043,56 @@ impl PreparedExistingGenerator {
             .terrain_assets
             .as_ref()
             .context("terrain registry is missing")?;
-        let positions = stage.proofs.keys().copied().chain([spawn.position]);
-        let visible = light
-            .engine
-            .snapshot(&batch.terrain, positions, &assets.blocks)?;
         batch.terrain.register_captured_postprocessing_neighbor(
             &mut stage.stage,
+            &light.engine,
             &assets.blocks,
             spawn.position,
             converted,
             proof.heightmaps().clone(),
-            Some(visible),
         )?;
         stage.proofs.insert(spawn.position, proof);
         stage.waiting_neighbor = None;
         Ok(())
+    }
+
+    /// Apply recorded light checks at an explicit caller-selected boundary.
+    /// The isolated pass and its previous checkpoint remain unchanged on error.
+    pub fn drain_captured_postprocessing_light(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        stage: &mut CapturedPostprocessingStage,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<bool> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && stage.matches_state(
+                    batch,
+                    light,
+                    spawn_mobs,
+                    game_time,
+                    next_sub_tick,
+                    water_source_conversion
+                ),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            stage.waiting_neighbor.is_none() && stage.retry_target.is_none(),
+            "finish the interrupted callback before draining light"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        batch.terrain.drain_captured_postprocessing_light(
+            &mut stage.stage,
+            &light.engine,
+            &assets.blocks,
+        )
     }
 
     /// Start a new empty engine for captured, unlit terrain. The caller must
@@ -7140,12 +7175,23 @@ mod tests {
                 .is_err()
         );
         pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, third)?;
+        assert!(
+            !actual.drain_captured_postprocessing_light(
+                &batch, &staged, &mut pass, false, 42, 9, true,
+            )?
+        );
+        assert!(actual.drain_captured_postprocessing_light(
+            &batch, &staged, &mut pass, false, 43, 9, true,
+        ).is_err());
         let before_pass = batch.terrain.snapshot();
         assert_eq!(
             pass.try_poll(&batch, &staged, false, 42, 9, true, target, 1)?,
             native_session::worldgen::PostprocessingAttempt::NeedsChunk(neighbor),
         );
         assert_eq!(pass.waiting_neighbor(), Some(neighbor));
+        assert!(actual.drain_captured_postprocessing_light(
+            &batch, &staged, &mut pass, false, 42, 9, true,
+        ).is_err());
         assert!(
             pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, third)
                 .is_err()
@@ -7195,6 +7241,9 @@ mod tests {
         )?;
         assert_eq!(pass.waiting_neighbor(), None);
         assert!(pass.proofs.contains_key(&neighbor));
+        assert!(actual.drain_captured_postprocessing_light(
+            &batch, &staged, &mut pass, false, 42, 9, true,
+        ).is_err());
         assert!(
             pass.request_converted_chunk(&batch, &staged, false, 42, 9, true, neighbor)
                 .is_err()
@@ -7243,6 +7292,18 @@ mod tests {
             baseline.try_poll(&batch, &staged, false, 42, 9, true, target, 1)?,
             "retry differs from registering the same neighbors in advance"
         );
+        if matches!(
+            retried,
+            native_session::worldgen::PostprocessingAttempt::Progress { .. }
+        ) {
+            let changed = actual.drain_captured_postprocessing_light(
+                &batch, &staged, &mut pass, false, 42, 9, true,
+            )?;
+            eprintln!("captured postprocessing light checks drained: {changed}");
+            assert!(!actual.drain_captured_postprocessing_light(
+                &batch, &staged, &mut pass, false, 42, 9, true,
+            )?);
+        }
         assert!(Arc::ptr_eq(&before_pass, &batch.terrain.snapshot()));
         assert!(pass.finish(&batch, &staged, false, 42, 9, true).is_err());
         let tick_world = batch.terrain.snapshot();

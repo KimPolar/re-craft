@@ -13,12 +13,12 @@ use native_resources::{
 use native_world::{generation_light::VisibleLightSnapshot, loaded::ChunkPos};
 
 use super::{
-    CarvedTerrainWorld, GeneratedPostprocessing,
+    CarvedTerrainWorld, GeneratedPostprocessing, StagedGenerationLightEngine,
     chunk_ticks::{ConvertedChunkTicks, SavedTick},
     postprocessing::{
         ConvertedChunkPostprocessing, ConvertedPostprocessingRegion, PostprocessingTask,
     },
-    postprocessing_world::ConvertedBlockEntities,
+    postprocessing_world::{ConvertedBlockEntities, PostprocessingLightCheckpoint},
 };
 
 impl CarvedTerrainWorld {
@@ -140,20 +140,28 @@ impl CarvedTerrainWorld {
     pub fn register_captured_postprocessing_neighbor(
         &self,
         stage: &mut GeneratedPostprocessing,
+        engine: &StagedGenerationLightEngine,
         registry: &GeneratedBlockRegistry,
         position: ChunkPos,
         converted: ConvertedChunkPostprocessing,
         heightmaps: FullHeightmaps,
-        light: Option<VisibleLightSnapshot>,
     ) -> Result<()> {
         ensure!(
             Arc::ptr_eq(&self.world, &stage.source),
             "postprocessing terrain revision differs"
         );
-        ensure!(
-            stage.light_checkpoint.is_none(),
-            "postprocessing light checkpoint requires an explicit drain"
-        );
+        let light = if stage.light.is_some() {
+            let mut covered: BTreeSet<_> = stage.region.tasks.keys().copied().collect();
+            covered.insert(position);
+            Some(self.captured_postprocessing_light_input(
+                engine,
+                registry,
+                stage.light_checkpoint.as_ref(),
+                covered,
+            )?)
+        } else {
+            None
+        };
         match (&stage.light, &light) {
             (None, None) => {}
             (Some(before), Some(after)) => {
@@ -179,6 +187,68 @@ impl CarvedTerrainWorld {
             registry,
         )?;
         stage.register_retry_neighbor(position, converted, entities, heightmaps, light)
+    }
+
+    /// Drain checks recorded by captured postprocessing at an explicit caller
+    /// selected boundary. A failure leaves the stage and light checkpoint intact.
+    pub fn drain_captured_postprocessing_light(
+        &self,
+        stage: &mut GeneratedPostprocessing,
+        engine: &StagedGenerationLightEngine,
+        registry: &GeneratedBlockRegistry,
+    ) -> Result<bool> {
+        ensure!(!stage.failed, "generated postprocessing attempt failed");
+        ensure!(
+            Arc::ptr_eq(&self.world, &stage.source),
+            "postprocessing terrain revision differs"
+        );
+        let checkpoint = stage.light_checkpoint.as_ref();
+        let drained = checkpoint.map_or(0, |saved| saved.drained_checks);
+        let pending = stage
+            .light_checks
+            .get(drained..)
+            .context("invalid postprocessing light checkpoint")?;
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let mut covered: BTreeSet<_> = stage.region.tasks.keys().copied().collect();
+        super::terrain_batch::extend_postprocessing_light_coverage(&mut covered, pending)?;
+        let before =
+            self.captured_postprocessing_light_input(engine, registry, checkpoint, covered)?;
+        stage.drain_recorded_light(before, &engine.active, &engine.fresh.sky_sources)
+    }
+
+    fn captured_postprocessing_light_input(
+        &self,
+        engine: &StagedGenerationLightEngine,
+        registry: &GeneratedBlockRegistry,
+        checkpoint: Option<&PostprocessingLightCheckpoint>,
+        covered: BTreeSet<ChunkPos>,
+    ) -> Result<VisibleLightSnapshot> {
+        let Some(checkpoint) = checkpoint else {
+            return engine.snapshot(self, covered, registry);
+        };
+        // Validate the engine against this terrain even when every requested
+        // column is already present in the checkpoint.
+        engine.snapshot(self, std::iter::empty(), registry)?;
+        let mut before = checkpoint.visible.clone();
+        let missing: BTreeSet<_> = covered
+            .into_iter()
+            .filter(|pos| before.complete_column(*pos).is_none())
+            .collect();
+        if !missing.is_empty() {
+            let fresh = engine.snapshot(self, missing.iter().copied(), registry)?;
+            for pos in missing {
+                let column = fresh
+                    .complete_column(pos)
+                    .context("new postprocessing light column is missing")?;
+                ensure!(
+                    before.insert_complete_column(pos, column).is_none(),
+                    "postprocessing light column changed"
+                );
+            }
+        }
+        Ok(before)
     }
 
     fn validate_captured_postprocessing_chunk(
@@ -251,5 +321,106 @@ impl CarvedTerrainWorld {
             self.generated_entity_order.get(&pos).map(Arc::as_ref),
             self.generated_pending_order.get(&pos).map(Arc::as_ref),
         )
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::super::{FreshGenerationLightTracker, MaterializedTerrain};
+    use super::*;
+    use native_world::loaded::{BLOCK_COUNT, BlockPosition, BlockState, Chunk, Section, World};
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn captured_light_checks_keep_checkpoint_and_reject_bad_inputs() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:spawn".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(Box::new([air; BLOCK_COUNT])),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let terrain = CarvedTerrainWorld::new(MaterializedTerrain {
+            world,
+            position: pos,
+            seed: 42,
+            min_y: 0,
+            height: 16,
+            postprocessing: Arc::from(vec![false; BLOCK_COUNT]),
+            noise_postprocessing: None,
+            surface_postprocessing: None,
+            carver_postprocessing: None,
+        });
+        let engine =
+            StagedGenerationLightEngine::new(FreshGenerationLightTracker::new(&terrain, false)?);
+        let region = ConvertedPostprocessingRegion {
+            tasks: BTreeMap::new(),
+            ticks: super::super::chunk_ticks::RegionTicks::new(BTreeMap::new(), 0, 0)?,
+        };
+        let mut stage = GeneratedPostprocessing::new(
+            terrain.snapshot(),
+            0,
+            16,
+            region,
+            None,
+            None,
+            BTreeMap::new(),
+            None,
+        );
+        assert!(!terrain.drain_captured_postprocessing_light(&mut stage, &engine, &registry)?);
+        stage.light_checks.push(BlockPosition { x: 8, y: 8, z: 8 });
+        assert!(terrain.drain_captured_postprocessing_light(&mut stage, &engine, &registry)?);
+        let checkpoint = stage
+            .light_checkpoint
+            .as_ref()
+            .context("checkpoint missing")?;
+        assert_eq!(checkpoint.drained_checks, 1);
+        let neighbor = ChunkPos { x: 3, z: 0 };
+        let extended = terrain.captured_postprocessing_light_input(
+            &engine,
+            &registry,
+            Some(checkpoint),
+            BTreeSet::from([pos, neighbor]),
+        )?;
+        assert_eq!(
+            checkpoint.visible.same_complete_column(&extended, pos),
+            Some(true)
+        );
+        assert!(extended.complete_column(neighbor).is_some());
+        assert!(!terrain.drain_captured_postprocessing_light(&mut stage, &engine, &registry)?);
+        stage.light_checks.push(BlockPosition { x: 8, y: 16, z: 8 });
+        assert!(
+            terrain
+                .drain_captured_postprocessing_light(&mut stage, &engine, &registry)
+                .is_err()
+        );
+        assert_eq!(stage.light_checkpoint.as_ref().unwrap().drained_checks, 1);
+        assert!(
+            terrain
+                .drain_captured_postprocessing_light(&mut stage, &engine, &registry)
+                .is_err()
+        );
+        Ok(())
     }
 }

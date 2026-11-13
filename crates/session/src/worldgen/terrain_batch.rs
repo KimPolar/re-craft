@@ -435,7 +435,7 @@ pub(super) fn updated_postprocessing_sky_sources(
     Ok(Some(sources))
 }
 
-fn extend_postprocessing_light_coverage(
+pub(super) fn extend_postprocessing_light_coverage(
     covered: &mut BTreeSet<ChunkPos>,
     checks: &[native_world::loaded::BlockPosition],
 ) -> Result<()> {

@@ -1242,7 +1242,7 @@ impl PreparedExistingGenerator {
             .terrain
             .as_ref()
             .context("saved terrain source missing")?;
-        validate_empty_biomes_target(saved)?;
+        validate_empty_preterrain_target(saved, true)?;
         reject_saved_lighting(saved)?;
         let source = Arc::clone(&saved.document);
         ensure!(
@@ -2534,7 +2534,7 @@ impl PreparedExistingGenerator {
             .entities
             .as_ref()
             .map(|saved| Arc::clone(&saved.document));
-        validate_empty_biomes_target(saved)?;
+        validate_empty_preterrain_target(saved, !self.generate_structures)?;
         let source = Arc::clone(&saved.document);
         ensure!(
             world
@@ -2563,7 +2563,7 @@ impl PreparedExistingGenerator {
         })
     }
 
-    /// Merge generated data into the captured BIOMES-stage document.
+    /// Merge generated data into the captured pre-terrain document.
     fn populate_saved_feature_document(
         &mut self,
         terrain: &native_session::worldgen::CarvedTerrainWorld,
@@ -2600,12 +2600,24 @@ impl PreparedExistingGenerator {
                     .is_some_and(|id| biome_ids.contains(&id))
             },
         )?;
-        let original_sections =
-            unique_root_field(source, "sections")?.context("saved sections missing")?;
-        let sections = native_persistence::generated_section::merge_biome_stage_blocks(
-            original_sections,
-            &sections,
-        )?;
+        let status = match unique_root_field(source, "Status")? {
+            Some(Tag::String(status)) => String::from_utf16(&status.0)?,
+            _ => bail!("saved chunk status is missing or invalid"),
+        };
+        let stage = native_session::worldgen::schedule::GenerationStage::from_id(&status)
+            .context("unknown saved chunk status")?;
+        let original_sections = unique_root_field(source, "sections")?;
+        let sections = if stage < native_session::worldgen::schedule::GenerationStage::Biomes {
+            native_persistence::generated_section::merge_prebiome_stage_sections(
+                original_sections,
+                &sections,
+            )?
+        } else {
+            native_persistence::generated_section::merge_biome_stage_blocks(
+                original_sections.context("saved sections missing")?,
+                &sections,
+            )?
+        };
         let block_entities = terrain.generated_block_entity_data(key, &assets.blocks)?;
         let block_ticks = native_persistence::generated_ticks::encode_block_ticks(
             key,
@@ -5219,6 +5231,7 @@ mod tests {
         std::fs::write(root.join("level.dat"), gzip.finish()?)?;
         let target = native_world::loaded::ChunkPos { x: -1, z: 2 };
         let second = native_world::loaded::ChunkPos { x: 0, z: 2 };
+        let third = native_world::loaded::ChunkPos { x: 1, z: 2 };
         let (lighting, _, _) = GeneratedDimensionLighting::load_preset_with_definition(
             &mut resources,
             "minecraft:normal",
@@ -5285,6 +5298,34 @@ mod tests {
         region[8192..8196].copy_from_slice(&u32::try_from(bytes.len() + 1)?.to_be_bytes());
         region[8196] = 3;
         region[8197..8197 + bytes.len()].copy_from_slice(&bytes);
+        let early_saved = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("xPos".into(), Tag::Int(third.x)),
+                ("zPos".into(), Tag::Int(third.z)),
+                (
+                    "Status".into(),
+                    Tag::String("minecraft:structure_references".into()),
+                ),
+                ("example:root".into(), Tag::Int(74)),
+            ]),
+        };
+        let bytes = native_persistence::nbt::write(&early_saved)?;
+        let sectors = (bytes.len() + 5).div_ceil(4096);
+        let offset = region.len() / 4096;
+        ensure!(
+            sectors < 256 && offset < (1 << 24),
+            "test protochunk is too large"
+        );
+        let header = usize::try_from((third.x + third.z * 32) * 4)?;
+        region[header..header + 4]
+            .copy_from_slice(&(((offset as u32) << 8) | sectors as u32).to_be_bytes());
+        region.resize(region.len() + sectors * 4096, 0);
+        let start = offset * 4096;
+        region[start..start + 4].copy_from_slice(&u32::try_from(bytes.len() + 1)?.to_be_bytes());
+        region[start + 4] = 3;
+        region[start + 5..start + 5 + bytes.len()].copy_from_slice(&bytes);
         let region_dir = root.join("dimensions/minecraft/overworld/region");
         std::fs::create_dir_all(&region_dir)?;
         std::fs::write(region_dir.join("r.0.0.mca"), region)?;
@@ -5344,16 +5385,21 @@ mod tests {
             x: second.x,
             z: second.z,
         };
+        let saved_third = native_persistence::world::ChunkPos {
+            x: third.x,
+            z: third.z,
+        };
         let mut schedule = GenerationSchedule::new();
         schedule.request(target, GenerationStage::Spawn)?;
         schedule.request(second, GenerationStage::Spawn)?;
+        schedule.request(third, GenerationStage::Spawn)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
         // The saved BIOMES protochunk participates in the live-state guard
         // even though it has not yet reached TERRAIN. It must not be silently
         // promoted or treated as an absent chunk.
         let restored = actual.restore_captured_terrain()?;
-        assert_eq!(restored.world().chunks.len(), 1);
+        assert_eq!(restored.world().chunks.len(), 2);
         let restored_chunk = restored
             .world()
             .chunks
@@ -5383,6 +5429,8 @@ mod tests {
         assert!(actual.capture_live_inputs(&live, &restored).is_err());
         live.set_initial_poi_chunk(second, native_session::loaded::SavedPoiData::Missing)?;
         live.set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
+        live.set_initial_poi_chunk(third, native_session::loaded::SavedPoiData::Missing)?;
+        live.set_initial_entity_chunk(third, native_session::loaded::SavedEntityData::Empty)?;
         let guard = actual.capture_live_inputs(&live, &restored)?;
         actual.verify_live_inputs(&live, &guard)?;
         live.queue_missing_chunk(second);
@@ -5808,8 +5856,9 @@ mod tests {
             }
         }
         actual.run_captured_saved_terrain(&mut work, &mut evaluator, second, &[])?;
+        actual.run_captured_saved_terrain(&mut work, &mut evaluator, third, &[])?;
         for &position in &terrain_positions {
-            if position != target && position != second {
+            if position != target && position != second && position != third {
                 actual.run_captured_new_terrain(&mut work, &mut evaluator, position)?;
             }
         }
@@ -5851,6 +5900,9 @@ mod tests {
         assert!(matches!(batch.sources().get(&saved_target), Some(None)));
         assert!(
             matches!(batch.sources().get(&saved_second), Some(Some(source)) if source.as_ref() == &saved)
+        );
+        assert!(
+            matches!(batch.sources().get(&saved_third), Some(Some(source)) if source.as_ref() == &early_saved)
         );
         assert!(batch.biomes().chunk([second.x, second.z]).is_some());
         let world = batch.terrain().snapshot();
@@ -6001,13 +6053,14 @@ mod tests {
                     &mut batch,
                     &mut staged,
                     native_world::loaded::ChunkPos {
-                        x: second.x + 1,
+                        x: second.x + 100,
                         z: second.z
                     }
                 )
                 .is_err()
         );
         actual.propagate_captured_light(&mut batch, &mut staged, second)?;
+        actual.propagate_captured_light(&mut batch, &mut staged, third)?;
         let visible = actual.propagate_captured_light(&mut batch, &mut staged, target)?;
         assert!(visible.raw_brightness(marker, 0).is_some());
         assert!(staged.activated.contains(&target));
@@ -6031,6 +6084,7 @@ mod tests {
         );
         actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, target, false)?;
         actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, second, false)?;
+        actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, third, false)?;
         assert!(
             actual
                 .complete_captured_spawn_without_mobs(&mut batch, &mut staged, target, false)
@@ -6045,12 +6099,16 @@ mod tests {
             actual.draft_captured_empty_spawn(&batch, &staged, saved_target, false, 42)?;
         let saved_spawn =
             actual.draft_captured_empty_spawn(&batch, &staged, saved_second, false, 42)?;
+        let early_spawn =
+            actual.draft_captured_empty_spawn(&batch, &staged, saved_third, false, 42)?;
         assert!(new_spawn.matches_state(&batch, &staged, false));
         assert!(saved_spawn.matches_state(&batch, &staged, false));
         assert!(!new_spawn.matches_state(&batch, &staged, true));
         assert!(new_spawn.matches_source(None)?);
         assert!(!new_spawn.matches_source(Some(&saved))?);
         assert!(saved_spawn.matches_source(Some(&saved))?);
+        assert!(early_spawn.matches_source(Some(&early_saved))?);
+        assert!(early_spawn.matches_state(&batch, &staged, false));
         assert!(!saved_spawn.matches_source(None)?);
         assert!(new_spawn.entity_sidecar_source().is_none());
         assert!(saved_spawn.entity_sidecar_source().is_none());
@@ -6066,6 +6124,32 @@ mod tests {
         );
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
+        let early_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_third)?;
+        assert!(early_draft.matches_state(&batch, &staged));
+        assert!(early_draft.matches_source(&early_saved)?);
+        assert_eq!(
+            early_draft.document().value.get("Status"),
+            early_saved.value.get("Status")
+        );
+        assert_eq!(
+            early_draft.document().value.get("example:root"),
+            Some(&Tag::Int(74))
+        );
+        let early_sections =
+            native_persistence::palette::decode_sections(&early_draft.document().value)?;
+        let early_marker = [third.x * 16 + 8, lighting.min_y + 8, third.z * 16 + 8];
+        let early_block = early_sections
+            .iter()
+            .find(|section| i32::from(section.y) == early_marker[1].div_euclid(16))
+            .and_then(|section| section.blocks.as_ref())
+            .and_then(|blocks| blocks.block(8, early_marker[1].rem_euclid(16) as usize, 8))
+            .context("early draft marker block missing")?;
+        assert!(early_block.name.matches("minecraft:melon"));
+        assert!(
+            early_sections
+                .iter()
+                .any(|section| section.block_light.is_some() || section.sky_light.is_some())
+        );
         assert!(saved_draft.matches_state(&batch, &staged));
         assert!(saved_draft.matches_source(&saved)?);
         assert!(!saved_draft.matches_source(draft.document())?);
@@ -6217,6 +6301,7 @@ mod tests {
         for (name, document, spawn_status) in [
             ("new", draft.document(), false),
             ("saved", saved_draft.document(), false),
+            ("early", early_draft.document(), false),
             ("spawn", new_spawn.document(), true),
         ] {
             let nbt = oracle.path().join(format!("{name}-light.nbt"));

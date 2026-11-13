@@ -5031,7 +5031,16 @@ impl PreparedExistingGenerator {
         &self,
         work: CapturedBiomeSchedule,
     ) -> Result<CapturedTerrainBatch> {
+        self.assemble_captured_terrain_checked(work, &mut || Ok(()))
+    }
+
+    fn assemble_captured_terrain_checked(
+        &self,
+        work: CapturedBiomeSchedule,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<CapturedTerrainBatch> {
         use native_session::worldgen::schedule::GenerationStage;
+        check()?;
         ensure!(
             Arc::ptr_eq(&self.identity, &work.identity),
             "terrain belongs to another generation capture"
@@ -5043,6 +5052,7 @@ impl PreparedExistingGenerator {
         let captured = self.context.inputs().sources().chunks();
         let mut sources = BTreeMap::new();
         for (position, chunk) in &work.terrain {
+            check()?;
             let expected = captured
                 .get(position)
                 .and_then(|source| source.terrain.as_ref())
@@ -5060,6 +5070,7 @@ impl PreparedExistingGenerator {
             );
         }
         for position in work.new_terrain.keys() {
+            check()?;
             let source = captured
                 .get(position)
                 .context("new terrain source was not captured")?;
@@ -5070,6 +5081,7 @@ impl PreparedExistingGenerator {
             );
         }
         for position in sources.keys() {
+            check()?;
             let key = native_world::loaded::ChunkPos {
                 x: position.x,
                 z: position.z,
@@ -5099,11 +5111,14 @@ impl PreparedExistingGenerator {
             native_session::worldgen::CarvedTerrainWorld::new(first)
         };
         for chunk in saved {
+            check()?;
             world.insert(&chunk.terrain)?;
         }
         for chunk in new_terrain.into_values() {
+            check()?;
             world.insert(&chunk)?;
         }
+        check()?;
         Ok(CapturedTerrainBatch {
             identity,
             schedule,
@@ -5125,14 +5140,28 @@ impl PreparedExistingGenerator {
         restored: &RestoredSavedTerrain,
         positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
     ) -> Result<CapturedTerrainBatch> {
+        self.assemble_captured_terrain_with_saved_checked(work, restored, positions, || Ok(()))
+    }
+
+    /// Assemble a captured terrain batch while checking cancellation and disk
+    /// identity between chunk imports. On failure no partial result is returned.
+    pub fn assemble_captured_terrain_with_saved_checked(
+        &self,
+        work: CapturedBiomeSchedule,
+        restored: &RestoredSavedTerrain,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<CapturedTerrainBatch> {
         use native_session::worldgen::schedule::GenerationStage;
+        check()?;
         ensure!(
             Arc::ptr_eq(&self.identity, &restored.identity),
             "saved terrain belongs to another capture"
         );
-        let mut batch = self.assemble_captured_terrain(work)?;
+        let mut batch = self.assemble_captured_terrain_checked(work, &mut check)?;
         let captured = self.context.inputs().sources().chunks();
         for position in positions {
+            check()?;
             let key = native_persistence::world::ChunkPos {
                 x: position.x,
                 z: position.z,
@@ -5175,6 +5204,7 @@ impl PreparedExistingGenerator {
             )?;
             batch.sources.insert(key, Some(Arc::clone(&saved.document)));
         }
+        check()?;
         Ok(batch)
     }
 

@@ -440,6 +440,34 @@ impl CapturedConvertedHeightmaps {
     }
 }
 
+/// A single captured chunk's converted pending ticks and ordered callbacks.
+/// The proof must be rechecked against the same generation revision before
+/// using the parts in an isolated postprocessing pass.
+pub(crate) struct CapturedConvertedPostprocessing {
+    proof: CapturedConvertedHeightmaps,
+    converted: native_session::worldgen::postprocessing::ConvertedChunkPostprocessing,
+}
+
+impl CapturedConvertedPostprocessing {
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+    ) -> bool {
+        self.proof.matches_state(batch, light, spawn_mobs)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        CapturedConvertedHeightmaps,
+        native_session::worldgen::postprocessing::ConvertedChunkPostprocessing,
+    ) {
+        (self.proof, self.converted)
+    }
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -1517,6 +1545,104 @@ impl PreparedExistingGenerator {
             source,
             heightmaps,
             other_fields,
+        })
+    }
+
+    /// Prepare the exact pending tick containers and ordered marks belonging
+    /// to the same captured spawn result. This does not execute callbacks or
+    /// publish the converted chunk.
+    pub fn begin_captured_postprocessing(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn: &CapturedEmptySpawnDraft,
+        proof: CapturedConvertedHeightmaps,
+    ) -> Result<CapturedConvertedPostprocessing> {
+        use native_session::worldgen::{
+            chunk_ticks::{ChunkTicks, ConvertedChunkTicks, SavedTick},
+            postprocessing::{ConvertedChunkPostprocessing, PostprocessingTask},
+        };
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && spawn.matches_state(batch, light, spawn.spawn_mobs)
+                && proof.matches_state(batch, light, spawn.spawn_mobs)
+                && proof.position == spawn.position,
+            "postprocessing inputs belong to another generation revision"
+        );
+        let position = spawn.position;
+        let source = batch
+            .sources
+            .get(&native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            })
+            .context("terrain source was not captured")?;
+        ensure!(
+            proof.matches_source(source.as_deref())? && spawn.matches_source(source.as_deref())?,
+            "postprocessing source differs"
+        );
+        let world = batch.terrain.snapshot();
+        let block_ticks = world
+            .saved_block_ticks
+            .get(&position)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let fluid_ticks = world
+            .saved_fluid_ticks
+            .get(&position)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let encoded_blocks =
+            native_persistence::generated_ticks::encode_block_ticks(position, block_ticks, |id| {
+                assets.block_ids.contains(id)
+            })?;
+        let encoded_fluids =
+            native_persistence::generated_ticks::encode_fluid_ticks(position, fluid_ticks)?;
+        ensure!(
+            unique_root_field(spawn.document(), "block_ticks")? == Some(&encoded_blocks)
+                && unique_root_field(spawn.document(), "fluid_ticks")? == Some(&encoded_fluids),
+            "spawn tick data differs from generation"
+        );
+        let marks = batch
+            .terrain
+            .postprocessing_marks_to_date(position)
+            .context("generation postprocessing history is missing")?;
+        ensure!(
+            unique_root_field(spawn.document(), "PostProcessing")?
+                == Some(&native_persistence::postprocessing::encode(&marks)),
+            "spawn postprocessing marks differ from generation"
+        );
+        let blocks = block_ticks
+            .iter()
+            .map(|tick| SavedTick {
+                kind: tick.block.clone(),
+                position: tick.position,
+                delay: tick.delay,
+                priority: tick.priority,
+            })
+            .collect();
+        let fluids = fluid_ticks
+            .iter()
+            .map(|tick| SavedTick {
+                kind: tick.fluid.clone(),
+                position: tick.position,
+                delay: tick.delay,
+                priority: tick.priority,
+            })
+            .collect();
+        Ok(CapturedConvertedPostprocessing {
+            proof,
+            converted: ConvertedChunkPostprocessing {
+                task: PostprocessingTask::new(Arc::new(marks), position),
+                ticks: ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(position, blocks)?,
+                    fluids: ChunkTicks::from_saved(position, fluids)?,
+                },
+            },
         })
     }
 
@@ -6271,6 +6397,38 @@ mod tests {
             };
             assert_eq!(fields.len(), 4);
         }
+        let new_post = actual.begin_captured_postprocessing(
+            &batch,
+            &staged,
+            &new_spawn,
+            actual.convert_captured_heightmaps(&batch, &staged, &new_spawn)?,
+        )?;
+        let saved_post = actual.begin_captured_postprocessing(
+            &batch,
+            &staged,
+            &saved_spawn,
+            actual.convert_captured_heightmaps(&batch, &staged, &saved_spawn)?,
+        )?;
+        let early_post = actual.begin_captured_postprocessing(
+            &batch,
+            &staged,
+            &early_spawn,
+            actual.convert_captured_heightmaps(&batch, &staged, &early_spawn)?,
+        )?;
+        assert!(
+            actual
+                .begin_captured_postprocessing(
+                    &batch,
+                    &staged,
+                    &saved_spawn,
+                    actual.convert_captured_heightmaps(&batch, &staged, &new_spawn)?,
+                )
+                .is_err()
+        );
+        for converted in [&new_post, &saved_post, &early_post] {
+            assert!(converted.matches_state(&batch, &staged, false));
+            assert!(!converted.matches_state(&batch, &staged, true));
+        }
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
         let early_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_third)?;
@@ -6407,12 +6565,59 @@ mod tests {
         assert!(!saved_spawn.matches_state(&batch, &staged, false));
         assert!(!early_spawn.matches_state(&batch, &staged, false));
         assert!(!early_maps.matches_state(&batch, &staged, false));
+        assert!(!early_post.matches_state(&batch, &staged, false));
         assert!(
             actual
                 .convert_captured_heightmaps(&batch, &staged, &early_spawn)
                 .is_err()
         );
         staged.light_revision = original_revision;
+        let tick_world = batch.terrain.snapshot();
+        for (position, converted) in [
+            (target, new_post),
+            (second, saved_post),
+            (third, early_post),
+        ] {
+            use native_session::worldgen::chunk_ticks::SavedTick;
+            assert!(converted.matches_state(&batch, &staged, false));
+            let (proof, converted) = converted.into_parts();
+            assert!(proof.matches_state(&batch, &staged, false));
+            let expected_blocks: Vec<_> = tick_world
+                .saved_block_ticks
+                .get(&position)
+                .into_iter()
+                .flatten()
+                .map(|tick| SavedTick {
+                    kind: tick.block.clone(),
+                    position: tick.position,
+                    delay: tick.delay,
+                    priority: tick.priority,
+                })
+                .collect();
+            let expected_fluids: Vec<_> = tick_world
+                .saved_fluid_ticks
+                .get(&position)
+                .into_iter()
+                .flatten()
+                .map(|tick| SavedTick {
+                    kind: tick.fluid.clone(),
+                    position: tick.position,
+                    delay: tick.delay,
+                    priority: tick.priority,
+                })
+                .collect();
+            assert_eq!(converted.ticks.blocks.pack(42), expected_blocks);
+            assert_eq!(converted.ticks.fluids.pack(42), expected_fluids);
+            assert!(converted.ticks.blocks.peek().is_none());
+            assert!(converted.ticks.fluids.peek().is_none());
+            assert!(
+                expected_blocks
+                    .iter()
+                    .any(|tick| tick.kind == "minecraft:melon")
+            );
+            let activated = converted.ticks.blocks.activated(42);
+            assert_eq!(activated.len(), expected_blocks.len());
+        }
         assert!(draft.matches_state(&batch, &staged));
         assert!(
             actual

@@ -33,6 +33,20 @@ pub fn jigsaw_state(state: &BlockState) -> bool {
         )
 }
 
+/// Validate the complete built-in barrel state.
+pub fn barrel_state(state: &BlockState) -> bool {
+    state.name == "minecraft:barrel"
+        && state.properties.len() == 2
+        && matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west" | "up" | "down")
+        )
+        && matches!(
+            state.properties.get("open").map(String::as_str),
+            Some("true" | "false")
+        )
+}
+
 /// Validate a barrier state and return its contained-water flag.
 pub fn barrier_waterlogged(state: &BlockState) -> Option<bool> {
     if state.name != "minecraft:barrier" || state.properties.len() != 1 {
@@ -1259,6 +1273,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         || full_tuff(state)
         || copper_grate_waterlogged(state).is_some()
         || vault_state(state).is_some()
+        || barrel_state(state)
     {
         return Some(FULL.to_vec());
     }

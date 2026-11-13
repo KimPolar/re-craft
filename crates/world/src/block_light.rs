@@ -208,6 +208,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
         }
         "minecraft:jigsaw" if crate::collision::jigsaw_state(state) => (15, 0),
+        "minecraft:barrel" if crate::collision::barrel_state(state) => (15, 0),
         "minecraft:bee_nest" | "minecraft:beehive"
             if state.properties.len() == 2 && facing() && bounded("honey_level", 5).is_some() =>
         {
@@ -1485,6 +1486,20 @@ mod tests {
     }
 
     #[test]
+    fn barrel_light_requires_all_valid_properties() {
+        let mut barrel = state("barrel", None);
+        barrel.properties = BTreeMap::from([
+            ("facing".into(), "up".into()),
+            ("open".into(), "false".into()),
+        ]);
+        assert_eq!(properties(&barrel), Some((15, 0)));
+        assert!(crate::collision::block_shape(&barrel).is_some());
+        barrel.properties.insert("open".into(), "invalid".into());
+        assert!(properties(&barrel).is_none());
+        assert!(crate::collision::block_shape(&barrel).is_none());
+    }
+
+    #[test]
     fn copper_grate_transmits_light_in_both_fluid_states() {
         let mut grate = state("waxed_oxidized_copper_grate", None);
         for wet in [false, true] {
@@ -2616,6 +2631,7 @@ mod tests {
             "redstone_lamp",
             "vault",
             "decorated_pot",
+            "barrel",
             "copper_bulb",
             "exposed_copper_bulb",
             "weathered_copper_bulb",
@@ -2772,6 +2788,7 @@ mod tests {
                 || crate::collision::vault_state(&s).is_some()
                 || crate::collision::flower_pot(&s)
                 || crate::collision::decorated_pot_waterlogged(&s).is_some()
+                || crate::collision::barrel_state(&s)
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);

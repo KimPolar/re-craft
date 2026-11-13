@@ -26,7 +26,28 @@ pub(super) fn place_block_for_light_test(
     let mut random = DecorationRandom::new(42);
     let mut draft = JigsawRegion { region, registry };
     let fluid = if waterlog { draft.fluid_at(pos)? } else { None };
-    ensure!(draft.place_template_block(pos, state, None, &mut random)?);
+    let nbt = (state.name == "minecraft:vault").then(|| {
+        Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:vault".into())),
+            (
+                "config".into(),
+                Tag::Compound(vec![
+                    (
+                        "key_item".into(),
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:trial_key".into())),
+                            ("count".into(), Tag::Int(1)),
+                        ]),
+                    ),
+                    (
+                        "loot_table".into(),
+                        Tag::String("minecraft:chests/trial_chambers/reward".into()),
+                    ),
+                ]),
+            ),
+        ])
+    });
+    ensure!(draft.place_template_block(pos, state, nbt.as_ref(), &mut random)?);
     if waterlog {
         draft.place_liquid(pos, state, fluid)?;
     }
@@ -104,6 +125,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::full_copper(state)
         || native_world::collision::full_tuff(state)
         || native_world::collision::copper_grate_waterlogged(state).is_some()
+        || native_world::collision::vault_state(state).is_some()
     {
         return Ok(true);
     }
@@ -232,7 +254,18 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         if self.region.is_outside(pos[1]) {
             return Ok(true);
         }
-        let chest_table = if let Some(nbt) = nbt {
+        let vault = if state.name == "minecraft:vault" {
+            Some(super::super::GeneratedVault::from_template(
+                pos,
+                state.clone(),
+                nbt.context("vault template data is missing")?,
+            )?)
+        } else {
+            None
+        };
+        let chest_table = if vault.is_some() {
+            None
+        } else if let Some(nbt) = nbt {
             let Tag::Compound(fields) = nbt else {
                 bail!("jigsaw block entity placement requires a compound")
             };
@@ -287,7 +320,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         ensure!(
             self.registry
                 .is_canonical_state(&state.name, &state.properties)
-                && self.registry.has_block_entity(&state.name) == Some(chest_table.is_some())
+                && self.registry.has_block_entity(&state.name)
+                    == Some(chest_table.is_some() || vault.is_some())
                 && jigsaw_static_full(state).is_ok(),
             "unsupported jigsaw block effects at {pos:?}: {state:?}"
         );
@@ -324,6 +358,26 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 None => super::super::GeneratedMonsterRoomEntity::EmptyChest(chest),
             };
             Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
+            Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
+        } else if let Some(vault) = vault {
+            self.region.jigsaw_block_write = true;
+            let barrier = BlockState {
+                name: "minecraft:barrier".into(),
+                properties: BTreeMap::from([("waterlogged".into(), "false".into())]),
+            };
+            let result = self
+                .region
+                .set_proto_block(pos, &barrier)
+                .and_then(|_| self.region.set_proto_block(pos, state));
+            self.region.jigsaw_block_write = false;
+            result?;
+            let pending = self.region.pending_order.entry(chunk(pos)).or_default();
+            Arc::make_mut(pending).insert(pos);
+            Arc::make_mut(pending).remove(pos);
+            Arc::make_mut(&mut self.region.monster_entities).insert(
+                pos,
+                Some(super::super::GeneratedMonsterRoomEntity::Vault(vault)),
+            );
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         } else {
             self.region.jigsaw_block_write = jigsaw_wood(state)
@@ -440,6 +494,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 Some(Some(
                     super::super::GeneratedMonsterRoomEntity::Chest(_)
                         | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
+                        | super::super::GeneratedMonsterRoomEntity::Vault(_)
                 ))
             ),
             "jigsaw block entity marking is not yet supported"
@@ -706,6 +761,80 @@ mod tests {
                 properties: BTreeMap::from([("level".into(), "16".into())]),
             };
             assert!(jigsaw_static_full(&invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_vault_placement_keeps_config_and_random() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for ominous in [false, true] {
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let (id, properties) = registry.resolve(&serde_json::json!({"id":"minecraft:vault","properties":{"facing":"west","ominous":ominous.to_string()}}))?;
+            let state = BlockState {
+                name: id,
+                properties,
+            };
+            let key = if ominous {
+                "minecraft:ominous_trial_key"
+            } else {
+                "minecraft:trial_key"
+            };
+            let loot = if ominous {
+                "minecraft:chests/trial_chambers/reward_ominous"
+            } else {
+                "minecraft:chests/trial_chambers/reward"
+            };
+            let nbt = Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:vault".into())),
+                (
+                    "config".into(),
+                    Tag::Compound(vec![
+                        (
+                            "key_item".into(),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String(key.into())),
+                                ("count".into(), Tag::Int(1)),
+                            ]),
+                        ),
+                        ("loot_table".into(), Tag::String(loot.into())),
+                    ]),
+                ),
+            ]);
+            let pos = [1, 8, 1];
+            let mut random = DecorationRandom::new(42);
+            let mut original = random.clone();
+            {
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(pos, &state, Some(&nbt), &mut random)?);
+                draft.mark_block_entity_changed(pos)?;
+            }
+            region.finish()?;
+            assert_eq!(random.next_long(), original.next_long());
+            assert_eq!(
+                terrain.snapshot().block(pos[0], pos[1], pos[2]),
+                Some(&state)
+            );
+            let Tag::List { values, .. } =
+                terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+            else {
+                bail!("missing vault entity list")
+            };
+            assert_eq!(values.len(), 1);
+            let expected = super::super::super::GeneratedVault::from_template(pos, state, &nbt)?
+                .block_entity();
+            assert_eq!(values[0], expected);
         }
         Ok(())
     }

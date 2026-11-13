@@ -7974,6 +7974,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::full_copper(state)
                             || native_world::collision::full_tuff(state)
                             || native_world::collision::copper_grate_waterlogged(state).is_some()
+                            || native_world::collision::vault_state(state).is_some()
+                            || native_world::collision::barrier_waterlogged(state).is_some()
                             || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                             || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state)
@@ -8004,6 +8006,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 && (old_air
                                     || jigsaw_water
                                     || jigsaw_waterlog
+                                    || (old.name == "minecraft:barrier"
+                                        && native_world::collision::barrier_waterlogged(&old) == Some(false)
+                                        && native_world::collision::vault_state(state).is_some())
                                     || ((jigsaw::jigsaw_carpet(state) || jigsaw::jigsaw_ladder(state))
                                         && (disk_safe_solid(&old.name).is_some()
                                             || jigsaw::jigsaw_static_full(&old).is_ok()))
@@ -8020,6 +8025,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && native_world::collision::bed_leg_end(state).is_none()
                             && !native_world::collision::full_glass(state)
                             && native_world::collision::copper_grate_waterlogged(state).is_none()
+                            && native_world::collision::barrier_waterlogged(state).is_none()
                             && !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                             && !jigsaw::jigsaw_candle(state)
                             && !jigsaw::jigsaw_carpet(state)
@@ -12820,6 +12826,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_vaults_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_vault",
+            "vine_active_self_jigsaw_active_vault",
+            "vine_active_empty_jigsaw_active_vault",
+            "vine_active_self_empty_jigsaw_vault",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13270,6 +13287,8 @@ mod tests {
                         "water"
                     } else if mode.ends_with("_liquidlava") {
                         "lava"
+                    } else if mode.ends_with("_vault") {
+                        "vault"
                     } else if mode.ends_with("_grate") {
                         "waxed_copper_grate"
                     } else if mode.ends_with("_carpet") {
@@ -13353,6 +13372,12 @@ mod tests {
                         block.properties = BTreeMap::from([("waterlogged".into(), "false".into())]);
                     } else if mode.ends_with("_liquidwater") || mode.ends_with("_liquidlava") {
                         block.properties = BTreeMap::from([("level".into(), "0".into())]);
+                    } else if mode.ends_with("_vault") {
+                        block.properties = BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("ominous".into(), "false".into()),
+                            ("vault_state".into(), if mode.contains("_jigsaw_active_") { "active" } else { "inactive" }.into()),
+                        ]);
                     } else if mode.ends_with("_ladder") {
                         block.properties = BTreeMap::from([
                             ("facing".into(), "north".into()),
@@ -20462,6 +20487,7 @@ mod tests {
                         }
                         | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
                         | super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(_)
+                        | super::super::GeneratedMonsterRoomEntity::Vault(_)
                         | super::super::GeneratedMonsterRoomEntity::Brushable(_) => {
                             panic!("monster rooms should resolve generated chests")
                         }

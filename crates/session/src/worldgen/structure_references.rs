@@ -89,6 +89,21 @@ impl OrderedStructureReferences {
         self.structure_order.as_deref()
     }
 
+    /// Encode the per-key fastutil iteration order used by Java's chunk data.
+    pub fn to_tag(&self) -> Tag {
+        Tag::Compound(
+            self.ordered
+                .iter()
+                .map(|(id, values)| {
+                    (
+                        format!("{}:{}", id.namespace, id.path).as_str().into(),
+                        Tag::LongArray(values.clone()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     pub(super) fn into_membership(self) -> StructureReferences {
         self.membership
     }

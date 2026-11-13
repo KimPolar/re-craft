@@ -212,6 +212,10 @@ pub(crate) struct CapturedBiomeSchedule {
         native_persistence::world::ChunkPos,
         native_session::worldgen::MaterializedTerrain,
     >,
+    generated_references: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_session::worldgen::structure_references::OrderedStructureReferences,
+    >,
 }
 
 /// Intermediate terrain assembled from one capture. `None` in `sources`
@@ -223,6 +227,10 @@ pub(crate) struct CapturedTerrainBatch {
     biomes: native_session::worldgen::BiomeNeighborhood,
     terrain: native_session::worldgen::CarvedTerrainWorld,
     sources: BTreeMap<native_persistence::world::ChunkPos, Option<Arc<NamedTag>>>,
+    generated_references: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_session::worldgen::structure_references::OrderedStructureReferences,
+    >,
     feature_entity_sources: ResumedFeatureEntitySources,
     revision: Arc<()>,
 }
@@ -711,6 +719,7 @@ pub(crate) struct CapturedPostprocessedComponents {
         native_world::loaded::ChunkPos,
         native_session::worldgen::PostprocessedChunkComponents,
     >,
+    structures: BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
 }
 
 impl CapturedPostprocessedComponents {
@@ -721,6 +730,10 @@ impl CapturedPostprocessedComponents {
         native_session::worldgen::PostprocessedChunkComponents,
     > {
         &self.chunks
+    }
+
+    pub fn structures(&self) -> &BTreeMap<native_world::loaded::ChunkPos, Option<Tag>> {
+        &self.structures
     }
 
     pub fn matches_state(
@@ -1568,6 +1581,11 @@ impl PreparedExistingGenerator {
                 entities,
             },
         )?;
+        let references = batch
+            .generated_references
+            .get(&key)
+            .context("generated structure references are missing")?;
+        merge_generated_structure_references(&mut document, references)?;
         replace_unique_root_field(
             &mut document,
             "Status",
@@ -1641,6 +1659,9 @@ impl PreparedExistingGenerator {
         let source_nbt = native_persistence::nbt::write(&source)?;
         let mut document =
             self.populate_saved_feature_document(&batch.terrain, key, &source, (*source).clone())?;
+        if let Some(references) = batch.generated_references.get(&key) {
+            merge_generated_structure_references(&mut document, references)?;
+        }
         let registry = &self
             .terrain_assets
             .as_ref()
@@ -2263,6 +2284,7 @@ impl PreparedExistingGenerator {
             sections.sections.keys().copied(),
         )?;
         let mut chunks = BTreeMap::new();
+        let mut structures = BTreeMap::new();
         for (pos, data) in data {
             let proof = completed
                 .proofs
@@ -2276,6 +2298,19 @@ impl PreparedExistingGenerator {
                 proof.matches_source(source.as_deref())?,
                 "postprocessing source differs"
             );
+            let mut document = source.as_deref().cloned().unwrap_or_else(|| NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            });
+            if let Some(references) = batch.generated_references.get(&pos) {
+                merge_generated_structure_references(&mut document, references)?;
+            } else {
+                ensure!(
+                    source.is_some(),
+                    "generated structure references are missing"
+                );
+            }
+            structures.insert(pos, unique_root_field(&document, "structures")?.cloned());
             let heightmaps =
                 merge_captured_postprocessed_heightmaps(&proof.other_fields, data.heightmaps)?;
             chunks.insert(
@@ -2297,6 +2332,7 @@ impl PreparedExistingGenerator {
         Ok(CapturedPostprocessedComponents {
             result_identity: Arc::clone(&completed.identity),
             chunks,
+            structures,
         })
     }
 
@@ -4478,6 +4514,7 @@ impl PreparedExistingGenerator {
             biomes,
             terrain: BTreeMap::new(),
             new_terrain: BTreeMap::new(),
+            generated_references: BTreeMap::new(),
         })
     }
 
@@ -4579,15 +4616,21 @@ impl PreparedExistingGenerator {
             .and_then(|source| source.terrain.as_ref())
             .context("saved terrain target is missing")?;
         let saved_stage = validate_empty_preterrain_target(saved, true)?;
-        let early_structure = if saved_stage < GenerationStage::StructureReferences {
-            Some(Arc::new(self.captured_beardifier(
-                &work.schedule,
-                position,
-                structure_order,
-            )?))
-        } else {
-            None
-        };
+        let source_document = Arc::clone(&saved.document);
+        let (early_structure, generated_references) =
+            if saved_stage < GenerationStage::StructureReferences {
+                let (structure, references) =
+                    self.captured_beardifier(&work.schedule, position, structure_order)?;
+                let mut validation = (*source_document).clone();
+                merge_generated_structure_references(&mut validation, &references)?;
+                (Some(Arc::new(structure)), Some(references))
+            } else {
+                (None, None)
+            };
+        ensure!(
+            !work.generated_references.contains_key(&position),
+            "structure references already exist"
+        );
         let (terrain, biome) = self.generate_saved_terrain_from_biomes(
             target,
             structure_order,
@@ -4601,6 +4644,9 @@ impl PreparedExistingGenerator {
         if let Err(error) = work.schedule.complete(position, GenerationStage::Terrain) {
             work.terrain.remove(&target);
             return Err(error);
+        }
+        if let Some(references) = generated_references {
+            work.generated_references.insert(position, references);
         }
         Ok(())
     }
@@ -4676,7 +4722,12 @@ impl PreparedExistingGenerator {
                 .chunk([position.x, position.z])
                 .context("terrain biome is missing")?,
         );
-        let structure = self.captured_beardifier(&work.schedule, position, structure_order)?;
+        ensure!(
+            !work.generated_references.contains_key(&position),
+            "structure references already exist"
+        );
+        let (structure, references) =
+            self.captured_beardifier(&work.schedule, position, structure_order)?;
         let terrain = self.generate_terrain_from_biomes(
             target,
             evaluator,
@@ -4701,6 +4752,7 @@ impl PreparedExistingGenerator {
             work.new_terrain.remove(&target);
             return Err(error);
         }
+        work.generated_references.insert(position, references);
         Ok(())
     }
 
@@ -4766,6 +4818,7 @@ impl PreparedExistingGenerator {
             biomes,
             terrain,
             mut new_terrain,
+            generated_references,
         } = work;
         let mut saved = terrain.into_values();
         let mut world = if let Some(first) = saved.next() {
@@ -4788,6 +4841,7 @@ impl PreparedExistingGenerator {
             biomes,
             terrain: world,
             sources,
+            generated_references,
             feature_entity_sources: ResumedFeatureEntitySources::default(),
             revision: Arc::new(()),
         })
@@ -4972,7 +5026,10 @@ impl PreparedExistingGenerator {
         schedule: &GenerationSchedule,
         target: native_world::loaded::ChunkPos,
         structure_order: &[ResourceId],
-    ) -> Result<native_core::beardifier::Beardifier> {
+    ) -> Result<(
+        native_core::beardifier::Beardifier,
+        native_session::worldgen::structure_references::OrderedStructureReferences,
+    )> {
         use native_session::worldgen::{
             saved_structure_starts::{RestoredStructureStart, beardifier_for_ordered_references},
             schedule::GenerationStage,
@@ -5039,19 +5096,25 @@ impl PreparedExistingGenerator {
                 .filter_map(|(id, start)| start.reference_bounds(id).transpose())
                 .collect()
         })?;
-        beardifier_for_ordered_references(target, &references, structure_order, |id, position| {
-            let start = starts
-                .get(&position)
-                .and_then(|entries| entries.get(id))
-                .context("referenced structure start is missing")?;
-            if let RestoredStructureStart::Present { chunk, .. } = start {
-                ensure!(
-                    *chunk == position,
-                    "saved structure start belongs to another chunk"
-                );
-            }
-            start.terrain_pieces()
-        })
+        let beardifier = beardifier_for_ordered_references(
+            target,
+            &references,
+            structure_order,
+            |id, position| {
+                let start = starts
+                    .get(&position)
+                    .and_then(|entries| entries.get(id))
+                    .context("referenced structure start is missing")?;
+                if let RestoredStructureStart::Present { chunk, .. } = start {
+                    ensure!(
+                        *chunk == position,
+                        "saved structure start belongs to another chunk"
+                    );
+                }
+                start.terrain_pieces()
+            },
+        )?;
+        Ok((beardifier, references))
     }
 
     /// Prepare terrain adaptation from captured starts and references. The
@@ -5882,6 +5945,53 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
+/// Retain opaque structure fields and starts while adding references produced
+/// by this capture. Earlier nonempty references need a Java-order merge that
+/// is not yet available, so they cannot be overwritten.
+fn merge_generated_structure_references(
+    document: &mut NamedTag,
+    references: &native_session::worldgen::structure_references::OrderedStructureReferences,
+) -> Result<()> {
+    let mut structures = match unique_root_field(document, "structures")? {
+        Some(Tag::Compound(fields)) => fields.clone(),
+        Some(_) => bail!("saved structures are not a compound"),
+        None => Vec::new(),
+    };
+    let starts: Vec<_> = structures
+        .iter()
+        .filter(|(name, _)| name.matches("starts"))
+        .collect();
+    ensure!(starts.len() <= 1, "duplicate structure starts");
+    if let Some((_, value)) = starts.first() {
+        ensure!(
+            matches!(value, Tag::Compound(_)),
+            "saved structure starts are not a compound"
+        );
+    } else {
+        structures.push(("starts".into(), Tag::Compound(vec![])));
+    }
+    let existing: Vec<_> = structures
+        .iter()
+        .filter(|(name, _)| name.matches("References"))
+        .collect();
+    ensure!(existing.len() <= 1, "duplicate structure references");
+    if let Some((_, value)) = existing.first() {
+        ensure!(
+            matches!(value, Tag::Compound(fields) if fields.is_empty()),
+            "existing structure references need a verified merge"
+        );
+    }
+    if let Some((_, value)) = structures
+        .iter_mut()
+        .find(|(name, _)| name.matches("References"))
+    {
+        *value = references.to_tag();
+    } else {
+        structures.push(("References".into(), references.to_tag()));
+    }
+    replace_unique_root_field(document, "structures", Tag::Compound(structures))
+}
+
 /// Read neighbor ticks while rejecting unimplemented block and side fixups.
 fn parse_captured_upgrade_data(
     document: &NamedTag,
@@ -6433,6 +6543,62 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn generated_structure_references_preserve_saved_structure_fields() -> Result<()> {
+        use native_session::worldgen::structure_references::{
+            StructureStartBounds, collect_ordered_structure_references,
+        };
+        let target = native_world::loaded::ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("minecraft:buried_treasure")?;
+        let bounds = native_core::beardifier::BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let refs = collect_ordered_structure_references(target, |source| {
+            Ok(if source == target {
+                vec![StructureStartBounds {
+                    structure: id.clone(),
+                    bounds,
+                }]
+            } else {
+                vec![]
+            })
+        })?;
+        let starts = Tag::Compound(vec![("custom:start".into(), Tag::Int(9))]);
+        let mut source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("custom_root".into(), Tag::Int(17)),
+                (
+                    "structures".into(),
+                    Tag::Compound(vec![
+                        ("starts".into(), starts.clone()),
+                        ("custom".into(), Tag::String("keep".into())),
+                    ]),
+                ),
+            ]),
+        };
+        merge_generated_structure_references(&mut source, &refs)?;
+        let structures = source.value.get("structures").unwrap();
+        assert_eq!(structures.get("starts"), Some(&starts));
+        assert_eq!(structures.get("custom"), Some(&Tag::String("keep".into())));
+        assert_eq!(
+            structures
+                .get("References")
+                .and_then(|tag| tag.get("minecraft:buried_treasure")),
+            Some(&Tag::LongArray(vec![0]))
+        );
+        assert_eq!(source.value.get("custom_root"), Some(&Tag::Int(17)));
+        let unchanged = source.clone();
+        assert!(merge_generated_structure_references(&mut source, &refs).is_err());
+        assert_eq!(source, unchanged);
+        let mut malformed = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("structures".into(), Tag::Int(1))]),
+        };
+        let unchanged = malformed.clone();
+        assert!(merge_generated_structure_references(&mut malformed, &refs).is_err());
+        assert_eq!(malformed, unchanged);
+        Ok(())
+    }
 
     #[test]
     fn captured_postprocessing_rejects_active_or_ambiguous_upgrade_data() -> Result<()> {
@@ -7139,7 +7305,7 @@ mod tests {
         schedule.request(second, GenerationStage::Spawn)?;
         schedule.request(third, GenerationStage::Spawn)?;
         schedule.request(neighbor, GenerationStage::Spawn)?;
-        schedule.request(structure_target, GenerationStage::Features)?;
+        schedule.request(structure_target, GenerationStage::Spawn)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
         // The saved BIOMES protochunk participates in the live-state guard
@@ -7872,6 +8038,7 @@ mod tests {
         actual.propagate_captured_light(&mut batch, &mut staged, second)?;
         actual.propagate_captured_light(&mut batch, &mut staged, third)?;
         actual.propagate_captured_light(&mut batch, &mut staged, neighbor)?;
+        actual.propagate_captured_light(&mut batch, &mut staged, structure_target)?;
         let visible = actual.propagate_captured_light(&mut batch, &mut staged, target)?;
         assert!(visible.raw_brightness(marker, 0).is_some());
         assert!(staged.activated.contains(&target));
@@ -8049,6 +8216,24 @@ mod tests {
         assert!(!converted_region.matches_state(&batch, &staged, false, 43, 9));
         assert!(!converted_region.matches_state(&batch, &staged, false, 42, 10));
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
+        let structure_draft = actual.draft_captured_new_lit_chunk(
+            &batch,
+            &staged,
+            native_persistence::world::ChunkPos {
+                x: structure_target.x,
+                z: structure_target.z,
+            },
+            42,
+        )?;
+        assert_eq!(
+            structure_draft
+                .document()
+                .value
+                .get("structures")
+                .and_then(|value| value.get("References"))
+                .and_then(|value| value.get("minecraft:buried_treasure")),
+            Some(&Tag::LongArray(vec![(2i64 << 32) | 0])),
+        );
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
         let early_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_third)?;
         assert!(early_draft.matches_state(&batch, &staged));
@@ -8521,16 +8706,66 @@ mod tests {
             &heightmap_oracle,
             include_str!("../../../persistence/tests/java/FullHeightmapOracle.java"),
         )?;
+        let structure_oracle = oracle.path().join("SavedStructureReferencesOracle.java");
+        std::fs::write(
+            &structure_oracle,
+            include_str!("../../../session/tests/java/SavedStructureReferencesOracle.java"),
+        )?;
         let compiled = std::process::Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg(&source)
             .arg(&heightmap_oracle)
+            .arg(&structure_oracle)
             .output()?;
         ensure!(
             compiled.status.success(),
             "Java oracle compilation failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
+        );
+        let structure_input = oracle.path().join("generated-structure-references.nbt");
+        let structures = structure_draft
+            .document()
+            .value
+            .get("structures")
+            .context("generated structures missing")?
+            .clone();
+        let case = Tag::Compound(vec![
+            ("x".into(), Tag::Int(structure_target.x)),
+            ("z".into(), Tag::Int(structure_target.z)),
+            ("structures".into(), structures),
+            (
+                "expected".into(),
+                Tag::Compound(vec![(
+                    "minecraft:buried_treasure".into(),
+                    Tag::LongArray(vec![2i64 << 32]),
+                )]),
+            ),
+        ]);
+        std::fs::write(
+            &structure_input,
+            native_persistence::nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "cases".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![case],
+                    },
+                )]),
+            })?,
+        )?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("SavedStructureReferencesOracle")
+            .arg(&structure_input)
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java structure references validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
         );
         let mut heightmap_cases = Vec::new();
         for (position, maps) in [

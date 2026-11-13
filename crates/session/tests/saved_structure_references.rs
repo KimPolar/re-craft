@@ -1,6 +1,8 @@
 use native_persistence::nbt::{self, NamedTag, Tag, TagType};
 use native_resources::packs::ResourceId;
-use native_session::worldgen::structure_references::restore_saved_structure_references;
+use native_session::worldgen::structure_references::{
+    StructureStartBounds, collect_ordered_structure_references, restore_saved_structure_references,
+};
 use native_world::loaded::ChunkPos;
 use std::{path::PathBuf, process::Command};
 
@@ -117,6 +119,46 @@ fn saved_structure_reference_order_matches_java_26_3() {
                 ("expected".into(), expected),
             ]));
         }
+    }
+    // Encode generated sets in the same form used by chunk drafts, then let
+    // Java rebuild each fastutil set from those arrays.
+    let target = ChunkPos { x: -7, z: 13 };
+    let bounds = native_core::beardifier::BoundingBox::new([-112, 0, 208], [-97, 15, 223]).unwrap();
+    for count in [1usize, 2, 12, 24, 100, 289] {
+        let generated = collect_ordered_structure_references(target, |source| {
+            let dx = source.x - target.x + 8;
+            let dz = source.z - target.z + 8;
+            Ok(if (dx * 17 + dz) < count as i32 {
+                vec![StructureStartBounds {
+                    structure: ids[0].clone(),
+                    bounds,
+                }]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        let references = generated.to_tag();
+        let decoded =
+            restore_saved_structure_references(
+                target,
+                Some(&references),
+                |id| Ok(ids.contains(id)),
+            )
+            .unwrap();
+        let expected = Tag::Compound(vec![(
+            "minecraft:buried_treasure".into(),
+            Tag::LongArray(decoded.references.order(&ids[0]).unwrap().to_vec()),
+        )]);
+        cases.push(Tag::Compound(vec![
+            ("x".into(), Tag::Int(target.x)),
+            ("z".into(), Tag::Int(target.z)),
+            (
+                "structures".into(),
+                Tag::Compound(vec![("References".into(), references)]),
+            ),
+            ("expected".into(), expected),
+        ]));
     }
     let invalid = Tag::Int(7);
     let decoded =

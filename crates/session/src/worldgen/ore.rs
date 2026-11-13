@@ -5310,7 +5310,7 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if native_world::collision::copper_grate_waterlogged(state).is_some() {
         return Ok((true, false));
     }
-    if jigsaw::jigsaw_torch(state) {
+    if jigsaw::jigsaw_torch(state) || jigsaw::jigsaw_candle(state) {
         return Ok((false, false));
     }
     if native_world::collision::pane_waterlogged(state).is_some()

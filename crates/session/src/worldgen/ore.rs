@@ -5301,6 +5301,15 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if jigsaw::jigsaw_wood(state) {
         return Ok((true, true));
     }
+    if native_world::collision::full_tuff(state)
+        || native_world::collision::full_copper(state)
+        || native_world::collision::copper_bulb_state(state).is_some()
+    {
+        return Ok((true, true));
+    }
+    if native_world::collision::copper_grate_waterlogged(state).is_some() {
+        return Ok((true, false));
+    }
     if jigsaw::jigsaw_torch(state) {
         return Ok((false, false));
     }

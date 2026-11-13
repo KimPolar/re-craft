@@ -20,6 +20,14 @@ public class MonsterRoomBlockOracle {
   });
   var names=List.of("air","cave_air","void_air","water","lava","leaf_litter","oak_leaves","dark_oak_leaves","birch_leaves","azalea_leaves","flowering_azalea_leaves","chest","spawner","stone","deepslate","tuff","granite","diorite","andesite","calcite","dirt","grass_block","podzol","mycelium","coarse_dirt","rooted_dirt","mud","packed_mud","moss_block","clay","gravel","sand","red_sand","sandstone","bedrock","cobblestone","mossy_cobblestone","cobbled_deepslate","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","netherrack","basalt","smooth_basalt","amethyst_block","budding_amethyst","blackstone","ancient_debris");
   var expandedNames=new ArrayList<>(names);
+  expandedNames.addAll(List.of("polished_tuff","tuff_bricks","chiseled_tuff","chiseled_tuff_bricks"));
+  for (var prefix : List.of("", "exposed_", "weathered_", "oxidized_", "waxed_", "waxed_exposed_", "waxed_weathered_", "waxed_oxidized_")) {
+   expandedNames.add(prefix + ((prefix.equals("") || prefix.equals("waxed_")) ? "copper_block" : "copper"));
+   expandedNames.add(prefix + "cut_copper");
+   expandedNames.add(prefix + "chiseled_copper");
+   expandedNames.add(prefix + "copper_bulb");
+   expandedNames.add(prefix + "copper_grate");
+  }
   expandedNames.addAll(List.of("moss_carpet","short_grass","tall_grass","fern","large_fern","azalea","flowering_azalea","oak_log","birch_log","dark_oak_log","brown_mushroom_block","red_mushroom_block","mushroom_stem"));
   expandedNames.addAll(List.of("rail","powered_rail","detector_rail","activator_rail","cobweb","torch","wall_torch","soul_torch","soul_wall_torch","lantern","soul_lantern","oak_slab","oak_stairs"));
   var supportNames=new HashSet<>(List.of("rail","powered_rail","detector_rail","activator_rail","cobweb","torch","wall_torch","soul_torch","soul_wall_torch","lantern","soul_lantern"));

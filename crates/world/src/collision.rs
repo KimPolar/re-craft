@@ -1127,6 +1127,26 @@ pub fn copper_grate_waterlogged(state: &BlockState) -> Option<bool> {
     }
 }
 
+pub fn vault_state(state: &BlockState) -> Option<&str> {
+    if state.name != "minecraft:vault"
+        || state.properties.len() != 3
+        || !matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west")
+        )
+        || !matches!(
+            state.properties.get("ominous").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    match state.properties.get("vault_state")?.as_str() {
+        value @ ("inactive" | "active" | "unlocking" | "ejecting") => Some(value),
+        _ => None,
+    }
+}
+
 pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
     if !matches!(
         state.name.as_str(),
@@ -1156,6 +1176,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         || full_copper(state)
         || full_tuff(state)
         || copper_grate_waterlogged(state).is_some()
+        || vault_state(state).is_some()
     {
         return Some(FULL.to_vec());
     }

@@ -17,20 +17,7 @@ impl GeneratedVault {
         nbt: &Tag,
     ) -> Result<Self> {
         ensure!(
-            state.name == "minecraft:vault"
-                && state.properties.len() == 3
-                && matches!(
-                    state.properties.get("facing").map(String::as_str),
-                    Some("north" | "south" | "east" | "west")
-                )
-                && matches!(
-                    state.properties.get("ominous").map(String::as_str),
-                    Some("true" | "false")
-                )
-                && matches!(
-                    state.properties.get("vault_state").map(String::as_str),
-                    Some("inactive" | "active" | "unlocking" | "ejecting")
-                ),
+            native_world::collision::vault_state(&state).is_some(),
             "invalid vault state"
         );
         let config = nbt

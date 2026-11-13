@@ -31,6 +31,7 @@ enum StateSchema {
     Dusted,
     Lit,
     CopperBulb,
+    Vault,
     PotentSulfur,
     SulfurSpike,
     Liquid,
@@ -83,6 +84,13 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("lit".into(), "false".into()),
                     ("powered".into(), "false".into()),
+                ]);
+            }
+            Self::Vault => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("ominous".into(), "false".into()),
+                    ("vault_state".into(), "inactive".into()),
                 ]);
             }
             Self::Beehive => {
@@ -316,6 +324,14 @@ impl StateSchema {
             }
             Self::CopperBulb
                 if matches!(name, "lit" | "powered") && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Vault
+                if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
+                    || (name == "ominous" && matches!(value, "true" | "false"))
+                    || (name == "vault_state"
+                        && matches!(value, "inactive" | "active" | "unlocking" | "ejecting")) =>
             {
                 Some(value.to_owned())
             }
@@ -964,6 +980,7 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/WeatheringCopperBulbBlock" => {
                     Some(StateSchema::CopperBulb)
                 }
+                "net/minecraft/world/level/block/VaultBlock" => Some(StateSchema::Vault),
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
@@ -1232,6 +1249,7 @@ impl GeneratedBlockRegistry {
             matches!(
                 schema,
                 StateSchema::HorizontalFacing
+                    | StateSchema::Vault
                     | StateSchema::Ladder
                     | StateSchema::Stairs
                     | StateSchema::Chest

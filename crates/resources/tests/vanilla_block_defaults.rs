@@ -330,6 +330,14 @@ fn generated_block_defaults_match_java() {
             }
         }
     }
+    assert!(registry.contains("minecraft:vault"));
+    for facing in ["north", "south", "east", "west", "invalid"] {
+        for ominous in ["false", "true", "invalid"] {
+            for vault_state in ["inactive", "active", "unlocking", "ejecting", "invalid"] {
+                cases.push(serde_json::json!({"id":"minecraft:vault","properties":{"facing":facing,"ominous":ominous,"vault_state":vault_state}}));
+            }
+        }
+    }
     for age in 0..=25 {
         cases.push(serde_json::json!({"id":"minecraft:kelp","properties":{"age":age.to_string()}}));
     }

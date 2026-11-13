@@ -4379,7 +4379,8 @@ impl PreparedExistingGenerator {
 
     /// Restore every terrain chunk present in the capture. Missing chunks stay
     /// absent and can be checked against the same live-session guard as the
-    /// restored neighbors. Saved protochunks without terrain are still rejected.
+    /// restored neighbors. Earlier protochunks retain their raw materialized
+    /// sections, but do not become proof that later generation stages ran.
     pub fn restore_captured_terrain(&mut self) -> Result<RestoredSavedTerrain> {
         let sources = self.context.inputs().sources();
         let positions: Vec<_> = sources
@@ -4400,7 +4401,7 @@ impl PreparedExistingGenerator {
                 postprocessing: BTreeMap::new(),
             });
         }
-        self.restore_saved_terrain(positions)
+        self.restore_saved_terrain_inner(positions, true)
     }
 
     /// Restore captured terrain and recorded generation metadata without
@@ -4408,6 +4409,14 @@ impl PreparedExistingGenerator {
     pub fn restore_saved_terrain(
         &mut self,
         positions: impl IntoIterator<Item = native_persistence::world::ChunkPos>,
+    ) -> Result<RestoredSavedTerrain> {
+        self.restore_saved_terrain_inner(positions, false)
+    }
+
+    fn restore_saved_terrain_inner(
+        &mut self,
+        positions: impl IntoIterator<Item = native_persistence::world::ChunkPos>,
+        allow_preterrain: bool,
     ) -> Result<RestoredSavedTerrain> {
         use native_persistence::{
             heightmap::{HeightBounds, SavedGenerationHeightmaps},
@@ -4420,7 +4429,37 @@ impl PreparedExistingGenerator {
             ensure!(requested.insert(position), "duplicate saved terrain chunk");
         }
         ensure!(!requested.is_empty(), "no saved terrain chunks requested");
-        let biomes = self.restore_saved_biomes(requested.iter().copied())?;
+        let mut biome_positions = Vec::new();
+        for &position in &requested {
+            let source = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&position)
+                .context("terrain chunk was not captured")?
+                .terrain
+                .as_ref()
+                .context("saved terrain chunk is missing")?;
+            let status = source
+                .status
+                .as_ref()
+                .context("saved chunk status is missing")?;
+            let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+            let stage = GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+            ensure!(
+                allow_preterrain || stage >= GenerationStage::Terrain,
+                "saved chunk has not generated terrain"
+            );
+            if stage >= GenerationStage::Biomes {
+                biome_positions.push(position);
+            }
+        }
+        let biomes = if biome_positions.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.restore_saved_biomes(biome_positions)?
+        };
         let block_registry = self.resources.vanilla_generated_block_registry()?;
         let bounds = HeightBounds {
             min_y: self.lighting.min_y,
@@ -4444,16 +4483,6 @@ impl PreparedExistingGenerator {
                 .terrain
                 .as_ref()
                 .context("saved terrain chunk is missing")?;
-            let status = source
-                .status
-                .as_ref()
-                .context("saved chunk status is missing")?;
-            let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
-            ensure!(
-                GenerationStage::from_id(&status)
-                    .is_some_and(|stage| stage >= GenerationStage::Terrain),
-                "saved chunk has not generated terrain"
-            );
             let key = native_world::loaded::ChunkPos {
                 x: position.x,
                 z: position.z,
@@ -5217,6 +5246,53 @@ mod tests {
         let region_dir = root.join("dimensions/minecraft/overworld/region");
         std::fs::create_dir_all(&region_dir)?;
         std::fs::write(region_dir.join("r.0.0.mca"), region)?;
+        // Keep earlier protochunks far outside the test generation schedule.
+        // Their original NBT must be captured without assuming biome data exists.
+        let early_positions = [
+            (
+                native_persistence::world::ChunkPos { x: 1000, z: 0 },
+                "minecraft:empty",
+            ),
+            (
+                native_persistence::world::ChunkPos { x: 1001, z: 0 },
+                "minecraft:structure_starts",
+            ),
+            (
+                native_persistence::world::ChunkPos { x: 1002, z: 0 },
+                "minecraft:structure_references",
+            ),
+        ];
+        let mut early_region = vec![0; 8192];
+        for (position, status) in early_positions {
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("xPos".into(), Tag::Int(position.x)),
+                    ("zPos".into(), Tag::Int(position.z)),
+                    ("Status".into(), Tag::String(status.into())),
+                    ("example:unrecognized".into(), Tag::Int(73)),
+                ]),
+            };
+            let bytes = native_persistence::nbt::write(&document)?;
+            let sectors = (bytes.len() + 5).div_ceil(4096);
+            let offset = early_region.len() / 4096;
+            ensure!(
+                sectors < 256 && offset < (1 << 24),
+                "test protochunk is too large"
+            );
+            let header =
+                usize::try_from((position.x.rem_euclid(32) + position.z.rem_euclid(32) * 32) * 4)?;
+            early_region[header..header + 4]
+                .copy_from_slice(&(((offset as u32) << 8) | sectors as u32).to_be_bytes());
+            early_region.resize(early_region.len() + sectors * 4096, 0);
+            let start = offset * 4096;
+            early_region[start..start + 4]
+                .copy_from_slice(&u32::try_from(bytes.len() + 1)?.to_be_bytes());
+            early_region[start + 4] = 3;
+            early_region[start + 5..start + 5 + bytes.len()].copy_from_slice(&bytes);
+        }
+        std::fs::write(region_dir.join("r.31.0.mca"), early_region)?;
         let mut reader = WorldReader::open_for_session(root, DimensionId::parse("overworld")?)?;
         let saved_target = native_persistence::world::ChunkPos {
             x: target.x,
@@ -5231,6 +5307,122 @@ mod tests {
         schedule.request(second, GenerationStage::Spawn)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
+        // The saved BIOMES protochunk participates in the live-state guard
+        // even though it has not yet reached TERRAIN. It must not be silently
+        // promoted or treated as an absent chunk.
+        let restored = actual.restore_captured_terrain()?;
+        assert_eq!(restored.world().chunks.len(), 1);
+        let restored_chunk = restored
+            .world()
+            .chunks
+            .get(&second)
+            .context("saved protochunk missing")?;
+        assert_eq!(restored_chunk.status.as_deref(), Some("minecraft:biomes"));
+        assert!(restored.biomes().contains_key(&second));
+        assert!(actual.restore_saved_terrain([saved_second]).is_err());
+        let player = native_session::PlayerState {
+            position: glam::Vec3::new(8.5, lighting.min_y as f32 + 2.0, 40.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut live = native_session::loaded::LoadedSession::new(
+            restored.world().clone(),
+            glam::IVec3::ZERO,
+            native_session::loaded::BuildBounds {
+                min_y: lighting.min_y,
+                max_y: lighting.min_y + lighting.height,
+            },
+            player,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(actual.capture_live_inputs(&live, &restored).is_err());
+        live.set_initial_poi_chunk(second, native_session::loaded::SavedPoiData::Missing)?;
+        live.set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
+        let guard = actual.capture_live_inputs(&live, &restored)?;
+        actual.verify_live_inputs(&live, &guard)?;
+        live.queue_missing_chunk(second);
+        assert!(actual.verify_live_inputs(&live, &guard).is_err());
+        assert_eq!(
+            actual.context.inputs().sources().chunks()[&saved_second]
+                .terrain
+                .as_ref()
+                .unwrap()
+                .document
+                .as_ref(),
+            &saved
+        );
+        let early_context = reader.capture_generation_context(
+            early_positions
+                .iter()
+                .map(|(position, _)| *position)
+                .chain([saved_second]),
+        )?;
+        let mut early_generator = prepare_existing_generator(early_context, &game)?;
+        let early_restored = early_generator.restore_captured_terrain()?;
+        assert_eq!(early_restored.world().chunks.len(), 4);
+        assert_eq!(early_restored.biomes().len(), 1);
+        assert!(early_restored.biomes().contains_key(&second));
+        let without_biomes = early_generator.restore_saved_terrain_inner(
+            early_positions.iter().map(|(position, _)| *position),
+            true,
+        )?;
+        assert_eq!(without_biomes.world().chunks.len(), early_positions.len());
+        assert!(without_biomes.biomes().is_empty());
+        for (position, status) in early_positions {
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            assert_eq!(
+                early_restored.world().chunks[&key].status.as_deref(),
+                Some(status)
+            );
+            assert!(!early_restored.biomes().contains_key(&key));
+            assert!(early_generator.restore_saved_terrain([position]).is_err());
+            assert_eq!(
+                early_generator.inputs().sources().chunks()[&position]
+                    .terrain
+                    .as_ref()
+                    .unwrap()
+                    .document
+                    .value
+                    .get("example:unrecognized"),
+                Some(&Tag::Int(73))
+            );
+        }
+        let mut early_live = native_session::loaded::LoadedSession::new(
+            early_restored.world().clone(),
+            glam::IVec3::ZERO,
+            native_session::loaded::BuildBounds {
+                min_y: lighting.min_y,
+                max_y: lighting.min_y + lighting.height,
+            },
+            player,
+        )
+        .map_err(anyhow::Error::msg)?;
+        for (position, _) in early_positions {
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            early_live.set_initial_poi_chunk(key, native_session::loaded::SavedPoiData::Missing)?;
+            early_live
+                .set_initial_entity_chunk(key, native_session::loaded::SavedEntityData::Empty)?;
+        }
+        early_live.set_initial_poi_chunk(second, native_session::loaded::SavedPoiData::Missing)?;
+        early_live
+            .set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
+        let early_guard = early_generator.capture_live_inputs(&early_live, &early_restored)?;
+        early_generator.verify_live_inputs(&early_live, &early_guard)?;
+        early_live.queue_missing_chunk(native_world::loaded::ChunkPos { x: 1000, z: 0 });
+        assert!(
+            early_generator
+                .verify_live_inputs(&early_live, &early_guard)
+                .is_err()
+        );
         let selected = actual.context.selection();
         let selection = DataPackSettings {
             enabled: selected.enabled.clone(),

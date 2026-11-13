@@ -76,6 +76,9 @@ pub struct ChunkStreamer {
     skipped_target_checks: u64,
     pending: BTreeSet<ChunkPos>,
     awaiting_attachment: BTreeSet<ChunkPos>,
+    /// Other queued terrain superseded an absent disk read; wait for its
+    /// tick-boundary validation before deciding whether another read is needed.
+    awaiting_competing_attachment: BTreeSet<ChunkPos>,
     missing: BTreeSet<ChunkPos>,
     failed: BTreeMap<ChunkPos, (Instant, u32)>,
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
@@ -239,6 +242,7 @@ impl ChunkStreamer {
             skipped_target_checks: 0,
             pending: BTreeSet::new(),
             awaiting_attachment: BTreeSet::new(),
+            awaiting_competing_attachment: BTreeSet::new(),
             missing,
             failed: BTreeMap::new(),
             entity_retry: BTreeMap::new(),
@@ -271,6 +275,7 @@ impl ChunkStreamer {
             self.missing.remove(&pos);
             self.failed.remove(&pos);
             self.awaiting_attachment.remove(&pos);
+            self.awaiting_competing_attachment.remove(&pos);
             if session.has_resident_or_parked_chunk(pos) {
                 self.entity_retry.insert(pos, (Instant::now(), 0));
             }
@@ -288,6 +293,8 @@ impl ChunkStreamer {
         let shape_required = session.required_shape_update_chunks();
         if self.shape_required != shape_required {
             self.shape_required = shape_required;
+            self.awaiting_competing_attachment
+                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
             self.missing
                 .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
             self.failed
@@ -312,6 +319,8 @@ impl ChunkStreamer {
             // every absent chunk ever visited grows without bound and can
             // suppress a fresh disk read when a distant area is revisited.
             self.missing
+                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
+            self.awaiting_competing_attachment
                 .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
             self.entity_retry.retain(|pos, _| windows.contains(*pos));
             self.failed
@@ -398,6 +407,13 @@ impl ChunkStreamer {
                         }
                         Ok(None) => {
                             self.failed.remove(&response.pos);
+                            if session.has_chunk_or_pending(response.pos) {
+                                self.missing.remove(&response.pos);
+                                if !session.has_resident_or_parked_chunk(response.pos) {
+                                    self.awaiting_competing_attachment.insert(response.pos);
+                                }
+                                continue;
+                            }
                             self.missing.insert(response.pos);
                             if within(response.pos, (center, self.radius)) {
                                 session.queue_streamed_chunk(
@@ -413,7 +429,9 @@ impl ChunkStreamer {
                         Err(error) => {
                             if response.entities_only {
                                 schedule_retry(&mut self.entity_retry, response.pos);
-                            } else if !session.has_chunk_or_pending(response.pos) {
+                            } else if !session.has_resident_or_parked_chunk(response.pos) {
+                                // A queued competing chunk can still fail validation.
+                                // Keep the retry until it is actually resident.
                                 schedule_retry(&mut self.failed, response.pos);
                             } else {
                                 self.failed.remove(&response.pos);
@@ -430,6 +448,22 @@ impl ChunkStreamer {
                     anyhow::bail!("chunk reader stopped unexpectedly")
                 }
             }
+        }
+        // The competing source may still be rejected at the tick boundary.
+        // It need not come from this disk read, so do not infer its sidecars
+        // from the absent terrain response.
+        let competing_settled: Vec<_> = if self.awaiting_competing_attachment.is_empty() {
+            Vec::new()
+        } else {
+            let pending = session.pending_stream_data_positions();
+            self.awaiting_competing_attachment
+                .difference(&pending)
+                .copied()
+                .collect()
+        };
+        let competing_settled_any = !competing_settled.is_empty();
+        for pos in competing_settled {
+            self.awaiting_competing_attachment.remove(&pos);
         }
         // Reads are only applied by the session at a tick boundary. A valid
         // region record can still fail position or data validation there, so
@@ -517,8 +551,8 @@ impl ChunkStreamer {
                 }
             }
         }
-        if windows_changed || received || retry_due || stale_received {
-            if stale_received {
+        if windows_changed || received || retry_due || stale_received || competing_settled_any {
+            if stale_received || competing_settled_any {
                 self.settled_prefix = 0;
             }
             while let Some(&pos) = self.targets.get(self.settled_prefix) {
@@ -1369,6 +1403,180 @@ mod tests {
         assert!(!streamer.failed.contains_key(&failed));
         assert!(!streamer.pending.contains(&missing));
         assert!(!streamer.pending.contains(&failed));
+    }
+
+    #[test]
+    fn absent_or_failed_read_does_not_hide_a_concurrently_delivered_chunk() {
+        for (already_attached, sidecars_known, failed_read) in [
+            (false, true, false),
+            (true, true, false),
+            (false, false, false),
+            (true, false, false),
+            (false, true, true),
+            (true, true, true),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let home = ChunkPos { x: 0, z: 0 };
+            let target = ChunkPos { x: 1, z: 0 };
+            let player = PlayerState {
+                position: Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let mut session = LoadedSession::new(
+                chunk_world(home),
+                IVec3::ZERO,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            if sidecars_known {
+                session.queue_loaded_chunk_with_poi(
+                    target,
+                    chunk_world(target),
+                    SavedEntityData::Empty,
+                    Some(SavedPoiData::Missing),
+                    None,
+                );
+            } else {
+                session.queue_loaded_chunk(target, chunk_world(target));
+            }
+            if already_attached {
+                session.update(Duration::from_millis(50));
+                assert!(session.has_resident_or_parked_chunk(target));
+            }
+
+            let mut streamer =
+                ChunkStreamer::with_source(1, BTreeSet::new(), |_| Ok(None)).unwrap();
+            let (response_tx, responses) = mpsc::channel();
+            let (requests, request_rx) = mpsc::sync_channel(8);
+            streamer.responses = responses;
+            streamer.requests = Some(requests);
+            streamer.center = Some(home);
+            streamer.targets = vec![target];
+            streamer.pending.insert(target);
+            response_tx
+                .send(Response {
+                    pos: target,
+                    result: if failed_read {
+                        Err("temporary read failure".into())
+                    } else {
+                        Ok(None)
+                    },
+                    stale: false,
+                    entities_only: false,
+                    stamp: None,
+                })
+                .unwrap();
+
+            streamer.service(&mut session).unwrap();
+            assert!(
+                !streamer.missing.contains(&target),
+                "delivered chunk was cached as absent"
+            );
+            assert!(
+                !streamer.entity_retry.contains_key(&target),
+                "sidecars must not be inferred from an absent terrain read"
+            );
+            session.update(Duration::from_millis(50));
+            assert!(session.has_resident_or_parked_chunk(target));
+            streamer.service(&mut session).unwrap();
+            assert!(!streamer.failed.contains_key(&target));
+            assert!(
+                request_rx.try_recv().is_err(),
+                "resident terrain should not be re-read"
+            );
+            if sidecars_known {
+                assert!(matches!(
+                    session.saved_entity_chunk(target),
+                    Some(SavedEntityData::Empty)
+                ));
+                assert!(matches!(
+                    session.saved_poi_chunk(target),
+                    Some(SavedPoiData::Missing)
+                ));
+            } else {
+                assert!(matches!(
+                    session.saved_entity_chunk(target),
+                    Some(SavedEntityData::Unavailable)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_failed_read_retries_if_competing_chunk_is_rejected() {
+        for failed_read in [false, true] {
+            let home = ChunkPos { x: 0, z: 0 };
+            let target = ChunkPos { x: 1, z: 0 };
+            let player = PlayerState {
+                position: Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let mut session = LoadedSession::new(
+                chunk_world(home),
+                IVec3::ZERO,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            session.queue_loaded_chunk(target, World::new("minecraft:the_nether"));
+            let mut streamer =
+                ChunkStreamer::with_source(1, BTreeSet::new(), |_| Ok(None)).unwrap();
+            let (response_tx, responses) = mpsc::channel();
+            let (requests, request_rx) = mpsc::sync_channel(8);
+            streamer.responses = responses;
+            streamer.requests = Some(requests);
+            streamer.center = Some(home);
+            streamer.targets = vec![target];
+            streamer.pending.insert(target);
+            response_tx
+                .send(Response {
+                    pos: target,
+                    result: if failed_read {
+                        Err("temporary read failure".into())
+                    } else {
+                        Ok(None)
+                    },
+                    stale: false,
+                    entities_only: false,
+                    stamp: None,
+                })
+                .unwrap();
+            streamer.service(&mut session).unwrap();
+            if failed_read {
+                assert!(streamer.failed.contains_key(&target));
+            } else {
+                assert!(streamer.awaiting_competing_attachment.contains(&target));
+            }
+            assert!(request_rx.try_recv().is_err());
+            session.update(Duration::from_millis(50));
+            assert!(!session.has_chunk_or_pending(target));
+            if failed_read {
+                streamer.failed.get_mut(&target).unwrap().0 = Instant::now();
+            }
+            streamer.service(&mut session).unwrap();
+            let request = request_rx
+                .try_recv()
+                .expect("rejected terrain was not retried");
+            assert_eq!(request.pos, target);
+            assert!(!request.entities_only);
+            assert!(!streamer.missing.contains(&target));
+        }
     }
 
     fn chunk_world(pos: ChunkPos) -> World {

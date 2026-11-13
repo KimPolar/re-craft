@@ -3481,8 +3481,10 @@ impl PreparedExistingGenerator {
         })
     }
 
-    /// Generate only a captured absent chunk at the schedule's ready BIOMES
-    /// step. Discard the generator and evaluator after a generation error.
+    /// Generate biomes for a captured absent chunk or a saved protochunk that
+    /// has not reached BIOMES. Saved source NBT remains unchanged; the result
+    /// is an intermediate input and does not authorize a world write. Discard
+    /// the generator and evaluator after a generation error.
     pub fn run_captured_biomes(
         &mut self,
         work: &mut CapturedBiomeSchedule,
@@ -3503,10 +3505,24 @@ impl PreparedExistingGenerator {
                 z: position.z,
             })
             .context("biome chunk was not captured")?;
-        ensure!(
-            source.terrain.is_none(),
-            "saved biome chunk must be restored"
-        );
+        if let Some(saved) = &source.terrain {
+            use native_session::worldgen::schedule::GenerationStage;
+            ensure!(
+                saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
+                "unsupported saved biome data version"
+            );
+            let status = saved
+                .status
+                .as_ref()
+                .context("saved chunk status is missing")?;
+            let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+            let stage = GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+            ensure!(
+                stage < GenerationStage::Biomes,
+                "saved biome chunk must be restored"
+            );
+            reject_saved_blending(&saved.document)?;
+        }
         work.schedule
             .run_biomes(&mut self.generator, evaluator, &mut work.biomes, position)
     }
@@ -5442,6 +5458,85 @@ mod tests {
             ResourceId::parse("minecraft:overworld")?,
             &stem,
         )?;
+        // A saved protochunk before BIOMES must follow the schedule just like
+        // an absent chunk, while keeping its original document as the source.
+        let mut early_schedule = GenerationSchedule::new();
+        for (position, _) in early_positions {
+            early_schedule.request(
+                native_world::loaded::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                },
+                GenerationStage::Biomes,
+            )?;
+        }
+        let imported: Vec<_> = early_schedule
+            .requirements()
+            .map(|(pos, required)| {
+                (
+                    pos,
+                    if required >= GenerationStage::Biomes {
+                        GenerationStage::StructureReferences
+                    } else {
+                        GenerationStage::StructureStarts
+                    },
+                )
+            })
+            .collect();
+        let early_context = reader.capture_generation_context(
+            early_schedule
+                .requirements()
+                .map(|(pos, _)| native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+                .chain([saved_second]),
+        )?;
+        early_schedule.restore_imported(imported)?;
+        let mut scheduled_early = prepare_existing_generator(early_context, &game)?;
+        let mut early_work = scheduled_early.begin_captured_biome_schedule(early_schedule, [])?;
+        let mut early_evaluator = native_resources::density::DensityEvaluator::default();
+        let mut early_reference = TerrainGenerator::without_terrain_adjustments(
+            &mut resources,
+            &definition,
+            42,
+            lighting.min_y,
+            lighting.height,
+        )?;
+        let mut early_reference_evaluator = native_resources::density::DensityEvaluator::default();
+        assert!(
+            scheduled_early
+                .run_captured_biomes(&mut early_work, &mut early_evaluator, second)
+                .is_err()
+        );
+        for (position, status) in early_positions {
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            scheduled_early.run_captured_biomes(&mut early_work, &mut early_evaluator, key)?;
+            assert_eq!(
+                early_work.schedule().completed(key),
+                Some(GenerationStage::Biomes)
+            );
+            let expected =
+                early_reference.generate_biomes([key.x, key.z], &mut early_reference_evaluator)?;
+            assert_eq!(
+                early_work.biomes().chunk([key.x, key.z]).unwrap().values(),
+                expected.values()
+            );
+            let source = scheduled_early.inputs().sources().chunks()[&position]
+                .terrain
+                .as_ref()
+                .unwrap();
+            assert!(source.status.as_ref().unwrap().matches(status));
+            assert_eq!(
+                source.document.value.get("example:unrecognized"),
+                Some(&Tag::Int(73))
+            );
+            assert!(
+                scheduled_early
+                    .run_captured_biomes(&mut early_work, &mut early_evaluator, key)
+                    .is_err()
+            );
+        }
         let biome_positions: Vec<_> = schedule
             .requirements()
             .filter_map(|(pos, required)| (required >= GenerationStage::Biomes).then_some(pos))

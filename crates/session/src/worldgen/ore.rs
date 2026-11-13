@@ -10614,6 +10614,97 @@ mod tests {
     }
 
     #[test]
+    fn saved_partial_heightmaps_are_primed_without_replacing_existing_values() {
+        use native_persistence::{
+            heightmap::{
+                GeneratedHeightmaps, HeightBounds, SavedGenerationHeightmaps,
+                encode_generated_heightmaps,
+            },
+            nbt::{NamedTag, Tag},
+        };
+        let center = ChunkPos { x: 0, z: 0 };
+        let bounds = HeightBounds {
+            min_y: 0,
+            max_y: 16,
+        };
+        for (surface_saved, ocean_saved, final_saved) in [
+            (Some(3), None, Some(5)),
+            (None, Some(2), None),
+            (None, None, None),
+        ] {
+            let (mut terrain, _, motion, _) = fixture();
+            // Saved terrain has no synthetic noise-fill flag history.
+            terrain.postprocessing.remove(&center);
+            let surface = surface_saved.map(|value| [value; 256]);
+            let ocean = ocean_saved.map(|value| [value; 256]);
+            let final_surface = final_saved.map(|value| [value; 256]);
+            let encoded = encode_generated_heightmaps(
+                bounds,
+                &GeneratedHeightmaps {
+                    world_surface: final_surface.as_ref(),
+                    ocean_floor: None,
+                    motion_blocking: None,
+                    motion_blocking_no_leaves: None,
+                    world_surface_wg: surface.as_ref(),
+                    ocean_floor_wg: ocean.as_ref(),
+                },
+            )
+            .unwrap();
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("Heightmaps".into(), encoded.clone())]),
+            };
+            let saved = SavedGenerationHeightmaps::read(&document, bounds).unwrap();
+            terrain.restore_saved_heightmaps(center, &saved).unwrap();
+            terrain.ensure_worldgen_heightmaps(center, &motion).unwrap();
+            let (actual_surface, actual_ocean) = terrain.worldgen_heightmaps(center).unwrap();
+            assert!(
+                actual_surface
+                    .iter()
+                    .all(|&value| value == surface_saved.unwrap_or(8))
+            );
+            assert!(
+                actual_ocean
+                    .iter()
+                    .all(|&value| value == ocean_saved.unwrap_or(8))
+            );
+            let maps = terrain.generated_heightmap_data(center).unwrap();
+            assert_eq!(maps.get("WORLD_SURFACE").is_some(), final_saved.is_some());
+            assert_eq!(maps.get("WORLD_SURFACE"), encoded.get("WORLD_SURFACE"));
+            assert!(maps.get("OCEAN_FLOOR").is_none());
+            assert!(maps.get("MOTION_BLOCKING").is_none());
+            terrain.ensure_worldgen_heightmaps(center, &motion).unwrap();
+            assert_eq!(terrain.generated_heightmap_data(center).unwrap(), maps);
+        }
+
+        let (mut terrain, _, motion, _) = fixture();
+        let encoded = encode_generated_heightmaps(
+            bounds,
+            &GeneratedHeightmaps {
+                world_surface: Some(&[5; 256]),
+                ocean_floor: None,
+                motion_blocking: None,
+                motion_blocking_no_leaves: None,
+                world_surface_wg: Some(&[3; 256]),
+                ocean_floor_wg: None,
+            },
+        )
+        .unwrap();
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("Heightmaps".into(), encoded.clone())]),
+        };
+        let saved = SavedGenerationHeightmaps::read(&document, bounds).unwrap();
+        terrain.restore_saved_heightmaps(center, &saved).unwrap();
+        let world = Arc::make_mut(&mut terrain.world);
+        Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+            .sections
+            .clear();
+        assert!(terrain.ensure_worldgen_heightmaps(center, &motion).is_err());
+        assert_eq!(terrain.generated_heightmap_data(center).unwrap(), encoded);
+    }
+
+    #[test]
     fn unsupported_air_motion_tag_does_not_publish_partial_heightmaps() {
         struct BadTags;
         impl ResourceProvider for BadTags {

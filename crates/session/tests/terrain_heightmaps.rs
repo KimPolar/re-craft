@@ -188,6 +188,70 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
                 Ok(CarverBlockState { is_air, has_fluid })
             },
         )?;
+        if index == 0 {
+            use native_persistence::{
+                heightmap::{HeightBounds, SavedGenerationHeightmaps},
+                nbt::{NamedTag, Tag},
+            };
+            // Restore either saved map and compare the other, newly primed
+            // map with the same Java terrain-stage oracle.
+            for saved_name in ["WORLD_SURFACE_WG", "OCEAN_FLOOR_WG"] {
+                let copy = native_resources::surface_pass::SurfaceStageChunk {
+                    chunk_position: chunk.chunk_position,
+                    min_y: chunk.min_y,
+                    height: chunk.height,
+                    states: chunk.states.clone(),
+                    fluid_updates: chunk.fluid_updates.clone(),
+                    noise_postprocessing: chunk.noise_postprocessing.clone(),
+                    surface_postprocessing: chunk.surface_postprocessing.clone(),
+                    carver_postprocessing: chunk.carver_postprocessing.clone(),
+                };
+                let materialized = materialize_carved_terrain(
+                    copy,
+                    neighborhood.chunk(pos).context("missing biome")?,
+                    dimension,
+                    |value| resolve_generated_terrain_state(value, &registry),
+                )?;
+                let mut partial = CarvedTerrainWorld::new(materialized);
+                let document = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![(
+                        "Heightmaps".into(),
+                        Tag::Compound(vec![(
+                            saved_name.into(),
+                            Tag::LongArray(raw_stages[index * 4 + 3][saved_name].clone()),
+                        )]),
+                    )]),
+                };
+                let saved = SavedGenerationHeightmaps::read(
+                    &document,
+                    HeightBounds {
+                        min_y,
+                        max_y: min_y + height,
+                    },
+                )?;
+                let chunk_pos = ChunkPos {
+                    x: pos[0],
+                    z: pos[1],
+                };
+                partial.restore_saved_heightmaps(chunk_pos, &saved)?;
+                partial.ensure_worldgen_heightmaps(chunk_pos, &tags)?;
+                let (surface, ocean) = partial
+                    .worldgen_heightmaps(chunk_pos)
+                    .context("missing maps")?;
+                assert_eq!(
+                    surface.as_slice(),
+                    stages[index * 4 + 2]["WORLD_SURFACE_WG"]
+                );
+                assert_eq!(ocean.as_slice(), stages[index * 4 + 2]["OCEAN_FLOOR_WG"]);
+                assert!(
+                    partial
+                        .generated_heightmap_data(chunk_pos)?
+                        .get("WORLD_SURFACE")
+                        .is_none()
+                );
+            }
+        }
         let materialized = materialize_carved_terrain(
             chunk,
             neighborhood.chunk(pos).context("missing biome")?,

@@ -4026,9 +4026,7 @@ impl PreparedExistingGenerator {
             .expect("heightmap tags initialized");
         for &position in &positions {
             if world.terrain.worldgen_heightmaps(position).is_none() {
-                world
-                    .terrain
-                    .initialize_worldgen_heightmaps(position, tags)?;
+                world.terrain.ensure_worldgen_heightmaps(position, tags)?;
             }
         }
         let (result, updates) = self.with_saved_prepared_decoration(context, |prepared| {
@@ -4355,9 +4353,7 @@ impl PreparedExistingGenerator {
             .expect("heightmap tags initialized");
         for position in positions {
             if batch.terrain.worldgen_heightmaps(position).is_none() {
-                batch
-                    .terrain
-                    .initialize_worldgen_heightmaps(position, tags)?;
+                batch.terrain.ensure_worldgen_heightmaps(position, tags)?;
             }
         }
         let result = self.with_saved_prepared_decoration(context, |prepared| match light {
@@ -5790,7 +5786,7 @@ impl PreparedExistingGenerator {
             )?);
         }
         if world.terrain.worldgen_heightmaps(position).is_none() {
-            world.terrain.initialize_worldgen_heightmaps(
+            world.terrain.ensure_worldgen_heightmaps(
                 position,
                 self.heightmap_tags
                     .as_ref()

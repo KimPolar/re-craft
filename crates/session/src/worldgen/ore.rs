@@ -8064,7 +8064,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || jigsaw::jigsaw_carpet(state)
                             || jigsaw::jigsaw_ladder(state)
                             || jigsaw::jigsaw_cobweb(state)
-                            || jigsaw::jigsaw_chain(state))
+                            || jigsaw::jigsaw_chain(state)
+                            || jigsaw::jigsaw_speleothem(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
                         && old.properties.len() == 1
@@ -8120,6 +8121,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && !jigsaw::jigsaw_carpet(state)
                             && !jigsaw::jigsaw_ladder(state)
                             && !jigsaw::jigsaw_chain(state)
+                            && !jigsaw::jigsaw_speleothem(state)
                             && native_world::collision::pane_waterlogged(state).is_none())
                             || native_world::block_light::same_light_behavior(&old, state)
                                 == Some(false));
@@ -12953,6 +12955,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_speleothems_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_dripstone", "vine_active_self_empty_jigsaw_dripstone",
+            "vine_active_jigsaw_wet_dripstone", "vine_active_self_jigsaw_wet_dripstone",
+            "vine_active_jigsaw_sulfurspike", "vine_active_self_empty_jigsaw_sulfurspike",
+            "vine_active_jigsaw_wet_sulfurspike", "vine_active_self_jigsaw_wet_sulfurspike",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_flower_pots_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_flowerpot",
@@ -13450,6 +13463,10 @@ mod tests {
                         "cobweb"
                     } else if mode.ends_with("_chain") {
                         "iron_chain"
+                    } else if mode.ends_with("_dripstone") {
+                        "pointed_dripstone"
+                    } else if mode.ends_with("_sulfurspike") {
+                        "sulfur_spike"
                     } else if mode.ends_with("_flowerpot") {
                         "flower_pot"
                     } else if mode.ends_with("_pottedbush") {
@@ -13478,6 +13495,11 @@ mod tests {
                     } else if mode.ends_with("_chain") {
                         block.properties = BTreeMap::from([
                             ("axis".into(), "y".into()), ("waterlogged".into(), "false".into()),
+                        ]);
+                    } else if mode.ends_with("_dripstone") || mode.ends_with("_sulfurspike") {
+                        block.properties = BTreeMap::from([
+                            ("thickness".into(), "tip".into()), ("vertical_direction".into(), "up".into()),
+                            ("waterlogged".into(), "false".into()),
                         ]);
                     } else if mode.ends_with("_barrel") {
                         block.properties = BTreeMap::from([
@@ -13725,6 +13747,8 @@ mod tests {
             } else if mode.ends_with("_hopper") {
                 0
             } else if mode.ends_with("_chain") {
+                0
+            } else if mode.ends_with("_dripstone") || mode.ends_with("_sulfurspike") {
                 0
             } else if (mode.ends_with("_flowerpot") || mode.ends_with("_pottedbush")) && !mode.contains("_jigsaw_water_") {
                 0

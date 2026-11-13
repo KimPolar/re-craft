@@ -90,7 +90,7 @@ fn spawn_with_payload<T: Send + 'static>(
 
 // A queued result can own a large temporary directory or generated world.
 // Closing the receiver off-thread avoids freeing either on the event loop.
-fn discard_async<T: Send + 'static>(value: T) {
+pub(crate) fn discard_async<T: Send + 'static>(value: T) {
     let _ = thread::Builder::new()
         .name("world-staging-discard".into())
         .spawn(move || drop(value));

@@ -1,11 +1,12 @@
 //! Windows title screen and the entry points available without command-line arguments.
 
 use std::{
+    cell::Cell,
     num::NonZeroU32,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -199,8 +200,40 @@ enum PreparedLaunch {
     World(crate::PreparedWorld),
 }
 
+/// One worker sends at most one result. If it is abandoned, discard a queued
+/// result and close the receiver away from the window event loop.
+struct BackgroundResult<T: Send + 'static> {
+    receiver: mpsc::Receiver<T>,
+    completed: Cell<bool>,
+}
+
+impl<T: Send + 'static> BackgroundResult<T> {
+    fn new(receiver: mpsc::Receiver<T>) -> Self {
+        Self {
+            receiver,
+            completed: Cell::new(false),
+        }
+    }
+
+    fn try_recv(&self) -> std::result::Result<T, mpsc::TryRecvError> {
+        let result = self.receiver.try_recv();
+        if !matches!(&result, Err(mpsc::TryRecvError::Empty)) {
+            self.completed.set(true);
+        }
+        result
+    }
+}
+
+impl<T: Send + 'static> Drop for BackgroundResult<T> {
+    fn drop(&mut self) {
+        if !self.completed.get() {
+            crate::generation_staging::discard_receiver(&mut self.receiver);
+        }
+    }
+}
+
 struct PendingLaunch {
-    result: mpsc::Receiver<Result<PreparedLaunch>>,
+    result: BackgroundResult<Result<PreparedLaunch>>,
     return_screen: Screen,
     world: Option<PathBuf>,
 }
@@ -295,7 +328,7 @@ struct PendingAssetLoad {
     directory: PathBuf,
     packs: Vec<PathBuf>,
     kind: AssetLoadKind,
-    result: mpsc::Receiver<Result<MenuAssets>>,
+    result: BackgroundResult<Result<MenuAssets>>,
 }
 
 enum LoadedWorlds {
@@ -561,7 +594,7 @@ impl State {
             directory,
             packs,
             kind,
-            result,
+            result: BackgroundResult::new(result),
         });
     }
 
@@ -589,6 +622,7 @@ impl State {
                     };
                     if let Err(error) = self.persist_settings(&settings) {
                         self.error = Some(format!("{error:#}"));
+                        crate::generation_staging::discard_async(assets);
                         return true;
                     }
                     self.video = video;
@@ -599,7 +633,9 @@ impl State {
                 }
                 self.minecraft_dir = load.directory;
                 self.packs = load.packs;
-                self.assets = Some(Arc::new(assets));
+                if let Some(previous) = self.assets.replace(Arc::new(assets)) {
+                    crate::generation_staging::discard_async(previous);
+                }
                 if self.audio.is_none() {
                     self.audio = crate::audio::Audio::new().ok();
                 }
@@ -1035,7 +1071,15 @@ struct SoftwareScene {
     size: (u32, u32),
     scale: u32,
     blur: u8,
-    assets: Option<Arc<MenuAssets>>,
+    assets: Option<Weak<MenuAssets>>,
+}
+
+fn same_asset_identity<T>(left: Option<&Weak<T>>, right: Option<&Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Weak::ptr_eq(left, &Arc::downgrade(right)),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 impl SoftwareScene {
@@ -1051,11 +1095,7 @@ impl SoftwareScene {
             && self.size == size
             && self.scale == scale
             && self.blur == blur
-            && match (&self.assets, assets) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
+            && same_asset_identity(self.assets.as_ref(), assets.as_ref())
     }
 }
 
@@ -1315,7 +1355,7 @@ impl<'a> Menu<'a> {
         self.state.error = None;
         self.state.screen = Screen::Launching;
         self.pending_launch = Some(PendingLaunch {
-            result,
+            result: BackgroundResult::new(result),
             return_screen,
             world: launch_world,
         });
@@ -2922,7 +2962,7 @@ impl<'a> Menu<'a> {
                     size: self.size,
                     scale: self.scale,
                     blur: self.state.video.menu_blur,
-                    assets: self.state.assets.clone(),
+                    assets: self.state.assets.as_ref().map(Arc::downgrade),
                 });
             }
             if let Some(image) = software.take()?
@@ -5030,6 +5070,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn software_scene_identity_does_not_keep_assets_alive() {
+        let original = Arc::new(42);
+        let identity = Arc::downgrade(&original);
+        let replacement = Arc::new(42);
+        assert!(same_asset_identity(Some(&identity), Some(&original)));
+        assert!(!same_asset_identity(Some(&identity), Some(&replacement)));
+        assert!(same_asset_identity::<i32>(None, None));
+        assert!(!same_asset_identity(Some(&identity), None));
+        drop(original);
+        assert!(identity.upgrade().is_none());
+        assert!(!same_asset_identity(Some(&identity), Some(&replacement)));
+    }
+
+    #[test]
+    fn abandoned_background_results_are_dropped_off_the_menu_thread() {
+        struct DropProbe(mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let menu_thread = std::thread::current().id();
+        let (dropped, observe) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel();
+        let pending = BackgroundResult::new(receiver);
+        sender
+            .send(DropProbe(dropped.clone()))
+            .unwrap_or_else(|_| panic!("receiver closed"));
+        drop(pending);
+        assert_ne!(
+            observe.recv_timeout(Duration::from_secs(5)).unwrap(),
+            menu_thread
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let pending = BackgroundResult::new(receiver);
+        drop(pending);
+        std::thread::spawn(move || {
+            let _ = sender.send(DropProbe(dropped));
+        })
+        .join()
+        .unwrap();
+        assert_ne!(
+            observe.recv_timeout(Duration::from_secs(5)).unwrap(),
+            menu_thread
+        );
+    }
+
+    #[test]
+    fn received_background_result_stays_owned_by_caller() {
+        let (sender, receiver) = mpsc::channel();
+        let pending = BackgroundResult::new(receiver);
+        assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        sender.send(42).unwrap();
+        assert_eq!(pending.try_recv().unwrap(), 42);
+        drop(pending);
+    }
+
+    #[test]
     fn create_world_tabs_expose_settings_but_keep_creation_unavailable() {
         let mut state = State::new(PathBuf::new(), Vec::new());
         state.asset_load = None;
@@ -5647,7 +5746,7 @@ mod tests {
         .unwrap();
         let mut menu = Menu::new(&mut state);
         menu.pending_launch = Some(PendingLaunch {
-            result,
+            result: BackgroundResult::new(result),
             return_screen: Screen::Worlds,
             world: None,
         });
@@ -6881,7 +6980,7 @@ public class GuiScaleOracle {
             directory: tmp.path().to_path_buf(),
             packs: vec![proposed],
             kind: AssetLoadKind::ChangePacks(None),
-            result,
+            result: BackgroundResult::new(result),
         });
         sender.send(Err(anyhow::anyhow!("invalid pack"))).unwrap();
         assert!(state.poll_asset_load());
@@ -6900,7 +6999,7 @@ public class GuiScaleOracle {
             directory: tmp.path().to_path_buf(),
             packs: Vec::new(),
             kind: AssetLoadKind::ChangeLanguage("ko_kr".into()),
-            result,
+            result: BackgroundResult::new(result),
         });
         sender.send(Err(anyhow::anyhow!("failed reload"))).unwrap();
         assert!(state.poll_asset_load());

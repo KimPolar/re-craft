@@ -1874,6 +1874,7 @@ impl PreparedExistingGenerator {
             proof.matches_source(source.as_deref())? && spawn.matches_source(source.as_deref())?,
             "postprocessing source differs"
         );
+        validate_inert_captured_upgrade_data(spawn.document(), self.lighting.height)?;
         let world = batch.terrain.snapshot();
         let block_ticks = world
             .saved_block_ticks
@@ -5731,6 +5732,60 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
+/// The current postprocessing world does not implement UpgradeData callbacks.
+/// Accept only data that cannot schedule neighbor ticks or change blocks.
+fn validate_inert_captured_upgrade_data(document: &NamedTag, height: i32) -> Result<()> {
+    let Some(data) = unique_root_field(document, "UpgradeData")? else {
+        return Ok(());
+    };
+    let Tag::Compound(fields) = data else {
+        bail!("saved upgrade data is not a compound")
+    };
+    ensure!(height > 0 && height % 16 == 0, "invalid upgrade height");
+    let mut names = BTreeSet::new();
+    for (name, value) in fields {
+        ensure!(
+            names.insert(name.0.clone()),
+            "duplicate saved upgrade data field"
+        );
+        if name.matches("Sides") {
+            ensure!(
+                value.as_java_int() == Some(0),
+                "saved upgrade sides require callbacks"
+            );
+        } else if name.matches("Indices") {
+            let Tag::Compound(indices) = value else {
+                bail!("saved upgrade indices are not a compound")
+            };
+            let mut seen = BTreeSet::new();
+            for (key, value) in indices {
+                ensure!(
+                    seen.insert(key.0.clone()),
+                    "duplicate saved upgrade section"
+                );
+                let key = String::from_utf16(&key.0).context("invalid upgrade section index")?;
+                let index: i32 = key.parse().context("invalid upgrade section index")?;
+                ensure!(
+                    index >= 0 && index < height / 16 && index.to_string() == key,
+                    "upgrade section is outside the dimension"
+                );
+                ensure!(
+                    matches!(value, Tag::IntArray(indices) if indices.is_empty()),
+                    "saved upgrade indices require callbacks"
+                );
+            }
+        } else if name.matches("neighbor_block_ticks") || name.matches("neighbor_fluid_ticks") {
+            ensure!(
+                matches!(value, Tag::List { element_type: native_persistence::nbt::TagType::End | native_persistence::nbt::TagType::Compound, values } if values.is_empty()),
+                "saved upgrade ticks require callbacks"
+            );
+        } else {
+            bail!("unrecognized saved upgrade data field");
+        }
+    }
+    Ok(())
+}
+
 fn merge_captured_postprocessed_heightmaps(
     original: &[(native_persistence::nbt::JavaString, Tag)],
     generated: Tag,
@@ -6160,6 +6215,183 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn captured_postprocessing_rejects_active_or_ambiguous_upgrade_data() -> Result<()> {
+        let document = |upgrade: Option<Tag>| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(
+                upgrade
+                    .into_iter()
+                    .map(|value| ("UpgradeData".into(), value))
+                    .collect(),
+            ),
+        };
+        let list = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        assert!(validate_inert_captured_upgrade_data(&document(None), 32).is_ok());
+        assert!(
+            validate_inert_captured_upgrade_data(&document(Some(Tag::Compound(vec![]))), 32)
+                .is_ok()
+        );
+        let harmless = Tag::Compound(vec![
+            ("Sides".into(), Tag::Byte(0)),
+            (
+                "Indices".into(),
+                Tag::Compound(vec![("0".into(), Tag::IntArray(vec![]))]),
+            ),
+            ("neighbor_block_ticks".into(), list(vec![])),
+            (
+                "neighbor_fluid_ticks".into(),
+                Tag::List {
+                    element_type: TagType::End,
+                    values: vec![],
+                },
+            ),
+        ]);
+        assert!(validate_inert_captured_upgrade_data(&document(Some(harmless)), 32).is_ok());
+        for value in [
+            Tag::Compound(vec![("Sides".into(), Tag::Int(1))]),
+            Tag::Compound(vec![("Sides".into(), Tag::String("0".into()))]),
+            Tag::Compound(vec![(
+                "Indices".into(),
+                Tag::Compound(vec![("0".into(), Tag::IntArray(vec![1]))]),
+            )]),
+            Tag::Compound(vec![(
+                "Indices".into(),
+                Tag::Compound(vec![("2".into(), Tag::IntArray(vec![]))]),
+            )]),
+            Tag::Compound(vec![(
+                "neighbor_block_ticks".into(),
+                list(vec![Tag::Compound(vec![])]),
+            )]),
+            Tag::Compound(vec![(
+                "neighbor_fluid_ticks".into(),
+                list(vec![Tag::Compound(vec![])]),
+            )]),
+            Tag::Compound(vec![("example:unknown".into(), Tag::Int(0))]),
+            Tag::Compound(vec![
+                ("Sides".into(), Tag::Int(0)),
+                ("Sides".into(), Tag::Int(0)),
+            ]),
+            Tag::Int(0),
+        ] {
+            assert!(validate_inert_captured_upgrade_data(&document(Some(value)), 32).is_err());
+        }
+        let duplicate = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("UpgradeData".into(), Tag::Compound(vec![])),
+                ("UpgradeData".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        assert!(validate_inert_captured_upgrade_data(&duplicate, 32).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn captured_upgrade_noop_classification_matches_java() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CapturedUpgradeDataOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/CapturedUpgradeDataOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("CapturedUpgradeDataOracle")
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout)?.replace("\r\n", "\n");
+        let java = output
+            .split_once("BEGIN_RESULT\n")
+            .context("Java result start missing")?
+            .1
+            .split_once("END_RESULT")
+            .context("Java result end missing")?
+            .0;
+        let index = |values| {
+            Tag::Compound(vec![(
+                "Indices".into(),
+                Tag::Compound(vec![("0".into(), Tag::IntArray(values))]),
+            )])
+        };
+        let ticks = |kind: &str| {
+            Tag::Compound(vec![(
+                format!("neighbor_{kind}_ticks").as_str().into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![])],
+                },
+            )])
+        };
+        let cases = [
+            ("empty", Tag::Compound(vec![])),
+            ("zero", Tag::Compound(vec![("Sides".into(), Tag::Int(0))])),
+            ("empty_indices", index(vec![])),
+            ("sides", Tag::Compound(vec![("Sides".into(), Tag::Int(1))])),
+            ("indices", index(vec![1])),
+            ("block_ticks", ticks("block")),
+            ("fluid_ticks", ticks("fluid")),
+        ];
+        let rust = cases
+            .into_iter()
+            .map(|(name, data)| {
+                let document = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![("UpgradeData".into(), data)]),
+                };
+                format!(
+                    "{name} {}",
+                    validate_inert_captured_upgrade_data(&document, 32).is_ok()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(java.trim(), rust);
+        Ok(())
+    }
+
+    #[test]
     fn captured_postprocessed_heightmaps_keep_unknown_fields() -> Result<()> {
         let original = vec![(
             JavaString::from("example:extra"),
@@ -6393,6 +6625,10 @@ mod tests {
                 ("zPos".into(), Tag::Int(second.z)),
                 ("Status".into(), Tag::String("minecraft:biomes".into())),
                 ("example:root".into(), Tag::Int(73)),
+                (
+                    "UpgradeData".into(),
+                    Tag::Compound(vec![("Sides".into(), Tag::Byte(0))]),
+                ),
                 (
                     "Heightmaps".into(),
                     Tag::Compound(vec![("example:map".into(), Tag::Int(37))]),
@@ -7297,6 +7533,22 @@ mod tests {
             &saved_spawn,
             actual.convert_captured_heightmaps(&batch, &staged, &saved_spawn)?,
         )?;
+        let mut active_upgrade =
+            actual.draft_captured_empty_spawn(&batch, &staged, saved_second, false, 42)?;
+        let CapturedLitChunkDraft::Saved(ref mut active_lit) = active_upgrade.lit else {
+            unreachable!()
+        };
+        replace_unique_root_field(
+            &mut active_lit.document,
+            "UpgradeData",
+            Tag::Compound(vec![("Sides".into(), Tag::Int(1))]),
+        )?;
+        let active_maps = actual.convert_captured_heightmaps(&batch, &staged, &active_upgrade)?;
+        let error = actual
+            .begin_captured_postprocessing(&batch, &staged, &active_upgrade, active_maps)
+            .err()
+            .context("active upgrade data was accepted")?;
+        assert!(format!("{error:#}").contains("saved upgrade sides require callbacks"));
         let early_post = actual.begin_captured_postprocessing(
             &batch,
             &staged,

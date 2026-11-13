@@ -13,7 +13,12 @@ public class BlockLightStatesOracle {
         var requested = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         var names = new ArrayList<String>();
         for (var request : requested) {
-            if (request.getAsString().equals("@flower_pots")) {
+            if (request.getAsString().equals("@concrete")) {
+                for (var id : BuiltInRegistries.BLOCK.keySet()) {
+                    var name = id.toString();
+                    if (name.matches("minecraft:(white|orange|magenta|light_blue|yellow|lime|pink|gray|light_gray|cyan|purple|blue|brown|green|red|black)_concrete")) names.add(name);
+                }
+            } else if (request.getAsString().equals("@flower_pots")) {
                 for (var id : BuiltInRegistries.BLOCK.keySet()) {
                     if (id.getNamespace().equals("minecraft") && BuiltInRegistries.BLOCK.getValue(id) instanceof net.minecraft.world.level.block.FlowerPotBlock) names.add(id.toString());
                 }
@@ -62,7 +67,7 @@ public class BlockLightStatesOracle {
                         entry.add((String)shape[0], boxes);
                     }
                 }
-                if (block instanceof net.minecraft.world.level.block.FlowerPotBlock || name.equals("minecraft:decorated_pot") || name.equals("minecraft:barrel") || name.equals("minecraft:trial_spawner") || name.equals("minecraft:frosted_ice") || name.equals("minecraft:vault") || name.endsWith("copper_bulb") || name.endsWith("copper_grate") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?") || name.matches("minecraft:(tuff|polished_tuff|tuff_bricks|chiseled_tuff|chiseled_tuff_bricks)")) {
+                if (block instanceof net.minecraft.world.level.block.FlowerPotBlock || name.endsWith("_concrete") || name.equals("minecraft:decorated_pot") || name.equals("minecraft:barrel") || name.equals("minecraft:trial_spawner") || name.equals("minecraft:frosted_ice") || name.equals("minecraft:vault") || name.endsWith("copper_bulb") || name.endsWith("copper_grate") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?") || name.matches("minecraft:(tuff|polished_tuff|tuff_bricks|chiseled_tuff|chiseled_tuff_bricks)")) {
                     entry.addProperty("friction", block.getFriction());
                     var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
                     var pos = net.minecraft.core.BlockPos.ZERO;

@@ -415,6 +415,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         }
         _ if crate::collision::full_glass(state) => (0, 0),
         _ if crate::collision::full_terracotta(state) => (15, 0),
+        _ if crate::collision::full_concrete(state) => (15, 0),
         "minecraft:short_grass"
         | "minecraft:fern"
         | "minecraft:bush"
@@ -1476,6 +1477,15 @@ mod tests {
         let unknown = state("potted_unknown", None);
         assert!(properties(&unknown).is_none());
         assert!(crate::collision::block_shape(&unknown).is_none());
+    }
+
+    #[test]
+    fn concrete_light_requires_known_color_and_no_properties() {
+        let mut concrete = state("red_concrete", None);
+        assert_eq!(properties(&concrete), Some((15, 0)));
+        concrete.properties.insert("extra".into(), "true".into());
+        assert!(properties(&concrete).is_none());
+        assert!(properties(&state("unknown_concrete", None)).is_none());
     }
 
     #[test]
@@ -2776,6 +2786,7 @@ mod tests {
         );
         requested.push("@vanilla_slabs_stairs".into());
         requested.push("@flower_pots".into());
+        requested.push("@concrete".into());
         std::fs::write(&input, serde_json::to_vec(&requested).unwrap()).unwrap();
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
@@ -2795,6 +2806,7 @@ mod tests {
             .collect();
         assert_eq!(shaped_names.len(), 198);
         let mut pots_checked = 0;
+        let mut concrete_checked = 0;
         for row in rows {
             let s = BlockState {
                 name: row["name"].as_str().unwrap().into(),
@@ -2807,6 +2819,7 @@ mod tests {
             };
             let (opacity, emission) =
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
+            concrete_checked += usize::from(crate::collision::full_concrete(&s));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
             if row["flower_pot"] == true {
@@ -2880,6 +2893,7 @@ mod tests {
                 || crate::collision::decorated_pot_waterlogged(&s).is_some()
                 || crate::collision::barrel_state(&s)
                 || crate::collision::trial_spawner_state(&s).is_some()
+                || crate::collision::full_concrete(&s)
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
@@ -2923,6 +2937,7 @@ mod tests {
             );
         }
         assert_eq!(pots_checked, 40);
+        assert_eq!(concrete_checked, 16);
     }
 
     #[test]

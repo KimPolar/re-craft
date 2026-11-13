@@ -329,6 +329,16 @@ pub fn full_terracotta(state: &BlockState) -> bool {
         && (name == "terracotta" || name.strip_suffix("_terracotta").is_some_and(dye_color))
 }
 
+/// Recognize the sixteen stateless vanilla concrete blocks.
+pub fn full_concrete(state: &BlockState) -> bool {
+    state.properties.is_empty()
+        && state
+            .name
+            .strip_prefix("minecraft:")
+            .and_then(|name| name.strip_suffix("_concrete"))
+            .is_some_and(dye_color)
+}
+
 /// Validate a vanilla glass pane or bars state and return its water flag.
 pub fn pane_waterlogged(state: &BlockState) -> Option<bool> {
     let name = state.name.strip_prefix("minecraft:")?;

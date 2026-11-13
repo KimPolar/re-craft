@@ -5934,16 +5934,39 @@ impl LoadedSession {
             Arc::ptr_eq(&self.generation_identity, &guard.session),
             "generation entities belong to another session"
         );
-        let current = self.generation_entity_chunks(&guard.sources)?;
+        let tracked = self.draft_tracked_entity_chunks()?;
+        let pending: BTreeSet<_> = self.incoming.iter().map(|incoming| incoming.pos).collect();
         for (&pos, expected) in &guard.chunks {
-            let same = match (expected, &current[&pos]) {
-                (None, None) | (Some(SavedEntityData::Empty), Some(SavedEntityData::Empty)) => true,
+            anyhow::ensure!(
+                !pending.contains(&pos),
+                "generation entity data is pending at {pos:?}"
+            );
+            let same = match (expected, self.entity_chunks.get(&pos)) {
+                (None, None) => !self.has_resident_or_parked_chunk(pos),
+                (Some(SavedEntityData::Empty), Some(SavedEntityData::Empty)) => true,
                 (Some(SavedEntityData::Present(a)), Some(SavedEntityData::Present(b))) => {
                     Arc::ptr_eq(a, b)
                 }
                 _ => false,
             };
             anyhow::ensure!(same, "live generation entities changed at {pos:?}");
+            // Capture already compared the immutable sidecar with its disk
+            // input. Pointer identity proves the same data is still present.
+            if let Some(draft) = tracked.get(&pos) {
+                let source = guard
+                    .sources
+                    .get(&pos)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("tracked entities changed an absent input at {pos:?}")
+                    })?;
+                anyhow::ensure!(
+                    draft.matches_source(source)?
+                        && native_persistence::nbt::write(draft.document())?
+                            == native_persistence::nbt::write(source)?,
+                    "tracked entities differ from captured input at {pos:?}"
+                );
+            }
         }
         Ok(())
     }
@@ -28907,6 +28930,13 @@ pub(crate) mod tests {
         session.verify_generation_entities(&guard).unwrap();
         assert!(other.verify_generation_entities(&guard).is_err());
 
+        let mut parked = (**session.world.chunks.get(&home).unwrap()).clone();
+        parked.position = absent;
+        session.parked_chunks.insert(absent, Arc::new(parked));
+        assert!(session.verify_generation_entities(&guard).is_err());
+        session.parked_chunks.remove(&absent);
+        session.verify_generation_entities(&guard).unwrap();
+
         session.queue_entity_chunk(home, SavedEntityData::Empty);
         assert!(session.verify_generation_entities(&guard).is_err());
         session.incoming.clear();
@@ -28945,6 +28975,44 @@ pub(crate) mod tests {
         session.dropped_items.spawn_from_entity(position, stack);
         assert!(session.verify_generation_entities(&guard).is_err());
         assert!(session.capture_generation_entities(&sources).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual synthetic generation-guard performance measurement"]
+    fn generation_entity_guard_revalidation_performance() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let mut session = session();
+        let mut sources = BTreeMap::new();
+        for x in 0..64 {
+            let pos = ChunkPos { x, z: 0 };
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("payload".into(), Tag::ByteArray(vec![7; 65_536]))]),
+            };
+            let live = native_persistence::world::SavedEntityChunk {
+                position: native_persistence::world::ChunkPos { x, z: 0 },
+                document: Arc::new(document.clone()),
+            };
+            session
+                .entity_chunks
+                .insert(pos, SavedEntityData::Present(Arc::new(live)));
+            sources.insert(pos, Some(Arc::new(document)));
+        }
+        let guard = session.capture_generation_entities(&sources).unwrap();
+        let iterations = 10;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(session.generation_entity_chunks(&guard.sources).unwrap());
+        }
+        let before = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(session.verify_generation_entities(&guard).unwrap());
+        }
+        let after = start.elapsed();
+        eprintln!(
+            "64 sidecars of 64 KiB, {iterations} checks: full comparison {before:?}, guarded revalidation {after:?}"
+        );
     }
 
     fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {

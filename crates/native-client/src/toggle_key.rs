@@ -17,6 +17,19 @@ pub struct HeldMovementKeys {
 }
 
 impl HeldMovementKeys {
+    // Windows scan codes refer to physical keys, as do winit's KeyCode values.
+    const SCAN_CODES: [(KeyCode, u32); 9] = [
+        (KeyCode::KeyW, 0x11),
+        (KeyCode::KeyS, 0x1f),
+        (KeyCode::KeyA, 0x1e),
+        (KeyCode::KeyD, 0x20),
+        (KeyCode::Space, 0x39),
+        (KeyCode::ShiftLeft, 0x2a),
+        (KeyCode::ShiftRight, 0x36),
+        (KeyCode::ControlLeft, 0x1d),
+        (KeyCode::ControlRight, 0xe01d),
+    ];
+
     pub fn update(&mut self, code: KeyCode, pressed: bool) {
         let key = match code {
             KeyCode::KeyW => &mut self.forward,
@@ -32,6 +45,37 @@ impl HeldMovementKeys {
         };
         *key = pressed;
     }
+
+    fn refresh_with(&mut self, focused: bool, mut query: impl FnMut(u32) -> Option<bool>) {
+        if !focused {
+            return;
+        }
+        for (key, scan_code) in Self::SCAN_CODES {
+            if let Some(pressed) = query(scan_code) {
+                self.update(key, pressed);
+            }
+        }
+    }
+
+    /// Reconcile events missed while another window had focus before grabbing the mouse.
+    #[cfg(target_os = "windows")]
+    pub fn refresh_system_state(&mut self, focused: bool) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW,
+        };
+        self.refresh_with(focused, |scan_code| {
+            // SAFETY: These Win32 functions take integer values only and do not dereference pointers.
+            let virtual_key = unsafe { MapVirtualKeyW(scan_code, MAPVK_VSC_TO_VK_EX) };
+            if virtual_key == 0 {
+                return None;
+            }
+            // SAFETY: MapVirtualKeyW returned a valid virtual-key code for this scan code.
+            Some(unsafe { GetAsyncKeyState(virtual_key as i32) } < 0)
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn refresh_system_state(&mut self, _focused: bool) {}
 
     pub fn restore_hold_keys(
         &self,
@@ -147,6 +191,34 @@ impl ToggleKey {
 #[cfg(test)]
 mod tests {
     use super::ToggleKey;
+
+    #[test]
+    fn focus_recapture_reconciles_physical_keys_without_reading_in_background() {
+        use super::HeldMovementKeys;
+        use winit::keyboard::KeyCode;
+
+        let mut keys = HeldMovementKeys::default();
+        keys.update(KeyCode::KeyW, true);
+        keys.update(KeyCode::KeyA, true);
+        keys.refresh_with(false, |_| panic!("must not inspect keys without focus"));
+        assert!(keys.forward && keys.left);
+
+        let mut queried = Vec::new();
+        keys.refresh_with(true, |scan| {
+            queried.push(scan);
+            match scan {
+                0x11 => Some(false), // W was released while unfocused.
+                0x20 => Some(true),  // D was pressed while unfocused.
+                0x1e => None,        // An unrecognized mapping retains the event state.
+                _ => Some(false),
+            }
+        });
+        assert_eq!(
+            queried,
+            [0x11, 0x1f, 0x1e, 0x20, 0x39, 0x2a, 0x36, 0x1d, 0xe01d]
+        );
+        assert!(!keys.forward && keys.left && keys.right);
+    }
 
     #[test]
     fn movement_keys_restore_after_screen_without_retriggering_toggles() {

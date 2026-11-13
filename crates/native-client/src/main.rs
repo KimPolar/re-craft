@@ -2439,6 +2439,7 @@ impl App {
             self.session.submit_command(PlayerCommand::StopUse);
         }
         let mut restored = false;
+        let mut focused = false;
         if let Some(window) = &self.window {
             if enabled {
                 match window
@@ -2448,6 +2449,7 @@ impl App {
                     Ok(()) => {
                         window.set_cursor_visible(false);
                         restored = !self.captured;
+                        focused = window.has_focus();
                         self.captured = true;
                     }
                     Err(error) => eprintln!("Could not capture the mouse: {error}"),
@@ -2459,6 +2461,7 @@ impl App {
             }
         }
         if restored {
+            self.held_keys.refresh_system_state(focused);
             self.input.restore_held_keys(&self.held_keys, self.video);
             self.input.submit(&mut self.session);
         }

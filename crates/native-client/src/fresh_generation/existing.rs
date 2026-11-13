@@ -386,6 +386,60 @@ impl CapturedEmptySpawnDraft {
     }
 }
 
+/// FULL-conversion heightmaps from one spawn-complete captured chunk. Unknown
+/// source heightmap fields are held separately so later drafts can preserve
+/// them. Postprocessing, entities and save validation are not established.
+pub(crate) struct CapturedConvertedHeightmaps {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    light_revision: Arc<()>,
+    position: native_world::loaded::ChunkPos,
+    spawn_mobs: bool,
+    source: Option<Arc<NamedTag>>,
+    heightmaps: native_persistence::heightmap::FullHeightmaps,
+    other_fields: Vec<(native_persistence::nbt::JavaString, Tag)>,
+}
+
+impl CapturedConvertedHeightmaps {
+    pub fn heightmaps(&self) -> &native_persistence::heightmap::FullHeightmaps {
+        &self.heightmaps
+    }
+
+    pub fn other_fields(&self) -> &[(native_persistence::nbt::JavaString, Tag)] {
+        &self.other_fields
+    }
+
+    pub fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        match (&self.source, source) {
+            (None, None) => Ok(true),
+            (Some(expected), Some(actual)) => Ok(native_persistence::nbt::write(expected)?
+                == native_persistence::nbt::write(actual)?),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+    ) -> bool {
+        Arc::ptr_eq(&self.identity, &batch.identity)
+            && Arc::ptr_eq(&self.revision, &batch.revision)
+            && Arc::ptr_eq(&self.identity, &light.identity)
+            && Arc::ptr_eq(&self.revision, &light.revision)
+            && Arc::ptr_eq(&self.light_revision, &light.light_revision)
+            && self.spawn_mobs == spawn_mobs
+            && light.completed_empty_spawns.get(&self.position) == Some(&spawn_mobs)
+            && batch
+                .schedule
+                .completed(self.position)
+                .is_some_and(|stage| {
+                    stage >= native_session::worldgen::schedule::GenerationStage::Spawn
+                })
+    }
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -1407,6 +1461,62 @@ impl PreparedExistingGenerator {
             lit,
             position: key,
             spawn_mobs,
+        })
+    }
+
+    /// Convert a spawn-complete chunk's existing heightmaps as the Java
+    /// LevelChunk constructor does. No terrain, entity or world write is made.
+    pub fn convert_captured_heightmaps(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn: &CapturedEmptySpawnDraft,
+    ) -> Result<CapturedConvertedHeightmaps> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && spawn.matches_state(batch, light, spawn.spawn_mobs),
+            "spawn draft belongs to another generation revision"
+        );
+        let position = native_persistence::world::ChunkPos {
+            x: spawn.position.x,
+            z: spawn.position.z,
+        };
+        let source = batch
+            .sources
+            .get(&position)
+            .context("terrain source was not captured")?
+            .clone();
+        ensure!(
+            spawn.matches_source(source.as_deref())?,
+            "spawn source differs"
+        );
+        let other_fields = source
+            .as_deref()
+            .map(preserved_heightmap_fields)
+            .transpose()?
+            .unwrap_or_default();
+        let bounds = native_persistence::heightmap::HeightBounds {
+            min_y: self.lighting.min_y,
+            max_y: self
+                .lighting
+                .min_y
+                .checked_add(self.lighting.height)
+                .context("dimension height overflow")?,
+        };
+        let source_maps = batch.terrain.generated_heightmap_data(spawn.position)?;
+        let converted =
+            native_persistence::heightmap::generated_full_heightmaps(bounds, &source_maps)?;
+        let heightmaps =
+            native_persistence::heightmap::FullHeightmaps::from_converted(bounds, &converted)?;
+        Ok(CapturedConvertedHeightmaps {
+            identity: Arc::clone(&batch.identity),
+            revision: Arc::clone(&batch.revision),
+            light_revision: Arc::clone(&light.light_revision),
+            position: spawn.position,
+            spawn_mobs: spawn.spawn_mobs,
+            source,
+            heightmaps,
+            other_fields,
         })
     }
 
@@ -6140,6 +6250,27 @@ mod tests {
             early_spawn.document().value.get("example:root"),
             Some(&Tag::Int(74))
         );
+        let new_maps = actual.convert_captured_heightmaps(&batch, &staged, &new_spawn)?;
+        let saved_maps = actual.convert_captured_heightmaps(&batch, &staged, &saved_spawn)?;
+        let early_maps = actual.convert_captured_heightmaps(&batch, &staged, &early_spawn)?;
+        assert!(new_maps.matches_source(None)?);
+        assert!(saved_maps.matches_source(Some(&saved))?);
+        assert!(early_maps.matches_source(Some(&early_saved))?);
+        assert!(!saved_maps.matches_source(Some(&early_saved))?);
+        assert!(new_maps.other_fields().is_empty());
+        assert!(early_maps.other_fields().is_empty());
+        assert_eq!(
+            saved_maps.other_fields(),
+            &[("example:map".into(), Tag::Int(37))]
+        );
+        for maps in [&new_maps, &saved_maps, &early_maps] {
+            assert!(maps.matches_state(&batch, &staged, false));
+            assert!(!maps.matches_state(&batch, &staged, true));
+            let Tag::Compound(fields) = maps.heightmaps().to_tag()? else {
+                unreachable!()
+            };
+            assert_eq!(fields.len(), 4);
+        }
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
         let early_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_third)?;
@@ -6275,6 +6406,12 @@ mod tests {
         assert!(!new_spawn.matches_state(&batch, &staged, false));
         assert!(!saved_spawn.matches_state(&batch, &staged, false));
         assert!(!early_spawn.matches_state(&batch, &staged, false));
+        assert!(!early_maps.matches_state(&batch, &staged, false));
+        assert!(
+            actual
+                .convert_captured_heightmaps(&batch, &staged, &early_spawn)
+                .is_err()
+        );
         staged.light_revision = original_revision;
         assert!(draft.matches_state(&batch, &staged));
         assert!(
@@ -6307,15 +6444,63 @@ mod tests {
             &source,
             include_str!("../../tests/java/ResumedLightOracle.java"),
         )?;
+        let heightmap_oracle = oracle.path().join("FullHeightmapOracle.java");
+        std::fs::write(
+            &heightmap_oracle,
+            include_str!("../../../persistence/tests/java/FullHeightmapOracle.java"),
+        )?;
         let compiled = std::process::Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg(&source)
+            .arg(&heightmap_oracle)
             .output()?;
         ensure!(
             compiled.status.success(),
             "Java oracle compilation failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut heightmap_cases = Vec::new();
+        for (position, maps) in [
+            (target, &new_maps),
+            (second, &saved_maps),
+            (third, &early_maps),
+        ] {
+            heightmap_cases.push(Tag::Compound(vec![
+                ("min_y".into(), Tag::Int(lighting.min_y)),
+                ("height".into(), Tag::Int(lighting.height)),
+                (
+                    "source".into(),
+                    batch.terrain.generated_heightmap_data(position)?,
+                ),
+                ("expected".into(), maps.heightmaps().to_tag()?),
+            ]));
+        }
+        let heightmap_input = oracle.path().join("converted-heightmaps.nbt");
+        std::fs::write(
+            &heightmap_input,
+            native_persistence::nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "cases".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: heightmap_cases,
+                    },
+                )]),
+            })?,
+        )?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("FullHeightmapOracle")
+            .arg(&heightmap_input)
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java converted heightmap validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
         );
         for (name, document, spawn_status) in [
             ("new", draft.document(), false),

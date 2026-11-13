@@ -5298,7 +5298,7 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     {
         return Ok((true, false));
     }
-    if jigsaw::jigsaw_wood(state) {
+    if jigsaw::jigsaw_wood(state) || native_world::collision::barrel_state(state) {
         return Ok((true, true));
     }
     if native_world::collision::full_tuff(state)
@@ -5310,11 +5310,20 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if native_world::collision::copper_grate_waterlogged(state).is_some() {
         return Ok((true, false));
     }
-    if jigsaw::jigsaw_torch(state) || jigsaw::jigsaw_candle(state) {
+    if jigsaw::jigsaw_torch(state)
+        || jigsaw::jigsaw_candle(state)
+        || native_world::collision::flower_pot(state)
+    {
         return Ok((false, false));
     }
     if native_world::collision::pane_waterlogged(state).is_some()
         || native_world::collision::bed_leg_end(state).is_some()
+        || native_world::collision::decorated_pot_waterlogged(state).is_some()
+        || native_world::collision::hopper_facing(state).is_some()
+        || native_world::collision::trial_spawner_state(state).is_some()
+        || native_world::collision::vault_state(state).is_some()
+        || jigsaw::jigsaw_chain(state)
+        || jigsaw::jigsaw_speleothem(state)
         || (name == "minecraft:cobweb" && state.properties.is_empty())
         || (matches!(name, "minecraft:lantern" | "minecraft:soul_lantern")
             && native_world::block_light::same_light_behavior(state, state).is_some())
@@ -5591,7 +5600,16 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
         }
         let old = self.read(pos)?;
         monster_block_flags(&old)?;
-        if matches!(old.name.as_str(), "minecraft:chest" | "minecraft:spawner") {
+        if matches!(
+            old.name.as_str(),
+            "minecraft:chest"
+                | "minecraft:spawner"
+                | "minecraft:barrel"
+                | "minecraft:hopper"
+                | "minecraft:trial_spawner"
+                | "minecraft:vault"
+                | "minecraft:decorated_pot"
+        ) {
             ensure!(
                 self.monster_entities.contains_key(&pos),
                 "existing monster-room block entity is unavailable"
@@ -20354,6 +20372,35 @@ mod tests {
     }
 
     #[test]
+    fn monster_room_refuses_to_replace_untracked_trial_block_entities() {
+        use native_resources::monster_room::{MonsterRoomWorld, RoomBlock};
+        for (name, properties) in [
+            ("barrel", vec![("facing", "up"), ("open", "false")]),
+            ("decorated_pot", vec![("facing", "north"), ("cracked", "false"), ("waterlogged", "false")]),
+            ("hopper", vec![("facing", "down"), ("enabled", "true")]),
+            ("trial_spawner", vec![("ominous", "false"), ("trial_spawner_state", "inactive")]),
+            ("vault", vec![("facing", "north"), ("ominous", "false"), ("vault_state", "inactive")]),
+        ] {
+            let mut block = state(name);
+            block.properties = properties.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+            let (mut terrain, tags, _, _) = fixture();
+            let mut registry = batch_registry();
+            registry.insert(block.name.clone());
+            let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+            let pos = [1, 8, 1];
+            region.set_proto_block(pos, &block).unwrap();
+            assert!(
+                MonsterRoomWorld::set_block(&mut region, pos, RoomBlock::CaveAir).is_err(),
+                "{}",
+                block.name
+            );
+            assert_eq!(OreWorld::block(&mut region, pos).unwrap(), block);
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn monster_room_block_flags_match_java() {
         use std::{path::PathBuf, process::Command};
@@ -20437,7 +20484,10 @@ mod tests {
             );
             assert_eq!(
                 parts[4].parse::<bool>().unwrap(),
-                matches!(parts[0], "chest" | "spawner"),
+                matches!(
+                    parts[0],
+                    "chest" | "spawner" | "barrel" | "hopper" | "trial_spawner" | "vault" | "decorated_pot"
+                ),
                 "{line}"
             );
             assert!(

@@ -682,6 +682,37 @@ impl GeneratedPostprocessing {
         Ok(())
     }
 
+    /// Register an independently validated missing neighbor between bounded
+    /// callback attempts. The caller must establish that the preceding
+    /// isolated attempt requested this exact chunk and that `light` preserves
+    /// all already registered columns.
+    pub(super) fn register_retry_neighbor(
+        &mut self,
+        pos: ChunkPos,
+        converted: super::postprocessing::ConvertedChunkPostprocessing,
+        entities: ConvertedBlockEntities,
+        heightmaps: native_persistence::heightmap::FullHeightmaps,
+        light: Option<VisibleLightSnapshot>,
+    ) -> Result<()> {
+        ensure!(!self.failed, "generated postprocessing attempt failed");
+        ensure!(
+            !self.region.tasks.contains_key(&pos)
+                && !self.heightmaps.contains_key(&pos)
+                && !self.block_entities.contains_key(&pos)
+                && self.region.ticks.chunk(pos).is_none(),
+            "postprocessing chunk is already registered"
+        );
+        self.region.ticks.register_chunk(pos, converted.ticks)?;
+        self.region.tasks.insert(pos, converted.task);
+        self.block_entities.insert(pos, entities);
+        self.entity_candidates.insert(pos, None);
+        self.heightmaps.insert(pos, heightmaps);
+        if let Some(light) = light {
+            self.light = Some(light);
+        }
+        Ok(())
+    }
+
     /// `before` must include the last checkpoint plus every newly needed
     /// column; callers are responsible for validating its batch revision.
     pub(super) fn drain_recorded_light(

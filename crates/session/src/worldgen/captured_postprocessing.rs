@@ -13,8 +13,12 @@ use native_resources::{
 use native_world::{generation_light::VisibleLightSnapshot, loaded::ChunkPos};
 
 use super::{
-    CarvedTerrainWorld, GeneratedPostprocessing, chunk_ticks::SavedTick,
-    postprocessing::ConvertedPostprocessingRegion, postprocessing_world::ConvertedBlockEntities,
+    CarvedTerrainWorld, GeneratedPostprocessing,
+    chunk_ticks::{ConvertedChunkTicks, SavedTick},
+    postprocessing::{
+        ConvertedChunkPostprocessing, ConvertedPostprocessingRegion, PostprocessingTask,
+    },
+    postprocessing_world::ConvertedBlockEntities,
 };
 
 impl CarvedTerrainWorld {
@@ -55,72 +59,20 @@ impl CarvedTerrainWorld {
             .min_y
             .checked_add(self.height)
             .context("dimension height overflow")?;
-        let bounds = HeightBounds {
-            min_y: self.min_y,
-            max_y,
-        };
         let mut block_entities = BTreeMap::new();
         for (&pos, task) in &region.tasks {
-            ensure!(
-                self.world.chunks.contains_key(&pos),
-                "postprocessing terrain chunk is missing"
-            );
-            let marks = self
-                .postprocessing_marks_to_date(pos)
-                .context("postprocessing marks are missing")?;
-            ensure!(
-                task.unstarted_marks()? == &marks,
-                "postprocessing marks differ from terrain"
-            );
             let ticks = region
                 .ticks
                 .chunk(pos)
                 .context("postprocessing tick chunk is missing")?;
-            ensure!(
-                ticks.blocks.peek().is_none() && ticks.fluids.peek().is_none(),
-                "postprocessing ticks are already active"
-            );
-            let blocks: Vec<_> = self
-                .world
-                .saved_block_ticks
-                .get(&pos)
-                .into_iter()
-                .flatten()
-                .map(|tick| SavedTick {
-                    kind: tick.block.clone(),
-                    position: tick.position,
-                    delay: tick.delay,
-                    priority: tick.priority,
-                })
-                .collect();
-            let fluids: Vec<_> = self
-                .world
-                .saved_fluid_ticks
-                .get(&pos)
-                .into_iter()
-                .flatten()
-                .map(|tick| SavedTick {
-                    kind: tick.fluid.clone(),
-                    position: tick.position,
-                    delay: tick.delay,
-                    priority: tick.priority,
-                })
-                .collect();
-            ensure!(
-                ticks.blocks.pack(0) == blocks && ticks.fluids.pack(0) == fluids,
-                "postprocessing ticks differ from terrain"
-            );
-            let expected = generated_full_heightmaps(bounds, &self.generated_heightmap_data(pos)?)?;
-            ensure!(
-                heightmaps[&pos].to_tag()? == expected,
-                "postprocessing heightmaps differ from terrain"
-            );
             block_entities.insert(
                 pos,
-                ConvertedBlockEntities::from_proto(
-                    self.generated_block_entity_data(pos, registry)?,
-                    self.generated_entity_order.get(&pos).map(Arc::as_ref),
-                    self.generated_pending_order.get(&pos).map(Arc::as_ref),
+                self.validate_captured_postprocessing_chunk(
+                    pos,
+                    task,
+                    ticks,
+                    &heightmaps[&pos],
+                    registry,
                 )?,
             );
         }
@@ -180,5 +132,124 @@ impl CarvedTerrainWorld {
         stage.set_bubble_tags(bubble);
         stage.set_fluid_tags(washed, lava);
         Ok(stage)
+    }
+
+    /// Add a validated, deferred neighbor after an isolated attempt reported
+    /// it missing. The caller must confirm the exact requested position and
+    /// supply a light snapshot covering every previously registered column.
+    pub fn register_captured_postprocessing_neighbor(
+        &self,
+        stage: &mut GeneratedPostprocessing,
+        registry: &GeneratedBlockRegistry,
+        position: ChunkPos,
+        converted: ConvertedChunkPostprocessing,
+        heightmaps: FullHeightmaps,
+        light: Option<VisibleLightSnapshot>,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.world, &stage.source),
+            "postprocessing terrain revision differs"
+        );
+        ensure!(
+            stage.light_checkpoint.is_none(),
+            "postprocessing light checkpoint requires an explicit drain"
+        );
+        match (&stage.light, &light) {
+            (None, None) => {}
+            (Some(before), Some(after)) => {
+                ensure!(
+                    before.has_block_channel() == after.has_block_channel()
+                        && before.has_sky_channel() == after.has_sky_channel(),
+                    "postprocessing light channels differ"
+                );
+                for &pos in stage.region.ticks.registration_order() {
+                    ensure!(
+                        before.same_complete_column(after, pos) == Some(true),
+                        "registered postprocessing light changed"
+                    );
+                }
+            }
+            _ => anyhow::bail!("postprocessing light coverage differs"),
+        }
+        let entities = self.validate_captured_postprocessing_chunk(
+            position,
+            &converted.task,
+            &converted.ticks,
+            &heightmaps,
+            registry,
+        )?;
+        stage.register_retry_neighbor(position, converted, entities, heightmaps, light)
+    }
+
+    fn validate_captured_postprocessing_chunk(
+        &self,
+        pos: ChunkPos,
+        task: &PostprocessingTask,
+        ticks: &ConvertedChunkTicks,
+        heightmaps: &FullHeightmaps,
+        registry: &GeneratedBlockRegistry,
+    ) -> Result<ConvertedBlockEntities> {
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "postprocessing terrain chunk is missing"
+        );
+        let marks = self
+            .postprocessing_marks_to_date(pos)
+            .context("postprocessing marks are missing")?;
+        ensure!(
+            task.unstarted_marks()? == &marks,
+            "postprocessing marks differ from terrain"
+        );
+        ensure!(
+            ticks.blocks.peek().is_none() && ticks.fluids.peek().is_none(),
+            "postprocessing ticks are already active"
+        );
+        let blocks: Vec<_> = self
+            .world
+            .saved_block_ticks
+            .get(&pos)
+            .into_iter()
+            .flatten()
+            .map(|tick| SavedTick {
+                kind: tick.block.clone(),
+                position: tick.position,
+                delay: tick.delay,
+                priority: tick.priority,
+            })
+            .collect();
+        let fluids: Vec<_> = self
+            .world
+            .saved_fluid_ticks
+            .get(&pos)
+            .into_iter()
+            .flatten()
+            .map(|tick| SavedTick {
+                kind: tick.fluid.clone(),
+                position: tick.position,
+                delay: tick.delay,
+                priority: tick.priority,
+            })
+            .collect();
+        ensure!(
+            ticks.blocks.pack(0) == blocks && ticks.fluids.pack(0) == fluids,
+            "postprocessing ticks differ from terrain"
+        );
+        let bounds = HeightBounds {
+            min_y: self.min_y,
+            max_y: self
+                .min_y
+                .checked_add(self.height)
+                .context("dimension height overflow")?,
+        };
+        let expected = generated_full_heightmaps(bounds, &self.generated_heightmap_data(pos)?)?;
+        ensure!(
+            heightmaps.to_tag()? == expected,
+            "postprocessing heightmaps differ from terrain"
+        );
+        ConvertedBlockEntities::from_proto(
+            self.generated_block_entity_data(pos, registry)?,
+            self.generated_entity_order.get(&pos).map(Arc::as_ref),
+            self.generated_pending_order.get(&pos).map(Arc::as_ref),
+        )
     }
 }

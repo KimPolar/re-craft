@@ -2055,6 +2055,24 @@ impl InputState {
         self.sprint.restore_after_screen(settings.toggle_sprint);
         self.sneak.restore_after_screen(settings.toggle_sneak);
     }
+
+    fn restore_held_keys(
+        &mut self,
+        keys: &toggle_key::HeldMovementKeys,
+        settings: menu_settings::VideoSettings,
+    ) {
+        self.forward = keys.forward;
+        self.back = keys.back;
+        self.left = keys.left;
+        self.right = keys.right;
+        self.jump = keys.jump;
+        keys.restore_hold_keys(
+            &mut self.sneak,
+            &mut self.sprint,
+            settings.toggle_sneak,
+            settings.toggle_sprint,
+        );
+    }
 }
 
 fn apply_game_video(
@@ -2298,6 +2316,7 @@ struct App {
     session: LocalSession,
     visual_look: visual_look::VisualLook,
     input: InputState,
+    held_keys: toggle_key::HeldMovementKeys,
     mouse_bindings: toggle_key::MouseBindings,
     hotbar_scroll: mouse_scroll::HotbarScroll,
     captured: bool,
@@ -2373,6 +2392,7 @@ impl App {
             session,
             visual_look: visual_look::VisualLook::default(),
             input: InputState::default(),
+            held_keys: toggle_key::HeldMovementKeys::default(),
             mouse_bindings: toggle_key::MouseBindings::default(),
             hotbar_scroll: mouse_scroll::HotbarScroll::default(),
             captured: false,
@@ -2418,6 +2438,7 @@ impl App {
             self.session.submit_command(PlayerCommand::StopBreak);
             self.session.submit_command(PlayerCommand::StopUse);
         }
+        let mut restored = false;
         if let Some(window) = &self.window {
             if enabled {
                 match window
@@ -2426,6 +2447,7 @@ impl App {
                 {
                     Ok(()) => {
                         window.set_cursor_visible(false);
+                        restored = !self.captured;
                         self.captured = true;
                     }
                     Err(error) => eprintln!("Could not capture the mouse: {error}"),
@@ -2435,6 +2457,10 @@ impl App {
                 window.set_cursor_visible(true);
                 self.captured = false;
             }
+        }
+        if restored {
+            self.input.restore_held_keys(&self.held_keys, self.video);
+            self.input.submit(&mut self.session);
         }
     }
 
@@ -2934,6 +2960,7 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                self.held_keys = toggle_key::HeldMovementKeys::default();
                 self.inventory_shift = false;
                 self.inventory_control = false;
                 self.inventory_alt = false;
@@ -2978,6 +3005,10 @@ impl ApplicationHandler for App {
                 update_chat_ime_area(&self.window, &self.ui);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.held_keys
+                        .update(code, event.state == ElementState::Pressed);
+                }
                 if screenshot_shortcut(event.physical_key, event.state, event.repeat) {
                     request_game_screenshot(&self.ui, &mut self.renderer);
                     return;

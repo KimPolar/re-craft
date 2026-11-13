@@ -1,5 +1,56 @@
 //! Hold and toggle key state, including the state restored after screens close.
 
+use winit::keyboard::KeyCode;
+
+/// Physical movement keys continue to be tracked while a screen consumes input.
+#[derive(Default)]
+pub struct HeldMovementKeys {
+    pub forward: bool,
+    pub back: bool,
+    pub left: bool,
+    pub right: bool,
+    pub jump: bool,
+    sneak_left: bool,
+    sneak_right: bool,
+    sprint_left: bool,
+    sprint_right: bool,
+}
+
+impl HeldMovementKeys {
+    pub fn update(&mut self, code: KeyCode, pressed: bool) {
+        let key = match code {
+            KeyCode::KeyW => &mut self.forward,
+            KeyCode::KeyS => &mut self.back,
+            KeyCode::KeyA => &mut self.left,
+            KeyCode::KeyD => &mut self.right,
+            KeyCode::Space => &mut self.jump,
+            KeyCode::ShiftLeft => &mut self.sneak_left,
+            KeyCode::ShiftRight => &mut self.sneak_right,
+            KeyCode::ControlLeft => &mut self.sprint_left,
+            KeyCode::ControlRight => &mut self.sprint_right,
+            _ => return,
+        };
+        *key = pressed;
+    }
+
+    pub fn restore_hold_keys(
+        &self,
+        sneak: &mut ToggleKey,
+        sprint: &mut ToggleKey,
+        toggle_sneak: bool,
+        toggle_sprint: bool,
+    ) {
+        if !toggle_sneak {
+            sneak.set(true, self.sneak_left, false, false);
+            sneak.set(false, self.sneak_right, false, false);
+        }
+        if !toggle_sprint {
+            sprint.set(true, self.sprint_left, false, false);
+            sprint.set(false, self.sprint_right, false, false);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ToggleKey {
     left: bool,
@@ -96,6 +147,47 @@ impl ToggleKey {
 #[cfg(test)]
 mod tests {
     use super::ToggleKey;
+
+    #[test]
+    fn movement_keys_restore_after_screen_without_retriggering_toggles() {
+        use super::HeldMovementKeys;
+        use crate::menu_settings::VideoSettings;
+        use winit::keyboard::KeyCode;
+
+        let mut keys = HeldMovementKeys::default();
+        let mut input = crate::InputState::default();
+        let settings = VideoSettings {
+            toggle_sprint: true,
+            ..Default::default()
+        };
+        input.sprint.set(true, true, false, true);
+        keys.update(KeyCode::KeyW, true);
+        keys.update(KeyCode::KeyA, true);
+        keys.update(KeyCode::Space, true);
+        keys.update(KeyCode::ShiftLeft, true);
+        keys.update(KeyCode::ControlLeft, true);
+        input.release_for_screen(settings);
+        // The screen consumed these events, but physical state must still change.
+        keys.update(KeyCode::KeyA, false);
+        keys.update(KeyCode::KeyD, true);
+        keys.update(KeyCode::ShiftRight, true);
+        keys.update(KeyCode::ShiftLeft, false);
+        input.restore_after_screen(settings);
+        input.restore_held_keys(&keys, settings);
+        assert!(input.forward && input.right && input.jump);
+        assert!(!input.back && !input.left);
+        assert!(input.sneak.down());
+        assert!(input.sprint.down());
+        keys.update(KeyCode::ShiftRight, false);
+        keys.update(KeyCode::KeyW, false);
+        input.restore_held_keys(&keys, settings);
+        assert!(!input.sneak.down());
+        assert!(!input.forward);
+        assert!(
+            input.sprint.down(),
+            "restoring a held toggle must not toggle it again"
+        );
+    }
 
     #[test]
     fn hold_supports_both_keys_and_toggle_ignores_release_and_repeats() {

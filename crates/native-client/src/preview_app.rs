@@ -251,6 +251,24 @@ impl Input {
         self.down.restore_after_screen(settings.toggle_sneak);
         self.fast.restore_after_screen(settings.toggle_sprint);
     }
+
+    fn restore_held_keys(
+        &mut self,
+        keys: &crate::toggle_key::HeldMovementKeys,
+        settings: VideoSettings,
+    ) {
+        self.forward = keys.forward;
+        self.back = keys.back;
+        self.left = keys.left;
+        self.right = keys.right;
+        self.up = keys.jump;
+        keys.restore_hold_keys(
+            &mut self.down,
+            &mut self.fast,
+            settings.toggle_sneak,
+            settings.toggle_sprint,
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -441,6 +459,7 @@ fn run_inner(
         window: None,
         renderer: None,
         input: Input::default(),
+        held_keys: crate::toggle_key::HeldMovementKeys::default(),
         mouse_bindings: crate::toggle_key::MouseBindings::default(),
         hotbar_scroll: crate::mouse_scroll::HotbarScroll::default(),
         captured: false,
@@ -547,6 +566,7 @@ struct Viewer {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     input: Input,
+    held_keys: crate::toggle_key::HeldMovementKeys,
     mouse_bindings: crate::toggle_key::MouseBindings,
     hotbar_scroll: crate::mouse_scroll::HotbarScroll,
     captured: bool,
@@ -690,6 +710,7 @@ impl Viewer {
                 play.session.submit_command(PlayerCommand::StopUse);
             }
         }
+        let mut restored = false;
         if let Some(window) = &self.window {
             if enabled {
                 match window
@@ -698,6 +719,7 @@ impl Viewer {
                 {
                     Ok(()) => {
                         window.set_cursor_visible(false);
+                        restored = !self.captured;
                         self.captured = true;
                     }
                     Err(error) => eprintln!("Could not capture the mouse: {error}"),
@@ -707,6 +729,10 @@ impl Viewer {
                 window.set_cursor_visible(true);
                 self.captured = false;
             }
+        }
+        if restored {
+            self.input.restore_held_keys(&self.held_keys, self.video);
+            self.submit_movement();
         }
     }
 
@@ -1829,6 +1855,7 @@ impl ApplicationHandler for Viewer {
                     }
                     return;
                 }
+                self.held_keys = crate::toggle_key::HeldMovementKeys::default();
                 self.inventory_shift = false;
                 self.inventory_control = false;
                 self.inventory_alt = false;
@@ -1875,6 +1902,10 @@ impl ApplicationHandler for Viewer {
                 crate::update_chat_ime_area(&self.window, &self.ui);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.held_keys
+                        .update(code, event.state == ElementState::Pressed);
+                }
                 if crate::screenshot_shortcut(event.physical_key, event.state, event.repeat) {
                     crate::request_game_screenshot(&self.ui, &mut self.renderer);
                     return;
@@ -2485,6 +2516,25 @@ impl ApplicationHandler for Viewer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loaded_world_restores_movement_after_a_screen() {
+        use crate::{menu_settings::VideoSettings, toggle_key::HeldMovementKeys};
+        use winit::keyboard::KeyCode;
+
+        let settings = VideoSettings::default();
+        let mut input = super::Input::default();
+        let mut keys = HeldMovementKeys::default();
+        keys.update(KeyCode::KeyW, true);
+        keys.update(KeyCode::Space, true);
+        keys.update(KeyCode::ShiftLeft, true);
+        input.release_for_screen(settings);
+        keys.update(KeyCode::KeyW, false);
+        keys.update(KeyCode::KeyS, true);
+        input.restore_after_screen(settings);
+        input.restore_held_keys(&keys, settings);
+        assert!(!input.forward && input.back && input.up && input.down());
+    }
+
     #[test]
     fn special_fog_and_camera_near_plane_respect_mode_and_order() {
         use native_session::loaded::CameraMedium;

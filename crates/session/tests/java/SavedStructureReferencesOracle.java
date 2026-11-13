@@ -1,5 +1,6 @@
 import com.mojang.serialization.Lifecycle;
 import it.unimi.dsi.fastutil.longs.LongSet;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
@@ -34,6 +35,15 @@ public class SavedStructureReferencesOracle {
             var test = (CompoundTag)item;
             var pos = new ChunkPos(test.getIntOr("x",0),test.getIntOr("z",0));
             var actual = (Map<Structure, LongSet>)read.invoke(null, access, pos, test.getCompoundOrEmpty("structures"));
+            if (test.get("additions") instanceof ListTag additions) {
+                for (var entry : additions) {
+                    var addition = (CompoundTag) entry;
+                    var key = ResourceKey.create(Registries.STRUCTURE, Identifier.parse(addition.getStringOr("id", "")));
+                    var structure = registry.getOrThrow(key).value();
+                    actual.computeIfAbsent(structure, ignored -> new LongOpenHashSet())
+                            .add(addition.getLongOr("value", 0));
+                }
+            }
             var expected = test.getCompoundOrEmpty("expected");
             if (actual.size() != expected.size()) throw new AssertionError("reference map size differs");
             for (var entry : actual.entrySet()) {

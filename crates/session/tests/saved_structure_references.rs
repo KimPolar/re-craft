@@ -1,7 +1,8 @@
 use native_persistence::nbt::{self, NamedTag, Tag, TagType};
 use native_resources::packs::ResourceId;
 use native_session::worldgen::structure_references::{
-    StructureStartBounds, collect_ordered_structure_references, restore_saved_structure_references,
+    StructureStartBounds, collect_ordered_structure_references,
+    collect_ordered_structure_references_with_saved, restore_saved_structure_references,
 };
 use native_world::loaded::ChunkPos;
 use std::{path::PathBuf, process::Command};
@@ -159,6 +160,79 @@ fn saved_structure_reference_order_matches_java_26_3() {
             ),
             ("expected".into(), expected),
         ]));
+    }
+    // Reuse the sets created by Java's saved-chunk decoder before inserting
+    // new starts, including duplicate entries and fastutil rehash boundaries.
+    for target in [ChunkPos { x: 0, z: 0 }, ChunkPos { x: -7, z: 13 }] {
+        let bounds = native_core::beardifier::BoundingBox::new(
+            [target.x * 16, 0, target.z * 16],
+            [target.x * 16 + 15, 15, target.z * 16 + 15],
+        )
+        .unwrap();
+        for count in [0usize, 1, 2, 12, 24, 100, 289] {
+            let values: Vec<_> = (0..count)
+                .map(|i| {
+                    let n = (i * 137) % 289;
+                    packed(
+                        target.x + (n / 17) as i32 - 8,
+                        target.z + (n % 17) as i32 - 8,
+                    )
+                })
+                .collect();
+            let original = Tag::Compound(vec![
+                ("minecraft:buried_treasure".into(), Tag::LongArray(values)),
+                ("minecraft:swamp_hut".into(), Tag::LongArray(vec![])),
+            ]);
+            let saved = restore_saved_structure_references(target, Some(&original), |id| {
+                Ok(ids.contains(id))
+            })
+            .unwrap();
+            assert!(saved.discarded.is_empty());
+            let mut additions = Vec::new();
+            let merged =
+                collect_ordered_structure_references_with_saved(target, &saved, |source| {
+                    let dx = source.x - target.x + 8;
+                    let dz = source.z - target.z + 8;
+                    let mut starts = Vec::new();
+                    for (index, divisor) in [(0usize, 3), (1usize, 11)] {
+                        if (dx * 17 + dz) % divisor == 0 {
+                            additions.push(Tag::Compound(vec![
+                                (
+                                    "id".into(),
+                                    Tag::String(
+                                        format!("{}:{}", ids[index].namespace, ids[index].path)
+                                            .as_str()
+                                            .into(),
+                                    ),
+                                ),
+                                ("value".into(), Tag::Long(packed(source.x, source.z))),
+                            ]));
+                            starts.push(StructureStartBounds {
+                                structure: ids[index].clone(),
+                                bounds,
+                            });
+                        }
+                    }
+                    Ok(starts)
+                })
+                .unwrap();
+            cases.push(Tag::Compound(vec![
+                ("x".into(), Tag::Int(target.x)),
+                ("z".into(), Tag::Int(target.z)),
+                (
+                    "structures".into(),
+                    Tag::Compound(vec![("References".into(), original)]),
+                ),
+                (
+                    "additions".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: additions,
+                    },
+                ),
+                ("expected".into(), merged.to_tag()),
+            ]));
+        }
     }
     let invalid = Tag::Int(7);
     let decoded =

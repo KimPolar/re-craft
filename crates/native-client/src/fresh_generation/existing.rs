@@ -212,10 +212,12 @@ pub(crate) struct CapturedBiomeSchedule {
         native_persistence::world::ChunkPos,
         native_session::worldgen::MaterializedTerrain,
     >,
-    generated_references: BTreeMap<
-        native_world::loaded::ChunkPos,
-        native_session::worldgen::structure_references::OrderedStructureReferences,
-    >,
+    generated_references: BTreeMap<native_world::loaded::ChunkPos, CapturedGeneratedReferences>,
+}
+
+struct CapturedGeneratedReferences {
+    original: Option<Tag>,
+    references: native_session::worldgen::structure_references::OrderedStructureReferences,
 }
 
 /// Intermediate terrain assembled from one capture. `None` in `sources`
@@ -227,10 +229,7 @@ pub(crate) struct CapturedTerrainBatch {
     biomes: native_session::worldgen::BiomeNeighborhood,
     terrain: native_session::worldgen::CarvedTerrainWorld,
     sources: BTreeMap<native_persistence::world::ChunkPos, Option<Arc<NamedTag>>>,
-    generated_references: BTreeMap<
-        native_world::loaded::ChunkPos,
-        native_session::worldgen::structure_references::OrderedStructureReferences,
-    >,
+    generated_references: BTreeMap<native_world::loaded::ChunkPos, CapturedGeneratedReferences>,
     feature_entity_sources: ResumedFeatureEntitySources,
     revision: Arc<()>,
 }
@@ -5028,12 +5027,16 @@ impl PreparedExistingGenerator {
         structure_order: &[ResourceId],
     ) -> Result<(
         native_core::beardifier::Beardifier,
-        native_session::worldgen::structure_references::OrderedStructureReferences,
+        CapturedGeneratedReferences,
     )> {
         use native_session::worldgen::{
             saved_structure_starts::{RestoredStructureStart, beardifier_for_ordered_references},
             schedule::GenerationStage,
-            structure_references::collect_ordered_structure_references,
+            structure_references::{
+                collect_ordered_structure_references,
+                collect_ordered_structure_references_with_saved,
+                restore_saved_structure_references,
+            },
         };
         let mut starts = BTreeMap::new();
         for dx in -8i32..=8 {
@@ -5087,7 +5090,37 @@ impl PreparedExistingGenerator {
                 );
             }
         }
-        let references = collect_ordered_structure_references(target, |position| {
+        let target_pos = native_persistence::world::ChunkPos {
+            x: target.x,
+            z: target.z,
+        };
+        let original = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target_pos)
+            .context("structure target was not captured")?
+            .terrain
+            .as_ref()
+            .map(|saved| original_structure_references(&saved.document).map(|value| value.cloned()))
+            .transpose()?
+            .flatten();
+        let saved = if original.is_some() {
+            let registry: BTreeSet<_> = self
+                .resources
+                .list_data("worldgen/structure")?
+                .into_iter()
+                .collect();
+            Some(restore_saved_structure_references(
+                target,
+                original.as_ref(),
+                |id| Ok(registry.contains(id)),
+            )?)
+        } else {
+            None
+        };
+        let lookup = |position| {
             let Some(entries) = starts.get(&position) else {
                 return Ok(Vec::new());
             };
@@ -5095,7 +5128,11 @@ impl PreparedExistingGenerator {
                 .iter()
                 .filter_map(|(id, start)| start.reference_bounds(id).transpose())
                 .collect()
-        })?;
+        };
+        let references = match &saved {
+            Some(saved) => collect_ordered_structure_references_with_saved(target, saved, lookup)?,
+            None => collect_ordered_structure_references(target, lookup)?,
+        };
         let beardifier = beardifier_for_ordered_references(
             target,
             &references,
@@ -5114,7 +5151,13 @@ impl PreparedExistingGenerator {
                 start.terrain_pieces()
             },
         )?;
-        Ok((beardifier, references))
+        Ok((
+            beardifier,
+            CapturedGeneratedReferences {
+                original,
+                references,
+            },
+        ))
     }
 
     /// Prepare terrain adaptation from captured starts and references. The
@@ -5945,13 +5988,32 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
+fn original_structure_references(document: &NamedTag) -> Result<Option<&Tag>> {
+    let Some(structures) = unique_root_field(document, "structures")? else {
+        return Ok(None);
+    };
+    let Tag::Compound(fields) = structures else {
+        bail!("saved structures are not a compound");
+    };
+    let mut entries = fields.iter().filter(|(name, _)| name.matches("References"));
+    let first = entries.next().map(|(_, value)| value);
+    ensure!(entries.next().is_none(), "duplicate structure references");
+    Ok(first)
+}
+
 /// Retain opaque structure fields and starts while adding references produced
-/// by this capture. Earlier nonempty references need a Java-order merge that
-/// is not yet available, so they cannot be overwritten.
+/// from this exact captured source.
 fn merge_generated_structure_references(
     document: &mut NamedTag,
-    references: &native_session::worldgen::structure_references::OrderedStructureReferences,
+    references: &CapturedGeneratedReferences,
 ) -> Result<()> {
+    let current = original_structure_references(document)?;
+    ensure!(
+        current == references.original.as_ref()
+            || (references.original.is_none()
+                && matches!(current, Some(Tag::Compound(fields)) if fields.is_empty())),
+        "saved structure references differ from the generation capture"
+    );
     let mut structures = match unique_root_field(document, "structures")? {
         Some(Tag::Compound(fields)) => fields.clone(),
         Some(_) => bail!("saved structures are not a compound"),
@@ -5970,24 +6032,13 @@ fn merge_generated_structure_references(
     } else {
         structures.push(("starts".into(), Tag::Compound(vec![])));
     }
-    let existing: Vec<_> = structures
-        .iter()
-        .filter(|(name, _)| name.matches("References"))
-        .collect();
-    ensure!(existing.len() <= 1, "duplicate structure references");
-    if let Some((_, value)) = existing.first() {
-        ensure!(
-            matches!(value, Tag::Compound(fields) if fields.is_empty()),
-            "existing structure references need a verified merge"
-        );
-    }
     if let Some((_, value)) = structures
         .iter_mut()
         .find(|(name, _)| name.matches("References"))
     {
-        *value = references.to_tag();
+        *value = references.references.to_tag();
     } else {
-        structures.push(("References".into(), references.to_tag()));
+        structures.push(("References".into(), references.references.to_tag()));
     }
     replace_unique_root_field(document, "structures", Tag::Compound(structures))
 }
@@ -6562,6 +6613,10 @@ mod tests {
                 vec![]
             })
         })?;
+        let refs = CapturedGeneratedReferences {
+            original: None,
+            references: refs,
+        };
         let starts = Tag::Compound(vec![("custom:start".into(), Tag::Int(9))]);
         let mut source = NamedTag {
             name: "".into(),
@@ -7213,7 +7268,25 @@ mod tests {
                     ("example:unrecognized".into(), Tag::Int(73)),
                 ]),
             };
-            if position.x == 1002 {
+            if position.x == 1000 {
+                let Tag::Compound(fields) = &mut document.value else {
+                    unreachable!()
+                };
+                fields.push((
+                    "structures".into(),
+                    Tag::Compound(vec![
+                        (
+                            "References".into(),
+                            Tag::Compound(vec![(
+                                "minecraft:buried_treasure".into(),
+                                Tag::LongArray(vec![1002]),
+                            )]),
+                        ),
+                        ("custom".into(), Tag::String("preserve".into())),
+                    ]),
+                ));
+            }
+            if position.x >= 1001 {
                 let Tag::Compound(fields) = &mut document.value else {
                     unreachable!()
                 };
@@ -7565,23 +7638,16 @@ mod tests {
                 x: position.x,
                 z: position.z,
             };
-            let structure_order = if position == first || position == early_positions[2].0 {
-                scheduled_early.generate_structures = position == early_positions[2].0;
-                assert!(scheduled_early.run_captured_saved_terrain(
-                    &mut early_work,
-                    &mut early_evaluator,
-                    key,
-                    &[],
-                ).is_err());
-                assert_eq!(
-                    early_work.schedule().completed(key),
-                    Some(GenerationStage::Biomes)
-                );
-                scheduled_early.generate_structures = false;
-                std::slice::from_ref(&early_treasure)
-            } else {
-                &[]
-            };
+            scheduled_early.generate_structures = position == early_positions[2].0;
+            assert!(
+                scheduled_early
+                    .run_captured_saved_terrain(&mut early_work, &mut early_evaluator, key, &[],)
+                    .is_err()
+            );
+            assert_eq!(
+                early_work.schedule().completed(key),
+                Some(GenerationStage::Biomes)
+            );
             // A chunk with saved structure references can resume even when
             // this world enables generation of new structure starts.
             scheduled_early.generate_structures = position == early_positions[2].0;
@@ -7589,9 +7655,35 @@ mod tests {
                 &mut early_work,
                 &mut early_evaluator,
                 key,
-                structure_order,
+                std::slice::from_ref(&early_treasure),
             )?;
             scheduled_early.generate_structures = false;
+            if position == first {
+                let generated = &early_work.generated_references[&key];
+                assert_eq!(
+                    generated.references.membership()[&early_treasure],
+                    BTreeSet::from([1001, 1002])
+                );
+                let original = &scheduled_early.context.inputs().sources().chunks()[&position]
+                    .terrain
+                    .as_ref()
+                    .unwrap()
+                    .document;
+                let mut merged = (**original).clone();
+                merge_generated_structure_references(&mut merged, generated)?;
+                let structures = merged.value.get("structures").unwrap();
+                assert_eq!(
+                    structures.get("custom"),
+                    Some(&Tag::String("preserve".into()))
+                );
+                assert_eq!(
+                    structures.get("References"),
+                    Some(&generated.references.to_tag())
+                );
+                let mut stale = (**original).clone();
+                replace_unique_root_field(&mut stale, "structures", Tag::Compound(vec![]))?;
+                assert!(merge_generated_structure_references(&mut stale, generated).is_err());
+            }
             let terrain = early_work
                 .terrain_chunk(position)
                 .context("resumed terrain missing")?;

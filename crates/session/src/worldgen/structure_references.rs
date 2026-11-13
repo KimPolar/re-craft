@@ -123,6 +123,8 @@ pub enum DiscardedSavedReference {
 pub struct SavedStructureReferences {
     pub references: OrderedStructureReferences,
     pub discarded: Vec<DiscardedSavedReference>,
+    target: ChunkPos,
+    sets: BTreeMap<ResourceId, ReferenceSet>,
 }
 
 /// Rebuild Java's LongOpenHashSet from a saved `References` compound. The
@@ -137,6 +139,7 @@ pub fn restore_saved_structure_references(
     let mut membership = StructureReferences::new();
     let mut ordered = BTreeMap::new();
     let mut discarded = Vec::new();
+    let mut sets = BTreeMap::new();
     let Some(Tag::Compound(entries)) = field else {
         if field.is_some() {
             discarded.push(DiscardedSavedReference::InvalidCompound);
@@ -148,6 +151,8 @@ pub fn restore_saved_structure_references(
                 structure_order: None,
             },
             discarded,
+            target,
+            sets,
         });
     };
     let mut seen = BTreeSet::new();
@@ -195,7 +200,8 @@ pub fn restore_saved_structure_references(
         }
         let values = set.ordered();
         membership.insert(id.clone(), values.iter().copied().collect());
-        ordered.insert(id, values);
+        ordered.insert(id.clone(), values);
+        sets.insert(id, set);
     }
     Ok(SavedStructureReferences {
         references: OrderedStructureReferences {
@@ -204,10 +210,13 @@ pub fn restore_saved_structure_references(
             structure_order: None,
         },
         discarded,
+        target,
+        sets,
     })
 }
 
 /// Insert-only default fastutil LongOpenHashSet, as used by ChunkAccess.
+#[derive(Clone)]
 struct ReferenceSet {
     slots: Vec<Option<u64>>,
     zero: bool,
@@ -304,7 +313,25 @@ pub fn collect_ordered_structure_references(
     target: ChunkPos,
     starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
 ) -> Result<OrderedStructureReferences> {
-    collect_with_hashes(target, starts, None)
+    collect_with_hashes(target, starts, None, BTreeMap::new())
+}
+
+/// Continue Java's reference stage from the exact sets reconstructed from a
+/// captured chunk. Discarded inputs must be handled before this can proceed.
+pub fn collect_ordered_structure_references_with_saved(
+    target: ChunkPos,
+    saved: &SavedStructureReferences,
+    starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
+) -> Result<OrderedStructureReferences> {
+    ensure!(
+        saved.target == target,
+        "saved references belong to another chunk"
+    );
+    ensure!(
+        saved.discarded.is_empty(),
+        "saved structure references contain discarded data"
+    );
+    collect_with_hashes(target, starts, None, saved.sets.clone())
 }
 
 /// Reproduce Java's structure-key map order with hashes observed from the same
@@ -314,13 +341,14 @@ pub fn collect_references_with_identity_hashes(
     starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
     hashes: &BTreeMap<ResourceId, i32>,
 ) -> Result<OrderedStructureReferences> {
-    collect_with_hashes(target, starts, Some(hashes))
+    collect_with_hashes(target, starts, Some(hashes), BTreeMap::new())
 }
 
 fn collect_with_hashes(
     target: ChunkPos,
     mut starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
     hashes: Option<&BTreeMap<ResourceId, i32>>,
+    mut references: BTreeMap<ResourceId, ReferenceSet>,
 ) -> Result<OrderedStructureReferences> {
     let min_x = target.x.checked_sub(8).context("chunk X underflow")?;
     let max_x = target.x.checked_add(8).context("chunk X overflow")?;
@@ -330,7 +358,6 @@ fn collect_with_hashes(
     let block_z = target.z.checked_mul(16).context("block Z overflow")?;
     let end_x = block_x.checked_add(15).context("block X overflow")?;
     let end_z = block_z.checked_add(15).context("block Z overflow")?;
-    let mut references = BTreeMap::<ResourceId, ReferenceSet>::new();
     let mut identities = hashes.map(StructureIdentityMap::new);
     for x in min_x..=max_x {
         for z in min_z..=max_z {
@@ -454,6 +481,29 @@ mod tests {
                 .unwrap()
                 .discarded,
             vec![DiscardedSavedReference::InvalidCompound]
+        );
+    }
+
+    #[test]
+    fn merging_requires_the_same_chunk_and_no_discarded_inputs() {
+        let target = ChunkPos { x: 0, z: 0 };
+        let invalid =
+            restore_saved_structure_references(target, Some(&Tag::Int(1)), |_| Ok(true)).unwrap();
+        assert!(
+            collect_ordered_structure_references_with_saved(target, &invalid, |_| Ok(vec![]))
+                .is_err()
+        );
+        let valid = restore_saved_structure_references(target, None, |_| Ok(true)).unwrap();
+        assert!(
+            collect_ordered_structure_references_with_saved(
+                ChunkPos { x: 1, z: 0 },
+                &valid,
+                |_| Ok(vec![])
+            )
+            .is_err()
+        );
+        assert!(
+            collect_ordered_structure_references_with_saved(target, &valid, |_| Ok(vec![])).is_ok()
         );
     }
 

@@ -8053,7 +8053,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || jigsaw::jigsaw_lantern(state)
                             || jigsaw::jigsaw_candle(state)
                             || jigsaw::jigsaw_carpet(state)
-                            || jigsaw::jigsaw_ladder(state))
+                            || jigsaw::jigsaw_ladder(state)
+                            || jigsaw::jigsaw_cobweb(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
                         && old.properties.len() == 1
@@ -12926,6 +12927,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_cobwebs_match_java_light_across_25_columns() {
+        check_staged_light_modes(&["vine_active_jigsaw_cobweb", "vine_active_self_empty_jigsaw_cobweb"]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_flower_pots_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_flowerpot",
@@ -13419,6 +13426,8 @@ mod tests {
                         "vault"
                     } else if mode.ends_with("_trialspawner") {
                         "trial_spawner"
+                    } else if mode.ends_with("_cobweb") {
+                        "cobweb"
                     } else if mode.ends_with("_flowerpot") {
                         "flower_pot"
                     } else if mode.ends_with("_pottedbush") {

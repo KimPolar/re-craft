@@ -157,6 +157,10 @@ pub(super) fn jigsaw_ladder(state: &BlockState) -> bool {
     native_world::collision::ladder_state(state).is_some()
 }
 
+pub(super) fn jigsaw_cobweb(state: &BlockState) -> bool {
+    state.name == "minecraft:cobweb" && state.properties.is_empty()
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
         ensure!(
@@ -194,6 +198,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::flower_pot(state)
         || native_world::collision::decorated_pot_waterlogged(state).is_some()
         || native_world::collision::hopper_facing(state).is_some()
+        || jigsaw_cobweb(state)
     {
         return Ok(false);
     }
@@ -543,7 +548,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || jigsaw_lantern(state)
                 || jigsaw_candle(state)
                 || jigsaw_carpet(state)
-                || jigsaw_ladder(state);
+                || jigsaw_ladder(state)
+                || jigsaw_cobweb(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -917,6 +923,18 @@ mod tests {
             };
             assert!(jigsaw_static_full(&invalid).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn jigsaw_cobweb_is_non_full_and_requires_a_canonical_state() -> Result<()> {
+        let mut state = BlockState {
+            name: "minecraft:cobweb".into(),
+            properties: BTreeMap::new(),
+        };
+        assert!(!jigsaw_static_full(&state)?);
+        state.properties.insert("extra".into(), "true".into());
+        assert!(jigsaw_static_full(&state).is_err());
         Ok(())
     }
 

@@ -134,6 +134,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || jigsaw_candle(state)
         || jigsaw_carpet(state)
         || jigsaw_ladder(state)
+        || native_world::collision::flower_pot(state)
     {
         return Ok(false);
     }
@@ -394,6 +395,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_copper(state)
                 || native_world::collision::full_tuff(state)
                 || native_world::collision::copper_grate_waterlogged(state).is_some()
+                || native_world::collision::flower_pot(state)
                 || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state)

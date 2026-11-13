@@ -8040,6 +8040,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::full_copper(state)
                             || native_world::collision::full_tuff(state)
                             || native_world::collision::copper_grate_waterlogged(state).is_some()
+                            || native_world::collision::flower_pot(state)
                             || native_world::collision::vault_state(state).is_some()
                             || native_world::collision::barrier_waterlogged(state).is_some()
                             || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
@@ -8091,6 +8092,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && native_world::collision::bed_leg_end(state).is_none()
                             && !native_world::collision::full_glass(state)
                             && native_world::collision::copper_grate_waterlogged(state).is_none()
+                            && !native_world::collision::flower_pot(state)
                             && native_world::collision::barrier_waterlogged(state).is_none()
                             && !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                             && !jigsaw::jigsaw_candle(state)
@@ -12903,6 +12905,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_flower_pots_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_flowerpot",
+            "vine_active_self_jigsaw_pottedbush",
+            "vine_active_empty_jigsaw_pottedbush",
+            "vine_active_self_empty_jigsaw_flowerpot",
+            "vine_active_jigsaw_water_flowerpot",
+            "vine_active_self_jigsaw_water_pottedbush",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13355,6 +13370,10 @@ mod tests {
                         "lava"
                     } else if mode.ends_with("_vault") {
                         "vault"
+                    } else if mode.ends_with("_flowerpot") {
+                        "flower_pot"
+                    } else if mode.ends_with("_pottedbush") {
+                        "potted_dead_bush"
                     } else if mode.ends_with("_grate") {
                         "waxed_copper_grate"
                     } else if mode.ends_with("_carpet") {
@@ -13589,6 +13608,8 @@ mod tests {
             } else if mode.contains("_jigsaw_wet_") {
                 2
             } else if mode.ends_with("_grate") {
+                0
+            } else if (mode.ends_with("_flowerpot") || mode.ends_with("_pottedbush")) && !mode.contains("_jigsaw_water_") {
                 0
             } else if mode.ends_with("_carpet")
                 && !mode.contains("_jigsaw_water_")

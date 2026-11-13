@@ -325,8 +325,9 @@ enum CapturedLitChunkDraft {
     Saved(CapturedSavedLitDraft),
 }
 
-/// Intermediate SPAWN result with no original mob spawning. Entity sidecars,
-/// live rules and the remaining save dependencies still require validation.
+/// Intermediate SPAWN result with no original mob spawning. The source NBT is
+/// retained separately; entity sidecars, live rules and remaining save
+/// dependencies still require validation before any write.
 pub(crate) struct CapturedEmptySpawnDraft {
     lit: CapturedLitChunkDraft,
     position: native_world::loaded::ChunkPos,
@@ -1381,26 +1382,27 @@ impl PreparedExistingGenerator {
                     .is_some_and(|stage| stage >= GenerationStage::Spawn),
             "spawn rule or stage differs"
         );
-        let lit = match batch
+        let mut lit = match batch
             .sources
             .get(&position)
             .context("terrain source was not captured")?
         {
-            None => {
-                let mut draft =
-                    self.draft_captured_new_lit_chunk(batch, light, position, last_update)?;
-                replace_unique_root_field(
-                    &mut draft.document,
-                    "Status",
-                    Tag::String("minecraft:spawn".into()),
-                )?;
-                native_persistence::nbt::write(&draft.document)?;
-                CapturedLitChunkDraft::New(draft)
-            }
+            None => CapturedLitChunkDraft::New(self.draft_captured_new_lit_chunk(
+                batch,
+                light,
+                position,
+                last_update,
+            )?),
             Some(_) => CapturedLitChunkDraft::Saved(
                 self.draft_captured_saved_lit_chunk(batch, light, position)?,
             ),
         };
+        let document = match &mut lit {
+            CapturedLitChunkDraft::New(draft) => &mut draft.document,
+            CapturedLitChunkDraft::Saved(draft) => &mut draft.document,
+        };
+        replace_unique_root_field(document, "Status", Tag::String("minecraft:spawn".into()))?;
+        native_persistence::nbt::write(document)?;
         Ok(CapturedEmptySpawnDraft {
             lit,
             position: key,
@@ -6120,7 +6122,23 @@ mod tests {
         );
         assert_eq!(
             saved_spawn.document().value.get("Status"),
+            Some(&Tag::String("minecraft:spawn".into()))
+        );
+        assert_eq!(
+            early_spawn.document().value.get("Status"),
+            Some(&Tag::String("minecraft:spawn".into()))
+        );
+        assert_eq!(
+            saved.value.get("Status"),
             Some(&Tag::String("minecraft:biomes".into()))
+        );
+        assert_eq!(
+            early_saved.value.get("Status"),
+            Some(&Tag::String("minecraft:structure_references".into()))
+        );
+        assert_eq!(
+            early_spawn.document().value.get("example:root"),
+            Some(&Tag::Int(74))
         );
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
@@ -6256,6 +6274,7 @@ mod tests {
         assert!(!saved_draft.matches_state(&batch, &staged));
         assert!(!new_spawn.matches_state(&batch, &staged, false));
         assert!(!saved_spawn.matches_state(&batch, &staged, false));
+        assert!(!early_spawn.matches_state(&batch, &staged, false));
         staged.light_revision = original_revision;
         assert!(draft.matches_state(&batch, &staged));
         assert!(
@@ -6303,6 +6322,8 @@ mod tests {
             ("saved", saved_draft.document(), false),
             ("early", early_draft.document(), false),
             ("spawn", new_spawn.document(), true),
+            ("saved_spawn", saved_spawn.document(), true),
+            ("early_spawn", early_spawn.document(), true),
         ] {
             let nbt = oracle.path().join(format!("{name}-light.nbt"));
             std::fs::write(&nbt, native_persistence::nbt::write(document)?)?;

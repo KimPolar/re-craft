@@ -214,29 +214,6 @@ pub fn merge_prebiome_stage_sections(source: Option<&Tag>, generated: &Tag) -> R
             let Tag::Compound(fields) = &mut output[index] else {
                 unreachable!()
             };
-            let mut blocks = fields.iter().filter(|(key, _)| key.matches("block_states"));
-            if let Some((_, Tag::Compound(storage))) = blocks.next() {
-                ensure!(
-                    storage
-                        .iter()
-                        .all(|(name, _)| name.matches("palette") || name.matches("data")),
-                    "unrecognized saved block storage"
-                );
-                for (_, palette) in storage.iter().filter(|(name, _)| name.matches("palette")) {
-                    if let Tag::List { values, .. } = palette {
-                        for entry in values {
-                            if let Tag::Compound(fields) = entry {
-                                ensure!(
-                                    fields.iter().all(|(name, _)| name.matches("id")
-                                        || name.matches("properties")),
-                                    "unrecognized saved block-state data"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            ensure!(blocks.next().is_none(), "duplicate saved block states");
             if !fields.iter().any(|(key, _)| key.matches("biomes")) {
                 fields.push(("biomes".into(), biome));
             }
@@ -259,7 +236,8 @@ pub fn merge_prebiome_stage_sections(source: Option<&Tag>, generated: &Tag) -> R
 
 /// Merge generated block storage into captured biome-stage sections without
 /// replacing their biome palettes, lighting, or unrecognized section fields.
-/// This returns one intermediate NBT component, not a writable chunk draft.
+/// Unknown fields in block storage being replaced cause rejection. This
+/// returns one intermediate NBT component, not a writable chunk draft.
 pub fn merge_biome_stage_blocks(source: &Tag, generated: &Tag) -> Result<Tag> {
     let wrap = |sections: &Tag| Tag::Compound(vec![("sections".into(), sections.clone())]);
     let source_container = wrap(source);
@@ -404,6 +382,7 @@ pub fn merge_biome_stage_blocks(source: &Tag, generated: &Tag) -> Result<Tag> {
         ensure!(positions.len() <= 1, "duplicate saved block states");
         if let Some(blocks) = replacements.remove(&y) {
             if let Some(&index) = positions.first() {
+                validate_replaced_block_storage(&fields[index].1)?;
                 fields[index].1 = blocks;
             } else {
                 fields.push(("block_states".into(), blocks));
@@ -418,6 +397,35 @@ pub fn merge_biome_stage_blocks(source: &Tag, generated: &Tag) -> Result<Tag> {
         element_type: TagType::Compound,
         values: output,
     })
+}
+
+/// Only the known block-state codec fields may be discarded when replacing
+/// all saved air with generated blocks. The caller validates the palette shape.
+fn validate_replaced_block_storage(value: &Tag) -> Result<()> {
+    let Tag::Compound(storage) = value else {
+        anyhow::bail!("saved block storage is not a compound")
+    };
+    ensure!(
+        storage
+            .iter()
+            .all(|(name, _)| name.matches("palette") || name.matches("data")),
+        "unrecognized saved block storage"
+    );
+    for (_, palette) in storage.iter().filter(|(name, _)| name.matches("palette")) {
+        if let Tag::List { values, .. } = palette {
+            for entry in values {
+                if let Tag::Compound(fields) = palette::unwrap_palette_entry(entry) {
+                    ensure!(
+                        fields
+                            .iter()
+                            .all(|(name, _)| name.matches("id") || name.matches("properties")),
+                        "unrecognized saved block-state data"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Attach a complete visible column to intermediate sections while preserving
@@ -633,6 +641,81 @@ mod tests {
         };
         blocks.push(("custom_storage".into(), Tag::Int(9)));
         assert!(merge_prebiome_stage_sections(Some(&list(vec![early])), &generated).is_err());
+    }
+
+    #[test]
+    fn biome_merge_rejects_unknown_data_only_when_block_storage_is_replaced() {
+        let generated = list(vec![section(
+            0,
+            Some("minecraft:stone"),
+            "minecraft:plains",
+        )]);
+        let mut source_section = section(0, Some("minecraft:air"), "minecraft:plains");
+        let Tag::Compound(fields) = &mut source_section else {
+            unreachable!()
+        };
+        let (_, Tag::Compound(storage)) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_states"))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        storage.push(("example:custom".into(), Tag::Int(9)));
+        let source = list(vec![source_section.clone()]);
+        assert!(merge_biome_stage_blocks(&source, &generated).is_err());
+        assert!(merge_prebiome_stage_sections(Some(&source), &generated).is_err());
+        // An unrelated section is kept as-is, even when it has custom storage.
+        let untouched = {
+            let Tag::Compound(fields) = &mut source_section else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(name, _)| name.matches("Y"))
+                .unwrap()
+                .1 = Tag::Byte(1);
+            source_section
+        };
+        let source = list(vec![
+            section(0, Some("minecraft:air"), "plains"),
+            untouched.clone(),
+        ]);
+        let merged = merge_biome_stage_blocks(&source, &generated).unwrap();
+        let Tag::List { values, .. } = merged else {
+            unreachable!()
+        };
+        assert_eq!(values[1], untouched);
+
+        let mut palette_section = section(0, Some("minecraft:air"), "plains");
+        let Tag::Compound(fields) = &mut palette_section else {
+            unreachable!()
+        };
+        let (_, Tag::Compound(storage)) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_states"))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let (_, palette) = storage
+            .iter_mut()
+            .find(|(name, _)| name.matches("palette"))
+            .unwrap();
+        *palette = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:air".into())),
+                ("example:custom".into(), Tag::Int(11)),
+            ])],
+        };
+        let source = list(vec![palette_section.clone()]);
+        assert!(merge_biome_stage_blocks(&source, &generated).is_err());
+        assert!(merge_prebiome_stage_sections(Some(&source), &generated).is_err());
+        let Tag::List { values, .. } = source else {
+            unreachable!()
+        };
+        assert_eq!(values[0], palette_section);
     }
 
     #[test]

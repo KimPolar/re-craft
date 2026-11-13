@@ -1874,7 +1874,12 @@ impl PreparedExistingGenerator {
             proof.matches_source(source.as_deref())? && spawn.matches_source(source.as_deref())?,
             "postprocessing source differs"
         );
-        validate_inert_captured_upgrade_data(spawn.document(), self.lighting.height)?;
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let upgrade =
+            parse_captured_upgrade_data(spawn.document(), self.lighting.height, &assets.block_ids)?;
         let world = batch.terrain.snapshot();
         let block_ticks = world
             .saved_block_ticks
@@ -1886,10 +1891,6 @@ impl PreparedExistingGenerator {
             .get(&position)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let assets = self
-            .terrain_assets
-            .as_ref()
-            .context("terrain registry is missing")?;
         let encoded_blocks =
             native_persistence::generated_ticks::encode_block_ticks(position, block_ticks, |id| {
                 assets.block_ids.contains(id)
@@ -1931,7 +1932,8 @@ impl PreparedExistingGenerator {
         Ok(CapturedConvertedPostprocessing {
             proof,
             converted: ConvertedChunkPostprocessing {
-                task: PostprocessingTask::new(Arc::new(marks), position),
+                task: PostprocessingTask::new(Arc::new(marks), position)
+                    .with_upgrade_ticks(upgrade)?,
                 ticks: ConvertedChunkTicks {
                     blocks: ChunkTicks::from_saved(position, blocks)?,
                     fluids: ChunkTicks::from_saved(position, fluids)?,
@@ -5732,11 +5734,16 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
-/// The current postprocessing world does not implement UpgradeData callbacks.
-/// Accept only data that cannot schedule neighbor ticks or change blocks.
-fn validate_inert_captured_upgrade_data(document: &NamedTag, height: i32) -> Result<()> {
+/// Read neighbor ticks while rejecting unimplemented block and side fixups.
+fn parse_captured_upgrade_data(
+    document: &NamedTag,
+    height: i32,
+    block_ids: &BTreeSet<String>,
+) -> Result<native_session::worldgen::postprocessing::UpgradeTicks> {
+    use native_session::worldgen::postprocessing::UpgradeTicks;
+    let mut result = UpgradeTicks::default();
     let Some(data) = unique_root_field(document, "UpgradeData")? else {
-        return Ok(());
+        return Ok(result);
     };
     let Tag::Compound(fields) = data else {
         bail!("saved upgrade data is not a compound")
@@ -5774,16 +5781,88 @@ fn validate_inert_captured_upgrade_data(document: &NamedTag, height: i32) -> Res
                     "saved upgrade indices require callbacks"
                 );
             }
-        } else if name.matches("neighbor_block_ticks") || name.matches("neighbor_fluid_ticks") {
-            ensure!(
-                matches!(value, Tag::List { element_type: native_persistence::nbt::TagType::End | native_persistence::nbt::TagType::Compound, values } if values.is_empty()),
-                "saved upgrade ticks require callbacks"
-            );
+        } else if name.matches("neighbor_block_ticks") {
+            result.blocks = parse_captured_upgrade_ticks(value, |id| block_ids.contains(id))?;
+        } else if name.matches("neighbor_fluid_ticks") {
+            result.fluids = parse_captured_upgrade_ticks(value, |id| {
+                matches!(
+                    id,
+                    "minecraft:empty"
+                        | "minecraft:water"
+                        | "minecraft:flowing_water"
+                        | "minecraft:lava"
+                        | "minecraft:flowing_lava"
+                )
+            })?;
         } else {
             bail!("unrecognized saved upgrade data field");
         }
     }
-    Ok(())
+    Ok(result)
+}
+
+fn parse_captured_upgrade_ticks(
+    value: &Tag,
+    known: impl Fn(&str) -> bool,
+) -> Result<Vec<native_session::worldgen::chunk_ticks::SavedTick>> {
+    use native_persistence::nbt::TagType;
+    use native_session::worldgen::chunk_ticks::SavedTick;
+    let Tag::List {
+        element_type,
+        values,
+    } = value
+    else {
+        bail!("saved upgrade ticks are not a list")
+    };
+    ensure!(
+        *element_type == TagType::Compound || (*element_type == TagType::End && values.is_empty()),
+        "invalid saved upgrade tick list"
+    );
+    values
+        .iter()
+        .map(|value| {
+            let Tag::Compound(fields) = value else {
+                bail!("saved upgrade tick is not a compound")
+            };
+            let mut seen = BTreeSet::new();
+            for (name, _) in fields {
+                ensure!(
+                    seen.insert(name.0.clone()),
+                    "duplicate saved upgrade tick field"
+                );
+                ensure!(
+                    ["i", "x", "y", "z", "t", "p"]
+                        .iter()
+                        .any(|expected| name.matches(expected)),
+                    "unrecognized saved upgrade tick field"
+                );
+            }
+            let number = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(Tag::as_java_int)
+                    .with_context(|| format!("invalid upgrade tick {key}"))
+            };
+            let Some(Tag::String(kind)) = value.get("i") else {
+                bail!("invalid upgrade tick type")
+            };
+            let kind = String::from_utf16(&kind.0).context("invalid upgrade tick type")?;
+            let id = ResourceId::parse(&kind)?;
+            let kind = format!("{}:{}", id.namespace, id.path);
+            ensure!(known(&kind), "unknown saved upgrade tick type {kind}");
+            let priority = number("p")?;
+            ensure!(
+                (-3..=3).contains(&priority),
+                "invalid upgrade tick priority"
+            );
+            Ok(SavedTick {
+                kind,
+                position: [number("x")?, number("y")?, number("z")?],
+                delay: number("t")?,
+                priority,
+            })
+        })
+        .collect()
 }
 
 fn merge_captured_postprocessed_heightmaps(
@@ -6229,11 +6308,10 @@ mod tests {
             element_type: TagType::Compound,
             values,
         };
-        assert!(validate_inert_captured_upgrade_data(&document(None), 32).is_ok());
-        assert!(
-            validate_inert_captured_upgrade_data(&document(Some(Tag::Compound(vec![]))), 32)
-                .is_ok()
-        );
+        let ids = BTreeSet::from(["minecraft:stone".to_owned()]);
+        let parse = |doc: &NamedTag| parse_captured_upgrade_data(doc, 32, &ids);
+        assert!(parse(&document(None)).is_ok());
+        assert!(parse(&document(Some(Tag::Compound(vec![])))).is_ok());
         let harmless = Tag::Compound(vec![
             ("Sides".into(), Tag::Byte(0)),
             (
@@ -6249,7 +6327,7 @@ mod tests {
                 },
             ),
         ]);
-        assert!(validate_inert_captured_upgrade_data(&document(Some(harmless)), 32).is_ok());
+        assert!(parse(&document(Some(harmless))).is_ok());
         for value in [
             Tag::Compound(vec![("Sides".into(), Tag::Int(1))]),
             Tag::Compound(vec![("Sides".into(), Tag::String("0".into()))]),
@@ -6276,7 +6354,7 @@ mod tests {
             ]),
             Tag::Int(0),
         ] {
-            assert!(validate_inert_captured_upgrade_data(&document(Some(value)), 32).is_err());
+            assert!(parse(&document(Some(value))).is_err());
         }
         let duplicate = NamedTag {
             name: "".into(),
@@ -6285,7 +6363,35 @@ mod tests {
                 ("UpgradeData".into(), Tag::Compound(vec![])),
             ]),
         };
-        assert!(validate_inert_captured_upgrade_data(&duplicate, 32).is_err());
+        assert!(parse(&duplicate).is_err());
+        let tick = |kind: &str| {
+            Tag::Compound(vec![
+                ("i".into(), Tag::String(kind.into())),
+                ("x".into(), Tag::Int(16)),
+                ("y".into(), Tag::Int(5)),
+                ("z".into(), Tag::Int(-1)),
+                ("t".into(), Tag::Int(-3)),
+                ("p".into(), Tag::Int(2)),
+            ])
+        };
+        let scheduled = document(Some(Tag::Compound(vec![
+            ("neighbor_block_ticks".into(), list(vec![tick("stone")])),
+            (
+                "neighbor_fluid_ticks".into(),
+                list(vec![tick("minecraft:empty")]),
+            ),
+        ])));
+        let ticks = parse(&scheduled)?;
+        assert_eq!(ticks.blocks.len(), 1);
+        assert_eq!(ticks.blocks[0].kind, "minecraft:stone");
+        assert_eq!(ticks.blocks[0].position, [16, 5, -1]);
+        assert_eq!((ticks.blocks[0].delay, ticks.blocks[0].priority), (-3, 2));
+        assert_eq!(ticks.fluids[0].kind, "minecraft:empty");
+        let unknown = document(Some(Tag::Compound(vec![(
+            "neighbor_block_ticks".into(),
+            list(vec![tick("minecraft:unknown")]),
+        )])));
+        assert!(parse(&unknown).is_err());
         Ok(())
     }
 
@@ -6360,7 +6466,24 @@ mod tests {
                 format!("neighbor_{kind}_ticks").as_str().into(),
                 Tag::List {
                     element_type: TagType::Compound,
-                    values: vec![Tag::Compound(vec![])],
+                    values: vec![Tag::Compound(vec![
+                        (
+                            "i".into(),
+                            Tag::String(
+                                if kind == "block" {
+                                    "minecraft:stone"
+                                } else {
+                                    "minecraft:water"
+                                }
+                                .into(),
+                            ),
+                        ),
+                        ("x".into(), Tag::Int(8)),
+                        ("y".into(), Tag::Int(8)),
+                        ("z".into(), Tag::Int(8)),
+                        ("t".into(), Tag::Int(2)),
+                        ("p".into(), Tag::Int(0)),
+                    ])],
                 },
             )])
         };
@@ -6382,7 +6505,12 @@ mod tests {
                 };
                 format!(
                     "{name} {}",
-                    validate_inert_captured_upgrade_data(&document, 32).is_ok()
+                    parse_captured_upgrade_data(
+                        &document,
+                        32,
+                        &BTreeSet::from(["minecraft:stone".to_owned()])
+                    )
+                    .is_ok_and(|ticks| ticks.is_empty())
                 )
             })
             .collect::<Vec<_>>()
@@ -6627,7 +6755,37 @@ mod tests {
                 ("example:root".into(), Tag::Int(73)),
                 (
                     "UpgradeData".into(),
-                    Tag::Compound(vec![("Sides".into(), Tag::Byte(0))]),
+                    Tag::Compound(vec![
+                        ("Sides".into(), Tag::Byte(0)),
+                        (
+                            "neighbor_block_ticks".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("i".into(), Tag::String("minecraft:stone".into())),
+                                    ("x".into(), Tag::Int(8)),
+                                    ("y".into(), Tag::Int(8)),
+                                    ("z".into(), Tag::Int(40)),
+                                    ("t".into(), Tag::Int(5)),
+                                    ("p".into(), Tag::Int(1)),
+                                ])],
+                            },
+                        ),
+                        (
+                            "neighbor_fluid_ticks".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("i".into(), Tag::String("minecraft:water".into())),
+                                    ("x".into(), Tag::Int(8)),
+                                    ("y".into(), Tag::Int(8)),
+                                    ("z".into(), Tag::Int(40)),
+                                    ("t".into(), Tag::Int(3)),
+                                    ("p".into(), Tag::Int(-1)),
+                                ])],
+                            },
+                        ),
+                    ]),
                 ),
                 (
                     "Heightmaps".into(),

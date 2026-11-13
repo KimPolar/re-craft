@@ -302,6 +302,10 @@ impl PostprocessedGeneratedRegion {
             .deferred_tasks
             .get(&pos)
             .context("chunk has no deferred postprocessing")?;
+        ensure!(
+            task.upgrade_ticks().is_empty(),
+            "deferred upgrade ticks require separate serialization"
+        );
         Ok(native_persistence::postprocessing::encode(
             task.unstarted_marks()?,
         ))
@@ -961,6 +965,7 @@ impl GeneratedPostprocessing {
             .tasks
             .get_mut(&pos)
             .context("chunk is not in the converted region")?;
+        let upgrade_ticks = Arc::clone(task.upgrade_ticks());
         self.active = Some(pos);
         self.failed = true;
         let mut entities = self
@@ -969,6 +974,7 @@ impl GeneratedPostprocessing {
             .context("converted block entities are missing")?;
         let mut view = GeneratedBlockView {
             chunk: pos,
+            upgrade_ticks: Some(upgrade_ticks),
             block_entities: &mut entities,
             other_block_entities: &self.block_entities,
             entity_candidates: &self.entity_candidates,
@@ -1058,6 +1064,7 @@ impl GeneratedPostprocessing {
             .context("converted block entities are missing")?;
         let mut view = GeneratedBlockView {
             chunk: pos,
+            upgrade_ticks: None,
             block_entities: &mut entities,
             other_block_entities: &self.block_entities,
             entity_candidates: &self.entity_candidates,
@@ -1148,6 +1155,7 @@ impl GeneratedPostprocessing {
 
 struct GeneratedBlockView<'a> {
     chunk: ChunkPos,
+    upgrade_ticks: Option<Arc<super::postprocessing::UpgradeTicks>>,
     block_entities: &'a mut ConvertedBlockEntities,
     other_block_entities: &'a BTreeMap<ChunkPos, ConvertedBlockEntities>,
     entity_candidates: &'a BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
@@ -3229,6 +3237,44 @@ impl PostprocessingChunk for GeneratedBlockView<'_> {
         Ok(())
     }
     fn apply_upgrade_data(&mut self) -> Result<()> {
+        use native_world::fluid::FluidKind;
+        let Some(upgrade) = self.upgrade_ticks.clone() else {
+            return Ok(());
+        };
+        for (registry, ticks) in [
+            (TickRegistry::Block, &upgrade.blocks),
+            (TickRegistry::Fluid, &upgrade.fluids),
+        ] {
+            for tick in ticks {
+                let pos = tick.position;
+                let chunk = ChunkPos {
+                    x: pos[0].div_euclid(16),
+                    z: pos[2].div_euclid(16),
+                };
+                if self.ticks.chunk(chunk).is_none() {
+                    return Err(MissingPostprocessingChunk(chunk).into());
+                }
+                let resolved = match (registry, tick.kind.as_str()) {
+                    (TickRegistry::Block, "minecraft:air") => self.read(pos)?.name,
+                    (TickRegistry::Fluid, "minecraft:empty") => {
+                        let state = self.read(pos)?;
+                        match PostprocessingWorld::fluid(self, &state)? {
+                            None => "minecraft:empty",
+                            Some(fluid) => match (fluid.kind, fluid.source) {
+                                (FluidKind::Water, true) => "minecraft:water",
+                                (FluidKind::Water, false) => "minecraft:flowing_water",
+                                (FluidKind::Lava, true) => "minecraft:lava",
+                                (FluidKind::Lava, false) => "minecraft:flowing_lava",
+                            },
+                        }
+                        .to_owned()
+                    }
+                    _ => tick.kind.clone(),
+                };
+                self.ticks
+                    .schedule(registry, &resolved, pos, tick.delay, tick.priority)?;
+            }
+        }
         Ok(())
     }
 }
@@ -3952,6 +3998,133 @@ mod tests {
             world,
             pos,
         )
+    }
+
+    #[test]
+    fn captured_upgrade_ticks_retry_and_preserve_java_order() -> Result<()> {
+        use super::super::postprocessing::{ConvertedChunkPostprocessing, UpgradeTicks};
+        let (mut stage, _, chunk) = fixture(false);
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let world = Arc::make_mut(&mut stage.world);
+        let mut next = (**world.chunks.get(&chunk).unwrap()).clone();
+        next.position = neighbor;
+        world.chunks.insert(neighbor, Arc::new(next));
+        let flowing = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "1".into())]),
+        });
+        world.set_block_id(11, 8, 8, flowing).unwrap();
+        stage.source = Arc::clone(&stage.world);
+        let saved = |kind: &str, position, delay, priority| SavedTick {
+            kind: kind.into(),
+            position,
+            delay,
+            priority,
+        };
+        let upgrade = UpgradeTicks {
+            blocks: vec![
+                saved("minecraft:air", [9, 8, 8], 5, -2),
+                saved("minecraft:sand", [8, 8, 8], 7, 1),
+                saved("minecraft:stone", [16, 8, 8], 3, 2),
+            ],
+            fluids: vec![
+                saved("minecraft:empty", [9, 8, 8], 4, 0),
+                saved("minecraft:empty", [11, 8, 8], 6, 1),
+                saved("minecraft:water", [8, 8, 8], 8, -1),
+                saved("minecraft:water", [8, 8, 8], 9, 2),
+            ],
+        };
+        let empty = Arc::new(PostProcessing::new(0, 16).unwrap());
+        stage.region.tasks.insert(
+            chunk,
+            PostprocessingTask::new(Arc::clone(&empty), chunk).with_upgrade_ticks(upgrade)?,
+        );
+        let before = stage.region.ticks.chunk(chunk).unwrap().blocks.pack(100);
+        assert_eq!(
+            stage.try_poll(chunk, 64)?,
+            PostprocessingAttempt::NeedsChunk(neighbor)
+        );
+        assert_eq!(stage.region.ticks.next_sub_tick(), 2);
+        assert_eq!(
+            stage.region.ticks.chunk(chunk).unwrap().blocks.pack(100),
+            before
+        );
+        stage.register_retry_neighbor(
+            neighbor,
+            ConvertedChunkPostprocessing {
+                task: PostprocessingTask::new(empty, neighbor).with_upgrade_ticks(
+                    UpgradeTicks {
+                        blocks: vec![saved("minecraft:dirt", [16, 8, 8], 1, 0)],
+                        fluids: vec![],
+                    },
+                )?,
+                ticks: ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(neighbor, vec![])?,
+                    fluids: ChunkTicks::from_saved(neighbor, vec![])?,
+                },
+            },
+            ConvertedBlockEntities::default(),
+            fixture_maps(0),
+            None,
+        )?;
+        assert_eq!(
+            stage.try_poll(chunk, 64)?,
+            PostprocessingAttempt::Progress { complete: true }
+        );
+        let done = stage.clone().finish()?;
+        assert!(done.deferred_postprocessing_data(neighbor).is_err());
+        let blocks = done.ticks().chunk(chunk).unwrap().blocks.pack(100);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1], saved("minecraft:red_sand", [9, 8, 8], 5, -2));
+        assert_eq!(
+            done.ticks().chunk(neighbor).unwrap().blocks.pack(100),
+            vec![saved("minecraft:stone", [16, 8, 8], 3, 2)]
+        );
+        assert_eq!(
+            done.ticks().chunk(chunk).unwrap().fluids.pack(100),
+            vec![
+                saved("minecraft:empty", [9, 8, 8], 4, 0),
+                saved("minecraft:flowing_water", [11, 8, 8], 6, 1),
+                saved("minecraft:water", [8, 8, 8], 8, -1),
+            ]
+        );
+        assert_eq!(done.ticks().next_sub_tick(), 9);
+        stage.request_converted_chunk(neighbor)?;
+        assert_eq!(
+            stage.try_poll(neighbor, 64)?,
+            PostprocessingAttempt::Progress { complete: true }
+        );
+        let completed = stage.finish()?;
+        assert_eq!(
+            completed.ticks().chunk(neighbor).unwrap().blocks.pack(100),
+            vec![
+                saved("minecraft:stone", [16, 8, 8], 3, 2),
+                saved("minecraft:dirt", [16, 8, 8], 1, 0),
+            ]
+        );
+        assert_eq!(completed.ticks().next_sub_tick(), 10);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn captured_upgrade_ticks_match_java() {
+        assert_eq!(
+            java_results(
+                "CapturedUpgradeTickOracle",
+                include_str!("../../tests/java/CapturedUpgradeTickOracle.java"),
+            ),
+            vec![
+                "block0 minecraft:sand 8 8 8 0 0",
+                "block0 minecraft:red_sand 9 8 8 5 -2",
+                "block1 minecraft:stone 16 8 8 3 2",
+                "fluid0 minecraft:empty 9 8 8 4 0",
+                "fluid0 minecraft:flowing_water 11 8 8 6 1",
+                "fluid0 minecraft:water 8 8 8 8 -1",
+                "counter 9",
+            ]
+        );
     }
 
     fn fence_postprocessing_trace(mode: &str) -> String {

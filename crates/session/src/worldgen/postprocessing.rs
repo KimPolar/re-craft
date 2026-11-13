@@ -179,6 +179,20 @@ pub struct PostprocessingTask {
     positions: Vec<[i32; 3]>,
     next_entity: usize,
     failed: bool,
+    upgrade_ticks: Arc<UpgradeTicks>,
+}
+
+/// Validated neighbor ticks retained from a captured UpgradeData compound.
+#[derive(Clone, Default)]
+pub struct UpgradeTicks {
+    pub blocks: Vec<super::chunk_ticks::SavedTick>,
+    pub fluids: Vec<super::chunk_ticks::SavedTick>,
+}
+
+impl UpgradeTicks {
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.fluids.is_empty()
+    }
 }
 
 /// The tick containers belong to the same converted chunk as the ordered
@@ -205,7 +219,19 @@ impl PostprocessingTask {
             positions: Vec::new(),
             next_entity: 0,
             failed: false,
+            upgrade_ticks: Arc::new(UpgradeTicks::default()),
         }
+    }
+
+    /// The caller must validate tick IDs and the original upgrade data.
+    pub fn with_upgrade_ticks(mut self, ticks: UpgradeTicks) -> Result<Self> {
+        self.unstarted_marks()?;
+        self.upgrade_ticks = Arc::new(ticks);
+        Ok(self)
+    }
+
+    pub(super) fn upgrade_ticks(&self) -> &Arc<UpgradeTicks> {
+        &self.upgrade_ticks
     }
 
     /// Capture marks only before any callbacks have observed the task.

@@ -2706,6 +2706,9 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
+            if matches!(s.name.as_str(), "minecraft:water" | "minecraft:lava") {
+                assert_eq!(row["postprocess"], false, "{s:?}");
+            }
             if s.name == "minecraft:frosted_ice"
                 || s.name.ends_with("copper_bulb")
                 || crate::collision::full_copper(&s)

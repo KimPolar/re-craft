@@ -232,10 +232,6 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         if self.region.is_outside(pos[1]) {
             return Ok(true);
         }
-        ensure!(
-            !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava"),
-            "jigsaw liquid block placement is not yet supported"
-        );
         let chest_table = if let Some(nbt) = nbt {
             let Tag::Compound(fields) = nbt else {
                 bail!("jigsaw block entity placement requires a compound")
@@ -344,6 +340,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_copper(state)
                 || native_world::collision::full_tuff(state)
                 || native_world::collision::copper_grate_waterlogged(state).is_some()
+                || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state)
                 || jigsaw_lantern(state)
@@ -709,6 +706,42 @@ mod tests {
                 properties: BTreeMap::from([("level".into(), "16".into())]),
             };
             assert!(jigsaw_static_full(&invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_liquid_placement_preserves_level_without_scheduled_tick() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for name in ["water", "lava"] {
+            for level in [0, 1, 7, 8, 15] {
+                let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                let state = BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::from([("level".into(), level.to_string())]),
+                };
+                let pos = [1, 8, 1];
+                let mut random = DecorationRandom::new(42);
+                let mut original = random.clone();
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(pos, &state, None, &mut random)?);
+                region.finish()?;
+                assert_eq!(random.next_long(), original.next_long());
+                let world = terrain.snapshot();
+                assert_eq!(world.block(pos[0], pos[1], pos[2]), Some(&state));
+                assert!(world.saved_fluid_ticks.values().all(Vec::is_empty));
+            }
         }
         Ok(())
     }

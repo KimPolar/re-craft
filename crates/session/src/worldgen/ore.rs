@@ -7974,6 +7974,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::full_copper(state)
                             || native_world::collision::full_tuff(state)
                             || native_world::collision::copper_grate_waterlogged(state).is_some()
+                            || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                             || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state)
                             || jigsaw::jigsaw_lantern(state)
@@ -8019,6 +8020,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && native_world::collision::bed_leg_end(state).is_none()
                             && !native_world::collision::full_glass(state)
                             && native_world::collision::copper_grate_waterlogged(state).is_none()
+                            && !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                             && !jigsaw::jigsaw_candle(state)
                             && !jigsaw::jigsaw_carpet(state)
                             && !jigsaw::jigsaw_ladder(state)
@@ -12807,6 +12809,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_liquids_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_liquidwater",
+            "vine_active_self_empty_jigsaw_liquidwater",
+            "vine_active_jigsaw_liquidlava",
+            "vine_active_self_empty_jigsaw_liquidlava",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13253,6 +13266,10 @@ mod tests {
                         "waxed_oxidized_copper"
                     } else if mode.ends_with("_tuffblock") {
                         "chiseled_tuff_bricks"
+                    } else if mode.ends_with("_liquidwater") {
+                        "water"
+                    } else if mode.ends_with("_liquidlava") {
+                        "lava"
                     } else if mode.ends_with("_grate") {
                         "waxed_copper_grate"
                     } else if mode.ends_with("_carpet") {
@@ -13334,6 +13351,8 @@ mod tests {
                         ]);
                     } else if mode.ends_with("_grate") {
                         block.properties = BTreeMap::from([("waterlogged".into(), "false".into())]);
+                    } else if mode.ends_with("_liquidwater") || mode.ends_with("_liquidlava") {
+                        block.properties = BTreeMap::from([("level".into(), "0".into())]);
                     } else if mode.ends_with("_ladder") {
                         block.properties = BTreeMap::from([
                             ("facing".into(), "north".into()),

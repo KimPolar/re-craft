@@ -334,6 +334,20 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:decorated_pot"));
     assert!(registry.contains("minecraft:barrel"));
     assert!(registry.contains("minecraft:hopper"));
+    assert!(registry.contains("minecraft:trial_spawner"));
+    for ominous in ["false", "true", "invalid"] {
+        for state in [
+            "inactive",
+            "waiting_for_players",
+            "active",
+            "waiting_for_reward_ejection",
+            "ejecting_reward",
+            "cooldown",
+            "invalid",
+        ] {
+            cases.push(serde_json::json!({"id":"minecraft:trial_spawner","properties":{"ominous":ominous,"trial_spawner_state":state}}));
+        }
+    }
     for facing in ["north", "south", "east", "west", "up", "down", "invalid"] {
         for enabled in ["false", "true", "invalid"] {
             cases.push(serde_json::json!({"id":"minecraft:hopper","properties":{"facing":facing,"enabled":enabled}}));

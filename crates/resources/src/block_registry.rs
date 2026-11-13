@@ -35,6 +35,7 @@ enum StateSchema {
     DecoratedPot,
     Barrel,
     Hopper,
+    TrialSpawner,
     PotentSulfur,
     SulfurSpike,
     Liquid,
@@ -113,6 +114,12 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("facing".into(), "down".into()),
                     ("enabled".into(), "true".into()),
+                ]);
+            }
+            Self::TrialSpawner => {
+                return BTreeMap::from([
+                    ("ominous".into(), "false".into()),
+                    ("trial_spawner_state".into(), "inactive".into()),
                 ]);
             }
             Self::Beehive => {
@@ -375,6 +382,21 @@ impl StateSchema {
                 if (name == "facing"
                     && matches!(value, "north" | "south" | "east" | "west" | "down"))
                     || (name == "enabled" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::TrialSpawner
+                if (name == "ominous" && matches!(value, "true" | "false"))
+                    || (name == "trial_spawner_state"
+                        && matches!(
+                            value,
+                            "inactive"
+                                | "waiting_for_players"
+                                | "active"
+                                | "waiting_for_reward_ejection"
+                                | "ejecting_reward"
+                                | "cooldown"
+                        )) =>
             {
                 Some(value.to_owned())
             }
@@ -1029,6 +1051,9 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/BarrelBlock" => Some(StateSchema::Barrel),
                 "net/minecraft/world/level/block/HopperBlock" => Some(StateSchema::Hopper),
+                "net/minecraft/world/level/block/TrialSpawnerBlock" => {
+                    Some(StateSchema::TrialSpawner)
+                }
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
@@ -1240,6 +1265,7 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Lantern
                 | StateSchema::Candle
                 | StateSchema::CopperBulb
+                | StateSchema::TrialSpawner
                 | StateSchema::Liquid
                 | StateSchema::PotentSulfur
                 | StateSchema::SulfurSpike

@@ -4043,69 +4043,90 @@ impl PreparedExistingGenerator {
                 &blocks,
             )?);
         }
-        let tags = self
-            .heightmap_tags
-            .as_ref()
-            .expect("heightmap tags initialized");
-        for &position in &positions {
-            if world.terrain.worldgen_heightmaps(position).is_none() {
-                world.terrain.ensure_worldgen_heightmaps(position, tags)?;
+        // Priming heightmaps is part of the feature attempt. If preparation or
+        // execution fails, a retry must see the original saved state, including
+        // whether each individual heightmap was absent.
+        let previous_terrain = positions
+            .iter()
+            .any(|&position| world.terrain.worldgen_heightmaps(position).is_none())
+            .then(|| world.terrain.clone());
+        let priming = (|| -> Result<()> {
+            let tags = self
+                .heightmap_tags
+                .as_ref()
+                .expect("heightmap tags initialized");
+            for &position in &positions {
+                if world.terrain.worldgen_heightmaps(position).is_none() {
+                    world.terrain.ensure_worldgen_heightmaps(position, tags)?;
+                }
             }
-        }
-        let (result, updates) = self.with_saved_prepared_decoration(context, |prepared| {
-            if let Some(structures) = &structures {
-                let mut planned = Vec::with_capacity(structures.order.len());
-                for (id, keys) in &structures.order {
-                    let entry = structures
-                        .schedule
-                        .as_ref()
-                        .context("structure schedule is missing")?
-                        .steps()
-                        .iter()
-                        .flatten()
-                        .find(|entry| &entry.id == id)
-                        .context("structure schedule entry disappeared")?;
-                    let starts = keys
-                        .iter()
-                        .map(|key| &structures.starts[key].placement)
-                        .collect();
-                    planned.push(
-                        native_session::worldgen::structure_batch::PlannedStructureDecoration {
-                            entry,
-                            starts,
-                        },
-                    );
-                }
-                if let Some(light) = light {
-                    schedule.run_features_with_structure_plan_and_visible_light(
-                        &mut world.terrain,
-                        prepared,
-                        &planned,
-                        &light.light,
-                    )
-                } else {
-                    schedule.run_features_with_structure_plan(
-                        &mut world.terrain,
-                        prepared,
-                        &planned,
-                    )
-                }
-            } else {
-                Ok((
+            Ok(())
+        })();
+        let attempt = priming.and_then(|()| {
+            self.with_saved_prepared_decoration(context, |prepared| {
+                if let Some(structures) = &structures {
+                    let mut planned = Vec::with_capacity(structures.order.len());
+                    for (id, keys) in &structures.order {
+                        let entry = structures
+                            .schedule
+                            .as_ref()
+                            .context("structure schedule is missing")?
+                            .steps()
+                            .iter()
+                            .flatten()
+                            .find(|entry| &entry.id == id)
+                            .context("structure schedule entry disappeared")?;
+                        let starts = keys
+                            .iter()
+                            .map(|key| &structures.starts[key].placement)
+                            .collect();
+                        planned.push(
+                            native_session::worldgen::structure_batch::PlannedStructureDecoration {
+                                entry,
+                                starts,
+                            },
+                        );
+                    }
                     if let Some(light) = light {
-                        schedule.run_features_with_visible_light(
+                        schedule.run_features_with_structure_plan_and_visible_light(
                             &mut world.terrain,
                             prepared,
-                            false,
+                            &planned,
                             &light.light,
-                        )?
+                        )
                     } else {
-                        schedule.run_features(&mut world.terrain, prepared, false, None)?
-                    },
-                    Vec::new(),
-                ))
+                        schedule.run_features_with_structure_plan(
+                            &mut world.terrain,
+                            prepared,
+                            &planned,
+                        )
+                    }
+                } else {
+                    Ok((
+                        if let Some(light) = light {
+                            schedule.run_features_with_visible_light(
+                                &mut world.terrain,
+                                prepared,
+                                false,
+                                &light.light,
+                            )?
+                        } else {
+                            schedule.run_features(&mut world.terrain, prepared, false, None)?
+                        },
+                        Vec::new(),
+                    ))
+                }
+            })
+        });
+        let (result, updates) = match attempt {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(previous) = previous_terrain {
+                    world.terrain = previous;
+                }
+                return Err(error);
             }
-        })?;
+        };
         if let Some(structures) = structures.as_mut() {
             debug_assert_eq!(structures.order.len(), updates.len());
             for ((_, keys), updated) in structures.order.iter().zip(updates) {
@@ -11615,6 +11636,19 @@ mod tests {
         }
         let y = actual.lighting.min_y + 8;
         let before_light = terrain.terrain().snapshot();
+        let neighbors = (2..=4)
+            .flat_map(|z| (2..=4).map(move |x| native_world::loaded::ChunkPos { x, z }))
+            .collect::<Vec<_>>();
+        let before_heightmaps = neighbors
+            .iter()
+            .map(|&pos| terrain.terrain().generated_heightmap_data(pos))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(
+            neighbors
+                .iter()
+                .any(|&pos| terrain.terrain().worldgen_heightmaps(pos).is_none()),
+            "the rollback check requires at least one unprimed heightmap"
+        );
         assert!(!stale_light.matches_world(&terrain));
         assert!(
             actual
@@ -11632,6 +11666,14 @@ mod tests {
                 .is_err()
         );
         assert!(Arc::ptr_eq(&before_light, &terrain.terrain().snapshot()));
+        assert_eq!(
+            neighbors
+                .iter()
+                .map(|&pos| terrain.terrain().generated_heightmap_data(pos))
+                .collect::<Result<Vec<_>>>()?,
+            before_heightmaps,
+            "a rejected feature pass must not prime any heightmaps"
+        );
         let empty_light = actual.bind_initial_feature_light(
             &terrain,
             native_world::generation_light::VisibleLightSnapshot::new(true, true),
@@ -11647,6 +11689,14 @@ mod tests {
                 .is_err()
         );
         assert!(Arc::ptr_eq(&before_light, &terrain.terrain().snapshot()));
+        assert_eq!(
+            neighbors
+                .iter()
+                .map(|&pos| terrain.terrain().generated_heightmap_data(pos))
+                .collect::<Result<Vec<_>>>()?,
+            before_heightmaps,
+            "a failed light-dependent feature must leave heightmaps untouched"
+        );
         assert!(
             actual
                 .bind_initial_feature_light(

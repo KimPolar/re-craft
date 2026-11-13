@@ -27,6 +27,7 @@ use native_resources::{
 use native_world::biome_zoom::{obfuscate_seed, quart_position};
 use serde_json::Value;
 
+mod captured_postprocessing;
 mod carving;
 pub mod chunk_ticks;
 mod entity_order;

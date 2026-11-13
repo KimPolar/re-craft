@@ -504,6 +504,127 @@ impl CapturedConvertedRegion {
     }
 }
 
+/// An isolated postprocessing pass tied to captured generation and live rules.
+pub(crate) struct CapturedPostprocessingStage {
+    proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedConvertedHeightmaps>,
+    stage: native_session::worldgen::GeneratedPostprocessing,
+    game_time: i64,
+    next_sub_tick: i64,
+    water_source_conversion: bool,
+}
+
+impl CapturedPostprocessingStage {
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> bool {
+        self.game_time == game_time
+            && self.next_sub_tick == next_sub_tick
+            && self.water_source_conversion == water_source_conversion
+            && !self.proofs.is_empty()
+            && self
+                .proofs
+                .values()
+                .all(|proof| proof.matches_state(batch, light, spawn_mobs))
+    }
+
+    /// Try callbacks on a private fork; a missing converted neighbor leaves
+    /// the stage unchanged and is reported to the caller.
+    pub fn try_poll(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+        position: native_world::loaded::ChunkPos,
+        budget: usize,
+    ) -> Result<native_session::worldgen::PostprocessingAttempt> {
+        ensure!(
+            self.matches_state(
+                batch,
+                light,
+                spawn_mobs,
+                game_time,
+                next_sub_tick,
+                water_source_conversion
+            ),
+            "captured postprocessing inputs changed"
+        );
+        self.stage.try_poll(position, budget)
+    }
+
+    pub fn finish(
+        self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<CapturedPostprocessedRegion> {
+        ensure!(
+            self.matches_state(
+                batch,
+                light,
+                spawn_mobs,
+                game_time,
+                next_sub_tick,
+                water_source_conversion
+            ),
+            "captured postprocessing inputs changed"
+        );
+        Ok(CapturedPostprocessedRegion {
+            proofs: self.proofs,
+            region: self.stage.finish()?,
+            game_time,
+            next_sub_tick,
+            water_source_conversion,
+        })
+    }
+}
+
+/// Isolated callback output. Disk, live entities, lighting updates, clocks and
+/// all other save dependencies still need validation before publication.
+pub(crate) struct CapturedPostprocessedRegion {
+    proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedConvertedHeightmaps>,
+    region: native_session::worldgen::PostprocessedGeneratedRegion,
+    game_time: i64,
+    next_sub_tick: i64,
+    water_source_conversion: bool,
+}
+
+impl CapturedPostprocessedRegion {
+    pub fn region(&self) -> &native_session::worldgen::PostprocessedGeneratedRegion {
+        &self.region
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> bool {
+        self.game_time == game_time
+            && self.next_sub_tick == next_sub_tick
+            && self.water_source_conversion == water_source_conversion
+            && !self.proofs.is_empty()
+            && self
+                .proofs
+                .values()
+                .all(|proof| proof.matches_state(batch, light, spawn_mobs))
+    }
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -1731,6 +1852,54 @@ impl PreparedExistingGenerator {
                     &registration,
                 )?,
             },
+        })
+    }
+
+    /// Start callbacks on a private terrain snapshot, retaining the captured
+    /// proofs and live rules. This does not install or save the resulting world.
+    pub fn run_captured_postprocessing(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        region: CapturedConvertedRegion,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<CapturedPostprocessingStage> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && region.matches_state(batch, light, spawn_mobs, game_time, next_sub_tick),
+            "captured postprocessing region changed"
+        );
+        let (proofs, region) = region.into_parts();
+        let positions: Vec<_> = proofs.keys().copied().collect();
+        let heightmaps = proofs
+            .iter()
+            .map(|(&pos, proof)| (pos, proof.heightmaps().clone()))
+            .collect();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let visible = light
+            .engine
+            .snapshot(&batch.terrain, positions, &assets.blocks)?;
+        let mut stage = batch.terrain.begin_captured_postprocessing(
+            &mut self.resources,
+            &assets.block_ids,
+            &assets.blocks,
+            region,
+            heightmaps,
+            Some(visible),
+        )?;
+        stage.set_water_source_conversion(water_source_conversion)?;
+        Ok(CapturedPostprocessingStage {
+            proofs,
+            stage,
+            game_time,
+            next_sub_tick,
+            water_source_conversion,
         })
     }
 
@@ -6711,6 +6880,61 @@ mod tests {
                     .any(|tick| tick.kind == "minecraft:melon")
             );
         }
+        let mut invalid_region = actual.begin_captured_postprocessing_region(
+            &batch,
+            &staged,
+            [&new_spawn, &saved_spawn, &early_spawn],
+            42,
+            9,
+        )?;
+        invalid_region
+            .region
+            .ticks
+            .chunk_mut(target)
+            .unwrap()
+            .blocks
+            .unpack(42);
+        assert!(
+            actual
+                .run_captured_postprocessing(&batch, &staged, invalid_region, false, 42, 9, true,)
+                .is_err()
+        );
+        let pass_region = actual.begin_captured_postprocessing_region(
+            &batch,
+            &staged,
+            [&new_spawn, &saved_spawn, &early_spawn],
+            42,
+            9,
+        )?;
+        let mut pass =
+            actual.run_captured_postprocessing(&batch, &staged, pass_region, false, 42, 9, true)?;
+        assert!(pass.matches_state(&batch, &staged, false, 42, 9, true));
+        assert!(!pass.matches_state(&batch, &staged, false, 43, 9, true));
+        assert!(!pass.matches_state(&batch, &staged, false, 42, 9, false));
+        assert!(
+            pass.try_poll(&batch, &staged, false, 43, 9, true, target, 1)
+                .is_err()
+        );
+        let before_pass = batch.terrain.snapshot();
+        let mut progressed = false;
+        for position in [target, second, third] {
+            match pass.try_poll(&batch, &staged, false, 42, 9, true, position, 1)? {
+                native_session::worldgen::PostprocessingAttempt::NeedsChunk(missing) => {
+                    assert!(![target, second, third].contains(&missing));
+                    eprintln!(
+                        "postprocessing at {position:?} needs converted neighbor {missing:?}"
+                    );
+                }
+                native_session::worldgen::PostprocessingAttempt::Progress { .. } => {
+                    progressed = true;
+                    break;
+                }
+            }
+        }
+        eprintln!("isolated postprocessing made progress: {progressed}");
+        assert!(progressed, "no converted chunk could advance postprocessing");
+        assert!(Arc::ptr_eq(&before_pass, &batch.terrain.snapshot()));
+        assert!(pass.finish(&batch, &staged, false, 42, 9, true).is_err());
         let tick_world = batch.terrain.snapshot();
         for (position, converted) in [
             (target, new_post),

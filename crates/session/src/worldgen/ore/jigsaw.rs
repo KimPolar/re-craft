@@ -161,6 +161,10 @@ pub(super) fn jigsaw_cobweb(state: &BlockState) -> bool {
     state.name == "minecraft:cobweb" && state.properties.is_empty()
 }
 
+pub(super) fn jigsaw_chain(state: &BlockState) -> bool {
+    state.name == "minecraft:iron_chain" && native_world::collision::block_shape(state).is_some()
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
         ensure!(
@@ -199,6 +203,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::decorated_pot_waterlogged(state).is_some()
         || native_world::collision::hopper_facing(state).is_some()
         || jigsaw_cobweb(state)
+        || jigsaw_chain(state)
     {
         return Ok(false);
     }
@@ -549,7 +554,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || jigsaw_candle(state)
                 || jigsaw_carpet(state)
                 || jigsaw_ladder(state)
-                || jigsaw_cobweb(state);
+                || jigsaw_cobweb(state)
+                || jigsaw_chain(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -569,6 +575,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || jigsaw_lantern(state)
                 || jigsaw_candle(state)
                 || jigsaw_ladder(state)
+                || jigsaw_chain(state)
                 || state.name == "minecraft:chest")
             && self
                 .registry
@@ -616,7 +623,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     || native_world::collision::decorated_pot_waterlogged(state).is_some()
                     || jigsaw_lantern(state)
                     || jigsaw_candle(state)
-                    || jigsaw_ladder(state);
+                    || jigsaw_ladder(state)
+                    || jigsaw_chain(state);
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
                 result?;
@@ -935,6 +943,89 @@ mod tests {
         assert!(!jigsaw_static_full(&state)?);
         state.properties.insert("extra".into(), "true".into());
         assert!(jigsaw_static_full(&state).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn jigsaw_chain_is_non_full_and_requires_canonical_properties() -> Result<()> {
+        for axis in ["x", "y", "z"] {
+            for waterlogged in ["true", "false"] {
+                let state = BlockState {
+                    name: "minecraft:iron_chain".into(),
+                    properties: BTreeMap::from([
+                        ("axis".into(), axis.into()),
+                        ("waterlogged".into(), waterlogged.into()),
+                    ]),
+                };
+                assert!(!jigsaw_static_full(&state)?);
+            }
+        }
+        let invalid = BlockState {
+            name: "minecraft:iron_chain".into(),
+            properties: BTreeMap::from([
+                ("axis".into(), "bad".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        assert!(jigsaw_static_full(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_chain_waterlogging_preserves_axis_and_schedules_water() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for axis in ["x", "y", "z"] {
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let (name, properties) = registry.resolve(
+                &serde_json::json!({"id":"minecraft:iron_chain","properties":{"axis":axis}}),
+            )?;
+            let state = BlockState { name, properties };
+            let pos = [1, 8, 1];
+            let mut random = DecorationRandom::new(42);
+            let mut expected_random = random.clone();
+            {
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(pos, &state, None, &mut random)?);
+                assert!(draft.is_liquid_container(&state)?);
+                draft.place_liquid(
+                    pos,
+                    &state,
+                    Some(FluidState {
+                        kind: FluidKind::Water,
+                        source: true,
+                        falling: false,
+                        amount: 8,
+                    }),
+                )?;
+            }
+            region.finish()?;
+            assert_eq!(random.next_long(), expected_random.next_long());
+            let snapshot = terrain.snapshot();
+            let saved = snapshot
+                .block(pos[0], pos[1], pos[2])
+                .context("missing chain")?;
+            assert_eq!(saved.properties["axis"], axis);
+            assert_eq!(saved.properties["waterlogged"], "true");
+            let ticks = snapshot
+                .saved_fluid_ticks
+                .get(&ChunkPos { x: 0, z: 0 })
+                .context("missing scheduled water")?;
+            assert_eq!(ticks.len(), 1);
+            assert_eq!(ticks[0].position, pos);
+            assert_eq!(ticks[0].fluid, "minecraft:water");
+            assert_eq!(ticks[0].delay, 0);
+        }
         Ok(())
     }
 

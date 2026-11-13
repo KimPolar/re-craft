@@ -389,6 +389,7 @@ impl CapturedEmptySpawnDraft {
 /// FULL-conversion heightmaps from one spawn-complete captured chunk. Unknown
 /// source heightmap fields are held separately so later drafts can preserve
 /// them. Postprocessing, entities and save validation are not established.
+#[derive(Clone)]
 pub(crate) struct CapturedConvertedHeightmaps {
     identity: Arc<()>,
     revision: Arc<()>,
@@ -1997,6 +1998,50 @@ impl PreparedExistingGenerator {
         )?;
         stage.stage.select_initial_targets(selected)?;
         Ok(stage)
+    }
+
+    /// Reopen a completed isolated pass without replaying callbacks, keeping
+    /// deferred neighbors, ticks and the postprocessing light checkpoint.
+    pub fn resume_captured_postprocessing(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedPostprocessedRegion,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<CapturedPostprocessingStage> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && completed.matches_state(
+                    batch,
+                    light,
+                    spawn_mobs,
+                    game_time,
+                    next_sub_tick,
+                    water_source_conversion
+                ),
+            "captured postprocessing inputs changed"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let stage = batch.terrain.resume_captured_postprocessing(
+            &assets.blocks,
+            &light.engine,
+            &completed.region,
+        )?;
+        Ok(CapturedPostprocessingStage {
+            proofs: completed.proofs.clone(),
+            stage,
+            game_time,
+            next_sub_tick,
+            water_source_conversion,
+            waiting_neighbor: None,
+            retry_target: None,
+        })
     }
 
     /// Supply exactly the converted neighbor requested by the most recent

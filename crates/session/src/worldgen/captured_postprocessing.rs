@@ -21,6 +21,70 @@ use super::{
     postprocessing_world::{ConvertedBlockEntities, PostprocessingLightCheckpoint},
 };
 
+struct CapturedPostprocessingTags {
+    heightmaps: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    mushroom: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    leaf: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    snow: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    fence: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    bubble: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
+    washed: Option<Arc<BTreeSet<String>>>,
+    lava: Option<Arc<BTreeSet<String>>>,
+}
+
+impl CapturedPostprocessingTags {
+    fn load(provider: &mut impl ResourceProvider, block_ids: &BTreeSet<String>) -> Result<Self> {
+        let heightmaps = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+            provider, block_ids,
+        )?);
+        let load_tags = |provider: &mut _, names: &[&str]| -> Result<_> {
+            let names = names
+                .iter()
+                .map(|name| ResourceId::parse(name))
+                .collect::<Result<BTreeSet<_>>>()?;
+            Ok(
+                native_resources::ore_feature::OreBlockTags::load(provider, block_ids, &names)
+                    .ok()
+                    .map(Arc::new),
+            )
+        };
+        Ok(Self {
+            heightmaps,
+            mushroom: load_tags(
+                provider,
+                &["minecraft:overrides_mushroom_light_requirement"],
+            )?,
+            leaf: load_tags(provider, &["minecraft:prevents_nearby_leaf_decay"])?,
+            snow: load_tags(provider, &["minecraft:snow"])?,
+            fence: load_tags(
+                provider,
+                &[
+                    "minecraft:fences",
+                    "minecraft:wooden_fences",
+                    "minecraft:shulker_boxes",
+                ],
+            )?,
+            bubble: native_resources::fluid_tags::BubbleColumnTags::load(provider, block_ids)
+                .ok()
+                .map(Arc::new),
+            washed: native_resources::fluid_tags::load_washed_away_blocks(provider, block_ids)
+                .ok()
+                .map(Arc::new),
+            lava: native_resources::fluid_tags::load_lava(provider)
+                .ok()
+                .map(Arc::new),
+        })
+    }
+
+    fn apply(self, stage: &mut GeneratedPostprocessing) {
+        stage.set_leaf_tags(self.leaf);
+        stage.set_snow_tags(self.snow);
+        stage.set_fence_tags(self.fence);
+        stage.set_bubble_tags(self.bubble);
+        stage.set_fluid_tags(self.washed, self.lava);
+    }
+}
+
 impl CarvedTerrainWorld {
     /// Start an isolated postprocessing pass from the exact generated terrain,
     /// pending ticks, marks and converted heightmaps. The caller must bind the
@@ -76,62 +140,76 @@ impl CarvedTerrainWorld {
                 )?,
             );
         }
-        let heightmap_tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
-            provider, block_ids,
-        )?);
-        let load_tags = |provider: &mut _, names: &[&str]| -> Result<_> {
-            let names = names
-                .iter()
-                .map(|name| ResourceId::parse(name))
-                .collect::<Result<BTreeSet<_>>>()?;
-            Ok(
-                native_resources::ore_feature::OreBlockTags::load(provider, block_ids, &names)
-                    .ok()
-                    .map(Arc::new),
-            )
-        };
-        let mushroom = load_tags(
-            provider,
-            &["minecraft:overrides_mushroom_light_requirement"],
-        )?;
-        let leaf = load_tags(provider, &["minecraft:prevents_nearby_leaf_decay"])?;
-        let snow = load_tags(provider, &["minecraft:snow"])?;
-        let fence = load_tags(
-            provider,
-            &[
-                "minecraft:fences",
-                "minecraft:wooden_fences",
-                "minecraft:shulker_boxes",
-            ],
-        )?;
-        let bubble = native_resources::fluid_tags::BubbleColumnTags::load(provider, block_ids)
-            .ok()
-            .map(Arc::new);
-        let washed = native_resources::fluid_tags::load_washed_away_blocks(provider, block_ids)
-            .ok()
-            .map(Arc::new);
-        let lava = native_resources::fluid_tags::load_lava(provider)
-            .ok()
-            .map(Arc::new);
+        let tags = CapturedPostprocessingTags::load(provider, block_ids)?;
         let mut stage = GeneratedPostprocessing::new(
             self.snapshot(),
             self.min_y,
             max_y,
             region,
             light,
-            mushroom,
+            tags.mushroom.clone(),
             heightmaps,
-            Some(heightmap_tags),
+            Some(Arc::clone(&tags.heightmaps)),
         );
         stage.set_block_entities(block_entities)?;
         // Captured proto-entities and entity sidecars have not been reconciled.
         // Leave entity candidates unknown, so callbacks that need them fail.
-        stage.set_leaf_tags(leaf);
-        stage.set_snow_tags(snow);
-        stage.set_fence_tags(fence);
-        stage.set_bubble_tags(bubble);
-        stage.set_fluid_tags(washed, lava);
+        tags.apply(&mut stage);
         Ok(stage)
+    }
+
+    /// Resume completed captured callbacks with the same terrain, frozen tags
+    /// and light revision. The caller must keep live state unchanged.
+    pub fn resume_captured_postprocessing(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        engine: &StagedGenerationLightEngine,
+        completed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<GeneratedPostprocessing> {
+        ensure!(
+            Arc::ptr_eq(&self.world, &completed.source),
+            "postprocessing terrain revision differs"
+        );
+        ensure!(
+            Arc::ptr_eq(&completed.world, &completed.sealed_world)
+                && completed.edits == completed.sealed_edits
+                && completed.read_chunks == completed.sealed_read_chunks
+                && completed.light_reads == completed.sealed_light_reads
+                && completed.light_checks == completed.sealed_checks
+                && completed.chunks == completed.sealed_chunks,
+            "postprocessing result was modified"
+        );
+        ensure!(!completed.chunks.is_empty(), "no postprocessed chunks");
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("dimension height overflow")?;
+        ensure!(
+            (self.min_y, max_y) == (completed.min_y, completed.max_y),
+            "postprocessing bounds differ"
+        );
+        let covered = completed
+            .chunks
+            .iter()
+            .copied()
+            .chain(completed.deferred_chunks())
+            .collect();
+        let light = self.captured_postprocessing_light_input(
+            engine,
+            registry,
+            completed.light_checkpoint.as_ref(),
+            covered,
+        )?;
+        let heightmap_tags = completed
+            .heightmap_tags
+            .as_ref()
+            .context("postprocessing heightmap tags are missing")?;
+        GeneratedPostprocessing::from_completed(
+            completed,
+            Some(light),
+            completed.mushroom_tags.clone(),
+            Arc::clone(heightmap_tags),
+        )
     }
 
     /// Add a validated, deferred neighbor after an isolated attempt reported
@@ -329,6 +407,174 @@ mod tests {
     use super::super::{FreshGenerationLightTracker, MaterializedTerrain};
     use super::*;
     use native_world::loaded::{BLOCK_COUNT, BlockPosition, BlockState, Chunk, Section, World};
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn captured_completed_pass_resumes_deferred_without_replaying_ticks() -> Result<()> {
+        use super::super::PostprocessingAttempt;
+        use super::super::chunk_ticks::{ChunkTicks, RegionTicks};
+        use native_core::postprocessing::PostProcessing;
+        use native_persistence::nbt::{Tag, TagType};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos { x: 1, z: 0 };
+        let mut world = World::new("minecraft:overworld");
+        let stone = world.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        });
+        let sand = world.intern_state(BlockState {
+            name: "minecraft:sand".into(),
+            properties: BTreeMap::new(),
+        });
+        for pos in [first, second] {
+            let mut blocks = Box::new([stone; BLOCK_COUNT]);
+            if pos == first {
+                blocks[8 + 8 * 16 + 8 * 256] = sand;
+            }
+            world.chunks.insert(
+                pos,
+                Arc::new(Chunk {
+                    position: pos,
+                    status: Some("minecraft:spawn".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+        }
+        let terrain = CarvedTerrainWorld::new(MaterializedTerrain {
+            world,
+            position: first,
+            seed: 42,
+            min_y: 0,
+            height: 16,
+            postprocessing: Arc::from(vec![false; BLOCK_COUNT]),
+            noise_postprocessing: None,
+            surface_postprocessing: None,
+            carver_postprocessing: None,
+        });
+        let engine =
+            StagedGenerationLightEngine::new(FreshGenerationLightTracker::new(&terrain, false)?);
+        let mut marks = PostProcessing::new(0, 16).context("invalid postprocessing bounds")?;
+        marks.mark(8, 8, 8);
+        let empty = Arc::new(PostProcessing::new(0, 16).context("invalid postprocessing bounds")?);
+        let mut ticks = BTreeMap::new();
+        for pos in [first, second] {
+            ticks.insert(
+                pos,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(pos, vec![])?,
+                    fluids: ChunkTicks::from_saved(pos, vec![])?,
+                },
+            );
+        }
+        let region = ConvertedPostprocessingRegion {
+            tasks: BTreeMap::from([
+                (first, PostprocessingTask::new(Arc::new(marks), first)),
+                (second, PostprocessingTask::new(empty, second)),
+            ]),
+            ticks: RegionTicks::new(ticks, 100, 0)?,
+        };
+        let tags = CapturedPostprocessingTags::load(&mut resources, &ids)?;
+        let mut initial = GeneratedPostprocessing::new(
+            terrain.snapshot(),
+            0,
+            16,
+            region,
+            None,
+            tags.mushroom.clone(),
+            BTreeMap::new(),
+            Some(Arc::clone(&tags.heightmaps)),
+        );
+        tags.apply(&mut initial);
+        let entities = [first, second]
+            .into_iter()
+            .map(|pos| {
+                Ok((
+                    pos,
+                    ConvertedBlockEntities::from_proto(
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![],
+                        },
+                        None,
+                        None,
+                    )?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        initial.set_block_entities(entities)?;
+        initial.set_water_source_conversion(false)?;
+        initial.select_initial_targets(BTreeSet::from([first]))?;
+        assert_eq!(
+            initial.try_poll(first, 64)?,
+            PostprocessingAttempt::Progress { complete: true }
+        );
+        for drain in [false, true] {
+            let mut original = initial.clone();
+            if drain {
+                original
+                    .light_checks
+                    .push(BlockPosition { x: 8, y: 8, z: 8 });
+                assert!(terrain.drain_captured_postprocessing_light(
+                    &mut original,
+                    &engine,
+                    &registry
+                )?);
+            }
+            let mut completed = original.finish()?;
+            let prior_ticks = completed.ticks().chunk(first).unwrap().blocks.pack(100);
+            assert_eq!(prior_ticks.len(), 1);
+            assert_eq!(prior_ticks[0].kind, "minecraft:sand");
+            let mut resumed =
+                terrain.resume_captured_postprocessing(&registry, &engine, &completed)?;
+            assert_eq!(resumed.light_checkpoint.is_some(), drain);
+            resumed.request_converted_chunk(second)?;
+            assert_eq!(
+                resumed.try_poll(second, 64)?,
+                PostprocessingAttempt::Progress { complete: true }
+            );
+            let result = resumed.finish()?;
+            assert_eq!(result.chunks, BTreeSet::from([first, second]));
+            assert!(Arc::ptr_eq(
+                completed.snow_tags.as_ref().context("snow tags missing")?,
+                result
+                    .snow_tags
+                    .as_ref()
+                    .context("resumed snow tags missing")?,
+            ));
+            assert_eq!(
+                result.ticks().chunk(first).unwrap().blocks.pack(100),
+                prior_ticks
+            );
+            assert_eq!(completed.chunks, BTreeSet::from([first]));
+            assert_eq!(
+                completed.deferred_chunks().collect::<Vec<_>>(),
+                vec![second]
+            );
+            completed.edits.push(BlockPosition { x: 8, y: 8, z: 8 });
+            assert!(
+                terrain
+                    .resume_captured_postprocessing(&registry, &engine, &completed)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]

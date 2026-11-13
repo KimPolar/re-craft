@@ -235,6 +235,14 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) min_y: i32,
     pub(super) max_y: i32,
     pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
+    pub(super) mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    pub(super) leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    pub(super) snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    pub(super) fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    pub(super) bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
+    pub(super) washed_blocks: Option<Arc<BTreeSet<String>>>,
+    pub(super) lava_fluids: Option<Arc<BTreeSet<String>>>,
+    pub(super) heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     water_source_conversion: Option<bool>,
     block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
@@ -619,6 +627,12 @@ impl GeneratedPostprocessing {
         stage.completed = completed.chunks.clone();
         stage.required = completed.chunks.clone();
         stage.light_checkpoint = completed.light_checkpoint.clone();
+        stage.leaf_tags = completed.leaf_tags.clone();
+        stage.snow_tags = completed.snow_tags.clone();
+        stage.fence_tags = completed.fence_tags.clone();
+        stage.bubble_tags = completed.bubble_tags.clone();
+        stage.washed_blocks = completed.washed_blocks.clone();
+        stage.lava_fluids = completed.lava_fluids.clone();
         stage.water_source_conversion = completed.water_source_conversion;
         stage.block_drops = completed.block_drops.clone();
         stage.edits = completed.edits.clone();
@@ -1114,6 +1128,14 @@ impl GeneratedPostprocessing {
             min_y: self.min_y,
             max_y: self.max_y,
             light_checkpoint: self.light_checkpoint,
+            mushroom_tags: self.mushroom_tags,
+            leaf_tags: self.leaf_tags,
+            snow_tags: self.snow_tags,
+            fence_tags: self.fence_tags,
+            bubble_tags: self.bubble_tags,
+            washed_blocks: self.washed_blocks,
+            lava_fluids: self.lava_fluids,
+            heightmap_tags: self.heightmap_tags,
             water_source_conversion: self.water_source_conversion,
             block_drops: self.block_drops,
             block_entities: self.block_entities,

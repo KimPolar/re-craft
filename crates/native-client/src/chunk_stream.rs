@@ -887,19 +887,25 @@ impl Drop for MissingGenerationTerrainWorker {
     }
 }
 
-/// An intermediate batch only; attaching or writing it still requires the
-/// independent live, disk, sidecar and later-stage validations.
+/// Intermediate data guarded against the captured live terrain, POI and
+/// supported entities. Other live state, disk inputs and later stages still
+/// require validation before attaching or writing anything.
 pub(crate) struct AssembledMissingGeneration {
     batch: crate::fresh_generation::existing::CapturedTerrainBatch,
     generator: crate::fresh_generation::existing::PreparedExistingGenerator,
     restored: crate::fresh_generation::existing::RestoredSavedTerrain,
     evaluator: native_resources::density::DensityEvaluator,
     observed: MissingGenerationTargets,
+    live: crate::fresh_generation::existing::LiveGenerationInputs,
 }
 
 impl AssembledMissingGeneration {
     pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
         self.observed.is_current(streamer, session)
+            && self
+                .generator
+                .verify_live_inputs(session, &self.live)
+                .is_ok()
     }
 
     pub fn batch(&self) -> &crate::fresh_generation::existing::CapturedTerrainBatch {
@@ -916,6 +922,7 @@ impl AssembledMissingGeneration {
         crate::fresh_generation::existing::RestoredSavedTerrain,
         native_resources::density::DensityEvaluator,
         MissingGenerationTargets,
+        crate::fresh_generation::existing::LiveGenerationInputs,
     )> {
         if !self.is_current(streamer, session) {
             crate::generation_staging::discard_async(self);
@@ -927,6 +934,7 @@ impl AssembledMissingGeneration {
             self.restored,
             self.evaluator,
             self.observed,
+            self.live,
         ))
     }
 }
@@ -960,6 +968,19 @@ impl MissingGenerationAssemblyWorker {
                 error: anyhow::anyhow!(error),
             });
         }
+        let live = match terrain
+            .state
+            .generator
+            .capture_live_inputs(session, &terrain.state.terrain)
+        {
+            Ok(live) => live,
+            Err(error) => {
+                return Err(MissingGenerationAssemblyStartError {
+                    terrain,
+                    error: error.context("cannot bind live generation inputs"),
+                });
+            }
+        };
         let observed = terrain.state.observed.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -996,6 +1017,7 @@ impl MissingGenerationAssemblyWorker {
                         restored,
                         evaluator,
                         observed,
+                        live,
                     })
                 })();
                 let _ = sender.send(result);
@@ -1046,7 +1068,12 @@ impl MissingGenerationAssemblyWorker {
             }
             anyhow::bail!("terrain assembly was cancelled or became stale");
         }
-        Ok(Some(result?))
+        let assembled = result?;
+        if !assembled.is_current(streamer, session) {
+            crate::generation_staging::discard_async(assembled);
+            anyhow::bail!("live generation inputs changed during terrain assembly");
+        }
+        Ok(Some(assembled))
     }
 }
 
@@ -1250,6 +1277,18 @@ impl MissingGenerationFeatureWorker {
         if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
             crate::generation_staging::discard_async(result);
             anyhow::bail!("feature generation was cancelled or became stale");
+        }
+        let live_current = match &result {
+            MissingGenerationFeatureResult::Completed(featured) => {
+                featured.is_current(streamer, session)
+            }
+            MissingGenerationFeatureResult::Failed { assembled, .. } => {
+                assembled.is_current(streamer, session)
+            }
+        };
+        if !live_current {
+            crate::generation_staging::discard_async(result);
+            anyhow::bail!("live generation inputs changed during feature generation");
         }
         Ok(Some(result))
     }
@@ -2940,7 +2979,8 @@ mod tests {
             session.update(Duration::from_millis(50));
             if streamer.pending.is_empty()
                 && streamer.missing.len() == 8
-                && session.has_chunk_or_pending(saved_pos)
+                && session.has_resident_or_parked_chunk(saved_pos)
+                && !session.pending_stream_data_positions().contains(&saved_pos)
             {
                 break;
             }
@@ -3080,7 +3120,7 @@ mod tests {
                 .is_some_and(Option::is_some)
         );
         assert_eq!(std::fs::read(&region_path)?, region);
-        let (mut batch, mut generator, restored, evaluator, observed) =
+        let (mut batch, mut generator, restored, evaluator, observed, live) =
             assembled.into_checked_parts(&streamer, &session)?;
         let context = generator.prepare_captured_decoration(
             &batch,
@@ -3102,6 +3142,7 @@ mod tests {
             restored,
             evaluator,
             observed,
+            live,
         };
         let failure = match MissingGenerationFeatureWorker::start(
             assembled, &streamer, &session, saved_pos, None,
@@ -3218,9 +3259,29 @@ mod tests {
             Some("minecraft:air")
         );
         assert_eq!(std::fs::read(&region_path)?, region);
-        session.queue_loaded_chunk(target, chunk_world(target));
+        session.queue_loaded_chunk(saved_pos, chunk_world(saved_pos));
+        assert!(assembled.observed.is_current(&streamer, &session));
         assert!(!assembled.is_current(&streamer, &session));
-        assert!(assembled.into_checked_parts(&streamer, &session).is_err());
+        let observed = assembled.observed.clone();
+        let (sender, result) = mpsc::channel();
+        sender
+            .send(MissingGenerationFeatureResult::Completed(
+                FeaturedMissingGeneration {
+                    state: assembled,
+                    position: target,
+                    placements: vec![true],
+                },
+            ))
+            .map_err(|_| anyhow::anyhow!("test result receiver disappeared"))?;
+        let mut stale_features = MissingGenerationFeatureWorker {
+            observed,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            result,
+            finished: false,
+        };
+        assert!(stale_features.try_result(&streamer, &session).is_err());
+        drop(stale_features);
+        drop(sender);
         drop(retried);
         drop(features);
         drop(assembly);

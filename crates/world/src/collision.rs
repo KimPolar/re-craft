@@ -64,6 +64,28 @@ pub fn hopper_facing(state: &BlockState) -> Option<&str> {
     }
 }
 
+/// Validate a trial spawner and return its current phase.
+pub fn trial_spawner_state(state: &BlockState) -> Option<&str> {
+    if state.name != "minecraft:trial_spawner"
+        || state.properties.len() != 2
+        || !matches!(
+            state.properties.get("ominous").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    match state.properties.get("trial_spawner_state")?.as_str() {
+        phase @ ("inactive"
+        | "waiting_for_players"
+        | "active"
+        | "waiting_for_reward_ejection"
+        | "ejecting_reward"
+        | "cooldown") => Some(phase),
+        _ => None,
+    }
+}
+
 /// Validate a barrier state and return its contained-water flag.
 pub fn barrier_waterlogged(state: &BlockState) -> Option<bool> {
     if state.name != "minecraft:barrier" || state.properties.len() != 1 {
@@ -1314,6 +1336,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         || copper_grate_waterlogged(state).is_some()
         || vault_state(state).is_some()
         || barrel_state(state)
+        || trial_spawner_state(state).is_some()
     {
         return Some(FULL.to_vec());
     }

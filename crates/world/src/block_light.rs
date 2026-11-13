@@ -210,6 +210,14 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         "minecraft:jigsaw" if crate::collision::jigsaw_state(state) => (15, 0),
         "minecraft:barrel" if crate::collision::barrel_state(state) => (15, 0),
         "minecraft:hopper" if crate::collision::hopper_facing(state).is_some() => (0, 0),
+        "minecraft:trial_spawner" if crate::collision::trial_spawner_state(state).is_some() => (
+            1,
+            match crate::collision::trial_spawner_state(state)? {
+                "waiting_for_players" => 4,
+                "active" | "waiting_for_reward_ejection" | "ejecting_reward" => 8,
+                _ => 0,
+            },
+        ),
         "minecraft:bee_nest" | "minecraft:beehive"
             if state.properties.len() == 2 && facing() && bounded("honey_level", 5).is_some() =>
         {
@@ -1515,6 +1523,22 @@ mod tests {
     }
 
     #[test]
+    fn trial_spawner_light_requires_all_valid_properties() {
+        let mut spawner = state("trial_spawner", None);
+        spawner.properties = BTreeMap::from([
+            ("ominous".into(), "false".into()),
+            ("trial_spawner_state".into(), "active".into()),
+        ]);
+        assert_eq!(properties(&spawner), Some((1, 8)));
+        assert!(crate::collision::block_shape(&spawner).is_some());
+        spawner
+            .properties
+            .insert("trial_spawner_state".into(), "invalid".into());
+        assert!(properties(&spawner).is_none());
+        assert!(crate::collision::block_shape(&spawner).is_none());
+    }
+
+    #[test]
     fn copper_grate_transmits_light_in_both_fluid_states() {
         let mut grate = state("waxed_oxidized_copper_grate", None);
         for wet in [false, true] {
@@ -2648,6 +2672,7 @@ mod tests {
             "decorated_pot",
             "barrel",
             "hopper",
+            "trial_spawner",
             "copper_bulb",
             "exposed_copper_bulb",
             "weathered_copper_bulb",
@@ -2854,6 +2879,7 @@ mod tests {
                 || crate::collision::flower_pot(&s)
                 || crate::collision::decorated_pot_waterlogged(&s).is_some()
                 || crate::collision::barrel_state(&s)
+                || crate::collision::trial_spawner_state(&s).is_some()
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);

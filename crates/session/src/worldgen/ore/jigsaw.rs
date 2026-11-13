@@ -82,6 +82,18 @@ pub(super) fn jigsaw_ladder(state: &BlockState) -> bool {
 }
 
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
+    if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+        ensure!(
+            state.properties.len() == 1
+                && state.properties.get("level").is_some_and(|level| {
+                    level
+                        .parse::<u8>()
+                        .is_ok_and(|value| value <= 15 && value.to_string() == *level)
+                }),
+            "invalid template liquid state"
+        );
+        return Ok(false);
+    }
     if native_world::wall::Wall::from_state(state).is_some() {
         return Ok(false);
     }
@@ -220,6 +232,10 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         if self.region.is_outside(pos[1]) {
             return Ok(true);
         }
+        ensure!(
+            !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava"),
+            "jigsaw liquid block placement is not yet supported"
+        );
         let chest_table = if let Some(nbt) = nbt {
             let Tag::Compound(fields) = nbt else {
                 bail!("jigsaw block entity placement requires a compound")
@@ -677,6 +693,25 @@ mod tests {
         nbt::{self, NamedTag, TagType},
         structure_processors::PreparedProcessors,
     };
+
+    #[test]
+    fn jigsaw_liquid_palette_states_are_non_full_and_validated() -> Result<()> {
+        for name in ["minecraft:water", "minecraft:lava"] {
+            for level in 0..=15 {
+                let state = BlockState {
+                    name: name.into(),
+                    properties: BTreeMap::from([("level".into(), level.to_string())]),
+                };
+                assert!(!jigsaw_static_full(&state)?);
+            }
+            let invalid = BlockState {
+                name: name.into(),
+                properties: BTreeMap::from([("level".into(), "16".into())]),
+            };
+            assert!(jigsaw_static_full(&invalid).is_err());
+        }
+        Ok(())
+    }
     use native_resources::{
         jigsaw_placement::Piece,
         structure_pool::{HolderValue, PoolElement, Projection},

@@ -38,6 +38,7 @@ impl GameplayKeys {
         }
         let mut other = VecDeque::with_capacity(commands.len());
         let mut position = None;
+        let mut mouse_position = None;
         for command in commands.drain(..) {
             match command {
                 PlayerCommand::GameplayKey(key) => {
@@ -56,11 +57,30 @@ impl GameplayKeys {
                 PlayerCommand::ClearGameplayKeys => {
                     self.clear();
                     position = None;
+                    mouse_position = None;
                 }
-                command => other.push_back(command),
+                command => {
+                    if matches!(
+                        command,
+                        PlayerCommand::Break
+                            | PlayerCommand::StopBreak
+                            | PlayerCommand::UseHeld(_)
+                            | PlayerCommand::Place
+                            | PlayerCommand::StopUse
+                            | PlayerCommand::PickBlock
+                    ) {
+                        mouse_position.get_or_insert(other.len());
+                    }
+                    other.push_back(command);
+                }
             }
         }
-        let mut index = position.unwrap_or(0);
+        let mut index = match (position, mouse_position) {
+            (Some(key), Some(mouse)) => key.min(mouse),
+            (Some(key), None) => key,
+            (None, Some(mouse)) => mouse,
+            (None, None) => 0,
+        };
         for (slot, count) in self.hotbar.iter_mut().enumerate() {
             if *count > 0 {
                 *count -= 1;
@@ -140,6 +160,60 @@ mod tests {
             Some(PlayerCommand::DropSelected { all: false })
         ));
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn keybinds_precede_mouse_actions_even_if_the_mouse_arrived_first() {
+        let mut keys = GameplayKeys::default();
+        let mut commands = VecDeque::from([
+            PlayerCommand::Look {
+                yaw: 0.25,
+                pitch: 0.0,
+            },
+            PlayerCommand::UseHeld(true),
+            PlayerCommand::Place,
+            PlayerCommand::GameplayKey(GameplayKey::Hotbar(1)),
+            PlayerCommand::GameplayKey(GameplayKey::SwapHands),
+        ]);
+        keys.prepare(&mut commands);
+        assert!(matches!(
+            commands.pop_front(),
+            Some(PlayerCommand::Look { .. })
+        ));
+        assert!(matches!(
+            commands.pop_front(),
+            Some(PlayerCommand::SelectSlot(1))
+        ));
+        assert!(matches!(
+            commands.pop_front(),
+            Some(PlayerCommand::SwapHands)
+        ));
+        assert!(matches!(
+            commands.pop_front(),
+            Some(PlayerCommand::UseHeld(true))
+        ));
+        assert!(matches!(commands.pop_front(), Some(PlayerCommand::Place)));
+    }
+
+    #[test]
+    fn hotbar_selection_affects_an_earlier_mouse_placement() {
+        use glam::IVec3;
+        use native_world::{Block, World};
+        let mut world = World::demo();
+        world.set_block(IVec3::new(0, 4, 3), Block::Stone);
+        let mut session = LocalSession::new(world);
+        session.submit_command(PlayerCommand::Place);
+        session.submit_command(PlayerCommand::GameplayKey(GameplayKey::Hotbar(1)));
+        session.update(Duration::from_millis(50));
+        assert_eq!(
+            session
+                .snapshot()
+                .world
+                .demo()
+                .unwrap()
+                .block(IVec3::new(0, 4, 4)),
+            Block::Dirt
+        );
     }
 
     #[test]

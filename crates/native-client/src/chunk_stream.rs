@@ -85,9 +85,249 @@ pub struct ChunkStreamer {
     shape_required: BTreeSet<ChunkPos>,
     _world_guard: Option<native_persistence::save::WorldSessionGuard>,
     observed_epoch: Option<u64>,
+    generation_owner: Arc<()>,
+    dimension: Option<native_persistence::world::DimensionId>,
+}
+
+/// Disk reads found no terrain for these chunks at `stamp`. A generator must
+/// still capture and validate all terrain, entity, POI and live dependencies;
+/// this is a scheduling hint, not permission to write or attach a chunk.
+#[derive(Clone)]
+pub(crate) struct MissingGenerationTargets {
+    targets: Vec<ChunkPos>,
+    stamp: WorldReadStamp,
+    owner: Arc<()>,
+}
+
+/// A captured disk snapshot only. Live-state and generation completeness must
+/// still be checked before the result can affect gameplay or be saved.
+pub(crate) struct CapturedMissingGeneration {
+    pub schedule: native_session::worldgen::schedule::GenerationSchedule,
+    pub context: native_persistence::world::GenerationContextSnapshot,
+    observed: MissingGenerationTargets,
+}
+
+impl CapturedMissingGeneration {
+    /// Recheck scheduling inputs; this does not validate unsaved neighbor state.
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.observed.is_current(streamer, session)
+    }
+
+    pub fn targets(&self) -> &[ChunkPos] {
+        self.observed.targets()
+    }
+}
+
+pub(crate) struct MissingGenerationCaptureWorker {
+    targets: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<CapturedMissingGeneration>>,
+    finished: bool,
+}
+
+impl MissingGenerationCaptureWorker {
+    pub fn start(
+        targets: MissingGenerationTargets,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        mut reader: WorldReader,
+    ) -> Result<Self> {
+        use native_session::worldgen::schedule::{GenerationSchedule, GenerationStage};
+        anyhow::ensure!(!targets.targets.is_empty(), "no missing generation targets");
+        anyhow::ensure!(
+            targets.is_current(streamer, session),
+            "missing chunk observations are stale"
+        );
+        let guard = reader
+            .session_guard()
+            .context("generation capture requires a locked world")?;
+        anyhow::ensure!(
+            targets.stamp.belongs_to_session(&guard),
+            "generation reader belongs to another world"
+        );
+        anyhow::ensure!(
+            streamer.dimension.as_ref() == Some(reader.dimension()),
+            "generation reader belongs to another dimension"
+        );
+        let positions = targets.targets.clone();
+        let stamp = targets.stamp.clone();
+        let observed = targets.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        thread::Builder::new()
+            .name("missing-generation-capture".into())
+            .spawn(move || {
+                let work = (|| -> Result<CapturedMissingGeneration> {
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "generation capture cancelled"
+                    );
+                    anyhow::ensure!(stamp.is_current(), "missing chunk observations are stale");
+                    let mut schedule = GenerationSchedule::new();
+                    schedule.request_many(
+                        positions
+                            .iter()
+                            .copied()
+                            .map(|pos| (pos, GenerationStage::Full)),
+                    )?;
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "generation capture cancelled"
+                    );
+                    let context = reader.capture_generation_context(
+                        schedule
+                            .requirements()
+                            .map(|(pos, _)| SavedChunkPos { x: pos.x, z: pos.z }),
+                    )?;
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "generation capture cancelled"
+                    );
+                    anyhow::ensure!(stamp.is_current(), "missing chunk observations are stale");
+                    for pos in positions {
+                        let source = context
+                            .inputs()
+                            .sources()
+                            .chunks()
+                            .get(&SavedChunkPos { x: pos.x, z: pos.z })
+                            .context("generation target was not captured")?;
+                        anyhow::ensure!(
+                            source.terrain.is_none()
+                                && source.entities.is_none()
+                                && source.poi.is_none(),
+                            "missing generation target {}, {} has existing saved data",
+                            pos.x,
+                            pos.z
+                        );
+                    }
+                    Ok(CapturedMissingGeneration {
+                        schedule,
+                        context,
+                        observed,
+                    })
+                })();
+                let _ = sender.send(work);
+            })
+            .context("cannot start missing generation capture")?;
+        Ok(Self {
+            targets,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<CapturedMissingGeneration>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("missing generation capture stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.targets.is_current(streamer, session) {
+            if let Ok(captured) = result {
+                crate::generation_staging::discard_async(captured);
+            }
+            anyhow::bail!("missing generation capture was cancelled or became stale");
+        }
+        Ok(Some(result?))
+    }
+}
+
+impl Drop for MissingGenerationCaptureWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
+impl MissingGenerationTargets {
+    pub fn targets(&self) -> &[ChunkPos] {
+        &self.targets
+    }
+
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        if !Arc::ptr_eq(&self.owner, &streamer.generation_owner) || !self.stamp.is_current() {
+            return false;
+        }
+        streamer
+            .missing_generation_targets(session, self.targets.len())
+            .is_some_and(|current| {
+                current.stamp.epoch() == self.stamp.epoch() && current.targets == self.targets
+            })
+    }
+}
+
+fn select_generation_targets(
+    shape_required: &BTreeSet<ChunkPos>,
+    targets: &[ChunkPos],
+    limit: usize,
+    mut eligible: impl FnMut(ChunkPos) -> bool,
+) -> Vec<ChunkPos> {
+    let mut seen = BTreeSet::new();
+    shape_required
+        .iter()
+        .chain(targets.iter())
+        .copied()
+        .filter(|pos| eligible(*pos) && seen.insert(*pos))
+        .take(limit)
+        .collect()
 }
 
 impl ChunkStreamer {
+    /// Prioritize absent chunks needed by deferred shape updates, followed by
+    /// the active streaming order. Return no snapshot if the world or session
+    /// moved since `service` last refreshed the cache.
+    pub(crate) fn missing_generation_targets(
+        &self,
+        session: &LoadedSession,
+        limit: usize,
+    ) -> Option<MissingGenerationTargets> {
+        let guard = self._world_guard.as_ref()?;
+        let stamp = guard.read_stamp().ok()?;
+        let center = self.center?;
+        if self.observed_epoch != Some(stamp.epoch())
+            || Some(center) != session.player_chunk()
+            || self.respawn != session.requested_respawn_window()
+            || self.shape_required != session.required_shape_update_chunks()
+        {
+            return None;
+        }
+        let pending_data = session.pending_stream_data_positions();
+        let targets =
+            select_generation_targets(&self.shape_required, &self.targets, limit, |pos| {
+                self.missing.contains(&pos)
+                    && !self.pending.contains(&pos)
+                    && !self.awaiting_attachment.contains(&pos)
+                    && !self.awaiting_competing_attachment.contains(&pos)
+                    && !pending_data.contains(&pos)
+                    && !session.has_chunk_or_pending(pos)
+            });
+        if !stamp.is_current() {
+            return None;
+        }
+        Some(MissingGenerationTargets {
+            targets,
+            stamp,
+            owner: Arc::clone(&self.generation_owner),
+        })
+    }
+
     pub fn radius(&self) -> u32 {
         self.radius
     }
@@ -110,6 +350,7 @@ impl ChunkStreamer {
         heightmap_context: Option<(HeightBounds, Arc<HeightmapTags>)>,
     ) -> Result<Self> {
         let guard = reader.session_guard();
+        let dimension = reader.dimension().clone();
         let epoch = guard
             .as_ref()
             .map(|guard| guard.read_stamp().map(|stamp| stamp.epoch()))
@@ -165,6 +406,7 @@ impl ChunkStreamer {
         })?;
         streamer._world_guard = guard;
         streamer.observed_epoch = epoch;
+        streamer.dimension = Some(dimension);
         Ok(streamer)
     }
 
@@ -249,6 +491,8 @@ impl ChunkStreamer {
             shape_required: BTreeSet::new(),
             _world_guard: None,
             observed_epoch: None,
+            generation_owner: Arc::new(()),
+            dimension: None,
         })
     }
 
@@ -752,6 +996,306 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn generation_targets_prioritize_shape_dependencies_without_duplicates() {
+        let a = ChunkPos { x: -2, z: 0 };
+        let b = ChunkPos { x: 3, z: 1 };
+        let c = ChunkPos { x: 0, z: 0 };
+        let d = ChunkPos { x: 1, z: 0 };
+        let shape = BTreeSet::from([a, b]);
+        let window = [c, a, d, b];
+        assert_eq!(
+            select_generation_targets(&shape, &window, 3, |_| true),
+            vec![a, b, c]
+        );
+        assert_eq!(
+            select_generation_targets(&shape, &window, 9, |pos| pos != b),
+            vec![a, c, d]
+        );
+        assert!(select_generation_targets(&shape, &window, 0, |_| true).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_generation_requests_reject_stale_or_competing_inputs() {
+        use native_persistence::{
+            nbt::{self, NamedTag, Tag},
+            world::DimensionId,
+        };
+        use native_session::worldgen::schedule::GenerationStage;
+        let (world, reader) = locked_world_fixture();
+        std::fs::create_dir_all(world.path().join("data/minecraft")).unwrap();
+        std::fs::create_dir_all(world.path().join("datapacks")).unwrap();
+        let settings = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                ),
+            ]),
+        };
+        std::fs::write(
+            world.path().join("data/minecraft/world_gen_settings.dat"),
+            nbt::write(&settings).unwrap(),
+        )
+        .unwrap();
+        let guard = reader.session_guard().unwrap();
+        let home = ChunkPos { x: 0, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let mut streamer =
+            ChunkStreamer::start(reader, BTreeMap::new(), 1, BTreeSet::new(), None).unwrap();
+        assert!(streamer.missing_generation_targets(&session, 3).is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if streamer.pending.is_empty() && streamer.missing.len() == 8 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "missing chunk reads timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let batch = streamer.missing_generation_targets(&session, 3).unwrap();
+        assert_eq!(batch.targets.len(), 3);
+        assert!(batch.is_current(&streamer, &session));
+        let wrong_dimension = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("the_nether").unwrap(),
+            guard.clone(),
+        )
+        .unwrap();
+        assert!(
+            MissingGenerationCaptureWorker::start(
+                batch.clone(),
+                &streamer,
+                &session,
+                wrong_dimension
+            )
+            .is_err()
+        );
+        let (_other_world, other_reader) = locked_world_fixture();
+        assert!(
+            MissingGenerationCaptureWorker::start(batch.clone(), &streamer, &session, other_reader)
+                .is_err()
+        );
+        let capture_reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+            guard.clone(),
+        )
+        .unwrap();
+        let mut capture = MissingGenerationCaptureWorker::start(
+            batch.clone(),
+            &streamer,
+            &session,
+            capture_reader,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let captured = loop {
+            if let Some(result) = capture.try_result(&streamer, &session).unwrap() {
+                break result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "generation input capture timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(captured.context.inputs().settings().seed(), 42);
+        assert!(captured.is_current(&streamer, &session));
+        assert_eq!(captured.targets(), batch.targets.as_slice());
+        for target in &batch.targets {
+            assert_eq!(
+                captured.schedule.required(*target),
+                Some(GenerationStage::Full)
+            );
+        }
+        assert!(captured.schedule.requested_chunks() > batch.targets.len());
+        assert_eq!(
+            captured.context.inputs().sources().chunks().len(),
+            captured.schedule.requested_chunks()
+        );
+        for target in &batch.targets {
+            let source = &captured.context.inputs().sources().chunks()[&SavedChunkPos {
+                x: target.x,
+                z: target.z,
+            }];
+            assert!(source.terrain.is_none() && source.entities.is_none() && source.poi.is_none());
+        }
+        assert!(capture.try_result(&streamer, &session).unwrap().is_none());
+        let capture_reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+            guard.clone(),
+        )
+        .unwrap();
+        let mut cancelled_capture = MissingGenerationCaptureWorker::start(
+            batch.clone(),
+            &streamer,
+            &session,
+            capture_reader,
+        )
+        .unwrap();
+        cancelled_capture.cancel();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match cancelled_capture.try_result(&streamer, &session) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("cancelled generation capture was accepted"),
+                Err(error) => {
+                    assert!(error.to_string().contains("cancelled"));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled generation capture timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        // A terrain miss alone does not prove that an entity sidecar is absent.
+        // Simulate an external writer that bypasses the session lock.
+        let first = batch.targets[0];
+        let entity = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![first.x, first.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: nbt::TagType::Compound,
+                        values: vec![],
+                    },
+                ),
+            ]),
+        };
+        let mut compressor =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut compressor, &nbt::write(&entity).unwrap()).unwrap();
+        let compressed = compressor.finish().unwrap();
+        assert!(compressed.len() + 5 <= 4096);
+        let mut region = vec![0u8; 3 * 4096];
+        let index = (first.x.rem_euclid(32) + first.z.rem_euclid(32) * 32) as usize;
+        region[index * 4..index * 4 + 4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+        region[8192..8196].copy_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
+        region[8196] = 2;
+        region[8197..8197 + compressed.len()].copy_from_slice(&compressed);
+        let entity_dir = world.path().join("dimensions/minecraft/overworld/entities");
+        std::fs::create_dir_all(&entity_dir).unwrap();
+        std::fs::write(
+            entity_dir.join(format!(
+                "r.{}.{}.mca",
+                first.x.div_euclid(32),
+                first.z.div_euclid(32)
+            )),
+            region,
+        )
+        .unwrap();
+        let capture_reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+            guard.clone(),
+        )
+        .unwrap();
+        let mut sidecar_capture = MissingGenerationCaptureWorker::start(
+            batch.clone(),
+            &streamer,
+            &session,
+            capture_reader,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match sidecar_capture.try_result(&streamer, &session) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("existing entity sidecar was accepted"),
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("existing saved data"),
+                        "{error:#}"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sidecar generation capture timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let capture_reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+            guard.clone(),
+        )
+        .unwrap();
+        let mut stale_capture = MissingGenerationCaptureWorker::start(
+            batch.clone(),
+            &streamer,
+            &session,
+            capture_reader,
+        )
+        .unwrap();
+        session.queue_loaded_chunk(first, chunk_world(first));
+        assert!(!batch.is_current(&streamer, &session));
+        assert!(!captured.is_current(&streamer, &session));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match stale_capture.try_result(&streamer, &session) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("stale generation capture was accepted"),
+                Err(error) => {
+                    assert!(error.to_string().contains("stale"));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stale generation capture timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let next = streamer.missing_generation_targets(&session, 3).unwrap();
+        assert!(!next.targets.contains(&first));
+        let foreign = ChunkStreamer::with_source(1, BTreeSet::new(), |_| Ok(None)).unwrap();
+        assert!(!next.is_current(&foreign, &session));
+        drop(guard.acquire_write().unwrap());
+        assert!(!next.stamp.is_current());
+        assert!(!next.is_current(&streamer, &session));
+        assert!(streamer.missing_generation_targets(&session, 3).is_none());
+        drop(batch);
+        drop(next);
+        drop(capture);
+        drop(cancelled_capture);
+        drop(sidecar_capture);
+        drop(stale_capture);
+        drop(captured);
+        drop(streamer);
+        drop(guard);
+        wait_for_world_unlock(world.path());
     }
 
     #[cfg(windows)]

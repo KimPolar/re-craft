@@ -2396,6 +2396,11 @@ impl WorldReadStamp {
         self.epoch
     }
 
+    /// Check identity, not merely an epoch that another world may also have.
+    pub fn belongs_to_session(&self, session: &WorldSessionGuard) -> bool {
+        Arc::ptr_eq(&self.session.shared, &session.shared)
+    }
+
     pub fn is_current(&self) -> bool {
         // Captures reserve disk I/O but do not modify it or advance the epoch.
         // Attachment still takes the gate before relying on this observation.

@@ -1257,7 +1257,7 @@ impl GenerationStage {
 
 /// Single-threaded plan. A caller may record a step only after performing the
 /// actual operation; this planner does not generate or save chunk contents.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GenerationSchedule {
     required: BTreeMap<ChunkPos, GenerationStage>,
     completed: BTreeMap<ChunkPos, GenerationStage>,

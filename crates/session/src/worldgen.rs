@@ -230,6 +230,7 @@ pub struct MaterializedTerrain {
 /// A collection of intermediate generated chunks sharing one world registry.
 /// Individual feature attempts may have modified these terrain-stage chunks;
 /// they are not ready for play or saving.
+#[derive(Clone)]
 pub struct CarvedTerrainWorld {
     world: Arc<native_world::loaded::World>,
     seed: i64,

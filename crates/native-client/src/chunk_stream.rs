@@ -1095,10 +1095,20 @@ pub(crate) struct MissingGenerationFeatureStartError {
     pub error: anyhow::Error,
 }
 
+/// A failed pass returns its unchanged terrain so recoverable missing inputs
+/// can be supplied without regenerating the entire surrounding area.
+pub(crate) enum MissingGenerationFeatureResult {
+    Completed(FeaturedMissingGeneration),
+    Failed {
+        assembled: AssembledMissingGeneration,
+        error: anyhow::Error,
+    },
+}
+
 pub(crate) struct MissingGenerationFeatureWorker {
     observed: MissingGenerationTargets,
     cancelled: Arc<AtomicBool>,
-    result: Receiver<Result<FeaturedMissingGeneration>>,
+    result: Receiver<MissingGenerationFeatureResult>,
     finished: bool,
 }
 
@@ -1148,7 +1158,7 @@ impl MissingGenerationFeatureWorker {
         crate::generation_staging::spawn_with_payload(
             assembled,
             move |mut state| {
-                let result = (|| -> Result<FeaturedMissingGeneration> {
+                let result = (|| -> Result<Vec<bool>> {
                     let check = || -> Result<()> {
                         anyhow::ensure!(
                             !worker_cancelled.load(Ordering::Acquire),
@@ -1180,13 +1190,22 @@ impl MissingGenerationFeatureWorker {
                             .run_captured_features(&mut state.batch, &context)?,
                     };
                     check()?;
-                    Ok(FeaturedMissingGeneration {
-                        state,
-                        position,
-                        placements,
-                    })
+                    Ok(placements)
                 })();
-                let _ = sender.send(result);
+                let outcome = match result {
+                    Ok(placements) => {
+                        MissingGenerationFeatureResult::Completed(FeaturedMissingGeneration {
+                            state,
+                            position,
+                            placements,
+                        })
+                    }
+                    Err(error) => MissingGenerationFeatureResult::Failed {
+                        assembled: state,
+                        error,
+                    },
+                };
+                let _ = sender.send(outcome);
             },
             |task| {
                 thread::Builder::new()
@@ -1215,7 +1234,7 @@ impl MissingGenerationFeatureWorker {
         &mut self,
         streamer: &ChunkStreamer,
         session: &LoadedSession,
-    ) -> Result<Option<FeaturedMissingGeneration>> {
+    ) -> Result<Option<MissingGenerationFeatureResult>> {
         if self.finished {
             return Ok(None);
         }
@@ -1229,12 +1248,10 @@ impl MissingGenerationFeatureWorker {
         };
         self.finished = true;
         if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
-            if let Ok(featured) = result {
-                crate::generation_staging::discard_async(featured);
-            }
+            crate::generation_staging::discard_async(result);
             anyhow::bail!("feature generation was cancelled or became stale");
         }
-        Ok(Some(result?))
+        Ok(Some(result))
     }
 }
 
@@ -2772,7 +2789,8 @@ mod tests {
         )?;
         plains["features"] = json!([[{
             "feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
-            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]
+            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8},
+                {"type":"minecraft:block_predicate_filter", "predicate":{"type":"minecraft:not", "predicate":{"type":"minecraft:would_survive", "state":"minecraft:brown_mushroom"}}}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&plains)?)?;
         let level = NamedTag {
@@ -3097,6 +3115,12 @@ mod tests {
                 .to_string()
                 .contains("already completed features")
         );
+        let before = failure.assembled.batch().terrain().snapshot();
+        let before_maps = failure
+            .assembled
+            .batch()
+            .terrain()
+            .generated_heightmap_data(saved_pos)?;
         let mut features = MissingGenerationFeatureWorker::start(
             failure.assembled,
             &streamer,
@@ -3106,11 +3130,66 @@ mod tests {
         )
         .map_err(|failure| failure.error)?;
         let deadline = Instant::now() + Duration::from_secs(120);
-        let featured = loop {
+        let failed = loop {
             if let Some(result) = features.try_result(&streamer, &session)? {
-                break result;
+                match result {
+                    MissingGenerationFeatureResult::Failed { assembled, error } => {
+                        assert!(
+                            format!("{error:#}").contains("raw brightness unavailable"),
+                            "{error:#}"
+                        );
+                        break assembled;
+                    }
+                    MissingGenerationFeatureResult::Completed(_) => {
+                        anyhow::bail!("light-dependent feature succeeded without light");
+                    }
+                }
             }
             anyhow::ensure!(Instant::now() < deadline, "feature generation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(Arc::ptr_eq(&before, &failed.batch().terrain().snapshot()));
+        assert_eq!(
+            failed
+                .batch()
+                .terrain()
+                .generated_heightmap_data(saved_pos)?,
+            before_maps
+        );
+        assert_eq!(
+            failed.batch().schedule().completed(target),
+            Some(GenerationStage::Terrain)
+        );
+        let columns = (-1..=1).flat_map(|dz| {
+            (-1..=1).map(move |dx| ChunkPos {
+                x: target.x + dx,
+                z: target.z + dz,
+            })
+        });
+        let visible =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                columns,
+            )
+            .context("test light snapshot unavailable")?;
+        let light = failed
+            .generator
+            .bind_captured_initial_feature_light(&failed.batch, visible)?;
+        drop(before);
+        let mut retried =
+            MissingGenerationFeatureWorker::start(failed, &streamer, &session, target, Some(light))
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let featured = loop {
+            if let Some(result) = retried.try_result(&streamer, &session)? {
+                match result {
+                    MissingGenerationFeatureResult::Completed(featured) => break featured,
+                    MissingGenerationFeatureResult::Failed { error, .. } => return Err(error),
+                }
+            }
+            anyhow::ensure!(Instant::now() < deadline, "feature retry timed out");
             thread::sleep(Duration::from_millis(2));
         };
         assert_eq!(featured.position(), target);
@@ -3142,6 +3221,7 @@ mod tests {
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!assembled.is_current(&streamer, &session));
         assert!(assembled.into_checked_parts(&streamer, &session).is_err());
+        drop(retried);
         drop(features);
         drop(assembly);
         drop(terrain);

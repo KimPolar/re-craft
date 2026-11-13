@@ -4371,26 +4371,41 @@ impl PreparedExistingGenerator {
                 &blocks,
             )?);
         }
-        let tags = self
-            .heightmap_tags
-            .as_ref()
-            .expect("heightmap tags initialized");
-        for position in positions {
-            if batch.terrain.worldgen_heightmaps(position).is_none() {
-                batch.terrain.ensure_worldgen_heightmaps(position, tags)?;
+        let previous_terrain = batch.terrain.clone();
+        let previous_schedule = batch.schedule.clone();
+        let priming = (|| -> Result<()> {
+            let tags = self
+                .heightmap_tags
+                .as_ref()
+                .expect("heightmap tags initialized");
+            for position in positions {
+                if batch.terrain.worldgen_heightmaps(position).is_none() {
+                    batch.terrain.ensure_worldgen_heightmaps(position, tags)?;
+                }
             }
-        }
-        let result = self.with_saved_prepared_decoration(context, |prepared| match light {
-            Some(light) => batch.schedule.run_features_with_visible_light(
-                &mut batch.terrain,
-                prepared,
-                false,
-                &light.light,
-            ),
-            None => batch
-                .schedule
-                .run_features(&mut batch.terrain, prepared, false, None),
-        })?;
+            Ok(())
+        })();
+        let result = priming.and_then(|()| {
+            self.with_saved_prepared_decoration(context, |prepared| match light {
+                Some(light) => batch.schedule.run_features_with_visible_light(
+                    &mut batch.terrain,
+                    prepared,
+                    false,
+                    &light.light,
+                ),
+                None => batch
+                    .schedule
+                    .run_features(&mut batch.terrain, prepared, false, None),
+            })
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                batch.terrain = previous_terrain;
+                batch.schedule = previous_schedule;
+                return Err(error);
+            }
+        };
         batch.feature_entity_sources.complete(center, entity_free);
         batch.revision = Arc::new(());
         Ok(result)

@@ -8042,6 +8042,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::copper_grate_waterlogged(state).is_some()
                             || native_world::collision::flower_pot(state)
                             || native_world::collision::vault_state(state).is_some()
+                            || native_world::collision::barrel_state(state)
                             || native_world::collision::decorated_pot_waterlogged(state).is_some()
                             || native_world::collision::barrier_waterlogged(state).is_some()
                             || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
@@ -8077,6 +8078,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                     || (old.name == "minecraft:barrier"
                                         && native_world::collision::barrier_waterlogged(&old) == Some(false)
                                         && (native_world::collision::vault_state(state).is_some()
+                                            || native_world::collision::barrel_state(state)
                                             || native_world::collision::decorated_pot_waterlogged(state).is_some()))
                                     || ((jigsaw::jigsaw_carpet(state) || jigsaw::jigsaw_ladder(state))
                                         && (disk_safe_solid(&old.name).is_some()
@@ -12932,6 +12934,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_barrels_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_barrel",
+            "vine_active_self_empty_jigsaw_barrel",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_candles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_candle",
@@ -13390,6 +13401,8 @@ mod tests {
                         "potted_dead_bush"
                     } else if mode.ends_with("_decoratedpot") {
                         "decorated_pot"
+                    } else if mode.ends_with("_barrel") {
+                        "barrel"
                     } else if mode.ends_with("_grate") {
                         "waxed_copper_grate"
                     } else if mode.ends_with("_carpet") {
@@ -13405,6 +13418,11 @@ mod tests {
                     });
                     if mode.ends_with("_log") {
                         block.properties.insert("axis".into(), "y".into());
+                    } else if mode.ends_with("_barrel") {
+                        block.properties = BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("open".into(), "false".into()),
+                        ]);
                     } else if mode.ends_with("_slab") {
                         block.properties = BTreeMap::from([
                             ("type".into(), "bottom".into()),
@@ -20600,6 +20618,7 @@ mod tests {
                         | super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(_)
                         | super::super::GeneratedMonsterRoomEntity::Vault(_)
                         | super::super::GeneratedMonsterRoomEntity::DecoratedPot(_)
+                        | super::super::GeneratedMonsterRoomEntity::Barrel(_)
                         | super::super::GeneratedMonsterRoomEntity::Brushable(_) => {
                             panic!("monster rooms should resolve generated chests")
                         }

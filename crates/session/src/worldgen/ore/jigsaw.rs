@@ -26,7 +26,18 @@ pub(super) fn place_block_for_light_test(
     let mut random = DecorationRandom::new(42);
     let mut draft = JigsawRegion { region, registry };
     let fluid = if waterlog { draft.fluid_at(pos)? } else { None };
-    let nbt = if state.name == "minecraft:decorated_pot" {
+    let nbt = if state.name == "minecraft:barrel" {
+        Some(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:barrel".into())),
+            (
+                "Items".into(),
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::End,
+                    values: vec![],
+                },
+            ),
+        ]))
+    } else if state.name == "minecraft:decorated_pot" {
         let sherds = ["back", "front", "left", "right"]
             .into_iter()
             .map(|face| {
@@ -146,6 +157,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::full_tuff(state)
         || native_world::collision::copper_grate_waterlogged(state).is_some()
         || native_world::collision::vault_state(state).is_some()
+        || native_world::collision::barrel_state(state)
     {
         return Ok(true);
     }
@@ -299,7 +311,21 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         } else {
             None
         };
-        let chest_table = if vault.is_some() || pot.is_some() {
+        let mut barrel_random = None;
+        let barrel = if state.name == "minecraft:barrel" {
+            let mut next = random.clone();
+            let barrel = super::super::GeneratedBarrel::from_template(
+                pos,
+                state.clone(),
+                nbt.context("barrel template data is missing")?,
+                next.next_long(),
+            )?;
+            barrel_random = Some(next);
+            Some(barrel)
+        } else {
+            None
+        };
+        let chest_table = if vault.is_some() || pot.is_some() || barrel.is_some() {
             None
         } else if let Some(nbt) = nbt {
             let Tag::Compound(fields) = nbt else {
@@ -357,7 +383,12 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             self.registry
                 .is_canonical_state(&state.name, &state.properties)
                 && self.registry.has_block_entity(&state.name)
-                    == Some(chest_table.is_some() || vault.is_some() || pot.is_some())
+                    == Some(
+                        chest_table.is_some()
+                            || vault.is_some()
+                            || pot.is_some()
+                            || barrel.is_some()
+                    )
                 && jigsaw_static_full(state).is_ok(),
             "unsupported jigsaw block effects at {pos:?}: {state:?}"
         );
@@ -395,7 +426,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             };
             Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
-        } else if vault.is_some() || pot.is_some() {
+        } else if vault.is_some() || pot.is_some() || barrel.is_some() {
             self.region.jigsaw_block_write = true;
             let barrier = BlockState {
                 name: "minecraft:barrier".into(),
@@ -412,6 +443,9 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             Arc::make_mut(pending).remove(pos);
             let entity = if let Some(vault) = vault {
                 super::super::GeneratedMonsterRoomEntity::Vault(vault)
+            } else if let Some(barrel) = barrel {
+                *random = barrel_random.expect("barrel random state present");
+                super::super::GeneratedMonsterRoomEntity::Barrel(barrel)
             } else {
                 *random = pot_random.expect("pot random state present");
                 super::super::GeneratedMonsterRoomEntity::DecoratedPot(
@@ -547,6 +581,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                         | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
                         | super::super::GeneratedMonsterRoomEntity::Vault(_)
                         | super::super::GeneratedMonsterRoomEntity::DecoratedPot(_)
+                        | super::super::GeneratedMonsterRoomEntity::Barrel(_)
                 ))
             ),
             "jigsaw block entity marking is not yet supported"
@@ -996,6 +1031,78 @@ mod tests {
             } else {
                 assert!(ticks.is_none_or(|ticks| ticks.is_empty()));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_barrel_preserves_contents_and_random_order() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for table in [
+            None,
+            Some("minecraft:chests/trial_chambers/corridor"),
+            Some("minecraft:chests/trial_chambers/intersection_barrel"),
+        ] {
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let (id, properties) = registry.resolve(
+                &serde_json::json!({"id":"minecraft:barrel","properties":{"facing":"up"}}),
+            )?;
+            let state = BlockState {
+                name: id,
+                properties,
+            };
+            let mut fields = vec![("id".into(), Tag::String("minecraft:barrel".into()))];
+            if let Some(table) = table {
+                fields.push(("LootTable".into(), Tag::String(table.into())));
+            } else {
+                fields.push((
+                    "Items".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::End,
+                        values: vec![],
+                    },
+                ));
+            }
+            let nbt = Tag::Compound(fields);
+            let pos = [1, 8, 1];
+            let mut random = DecorationRandom::new(42);
+            let mut expected_random = random.clone();
+            let seed = expected_random.next_long();
+            {
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(pos, &state, Some(&nbt), &mut random)?);
+                assert!(!draft.is_liquid_container(&state)?);
+                draft.mark_block_entity_changed(pos)?;
+            }
+            region.finish()?;
+            assert_eq!(random.next_long(), expected_random.next_long());
+            assert_eq!(
+                terrain.snapshot().block(pos[0], pos[1], pos[2]),
+                Some(&state)
+            );
+            let Tag::List { values, .. } =
+                terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+            else {
+                bail!("missing barrel entity list")
+            };
+            assert_eq!(
+                values,
+                vec![
+                    super::super::super::GeneratedBarrel::from_template(pos, state, &nbt, seed)?
+                        .block_entity()
+                ]
+            );
         }
         Ok(())
     }

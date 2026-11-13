@@ -132,6 +132,7 @@ pub enum GeneratedMonsterRoomEntity {
     Brushable(GeneratedBrushable),
     Vault(GeneratedVault),
     DecoratedPot(GeneratedDecoratedPot),
+    Barrel(GeneratedBarrel),
     /// A protochunk DUMMY chest not yet materialized by getBlockEntity.
     PendingChest {
         position: [i32; 3],
@@ -1778,6 +1779,10 @@ impl CarvedTerrainWorld {
                         "generated decorated pot position mismatch"
                     );
                     (pot.state.clone(), pot.block_entity())
+                }
+                GeneratedMonsterRoomEntity::Barrel(barrel) => {
+                    ensure!(p == barrel.position, "generated barrel position mismatch");
+                    (barrel.state.clone(), barrel.block_entity())
                 }
                 GeneratedMonsterRoomEntity::EmptyChest(chest) => {
                     ensure!(

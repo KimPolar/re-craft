@@ -335,6 +335,22 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:barrel"));
     assert!(registry.contains("minecraft:hopper"));
     assert!(registry.contains("minecraft:trial_spawner"));
+    for button in native_core::button::Button::ALL {
+        assert!(
+            registry.contains(button.id()),
+            "missing button {}",
+            button.id()
+        );
+    }
+    for id in ["minecraft:oak_button", "minecraft:stone_button"] {
+        for face in ["floor", "wall", "ceiling", "invalid"] {
+            for facing in ["north", "south", "east", "west", "up", "invalid"] {
+                for powered in ["false", "true", "invalid"] {
+                    cases.push(serde_json::json!({"id":id,"properties":{"face":face,"facing":facing,"powered":powered}}));
+                }
+            }
+        }
+    }
     for color in [
         "white",
         "orange",

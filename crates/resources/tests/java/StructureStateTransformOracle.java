@@ -43,6 +43,8 @@ public class StructureStateTransformOracle {
         states.addAll(Blocks.DARK_OAK_TRAPDOOR.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.BARREL.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.HOPPER.getStateDefinition().getPossibleStates());
+        states.addAll(Blocks.OAK_BUTTON.getStateDefinition().getPossibleStates());
+        states.addAll(Blocks.STONE_BUTTON.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.TRIAL_SPAWNER.getStateDefinition().getPossibleStates());
         for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL,
                 Blocks.COBBLESTONE_WALL, Blocks.MOSSY_COBBLESTONE_WALL,

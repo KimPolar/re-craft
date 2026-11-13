@@ -35,6 +35,7 @@ enum StateSchema {
     DecoratedPot,
     Barrel,
     Hopper,
+    Button,
     TrialSpawner,
     PotentSulfur,
     SulfurSpike,
@@ -114,6 +115,13 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("facing".into(), "down".into()),
                     ("enabled".into(), "true".into()),
+                ]);
+            }
+            Self::Button => {
+                return BTreeMap::from([
+                    ("face".into(), "wall".into()),
+                    ("facing".into(), "north".into()),
+                    ("powered".into(), "false".into()),
                 ]);
             }
             Self::TrialSpawner => {
@@ -382,6 +390,14 @@ impl StateSchema {
                 if (name == "facing"
                     && matches!(value, "north" | "south" | "east" | "west" | "down"))
                     || (name == "enabled" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Button
+                if (name == "face" && matches!(value, "floor" | "wall" | "ceiling"))
+                    || (name == "facing"
+                        && matches!(value, "north" | "south" | "east" | "west"))
+                    || (name == "powered" && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -1052,6 +1068,7 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/BarrelBlock" => Some(StateSchema::Barrel),
                 "net/minecraft/world/level/block/HopperBlock" => Some(StateSchema::Hopper),
+                "net/minecraft/world/level/block/ButtonBlock" => Some(StateSchema::Button),
                 "net/minecraft/world/level/block/TrialSpawnerBlock" => {
                     Some(StateSchema::TrialSpawner)
                 }
@@ -1329,6 +1346,7 @@ impl GeneratedBlockRegistry {
                     | StateSchema::DecoratedPot
                     | StateSchema::Barrel
                     | StateSchema::Hopper
+                    | StateSchema::Button
                     | StateSchema::Ladder
                     | StateSchema::Stairs
                     | StateSchema::Chest
@@ -1704,6 +1722,24 @@ mod tests {
                 &BTreeMap::from([(property.into(), (max + 1).to_string())]),
             ));
         }
+    }
+
+    #[test]
+    fn button_properties_reject_incomplete_or_invalid_states() {
+        let id = "minecraft:oak_button";
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([(id.into(), StateSchema::Button)]),
+            block_entities: BTreeMap::new(),
+        };
+        let mut state = StateSchema::Button.default_properties();
+        assert!(registry.is_canonical_state(id, &state));
+        state.insert("face".into(), "floor".into());
+        state.insert("powered".into(), "true".into());
+        assert!(registry.is_canonical_state(id, &state));
+        state.insert("facing".into(), "up".into());
+        assert!(!registry.is_canonical_state(id, &state));
+        state.remove("facing");
+        assert!(!registry.is_canonical_state(id, &state));
     }
 
     #[test]

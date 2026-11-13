@@ -4957,10 +4957,6 @@ impl PreparedExistingGenerator {
         evaluator: &mut native_resources::density::DensityEvaluator,
     ) -> Result<native_resources::noise_stage::NoiseStageChunk> {
         use native_session::worldgen::schedule::GenerationStage;
-        ensure!(
-            self.generate_structures,
-            "generator has no structure context"
-        );
         let saved = self
             .context
             .inputs()
@@ -5337,7 +5333,9 @@ impl PreparedExistingGenerator {
                 .chunk([target.x, target.z])
                 .context("target biome is missing")?,
         );
-        let structure = if self.generate_structures {
+        // Existing references remain effective even if new structure starts
+        // have since been disabled in the world's settings.
+        let structure = if saved_stage >= GenerationStage::StructureReferences {
             Some(Arc::new(
                 self.restore_saved_beardifier(target, structure_order)?,
             ))
@@ -5374,32 +5372,24 @@ impl PreparedExistingGenerator {
                     .is_some(),
             })
         };
-        if let Some(structure) = structure {
-            self.generator
-                .generate_carved_surface_with_structure_context(
-                    &mut self.resources,
-                    evaluator,
-                    &mut assets.carvers,
-                    [target.x, target.z],
-                    neighborhood,
-                    &assets.tags,
-                    structure,
-                    classify,
-                )
-        } else {
-            let previous = evaluator.replace_structure_terrain_context(None);
-            let result = self.generator.generate_carved_surface(
+        let structure = structure.unwrap_or_else(|| {
+            Arc::new(native_core::beardifier::Beardifier::new(
+                vec![],
+                vec![],
+                None,
+            ))
+        });
+        self.generator
+            .generate_carved_surface_with_structure_context(
                 &mut self.resources,
                 evaluator,
                 &mut assets.carvers,
                 [target.x, target.z],
                 neighborhood,
                 &assets.tags,
+                structure,
                 classify,
-            );
-            evaluator.replace_structure_terrain_context(previous);
-            result
-        }
+            )
     }
 
     /// Restore every terrain chunk present in the capture. Missing chunks stay
@@ -6222,23 +6212,15 @@ pub(crate) fn prepare_existing_generator(
     let (lighting, definition, dimension_definition) =
         GeneratedDimensionLighting::from_stem(&mut resources, id, &stem)?;
     let seed = inputs.settings().seed();
-    let generator = if generate_structures {
-        TerrainGenerator::with_structure_context(
-            &mut resources,
-            &definition,
-            seed,
-            lighting.min_y,
-            lighting.height,
-        )?
-    } else {
-        TerrainGenerator::without_terrain_adjustments(
-            &mut resources,
-            &definition,
-            seed,
-            lighting.min_y,
-            lighting.height,
-        )?
-    };
+    // Saved starts can affect terrain even when the world no longer creates
+    // new structures, so every existing-world generator must accept them.
+    let generator = TerrainGenerator::with_structure_context(
+        &mut resources,
+        &definition,
+        seed,
+        lighting.min_y,
+        lighting.height,
+    )?;
     packs.verify()?;
     Ok(PreparedExistingGenerator {
         generator,
@@ -9210,6 +9192,7 @@ mod tests {
             file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
             // BIOMES-stage entries cover two neighboring terrain results and
             // their captured biome neighborhoods.
+            let mut referenced_biome = None;
             for z in 0..=6 {
                 for x in 0..=6 {
                     if z == 0 && matches!(x, 0 | 1 | 3) {
@@ -9295,6 +9278,29 @@ mod tests {
                         ));
                     }
                     let bytes = native_persistence::nbt::write(&biome_chunk)?;
+                    if x == 4 && z == 4 {
+                        let mut referenced = biome_chunk.clone();
+                        let Tag::Compound(fields) = &mut referenced.value else {
+                            unreachable!()
+                        };
+                        let Tag::Compound(structures) = &mut fields
+                            .iter_mut()
+                            .find(|(key, _)| key.matches("structures"))
+                            .unwrap()
+                            .1
+                        else {
+                            unreachable!()
+                        };
+                        structures
+                            .iter_mut()
+                            .find(|(key, _)| key.matches("References"))
+                            .unwrap()
+                            .1 = Tag::Compound(vec![(
+                            "minecraft:buried_treasure".into(),
+                            Tag::LongArray(vec![0]),
+                        )]);
+                        referenced_biome = Some(native_persistence::nbt::write(&referenced)?);
+                    }
                     let offset = file.seek(SeekFrom::End(0))?;
                     let sectors = (bytes.len() + 5).div_ceil(4096);
                     ensure!(
@@ -9404,6 +9410,100 @@ mod tests {
             assert_eq!(result.chunk_position(), [3, 0]);
             assert_eq!(result.materials(), expected.materials());
             assert_eq!(result.fluid_updates(), expected.fluid_updates());
+            // Disabling new starts must not discard references already saved
+            // in a BIOMES-stage chunk.
+            actual.generate_structures = false;
+            let mut disabled_evaluator = native_resources::density::DensityEvaluator::default();
+            assert!(
+                actual
+                    .generate_saved_structure_noise(clean_target, &[], &mut disabled_evaluator)
+                    .is_err()
+            );
+            let disabled_noise = actual.generate_saved_structure_noise(
+                clean_target,
+                std::slice::from_ref(&treasure),
+                &mut disabled_evaluator,
+            )?;
+            assert_eq!(disabled_noise.materials(), result.materials());
+            assert_eq!(disabled_noise.fluid_updates(), result.fluid_updates());
+            actual.generate_structures = true;
+            if name == "overworld" {
+                // Prepare a second world from actual disabled settings, rather
+                // than merely toggling the flag on an existing generator.
+                let disabled_world = tempfile::tempdir()?;
+                let disabled_root = disabled_world.path();
+                std::fs::create_dir_all(disabled_root.join("data/minecraft"))?;
+                let disabled_settings = draft_baked_worldgen_settings(
+                    &mut source,
+                    "minecraft:normal",
+                    NewWorldOptions {
+                        seed: -42,
+                        generate_structures: false,
+                        bonus_chest: false,
+                    },
+                )?;
+                std::fs::write(
+                    disabled_root.join("data/minecraft/world_gen_settings.dat"),
+                    native_persistence::nbt::write(&disabled_settings)?,
+                )?;
+                std::fs::copy(root.join("level.dat"), disabled_root.join("level.dat"))?;
+                let disabled_region = disabled_root.join("dimensions/minecraft/overworld/region");
+                std::fs::create_dir_all(&disabled_region)?;
+                std::fs::copy(
+                    region_dir.join("r.0.0.mca"),
+                    disabled_region.join("r.0.0.mca"),
+                )?;
+                let bytes = referenced_biome
+                    .as_ref()
+                    .context("referenced biome missing")?;
+                let mut region = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(disabled_region.join("r.0.0.mca"))?;
+                let offset = region.seek(SeekFrom::End(0))?;
+                let sectors = (bytes.len() + 5).div_ceil(4096);
+                ensure!(
+                    sectors < 256 && offset % 4096 == 0 && offset / 4096 < (1 << 24),
+                    "invalid test region offset"
+                );
+                region.write_all(&(u32::try_from(bytes.len() + 1)?).to_be_bytes())?;
+                region.write_all(&[3])?;
+                region.write_all(bytes)?;
+                region.write_all(&vec![0; sectors * 4096 - bytes.len() - 5])?;
+                region.seek(SeekFrom::Start(((4 + 4 * 32) * 4) as u64))?;
+                region
+                    .write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
+                region.flush()?;
+                drop(region);
+                let mut disabled_reader =
+                    WorldReader::open_for_session(disabled_root, DimensionId::parse(name)?)?;
+                let mut disabled_generator = prepare_existing_generator_for_schedule(
+                    &mut disabled_reader,
+                    &schedule,
+                    &game,
+                )?;
+                assert!(!disabled_generator.generate_structures);
+                let mut evaluator = native_resources::density::DensityEvaluator::default();
+                let referenced_target = ChunkPos { x: 4, z: 4 };
+                assert!(
+                    disabled_generator
+                        .generate_saved_terrain(referenced_target, &[], &mut evaluator)
+                        .is_err()
+                );
+                let restored = disabled_generator.generate_saved_terrain(
+                    referenced_target,
+                    std::slice::from_ref(&treasure),
+                    &mut evaluator,
+                )?;
+                disabled_generator.generate_structures = true;
+                let enabled_terrain = disabled_generator.generate_saved_terrain(
+                    referenced_target,
+                    std::slice::from_ref(&treasure),
+                    &mut native_resources::density::DensityEvaluator::default(),
+                )?;
+                assert_eq!(restored.states, enabled_terrain.states);
+                assert_eq!(restored.fluid_updates, enabled_terrain.fluid_updates);
+            }
             let target = ChunkPos { x: 3, z: 3 };
             let decoration = actual.prepare_saved_decoration(target)?;
             let plan = decoration.plan(&actual)?;

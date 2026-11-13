@@ -425,6 +425,209 @@ impl Drop for MissingGenerationPrepareWorker {
     }
 }
 
+/// Biomes and their generator remain isolated until live and disk inputs are
+/// independently revalidated and the remaining generation stages complete.
+pub(crate) struct BiomedMissingGeneration {
+    work: crate::fresh_generation::existing::CapturedBiomeSchedule,
+    generator: crate::fresh_generation::existing::PreparedExistingGenerator,
+    terrain: crate::fresh_generation::existing::RestoredSavedTerrain,
+    evaluator: native_resources::density::DensityEvaluator,
+    observed: MissingGenerationTargets,
+}
+
+impl BiomedMissingGeneration {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.observed.is_current(streamer, session)
+    }
+
+    pub fn targets(&self) -> &[ChunkPos] {
+        self.observed.targets()
+    }
+
+    pub fn into_checked_parts(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<(
+        crate::fresh_generation::existing::CapturedBiomeSchedule,
+        crate::fresh_generation::existing::PreparedExistingGenerator,
+        crate::fresh_generation::existing::RestoredSavedTerrain,
+        native_resources::density::DensityEvaluator,
+        MissingGenerationTargets,
+    )> {
+        if !self.is_current(streamer, session) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("biome generation is stale");
+        }
+        Ok((
+            self.work,
+            self.generator,
+            self.terrain,
+            self.evaluator,
+            self.observed,
+        ))
+    }
+}
+
+pub(crate) struct MissingGenerationBiomeStartError {
+    pub prepared: PreparedMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationBiomeWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<BiomedMissingGeneration>>,
+    finished: bool,
+}
+
+impl MissingGenerationBiomeWorker {
+    /// Retain the prepared capture if the worker cannot be started.
+    pub fn start(
+        prepared: PreparedMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> std::result::Result<Self, MissingGenerationBiomeStartError> {
+        if !prepared.is_current(streamer, session) {
+            return Err(MissingGenerationBiomeStartError {
+                prepared,
+                error: anyhow::anyhow!("prepared missing generation is stale"),
+            });
+        }
+        let observed = prepared.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            prepared,
+            move |prepared| {
+                let result = (|| -> Result<BiomedMissingGeneration> {
+                    use native_session::worldgen::schedule::GenerationStage;
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "biome generation cancelled"
+                    );
+                    anyhow::ensure!(
+                        prepared.observed.stamp.is_current(),
+                        "prepared missing generation is stale"
+                    );
+                    let PreparedMissingGeneration {
+                        schedule,
+                        mut generator,
+                        terrain,
+                        observed,
+                    } = prepared;
+                    let mut work =
+                        generator.begin_captured_generation_schedule_checked(schedule, || {
+                            anyhow::ensure!(
+                                !worker_cancelled.load(Ordering::Acquire),
+                                "biome generation cancelled"
+                            );
+                            anyhow::ensure!(
+                                observed.stamp.is_current(),
+                                "prepared missing generation is stale"
+                            );
+                            Ok(())
+                        })?;
+                    let positions: Vec<_> = work
+                        .schedule()
+                        .requirements()
+                        .filter_map(|(pos, required)| {
+                            (required >= GenerationStage::Biomes
+                                && work
+                                    .schedule()
+                                    .completed(pos)
+                                    .is_some_and(|stage| stage < GenerationStage::Biomes))
+                            .then_some(pos)
+                        })
+                        .collect();
+                    let mut evaluator = native_resources::density::DensityEvaluator::default();
+                    for position in positions {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "biome generation cancelled"
+                        );
+                        anyhow::ensure!(
+                            observed.stamp.is_current(),
+                            "prepared missing generation is stale"
+                        );
+                        generator.run_captured_biomes(&mut work, &mut evaluator, position)?;
+                    }
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "biome generation cancelled"
+                    );
+                    anyhow::ensure!(
+                        observed.stamp.is_current(),
+                        "prepared missing generation is stale"
+                    );
+                    Ok(BiomedMissingGeneration {
+                        work,
+                        generator,
+                        terrain,
+                        evaluator,
+                        observed,
+                    })
+                })();
+                let _ = sender.send(result);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-biomes".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(prepared, error)| MissingGenerationBiomeStartError {
+            prepared,
+            error: anyhow::Error::new(error).context("cannot start biome generation"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<BiomedMissingGeneration>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("biome generation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(work) = result {
+                crate::generation_staging::discard_async(work);
+            }
+            anyhow::bail!("biome generation was cancelled or became stale");
+        }
+        Ok(Some(result?))
+    }
+}
+
+impl Drop for MissingGenerationBiomeWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 impl MissingGenerationTargets {
     pub fn targets(&self) -> &[ChunkPos] {
         &self.targets
@@ -1601,6 +1804,92 @@ mod tests {
             }
         };
         let captured = capture_again()?;
+        let mut prepare_biomes =
+            MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared_biomes = loop {
+            if let Some(result) = prepare_biomes.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "biome preparation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut biome_worker =
+            MissingGenerationBiomeWorker::start(prepared_biomes, &streamer, &session)
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let biomed = loop {
+            if let Some(result) = biome_worker.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "biome generation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(biomed.targets(), &[target]);
+        assert_eq!(
+            biomed.work.schedule().completed(target),
+            Some(GenerationStage::Biomes)
+        );
+        assert!(
+            biomed
+                .work
+                .schedule()
+                .ready(target, GenerationStage::Terrain)
+        );
+        assert!(biomed.work.biomes().chunk([target.x, target.z]).is_some());
+        let biome_live = biomed
+            .generator
+            .capture_live_inputs(&session, &biomed.terrain)?;
+        biomed.generator.verify_live_inputs(&session, &biome_live)?;
+        let (work, generator, terrain, evaluator, observed) =
+            biomed.into_checked_parts(&streamer, &session)?;
+        let biomed = BiomedMissingGeneration {
+            work,
+            generator,
+            terrain,
+            evaluator,
+            observed,
+        };
+        let captured = capture_again()?;
+        let mut prepare_cancelled_biomes =
+            MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared_cancelled_biomes = loop {
+            if let Some(result) = prepare_cancelled_biomes.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "cancelled biome preparation timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut cancelled_biomes =
+            MissingGenerationBiomeWorker::start(prepared_cancelled_biomes, &streamer, &session)
+                .map_err(|failure| failure.error)?;
+        cancelled_biomes.cancel();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match cancelled_biomes.try_result(&streamer, &session) {
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("cancelled biome generation was accepted"),
+                Err(error) => {
+                    anyhow::ensure!(
+                        error.to_string().contains("cancelled"),
+                        "unexpected cancellation error: {error:#}"
+                    );
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "cancelled biome generation timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let captured = capture_again()?;
         let mut cancelled =
             MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
                 .map_err(|failure| failure.error)?;
@@ -1624,6 +1913,13 @@ mod tests {
         let stale_capture = capture_again()?;
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!prepared.is_current(&streamer, &session));
+        assert!(!biomed.is_current(&streamer, &session));
+        assert!(
+            biomed
+                .generator
+                .verify_live_inputs(&session, &biome_live)
+                .is_err()
+        );
         assert!(
             prepared
                 .generator
@@ -1638,7 +1934,22 @@ mod tests {
         assert!(failure.error.to_string().contains("stale"));
         assert!(!failure.captured.is_current(&streamer, &session));
         drop(failure);
-        assert!(prepared.into_checked_parts(&streamer, &session).is_err());
+        let failure = match MissingGenerationBiomeWorker::start(prepared, &streamer, &session) {
+            Ok(_) => anyhow::bail!("stale biome generation was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("stale"));
+        assert!(
+            failure
+                .prepared
+                .into_checked_parts(&streamer, &session)
+                .is_err()
+        );
+        assert!(biomed.into_checked_parts(&streamer, &session).is_err());
+        drop(cancelled_biomes);
+        drop(prepare_cancelled_biomes);
+        drop(biome_worker);
+        drop(prepare_biomes);
         drop(cancelled);
         drop(prepare);
         drop(capture);

@@ -24,6 +24,7 @@ pub(crate) struct PreparedExistingGenerator {
     feature_entity_evidence: Option<BTreeMap<native_resources::feature_order::FeatureKey, bool>>,
     structure_schedule:
         Option<Arc<native_resources::structure_decoration::StructureDecorationSchedule>>,
+    structure_registry: Option<Arc<BTreeSet<ResourceId>>>,
     captured_structure_starts: BTreeMap<
         native_world::loaded::ChunkPos,
         Arc<
@@ -1309,6 +1310,21 @@ impl RestoredSavedTerrain {
 }
 
 impl PreparedExistingGenerator {
+    fn structure_registry(&mut self) -> Result<Arc<BTreeSet<ResourceId>>> {
+        if self.structure_registry.is_none() {
+            let ids = self
+                .resources
+                .list_data("worldgen/structure")?
+                .into_iter()
+                .collect();
+            self.structure_registry = Some(Arc::new(ids));
+        }
+        Ok(Arc::clone(
+            self.structure_registry
+                .as_ref()
+                .expect("structure registry initialized"),
+        ))
+    }
     /// Start a fresh engine for a frozen mixed batch. The caller must still
     /// establish that no saved or live engine state contributes to the area.
     pub fn begin_captured_initial_light(
@@ -4517,6 +4533,158 @@ impl PreparedExistingGenerator {
         })
     }
 
+    /// Restore the stages needed before biome generation from captured chunk
+    /// data. Newly generated starts are not yet implemented; the caller must
+    /// still verify live state and complete all later stages before publishing.
+    pub fn begin_captured_generation_schedule(
+        &mut self,
+        schedule: GenerationSchedule,
+    ) -> Result<CapturedBiomeSchedule> {
+        self.begin_captured_generation_schedule_checked(schedule, || Ok(()))
+    }
+
+    /// Check cancellation or changing input stamps between bounded steps.
+    pub fn begin_captured_generation_schedule_checked(
+        &mut self,
+        mut schedule: GenerationSchedule,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<CapturedBiomeSchedule> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(schedule.requested_chunks() > 0, "no generation requests");
+        let requirements: Vec<_> = schedule.requirements().collect();
+        let mut saved_stages = BTreeMap::new();
+        for &(position, required) in &requirements {
+            check()?;
+            ensure!(
+                schedule.completed(position) == Some(GenerationStage::Empty),
+                "generation schedule is not fresh"
+            );
+            let key = native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let source = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&key)
+                .context("generation schedule includes an uncaptured chunk")?;
+            if let Some(saved) = &source.terrain {
+                ensure!(
+                    saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
+                    "unsupported saved generation data version"
+                );
+                reject_saved_blending(&saved.document)?;
+                let status = saved
+                    .status
+                    .as_ref()
+                    .context("saved chunk status is missing")?;
+                let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+                let stage =
+                    GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+                saved_stages.insert(position, stage);
+                if required >= GenerationStage::StructureStarts {
+                    let restored = self.restore_captured_structure_starts(
+                        key,
+                        stage < GenerationStage::StructureStarts,
+                    )?;
+                    self.captured_structure_starts
+                        .insert(position, Arc::new(restored));
+                }
+                if required >= GenerationStage::StructureReferences
+                    && stage >= GenerationStage::StructureReferences
+                {
+                    let references = self.restore_saved_structure_references(key)?;
+                    validate_saved_decoration_references(&references)?;
+                }
+            } else if required >= GenerationStage::StructureStarts {
+                ensure!(
+                    !self.generate_structures,
+                    "generated structure starts are not captured"
+                );
+            }
+        }
+        let saved_biomes: Vec<_> = requirements
+            .iter()
+            .filter_map(|(position, required)| {
+                (required >= &GenerationStage::Biomes
+                    && saved_stages
+                        .get(position)
+                        .is_some_and(|stage| *stage >= GenerationStage::Biomes))
+                .then_some(native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                })
+            })
+            .collect();
+        let restored_biomes = if saved_biomes.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.restore_saved_biomes(saved_biomes)?
+        };
+        check()?;
+        let imported = requirements
+            .iter()
+            .filter_map(|(position, required)| {
+                let saved = *saved_stages.get(position)?;
+                let stage = saved.min(*required).min(GenerationStage::Biomes);
+                (stage > GenerationStage::Empty).then_some((*position, stage))
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(imported)?;
+        for &(position, required) in &requirements {
+            check()?;
+            if required >= GenerationStage::StructureStarts
+                && schedule.completed(position) == Some(GenerationStage::Empty)
+            {
+                ensure!(
+                    !self.generate_structures,
+                    "generated structure starts are not captured"
+                );
+                schedule.complete(position, GenerationStage::StructureStarts)?;
+            }
+        }
+        let mut generated_references = BTreeMap::new();
+        for &(position, required) in &requirements {
+            check()?;
+            if required >= GenerationStage::StructureReferences
+                && schedule.completed(position) == Some(GenerationStage::StructureStarts)
+            {
+                ensure!(
+                    schedule.ready(position, GenerationStage::StructureReferences),
+                    "structure reference dependencies are incomplete"
+                );
+                let references = self.collect_captured_references(&schedule, position)?;
+                let key = native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                };
+                if let Some(saved) = self.context.inputs().sources().chunks()[&key]
+                    .terrain
+                    .as_ref()
+                {
+                    let mut source = (*saved.document).clone();
+                    merge_generated_structure_references(&mut source, &references)?;
+                }
+                schedule.complete(position, GenerationStage::StructureReferences)?;
+                generated_references.insert(position, references);
+            }
+        }
+        let mut biomes = self.generator.biome_neighborhood()?;
+        for biome in restored_biomes.into_values() {
+            biomes.insert(biome)?;
+        }
+        Ok(CapturedBiomeSchedule {
+            identity: Arc::clone(&self.identity),
+            schedule,
+            biomes,
+            terrain: BTreeMap::new(),
+            new_terrain: BTreeMap::new(),
+            generated_references,
+        })
+    }
+
     /// Generate biomes for a captured absent chunk or a saved protochunk that
     /// has not reached BIOMES. Saved source NBT remains unchanged; the result
     /// is an intermediate input and does not authorize a world write. Discard
@@ -4618,18 +4786,31 @@ impl PreparedExistingGenerator {
         let source_document = Arc::clone(&saved.document);
         let (early_structure, generated_references) =
             if saved_stage < GenerationStage::StructureReferences {
-                let (structure, references) =
-                    self.captured_beardifier(&work.schedule, position, structure_order)?;
-                let mut validation = (*source_document).clone();
-                merge_generated_structure_references(&mut validation, &references)?;
-                (Some(Arc::new(structure)), Some(references))
+                if let Some(references) = work.generated_references.get(&position) {
+                    let mut validation = (*source_document).clone();
+                    merge_generated_structure_references(&mut validation, references)?;
+                    (
+                        Some(Arc::new(self.beardifier_from_captured_references(
+                            position,
+                            references,
+                            structure_order,
+                        )?)),
+                        None,
+                    )
+                } else {
+                    let (structure, references) =
+                        self.captured_beardifier(&work.schedule, position, structure_order)?;
+                    let mut validation = (*source_document).clone();
+                    merge_generated_structure_references(&mut validation, &references)?;
+                    (Some(Arc::new(structure)), Some(references))
+                }
             } else {
+                ensure!(
+                    !work.generated_references.contains_key(&position),
+                    "unexpected generated structure references"
+                );
                 (None, None)
             };
-        ensure!(
-            !work.generated_references.contains_key(&position),
-            "structure references already exist"
-        );
         let (terrain, biome) = self.generate_saved_terrain_from_biomes(
             target,
             structure_order,
@@ -4721,12 +4902,18 @@ impl PreparedExistingGenerator {
                 .chunk([position.x, position.z])
                 .context("terrain biome is missing")?,
         );
-        ensure!(
-            !work.generated_references.contains_key(&position),
-            "structure references already exist"
-        );
-        let (structure, references) =
-            self.captured_beardifier(&work.schedule, position, structure_order)?;
+        let (structure, generated_references) = if let Some(references) =
+            work.generated_references.get(&position)
+        {
+            (
+                self.beardifier_from_captured_references(position, references, structure_order)?,
+                None,
+            )
+        } else {
+            let (structure, references) =
+                self.captured_beardifier(&work.schedule, position, structure_order)?;
+            (structure, Some(references))
+        };
         let terrain = self.generate_terrain_from_biomes(
             target,
             evaluator,
@@ -4751,7 +4938,9 @@ impl PreparedExistingGenerator {
             work.new_terrain.remove(&target);
             return Err(error);
         }
-        work.generated_references.insert(position, references);
+        if let Some(references) = generated_references {
+            work.generated_references.insert(position, references);
+        }
         Ok(())
     }
 
@@ -4855,11 +5044,7 @@ impl PreparedExistingGenerator {
         use native_session::worldgen::{
             schedule::GenerationStage, structure_references::restore_saved_structure_references,
         };
-        let registry: BTreeSet<_> = self
-            .resources
-            .list_data("worldgen/structure")?
-            .into_iter()
-            .collect();
+        let registry = self.structure_registry()?;
         let saved = self
             .context
             .inputs()
@@ -4932,11 +5117,7 @@ impl PreparedExistingGenerator {
             saved_structure_starts::restore_saved_structure_starts_with_templates,
             schedule::GenerationStage,
         };
-        let registry: BTreeSet<_> = self
-            .resources
-            .list_data("worldgen/structure")?
-            .into_iter()
-            .collect();
+        let registry = self.structure_registry()?;
         let saved = self
             .context
             .inputs()
@@ -5029,8 +5210,18 @@ impl PreparedExistingGenerator {
         native_core::beardifier::Beardifier,
         CapturedGeneratedReferences,
     )> {
+        let references = self.collect_captured_references(schedule, target)?;
+        let beardifier =
+            self.beardifier_from_captured_references(target, &references, structure_order)?;
+        Ok((beardifier, references))
+    }
+
+    fn collect_captured_references(
+        &mut self,
+        schedule: &GenerationSchedule,
+        target: native_world::loaded::ChunkPos,
+    ) -> Result<CapturedGeneratedReferences> {
         use native_session::worldgen::{
-            saved_structure_starts::{RestoredStructureStart, beardifier_for_ordered_references},
             schedule::GenerationStage,
             structure_references::{
                 collect_ordered_structure_references,
@@ -5107,11 +5298,7 @@ impl PreparedExistingGenerator {
             .transpose()?
             .flatten();
         let saved = if original.is_some() {
-            let registry: BTreeSet<_> = self
-                .resources
-                .list_data("worldgen/structure")?
-                .into_iter()
-                .collect();
+            let registry = self.structure_registry()?;
             Some(restore_saved_structure_references(
                 target,
                 original.as_ref(),
@@ -5133,12 +5320,28 @@ impl PreparedExistingGenerator {
             Some(saved) => collect_ordered_structure_references_with_saved(target, saved, lookup)?,
             None => collect_ordered_structure_references(target, lookup)?,
         };
-        let beardifier = beardifier_for_ordered_references(
+        Ok(CapturedGeneratedReferences {
+            original,
+            references,
+        })
+    }
+
+    fn beardifier_from_captured_references(
+        &self,
+        target: native_world::loaded::ChunkPos,
+        references: &CapturedGeneratedReferences,
+        structure_order: &[ResourceId],
+    ) -> Result<native_core::beardifier::Beardifier> {
+        use native_session::worldgen::saved_structure_starts::{
+            RestoredStructureStart, beardifier_for_ordered_references,
+        };
+        beardifier_for_ordered_references(
             target,
-            &references,
+            &references.references,
             structure_order,
             |id, position| {
-                let start = starts
+                let start = self
+                    .captured_structure_starts
                     .get(&position)
                     .and_then(|entries| entries.get(id))
                     .context("referenced structure start is missing")?;
@@ -5150,14 +5353,7 @@ impl PreparedExistingGenerator {
                 }
                 start.terrain_pieces()
             },
-        )?;
-        Ok((
-            beardifier,
-            CapturedGeneratedReferences {
-                original,
-                references,
-            },
-        ))
+        )
     }
 
     /// Prepare terrain adaptation from captured starts and references. The
@@ -6554,6 +6750,7 @@ pub(crate) fn prepare_existing_generator(
         feature_schedule: None,
         feature_entity_evidence: None,
         structure_schedule: None,
+        structure_registry: None,
         captured_structure_starts: BTreeMap::new(),
         creature_environment: None,
         mob_placement_assets: None,
@@ -7381,6 +7578,93 @@ mod tests {
         schedule.request(structure_target, GenerationStage::Spawn)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
+        let first_registry = actual.structure_registry()?;
+        assert!(Arc::ptr_eq(&first_registry, &actual.structure_registry()?));
+        // The production initializer must restore actual saved stage data and
+        // run missing structure stages, rather than trust saved status alone.
+        let make_plan = || -> Result<GenerationSchedule> {
+            let mut plan = GenerationSchedule::new();
+            plan.request(target, GenerationStage::Terrain)?;
+            plan.request(structure_target, GenerationStage::Terrain)?;
+            Ok(plan)
+        };
+        let mut checks = 0;
+        let interrupted = actual.begin_captured_generation_schedule_checked(make_plan()?, || {
+            checks += 1;
+            ensure!(checks < 3, "test cancellation");
+            Ok(())
+        });
+        assert!(interrupted.is_err());
+        assert_eq!(checks, 3);
+        actual.generate_structures = true;
+        assert!(
+            actual
+                .begin_captured_generation_schedule(make_plan()?)
+                .is_err()
+        );
+        actual.generate_structures = false;
+        let mut automatic = actual.begin_captured_generation_schedule(make_plan()?)?;
+        assert_eq!(
+            automatic.schedule.completed(second),
+            Some(GenerationStage::Biomes)
+        );
+        assert!(automatic.biomes.chunk([second.x, second.z]).is_some());
+        assert_eq!(
+            automatic.schedule.completed(structure_target),
+            Some(GenerationStage::StructureReferences)
+        );
+        let treasure = ResourceId::parse("minecraft:buried_treasure")?;
+        assert_eq!(
+            automatic.generated_references[&structure_target]
+                .references
+                .membership()[&treasure],
+            BTreeSet::from([2i64 << 32]),
+        );
+        let needed_biomes: Vec<_> = automatic
+            .schedule
+            .requirements()
+            .filter_map(|(position, required)| {
+                (required >= GenerationStage::Biomes
+                    && automatic
+                        .schedule
+                        .completed(position)
+                        .is_some_and(|stage| stage < GenerationStage::Biomes))
+                .then_some(position)
+            })
+            .collect();
+        let mut automatic_evaluator = native_resources::density::DensityEvaluator::default();
+        for position in needed_biomes {
+            actual.run_captured_biomes(&mut automatic, &mut automatic_evaluator, position)?;
+        }
+        assert!(
+            automatic
+                .schedule
+                .ready(structure_target, GenerationStage::Terrain)
+        );
+        assert!(
+            actual
+                .run_captured_new_terrain(
+                    &mut automatic,
+                    &mut automatic_evaluator,
+                    structure_target
+                )
+                .is_err()
+        );
+        actual.run_captured_new_terrain_with_structure_order(
+            &mut automatic,
+            &mut automatic_evaluator,
+            structure_target,
+            std::slice::from_ref(&treasure),
+        )?;
+        assert_eq!(
+            automatic.schedule.completed(structure_target),
+            Some(GenerationStage::Terrain)
+        );
+        assert!(
+            automatic
+                .generated_references
+                .contains_key(&structure_target)
+        );
         // The saved BIOMES protochunk participates in the live-state guard
         // even though it has not yet reached TERRAIN. It must not be silently
         // promoted or treated as an absent chunk.
@@ -7909,6 +8193,30 @@ mod tests {
                     )?;
                 } else {
                     actual.run_captured_new_terrain(&mut work, &mut evaluator, position)?;
+                }
+            }
+        }
+        let automatic_chunk = automatic
+            .new_terrain_chunk(native_persistence::world::ChunkPos {
+                x: structure_target.x,
+                z: structure_target.z,
+            })
+            .context("automatic terrain is missing")?;
+        let manually_scheduled = work
+            .new_terrain_chunk(native_persistence::world::ChunkPos {
+                x: structure_target.x,
+                z: structure_target.z,
+            })
+            .context("manually scheduled terrain is missing")?;
+        for z in [0, 15] {
+            for x in [0, 15] {
+                for y in lighting.min_y..lighting.min_y + lighting.height {
+                    let block_x = structure_target.x * 16 + x;
+                    let block_z = structure_target.z * 16 + z;
+                    assert_eq!(
+                        automatic_chunk.world().block(block_x, y, block_z),
+                        manually_scheduled.world().block(block_x, y, block_z)
+                    );
                 }
             }
         }

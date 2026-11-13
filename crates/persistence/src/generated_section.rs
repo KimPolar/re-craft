@@ -161,6 +161,102 @@ pub fn encode_generated_sections(
     })
 }
 
+/// Merge generated blocks and biomes into sections saved before BIOMES.
+/// Unknown section fields remain intact. Existing biome palettes are kept and
+/// must match; unknown fields inside block storage cause rejection because the
+/// generated blocks replace that storage. This is not a writable chunk.
+pub fn merge_prebiome_stage_sections(source: Option<&Tag>, generated: &Tag) -> Result<Tag> {
+    let mut output = match source {
+        None => Vec::new(),
+        Some(Tag::List { values, .. }) if values.is_empty() => Vec::new(),
+        Some(Tag::List {
+            element_type: TagType::Compound,
+            values,
+        }) => values.clone(),
+        _ => anyhow::bail!("saved sections must be a compound list"),
+    };
+    let Tag::List {
+        element_type: TagType::Compound,
+        values: generated_values,
+    } = generated
+    else {
+        anyhow::bail!("generated sections must be a compound list")
+    };
+    let section_y = |section: &Tag| -> Result<i8> {
+        let Tag::Compound(fields) = section else {
+            anyhow::bail!("invalid section")
+        };
+        let mut ys = fields.iter().filter(|(key, _)| key.matches("Y"));
+        let Some((_, Tag::Byte(y))) = ys.next() else {
+            anyhow::bail!("missing section Y")
+        };
+        ensure!(ys.next().is_none(), "duplicate section Y field");
+        Ok(*y)
+    };
+    let mut positions = BTreeMap::new();
+    for (index, section) in output.iter().enumerate() {
+        ensure!(
+            positions.insert(section_y(section)?, index).is_none(),
+            "duplicate saved section Y"
+        );
+    }
+    for generated_section in generated_values {
+        let y = section_y(generated_section)?;
+        let Tag::Compound(generated_fields) = generated_section else {
+            unreachable!()
+        };
+        let mut biomes = generated_fields
+            .iter()
+            .filter(|(key, _)| key.matches("biomes"));
+        let biome = biomes.next().context("generated biomes missing")?.1.clone();
+        ensure!(biomes.next().is_none(), "duplicate generated biomes");
+        if let Some(&index) = positions.get(&y) {
+            let Tag::Compound(fields) = &mut output[index] else {
+                unreachable!()
+            };
+            let mut blocks = fields.iter().filter(|(key, _)| key.matches("block_states"));
+            if let Some((_, Tag::Compound(storage))) = blocks.next() {
+                ensure!(
+                    storage
+                        .iter()
+                        .all(|(name, _)| name.matches("palette") || name.matches("data")),
+                    "unrecognized saved block storage"
+                );
+                for (_, palette) in storage.iter().filter(|(name, _)| name.matches("palette")) {
+                    if let Tag::List { values, .. } = palette {
+                        for entry in values {
+                            if let Tag::Compound(fields) = entry {
+                                ensure!(
+                                    fields.iter().all(|(name, _)| name.matches("id")
+                                        || name.matches("properties")),
+                                    "unrecognized saved block-state data"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            ensure!(blocks.next().is_none(), "duplicate saved block states");
+            if !fields.iter().any(|(key, _)| key.matches("biomes")) {
+                fields.push(("biomes".into(), biome));
+            }
+        } else {
+            positions.insert(y, output.len());
+            output.push(Tag::Compound(vec![
+                ("Y".into(), Tag::Byte(y)),
+                ("biomes".into(), biome),
+            ]));
+        }
+    }
+    merge_biome_stage_blocks(
+        &Tag::List {
+            element_type: TagType::Compound,
+            values: output,
+        },
+        generated,
+    )
+}
+
 /// Merge generated block storage into captured biome-stage sections without
 /// replacing their biome palettes, lighting, or unrecognized section fields.
 /// This returns one intermediate NBT component, not a writable chunk draft.
@@ -467,6 +563,76 @@ mod tests {
             element_type: TagType::Compound,
             values,
         }
+    }
+
+    #[test]
+    fn prebiome_merge_preserves_original_data_and_refuses_loss() {
+        let generated = list(vec![
+            section(-1, Some("minecraft:stone"), "minecraft:plains"),
+            section(0, Some("minecraft:dirt"), "minecraft:forest"),
+        ]);
+        let mut early = section(-1, Some("minecraft:air"), "minecraft:plains");
+        let Tag::Compound(fields) = &mut early else {
+            unreachable!()
+        };
+        fields.retain(|(key, _)| !key.matches("biomes"));
+        let outside = section(7, None, "minecraft:plains");
+        let source = list(vec![early.clone(), outside.clone()]);
+        let merged = merge_prebiome_stage_sections(Some(&source), &generated).unwrap();
+        let Tag::List { values, .. } = &merged else {
+            panic!()
+        };
+        assert_eq!(values[0].get("custom"), Some(&Tag::Int(7)));
+        assert_eq!(values[1], outside);
+        assert_eq!(values[2].get("Y"), Some(&Tag::Byte(0)));
+        assert!(early.get("biomes").is_none());
+        let decoded =
+            palette::decode_sections(&Tag::Compound(vec![("sections".into(), merged)])).unwrap();
+        assert!(
+            decoded[0]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .block(0, 0, 0)
+                .unwrap()
+                .name
+                .matches("minecraft:stone")
+        );
+        assert!(decoded[0].biomes.is_some());
+        assert!(merge_prebiome_stage_sections(None, &generated).is_ok());
+        assert!(
+            merge_prebiome_stage_sections(
+                Some(&list(vec![early.clone(), early.clone()])),
+                &generated
+            )
+            .is_err()
+        );
+        assert!(
+            merge_prebiome_stage_sections(
+                Some(&list(vec![section(-1, Some("minecraft:stone"), "plains")])),
+                &generated
+            )
+            .is_err()
+        );
+        assert!(
+            merge_prebiome_stage_sections(
+                Some(&list(vec![section(-1, None, "desert")])),
+                &generated
+            )
+            .is_err()
+        );
+        let Tag::Compound(fields) = &mut early else {
+            unreachable!()
+        };
+        let (_, Tag::Compound(blocks)) = fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("block_states"))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        blocks.push(("custom_storage".into(), Tag::Int(9)));
+        assert!(merge_prebiome_stage_sections(Some(&list(vec![early])), &generated).is_err());
     }
 
     #[test]

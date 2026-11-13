@@ -4072,8 +4072,9 @@ impl PreparedExistingGenerator {
         })
     }
 
-    /// Merge only regenerated blocks into their exact captured protochunk.
-    /// Status, heightmaps, ticks, structures and other fields remain untouched.
+    /// Merge regenerated blocks and, for earlier protochunks, generated
+    /// biomes into the exact captured source. Status and other root data remain
+    /// untouched; this intermediate draft does not authorize a world write.
     pub fn draft_resumed_sections(
         &mut self,
         chunk: &ResumedSavedTerrain,
@@ -4094,6 +4095,7 @@ impl PreparedExistingGenerator {
             Arc::ptr_eq(&captured.document, &chunk.source),
             "captured terrain source differs"
         );
+        let stage = validate_empty_preterrain_target(captured, true)?;
         let registry = &self
             .terrain_assets
             .as_ref()
@@ -4121,14 +4123,18 @@ impl PreparedExistingGenerator {
             },
         )?;
         let mut document = (*chunk.source).clone();
-        let Tag::Compound(fields) = &mut document.value else {
-            bail!("saved chunk is not a compound")
+        let original = unique_root_field(&document, "sections")?;
+        let sections = if stage < native_session::worldgen::schedule::GenerationStage::Biomes {
+            native_persistence::generated_section::merge_prebiome_stage_sections(
+                original, &sections,
+            )?
+        } else {
+            native_persistence::generated_section::merge_biome_stage_blocks(
+                original.context("saved sections are missing")?,
+                &sections,
+            )?
         };
-        let mut sources = fields.iter_mut().filter(|(key, _)| key.matches("sections"));
-        let (_, original) = sources.next().context("saved sections are missing")?;
-        *original =
-            native_persistence::generated_section::merge_biome_stage_blocks(original, &sections)?;
-        ensure!(sources.next().is_none(), "duplicate saved sections");
+        replace_unique_root_field(&mut document, "sections", sections)?;
         let source_nbt = native_persistence::nbt::write(&chunk.source)?;
         native_persistence::nbt::write(&document)?;
         Ok(ResumedSectionDraft {
@@ -5649,7 +5655,27 @@ mod tests {
                     }
                 }
             }
-            assert!(scheduled_early.draft_resumed_sections(terrain).is_err());
+            let draft = scheduled_early.draft_resumed_sections(terrain)?;
+            let source = scheduled_early.inputs().sources().chunks()[&position]
+                .terrain
+                .as_ref()
+                .unwrap();
+            assert!(draft.matches_source(&source.document)?);
+            assert_eq!(
+                draft.document().value.get("Status"),
+                source.document.value.get("Status")
+            );
+            assert_eq!(
+                draft.document().value.get("example:unrecognized"),
+                Some(&Tag::Int(73))
+            );
+            let sections = native_persistence::palette::decode_sections(&draft.document().value)?;
+            assert_eq!(sections.len(), usize::try_from(lighting.height / 16)?);
+            assert!(
+                sections
+                    .iter()
+                    .all(|section| section.blocks.is_some() && section.biomes.is_some())
+            );
         }
         let biome_positions: Vec<_> = schedule
             .requirements()

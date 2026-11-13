@@ -1057,6 +1057,194 @@ impl Drop for MissingGenerationAssemblyWorker {
     }
 }
 
+/// Result of one feature pass; this is not yet a playable or writable chunk.
+pub(crate) struct FeaturedMissingGeneration {
+    state: AssembledMissingGeneration,
+    position: ChunkPos,
+    placements: Vec<bool>,
+}
+
+impl FeaturedMissingGeneration {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.state.is_current(streamer, session)
+    }
+
+    pub fn position(&self) -> ChunkPos {
+        self.position
+    }
+
+    pub fn placements(&self) -> &[bool] {
+        &self.placements
+    }
+
+    pub fn into_checked_state(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<AssembledMissingGeneration> {
+        if !self.is_current(streamer, session) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("feature generation is stale");
+        }
+        Ok(self.state)
+    }
+}
+
+pub(crate) struct MissingGenerationFeatureStartError {
+    pub assembled: AssembledMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationFeatureWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<FeaturedMissingGeneration>>,
+    finished: bool,
+}
+
+impl MissingGenerationFeatureWorker {
+    /// The optional light must already be bound to this exact terrain revision.
+    /// A feature that needs unavailable light fails rather than assuming it.
+    pub fn start(
+        assembled: AssembledMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        position: ChunkPos,
+        light: Option<crate::fresh_generation::existing::CapturedFeatureLight>,
+    ) -> std::result::Result<Self, MissingGenerationFeatureStartError> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let error = if !assembled.is_current(streamer, session) {
+            Some("terrain assembly is stale")
+        } else if assembled
+            .batch
+            .saved_stage(position)
+            .is_some_and(|stage| stage >= GenerationStage::Features)
+        {
+            Some("saved chunk already completed features")
+        } else if !assembled
+            .batch
+            .schedule()
+            .ready(position, GenerationStage::Features)
+        {
+            Some("features dependencies are incomplete")
+        } else if light
+            .as_ref()
+            .is_some_and(|light| !light.matches_batch(&assembled.batch))
+        {
+            Some("feature light belongs to another terrain revision")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(MissingGenerationFeatureStartError {
+                assembled,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = assembled.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            assembled,
+            move |mut state| {
+                let result = (|| -> Result<FeaturedMissingGeneration> {
+                    let check = || -> Result<()> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "feature generation cancelled"
+                        );
+                        anyhow::ensure!(
+                            state.observed.stamp.is_current(),
+                            "terrain assembly is stale"
+                        );
+                        Ok(())
+                    };
+                    check()?;
+                    let context = state.generator.prepare_captured_decoration(
+                        &state.batch,
+                        native_persistence::world::ChunkPos {
+                            x: position.x,
+                            z: position.z,
+                        },
+                    )?;
+                    check()?;
+                    let placements = match light.as_ref() {
+                        Some(light) => state.generator.run_captured_features_with_initial_light(
+                            &mut state.batch,
+                            &context,
+                            light,
+                        )?,
+                        None => state
+                            .generator
+                            .run_captured_features(&mut state.batch, &context)?,
+                    };
+                    check()?;
+                    Ok(FeaturedMissingGeneration {
+                        state,
+                        position,
+                        placements,
+                    })
+                })();
+                let _ = sender.send(result);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-features".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(assembled, error)| MissingGenerationFeatureStartError {
+            assembled,
+            error: anyhow::Error::new(error).context("cannot start feature generation"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<FeaturedMissingGeneration>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("feature generation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(featured) = result {
+                crate::generation_staging::discard_async(featured);
+            }
+            anyhow::bail!("feature generation was cancelled or became stale");
+        }
+        Ok(Some(result?))
+    }
+}
+
+impl Drop for MissingGenerationFeatureWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 impl MissingGenerationTargets {
     pub fn targets(&self) -> &[ChunkPos] {
         &self.targets
@@ -2529,12 +2717,16 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn missing_generation_preserves_saved_terrain_neighbor() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
         use native_persistence::{
             nbt::{self, NamedTag, Tag, TagType},
             world::DimensionId,
             worldgen_settings::{NewWorldOptions, draft_baked_worldgen_settings},
         };
+        use native_resources::packs::ResourceProvider;
         use native_session::worldgen::schedule::GenerationStage;
+        use serde_json::json;
+        use std::io::Write;
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -2556,6 +2748,67 @@ mod tests {
             world.path().join("data/minecraft/world_gen_settings.dat"),
             nbt::write(&settings)?,
         )?;
+        let pack = world.path().join("datapacks/stream-test");
+        let dimension_file = pack.join("data/minecraft/dimension/overworld.json");
+        let biome_file = pack.join("data/minecraft/worldgen/biome/plains.json");
+        std::fs::create_dir_all(dimension_file.parent().unwrap())?;
+        std::fs::create_dir_all(biome_file.parent().unwrap())?;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+        )?;
+        std::fs::write(
+            &dimension_file,
+            serde_json::to_vec(&json!({
+                "type":"minecraft:overworld",
+                "generator":{"type":"minecraft:noise","settings":"minecraft:overworld",
+                    "biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"}}
+            }))?,
+        )?;
+        let mut plains: serde_json::Value = serde_json::from_slice(
+            &resources
+                .read_data("data/minecraft/worldgen/biome/plains.json")?
+                .context("plains biome missing")?,
+        )?;
+        plains["features"] = json!([[{
+            "feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
+            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]
+        }]]);
+        std::fs::write(&biome_file, serde_json::to_vec(&plains)?)?;
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "DataPacks".into(),
+                        Tag::Compound(vec![
+                            (
+                                "Enabled".into(),
+                                Tag::List {
+                                    element_type: TagType::String,
+                                    values: vec![
+                                        Tag::String("vanilla".into()),
+                                        Tag::String("file/stream-test".into()),
+                                    ],
+                                },
+                            ),
+                            (
+                                "Disabled".into(),
+                                Tag::List {
+                                    element_type: TagType::End,
+                                    values: vec![],
+                                },
+                            ),
+                        ]),
+                    ),
+                ]),
+            )]),
+        };
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&level)?)?;
+        std::fs::write(world.path().join("level.dat"), gzip.finish()?)?;
         let saved_pos = ChunkPos { x: 1, z: 0 };
         let sections = (-4i8..20)
             .map(|y| {
@@ -2832,9 +3085,64 @@ mod tests {
             evaluator,
             observed,
         };
+        let failure = match MissingGenerationFeatureWorker::start(
+            assembled, &streamer, &session, saved_pos, None,
+        ) {
+            Ok(_) => anyhow::bail!("completed saved features were accepted"),
+            Err(failure) => failure,
+        };
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("already completed features")
+        );
+        let mut features = MissingGenerationFeatureWorker::start(
+            failure.assembled,
+            &streamer,
+            &session,
+            target,
+            None,
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let featured = loop {
+            if let Some(result) = features.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "feature generation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(featured.position(), target);
+        assert_eq!(featured.placements(), &[true]);
+        let assembled = featured.into_checked_state(&streamer, &session)?;
+        assert_eq!(
+            assembled.batch().schedule().completed(target),
+            Some(GenerationStage::Features)
+        );
+        assert_eq!(
+            assembled
+                .batch()
+                .terrain()
+                .snapshot()
+                .block(target.x * 16 + 8, -56, target.z * 16 + 8)
+                .map(|block| block.name.as_str()),
+            Some("minecraft:melon")
+        );
+        assert_eq!(
+            assembled
+                .batch()
+                .terrain()
+                .snapshot()
+                .block(16, 0, 0)
+                .map(|block| block.name.as_str()),
+            Some("minecraft:air")
+        );
+        assert_eq!(std::fs::read(&region_path)?, region);
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!assembled.is_current(&streamer, &session));
         assert!(assembled.into_checked_parts(&streamer, &session).is_err());
+        drop(features);
         drop(assembly);
         drop(terrain);
         drop(biome);

@@ -468,6 +468,42 @@ impl CapturedConvertedPostprocessing {
     }
 }
 
+/// Converted neighboring chunks sharing one ordered tick region. The proofs
+/// remain separate from the mutable tasks so callers can recheck the captured
+/// generation state before publishing any result.
+pub(crate) struct CapturedConvertedRegion {
+    proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedConvertedHeightmaps>,
+    region: native_session::worldgen::postprocessing::ConvertedPostprocessingRegion,
+}
+
+impl CapturedConvertedRegion {
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> bool {
+        !self.proofs.is_empty()
+            && self.region.ticks.game_time() == game_time
+            && self.region.ticks.next_sub_tick() == next_sub_tick
+            && self
+                .proofs
+                .values()
+                .all(|proof| proof.matches_state(batch, light, spawn_mobs))
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        BTreeMap<native_world::loaded::ChunkPos, CapturedConvertedHeightmaps>,
+        native_session::worldgen::postprocessing::ConvertedPostprocessingRegion,
+    ) {
+        (self.proofs, self.region)
+    }
+}
+
 impl CapturedTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
@@ -1642,6 +1678,58 @@ impl PreparedExistingGenerator {
                     blocks: ChunkTicks::from_saved(position, blocks)?,
                     fluids: ChunkTicks::from_saved(position, fluids)?,
                 },
+            },
+        })
+    }
+
+    /// Prepare an isolated converted region in the caller's registration
+    /// order. Its shared clock and sub-tick counter must come from the same
+    /// live world and be rechecked before publishing the result.
+    pub fn begin_captured_postprocessing_region<'a>(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawns: impl IntoIterator<Item = &'a CapturedEmptySpawnDraft>,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> Result<CapturedConvertedRegion> {
+        let spawns: Vec<_> = spawns.into_iter().collect();
+        let first = spawns.first().context("no converted chunks")?;
+        let mut positions = BTreeSet::new();
+        for spawn in &spawns {
+            ensure!(
+                positions.insert(spawn.position),
+                "duplicate converted chunk"
+            );
+            ensure!(
+                spawn.spawn_mobs == first.spawn_mobs,
+                "spawn rules differ across region"
+            );
+        }
+        let mut proofs = BTreeMap::new();
+        let mut tasks = BTreeMap::new();
+        let mut ticks = BTreeMap::new();
+        let mut registration = Vec::with_capacity(spawns.len());
+        for spawn in spawns {
+            let proof = self.convert_captured_heightmaps(batch, light, spawn)?;
+            let converted = self.begin_captured_postprocessing(batch, light, spawn, proof)?;
+            let (proof, converted) = converted.into_parts();
+            let position = spawn.position;
+            proofs.insert(position, proof);
+            tasks.insert(position, converted.task);
+            ticks.insert(position, converted.ticks);
+            registration.push(position);
+        }
+        Ok(CapturedConvertedRegion {
+            proofs,
+            region: native_session::worldgen::postprocessing::ConvertedPostprocessingRegion {
+                tasks,
+                ticks: native_session::worldgen::chunk_ticks::RegionTicks::new_ordered(
+                    ticks,
+                    game_time,
+                    next_sub_tick,
+                    &registration,
+                )?,
             },
         })
     }
@@ -6429,6 +6517,33 @@ mod tests {
             assert!(converted.matches_state(&batch, &staged, false));
             assert!(!converted.matches_state(&batch, &staged, true));
         }
+        assert!(
+            actual
+                .begin_captured_postprocessing_region(&batch, &staged, [], 42, 9)
+                .is_err()
+        );
+        assert!(
+            actual
+                .begin_captured_postprocessing_region(
+                    &batch,
+                    &staged,
+                    [&new_spawn, &new_spawn],
+                    42,
+                    9
+                )
+                .is_err()
+        );
+        let converted_region = actual.begin_captured_postprocessing_region(
+            &batch,
+            &staged,
+            [&early_spawn, &new_spawn, &saved_spawn],
+            42,
+            9,
+        )?;
+        assert!(converted_region.matches_state(&batch, &staged, false, 42, 9));
+        assert!(!converted_region.matches_state(&batch, &staged, true, 42, 9));
+        assert!(!converted_region.matches_state(&batch, &staged, false, 43, 9));
+        assert!(!converted_region.matches_state(&batch, &staged, false, 42, 10));
         let draft = actual.draft_captured_new_lit_chunk(&batch, &staged, saved_target, 42)?;
         let saved_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_second)?;
         let early_draft = actual.draft_captured_saved_lit_chunk(&batch, &staged, saved_third)?;
@@ -6566,12 +6681,36 @@ mod tests {
         assert!(!early_spawn.matches_state(&batch, &staged, false));
         assert!(!early_maps.matches_state(&batch, &staged, false));
         assert!(!early_post.matches_state(&batch, &staged, false));
+        assert!(!converted_region.matches_state(&batch, &staged, false, 42, 9));
         assert!(
             actual
                 .convert_captured_heightmaps(&batch, &staged, &early_spawn)
                 .is_err()
         );
         staged.light_revision = original_revision;
+        assert!(converted_region.matches_state(&batch, &staged, false, 42, 9));
+        let (proofs, region) = converted_region.into_parts();
+        assert_eq!(region.ticks.registration_order(), &[third, target, second]);
+        assert_eq!(region.ticks.game_time(), 42);
+        assert_eq!(region.ticks.next_sub_tick(), 9);
+        assert_eq!(region.tasks.len(), 3);
+        assert!(proofs[&target].matches_source(None)?);
+        assert!(proofs[&second].matches_source(Some(&saved))?);
+        assert!(proofs[&third].matches_source(Some(&early_saved))?);
+        for pos in [third, target, second] {
+            let ticks = region
+                .ticks
+                .chunk(pos)
+                .context("region tick container missing")?;
+            assert!(ticks.blocks.peek().is_none());
+            assert!(
+                ticks
+                    .blocks
+                    .pack(42)
+                    .iter()
+                    .any(|tick| tick.kind == "minecraft:melon")
+            );
+        }
         let tick_world = batch.terrain.snapshot();
         for (position, converted) in [
             (target, new_post),

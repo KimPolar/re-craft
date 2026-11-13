@@ -4819,6 +4819,7 @@ impl DecorationRegion<'_> {
         let allowed = tree_generated_leaf(state)?
             || tree_generated_log(state)
             || tree_leaf_litter(state)?
+            || (flags == 2 && valid_vine(state))
             || (flags == 2 && tree_mushroom_block(state)?)
             || (flags == 2 && tree_grass_block(state))
             || (flags == 2 && state.name == "minecraft:air" && state.properties.is_empty())
@@ -4846,6 +4847,7 @@ impl DecorationRegion<'_> {
                 || tree_generated_log(&old)
                 || tree_leaf_litter(&old)?
                 || tree_mushroom_block(&old)?
+                || valid_vine(&old)
                 || simple_plant_kind(&old).is_ok()
                 || tree_edge_plant(&old)?.is_some(),
             "unsupported tree source effects"
@@ -6021,6 +6023,10 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                 updated.properties.insert(face.into(), "false".into());
                 return Ok(updated);
             }
+        } else if state.name == "minecraft:vine" {
+            return update_tree_edge_vine(state, direction, |offset| {
+                OreWorld::block(self, std::array::from_fn(|i| pos[i].wrapping_add(offset[i])))
+            });
         } else if tree_grass_block(state) {
             if direction == [0, 1, 0] {
                 let snowy = self
@@ -6423,6 +6429,66 @@ fn valid_vine(state: &BlockState) -> bool {
                     Some("true" | "false")
                 )
             })
+}
+
+fn update_tree_edge_vine(
+    state: &BlockState,
+    direction: [i32; 3],
+    mut neighbor: impl FnMut([i32; 3]) -> Result<BlockState>,
+) -> Result<BlockState> {
+    ensure!(valid_vine(state), "invalid vine state");
+    ensure!(
+        matches!(
+            direction,
+            [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1] | [-1, 0, 0] | [1, 0, 0]
+        ),
+        "invalid vine update direction"
+    );
+    if direction == [0, -1, 0] {
+        return Ok(state.clone());
+    }
+    let mut result = state.clone();
+    let mut above = None;
+    if state.properties["up"] == "true" {
+        let support = neighbor([0, 1, 0])?;
+        let retained = directional_multiface_support(&support, [0, -1, 0])?;
+        result.properties.insert("up".into(), retained.to_string());
+        above = Some(support);
+    }
+    for (name, offset) in [
+        ("north", [0, 0, -1]),
+        ("east", [1, 0, 0]),
+        ("south", [0, 0, 1]),
+        ("west", [-1, 0, 0]),
+    ] {
+        if state.properties[name] != "true" {
+            continue;
+        }
+        let support = neighbor(offset)?;
+        let retained = if directional_multiface_support(&support, offset)? {
+            true
+        } else {
+            if above.is_none() {
+                above = Some(neighbor([0, 1, 0])?);
+            }
+            let top = above.as_ref().expect("vine above was loaded");
+            if top.name == "minecraft:vine" {
+                ensure!(valid_vine(top), "invalid upper vine state");
+                top.properties[name] == "true"
+            } else {
+                false
+            }
+        };
+        result.properties.insert(name.into(), retained.to_string());
+    }
+    if result.properties.values().all(|value| value == "false") {
+        Ok(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        })
+    } else {
+        Ok(result)
+    }
 }
 
 impl VinesWorld for DecorationRegion<'_> {
@@ -22331,6 +22397,191 @@ mod tests {
         let world = terrain.snapshot();
         assert_eq!(world.block(4, 8, 4).unwrap().name, "minecraft:oak_log");
         assert_eq!(world.block(12, 8, 12).unwrap().name, "minecraft:oak_log");
+    }
+
+    #[test]
+    fn tree_edge_vine_updates_are_written_transactionally() {
+        use native_resources::tree_leaf_update::ShapeEdgeWorld;
+        let (mut terrain, tags, _, _) = fixture();
+        let mut registry = batch_registry();
+        registry.insert("minecraft:vine".into());
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut vine = state("vine");
+        vine.properties = ["up", "north", "east", "south", "west"]
+            .into_iter()
+            .map(|name| (name.into(), matches!(name, "north" | "east").to_string()))
+            .collect();
+        let pos = [8, 8, 8];
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.set_section_block(pos, &vine).unwrap();
+        for neighbor in [[8, 9, 8], [9, 8, 8], [8, 8, 9], [7, 8, 8]] {
+            region.set_section_block(neighbor, &state("air")).unwrap();
+        }
+        region
+            .set_section_block([8, 8, 7], &state("stone"))
+            .unwrap();
+        let updated = ShapeEdgeWorld::update_shape(
+            &mut region,
+            pos,
+            &vine,
+            [1, 0, 0],
+            [9, 8, 8],
+            &state("air"),
+        )
+        .unwrap();
+        assert_eq!(updated.properties["north"], "true");
+        assert_eq!(updated.properties["east"], "false");
+        ShapeEdgeWorld::set_block(&mut region, pos, &updated, 2).unwrap();
+        region.set_section_block([8, 8, 7], &state("air")).unwrap();
+        let removed = ShapeEdgeWorld::update_shape(
+            &mut region,
+            pos,
+            &updated,
+            [0, 0, -1],
+            [8, 8, 7],
+            &state("air"),
+        )
+        .unwrap();
+        assert_eq!(removed.name, "minecraft:air");
+        ShapeEdgeWorld::set_block(&mut region, pos, &removed, 2).unwrap();
+        region.finish().unwrap();
+        assert_eq!(
+            terrain
+                .snapshot()
+                .block(pos[0], pos[1], pos[2])
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tree_edge_vines_match_java_support_and_inheritance() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeEdgeVineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeEdgeVineOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeEdgeVineOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let names = ["up", "north", "east", "south", "west"];
+        let offsets = [[0, 1, 0], [0, 0, -1], [1, 0, 0], [0, 0, 1], [-1, 0, 0]];
+        let vine = |mask: u8| BlockState {
+            name: "minecraft:vine".into(),
+            properties: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ((*name).into(), (mask & (1 << i) != 0).to_string()))
+                .collect(),
+        };
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut count = 0;
+        for line in text.lines().filter_map(|line| line.strip_prefix("V ")) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 5);
+            let mask: u8 = fields[0].parse().unwrap();
+            let supports: u8 = fields[1].parse().unwrap();
+            let above: u8 = fields[2].parse().unwrap();
+            let direction = match fields[3] {
+                "down" => [0, -1, 0],
+                "up" => [0, 1, 0],
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "west" => [-1, 0, 0],
+                "east" => [1, 0, 0],
+                _ => panic!("invalid oracle direction"),
+            };
+            let updated = update_tree_edge_vine(&vine(mask), direction, |offset| {
+                if offset == offsets[0] {
+                    return Ok(match above {
+                        0 => state("air"),
+                        1 => state("stone"),
+                        2 | 3 => BlockState {
+                            name: "minecraft:stone_slab".into(),
+                            properties: BTreeMap::from([
+                                (
+                                    "type".into(),
+                                    if above == 2 { "bottom" } else { "top" }.into(),
+                                ),
+                                ("waterlogged".into(), "false".into()),
+                            ]),
+                        },
+                        4 => vine(10),
+                        5 => vine(31),
+                        _ => unreachable!(),
+                    });
+                }
+                let index = offsets.iter().position(|value| *value == offset).unwrap();
+                Ok(state(if supports & (1 << (index - 1)) != 0 {
+                    "stone"
+                } else {
+                    "air"
+                }))
+            })
+            .unwrap();
+            let actual: i32 = if updated.name == "minecraft:air" {
+                -1
+            } else {
+                names.iter().enumerate().fold(0, |bits, (i, name)| {
+                    bits | if updated.properties[*name] == "true" {
+                        1 << i
+                    } else {
+                        0
+                    }
+                })
+            };
+            assert_eq!(actual, fields[4].parse::<i32>().unwrap(), "{line}");
+            count += 1;
+        }
+        assert_eq!(count, 32 * 16 * 6 * 6);
     }
 
     #[test]

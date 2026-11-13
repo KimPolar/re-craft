@@ -233,7 +233,13 @@ impl LanguageUi {
         self.selected = Some(selected);
     }
 
-    pub fn draw(&self, canvas: &mut Canvas, assets: &MenuAssets, focused: bool) {
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        assets: &MenuAssets,
+        focused: bool,
+        cursor_visible: bool,
+    ) {
         let (w, h) = (canvas.width, canvas.height);
         canvas.text_centered(
             Some(assets),
@@ -247,6 +253,7 @@ impl LanguageUi {
             assets,
             Self::search_rect(w),
             focused,
+            cursor_visible,
             assets.translate("gui.language.search", "Search..."),
         );
         let list = Self::list_rect(w, h);

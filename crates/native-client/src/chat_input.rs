@@ -52,8 +52,17 @@ impl ChatInput {
     }
 
     pub fn blink_key(&self) -> u64 {
-        self.focused_at
-            .map_or(0, |start| (start.elapsed().as_millis() / 300) as u64)
+        self.blink_key_at(std::time::Instant::now())
+    }
+
+    pub fn blink_key_at(&self, now: std::time::Instant) -> u64 {
+        self.focused_at.map_or(0, |start| {
+            (now.saturating_duration_since(start).as_millis() / 300) as u64
+        })
+    }
+
+    pub fn reset_focus_at(&mut self, now: std::time::Instant) {
+        self.focused_at = Some(now);
     }
 
     pub fn open(&mut self, command: bool) {
@@ -380,6 +389,7 @@ impl ChatInput {
         assets: &MenuAssets,
         rect: Rect,
         focused: bool,
+        cursor_visible: bool,
         hint: &str,
     ) {
         canvas.fill(
@@ -416,9 +426,9 @@ impl ChatInput {
             );
         }
         let cursor = pos(self.caret);
-        if self.text.is_empty() && self.preedit.is_empty() {
+        if self.text.is_empty() && self.preedit.is_empty() && !focused {
             edit.text(Some(assets), 0, 0, hint, [128, 128, 128]);
-        } else {
+        } else if !self.text.is_empty() || !self.preedit.is_empty() {
             edit.text(
                 Some(assets),
                 0,
@@ -447,16 +457,20 @@ impl ChatInput {
                 );
             }
         }
-        if focused && self.preedit.is_empty() {
-            edit.fill(
-                Rect {
-                    x: cursor,
-                    y: 0,
-                    w: 1,
-                    h: 10,
-                },
-                [208, 208, 208, 255],
-            );
+        if focused && cursor_visible && self.preedit.is_empty() {
+            if self.caret < self.text.len() || self.text.encode_utf16().count() >= 32 {
+                edit.fill(
+                    Rect {
+                        x: cursor - 1,
+                        y: 0,
+                        w: 2,
+                        h: 10,
+                    },
+                    [208, 208, 208, 255],
+                );
+            } else {
+                edit.text(Some(assets), cursor, 0, "_", [224, 224, 224]);
+            }
         }
         canvas.composite(&edit, rect.x + 4, rect.y + 6);
     }
@@ -545,6 +559,66 @@ impl ChatInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_cursor_blinks_on_java_boundaries_and_restarts_on_focus() {
+        use std::time::{Duration, Instant};
+
+        let mut field = ChatInput::field("world");
+        let start = Instant::now();
+        field.reset_focus_at(start);
+        for (milliseconds, visible) in [
+            (0, true),
+            (299, true),
+            (300, false),
+            (599, false),
+            (600, true),
+            (899, true),
+            (900, false),
+        ] {
+            assert_eq!(
+                field.blink_key_at(start + Duration::from_millis(milliseconds)) % 2 == 0,
+                visible,
+                "at {milliseconds} ms"
+            );
+        }
+        let refocused = start + Duration::from_millis(450);
+        field.reset_focus_at(refocused);
+        assert_eq!(field.blink_key_at(refocused), 0);
+        assert_eq!(
+            field.blink_key_at(refocused + Duration::from_millis(300)),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn field_cursor_and_hint_follow_focus_and_blink_state() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = MenuAssets::load(&game, &[]).unwrap();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 150,
+            h: 20,
+        };
+        let draw = |input: &ChatInput, focused, visible| {
+            let mut canvas = Canvas::new(150, 20);
+            input.draw_field(&mut canvas, &assets, rect, focused, visible, "Search...");
+            canvas.pixels
+        };
+        let mut input = ChatInput::field("");
+        assert_ne!(draw(&input, false, false), draw(&input, true, false));
+        assert_ne!(draw(&input, true, true), draw(&input, true, false));
+        input.insert_limited("abc", 32);
+        assert_ne!(draw(&input, true, true), draw(&input, true, false));
+        input.key(KeyCode::ArrowLeft, false, false);
+        assert_ne!(draw(&input, true, true), draw(&input, true, false));
+        input.set_preedit("한".into());
+        assert_eq!(draw(&input, true, true), draw(&input, true, false));
+    }
 
     #[test]
     fn world_field_reuses_selection_and_enforces_utf16_limit() {

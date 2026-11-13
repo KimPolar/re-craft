@@ -1131,6 +1131,8 @@ struct Menu<'a> {
     #[cfg(test)]
     software_presented: Option<((u32, u32), u64, usize)>,
     overlay_dirty: bool,
+    caret_owner: Option<ButtonId>,
+    caret_rendered: Option<(ButtonId, bool)>,
     hover_buttons: Option<Rc<[Button]>>,
     occluded: bool,
     refresh_interval: Duration,
@@ -1208,6 +1210,8 @@ impl<'a> Menu<'a> {
             #[cfg(test)]
             software_presented: None,
             overlay_dirty: true,
+            caret_owner: None,
+            caret_rendered: None,
             hover_buttons: None,
             occluded: false,
             refresh_interval: Duration::from_nanos(1_000_000_000 / 60),
@@ -1490,6 +1494,49 @@ impl<'a> Menu<'a> {
 
     fn animation_active(&self) -> bool {
         self.state.assets.is_some() && !self.occluded && self.size.0 > 0 && self.size.1 > 0
+    }
+
+    fn update_caret(&mut self, now: Instant) -> Option<(ButtonId, bool)> {
+        let owner = match (self.state.screen, self.state.creation_tab, self.focused) {
+            (Screen::CreateWorld, CreationTab::Game, Some(ButtonId::CreationName)) => {
+                Some(ButtonId::CreationName)
+            }
+            (Screen::CreateWorld, CreationTab::World, Some(ButtonId::CreationSeed)) => {
+                Some(ButtonId::CreationSeed)
+            }
+            (Screen::Language, _, Some(ButtonId::LanguageSearch)) if self.language_ui.is_some() => {
+                Some(ButtonId::LanguageSearch)
+            }
+            _ => None,
+        };
+        if owner != self.caret_owner {
+            self.caret_owner = owner;
+            self.caret_rendered = None;
+            self.overlay_dirty = true;
+            match owner {
+                Some(ButtonId::CreationName) => self.state.creation.name.reset_focus_at(now),
+                Some(ButtonId::CreationSeed) => self.state.creation.seed.reset_focus_at(now),
+                Some(ButtonId::LanguageSearch) => {
+                    if let Some(ui) = &mut self.language_ui {
+                        ui.search.reset_focus_at(now);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let input = match owner {
+            Some(ButtonId::CreationName) => Some(&self.state.creation.name),
+            Some(ButtonId::CreationSeed) => Some(&self.state.creation.seed),
+            Some(ButtonId::LanguageSearch) => self.language_ui.as_ref().map(|ui| &ui.search),
+            _ => None,
+        };
+        let current = owner
+            .zip(input)
+            .map(|(id, input)| (id, !input.composing() && input.blink_key_at(now) % 2 == 0));
+        if current != self.caret_rendered {
+            self.overlay_dirty = true;
+        }
+        current
     }
 
     fn invalidate(&mut self) {
@@ -2946,6 +2993,7 @@ impl<'a> Menu<'a> {
         if width == 0 || height == 0 {
             return Ok(());
         }
+        let caret = self.update_caret(Instant::now());
         if let Some(software) = &self.software {
             if self.software_scene.as_ref().is_none_or(|scene| {
                 !scene.matches(
@@ -3162,6 +3210,8 @@ impl<'a> Menu<'a> {
                         &mut canvas,
                         assets,
                         self.focused == Some(ButtonId::LanguageSearch),
+                        caret
+                            .is_some_and(|(id, visible)| id == ButtonId::LanguageSearch && visible),
                     );
                 }
             }
@@ -3554,7 +3604,14 @@ impl<'a> Menu<'a> {
                     } else {
                         (&self.state.creation.name, "")
                     };
-                    editor.draw_field(&mut canvas, assets, button.rect, focused, hint);
+                    editor.draw_field(
+                        &mut canvas,
+                        assets,
+                        button.rect,
+                        focused,
+                        caret.is_some_and(|(id, visible)| id == button.id && visible),
+                        hint,
+                    );
                 }
                 continue;
             }
@@ -3673,11 +3730,13 @@ impl<'a> Menu<'a> {
                 screenshots,
             })?;
             self.overlay_dirty = false;
+            self.caret_rendered = caret;
             return Ok(());
         }
         self.software_overlay = Some(Arc::new(canvas));
         self.submit_software(seconds, blurred)?;
         self.overlay_dirty = false;
+        self.caret_rendered = caret;
         Ok(())
     }
 
@@ -4832,6 +4891,7 @@ impl ApplicationHandler for Menu<'_> {
         if self.action.is_some() {
             return;
         }
+        self.update_caret(Instant::now());
         if self.animation_active() {
             let now = Instant::now();
             let fps = self.inactivity.limit(
@@ -5068,6 +5128,61 @@ fn draw_pack_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_caret_invalidates_overlay_only_when_visibility_or_focus_changes() {
+        let mut state = State::new(PathBuf::new(), Vec::new());
+        state.asset_load = None;
+        state.screen = Screen::CreateWorld;
+        let mut menu = Menu::new(&mut state);
+        menu.focused = Some(ButtonId::CreationName);
+        let start = Instant::now();
+
+        let initial = menu.update_caret(start);
+        assert_eq!(initial, Some((ButtonId::CreationName, true)));
+        assert!(menu.overlay_dirty);
+        menu.caret_rendered = initial;
+        menu.overlay_dirty = false;
+        assert_eq!(
+            menu.update_caret(start + Duration::from_millis(299)),
+            initial
+        );
+        assert!(!menu.overlay_dirty);
+
+        let hidden = menu.update_caret(start + Duration::from_millis(300));
+        assert_eq!(hidden, Some((ButtonId::CreationName, false)));
+        assert!(menu.overlay_dirty);
+        menu.caret_rendered = hidden;
+        menu.overlay_dirty = false;
+        assert_eq!(
+            menu.update_caret(start + Duration::from_millis(599)),
+            hidden
+        );
+        assert!(!menu.overlay_dirty);
+        assert_eq!(
+            menu.update_caret(start + Duration::from_millis(600)),
+            initial
+        );
+        assert!(menu.overlay_dirty);
+
+        menu.state.creation_tab = CreationTab::World;
+        menu.focused = Some(ButtonId::CreationSeed);
+        let seed = menu.update_caret(start + Duration::from_millis(750));
+        assert_eq!(seed, Some((ButtonId::CreationSeed, true)));
+        menu.caret_rendered = seed;
+        menu.overlay_dirty = false;
+        menu.state.creation.seed.set_preedit("한".into());
+        assert_eq!(
+            menu.update_caret(start + Duration::from_millis(751)),
+            Some((ButtonId::CreationSeed, false))
+        );
+        assert!(menu.overlay_dirty);
+        menu.caret_rendered = Some((ButtonId::CreationSeed, false));
+        menu.overlay_dirty = false;
+        menu.focused = None;
+        assert_eq!(menu.update_caret(start + Duration::from_millis(752)), None);
+        assert!(menu.overlay_dirty);
+    }
 
     #[test]
     fn software_scene_identity_does_not_keep_assets_alive() {
@@ -7043,7 +7158,7 @@ public class GuiScaleOracle {
         assert!(ui.click(320, 240, (160, 40)));
         assert_eq!(ui.selected(), Some("ko_kr"));
         let mut canvas = Canvas::new(320, 240);
-        ui.draw(&mut canvas, state.assets.as_ref().unwrap(), true);
+        ui.draw(&mut canvas, state.assets.as_ref().unwrap(), true, true);
         assert!(canvas.pixels.iter().any(|pixel| *pixel != 0));
         state.begin_asset_load(
             game.clone(),

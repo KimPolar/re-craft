@@ -154,6 +154,7 @@ struct DrawKey {
     hud_tick: Option<u64>,
     chat: Option<crate::chat_hud::DisplayKey>,
     chat_input_tick: Option<u64>,
+    language_search_caret: Option<bool>,
     chat_tooltip_cursor: Option<(i32, i32)>,
     action_bar: Option<(u64, u8)>,
 }
@@ -1605,6 +1606,12 @@ impl GameUi {
     }
 
     fn activate(&mut self, button: PauseButton, mouse: bool) -> PauseAction {
+        if button == PauseButton::LanguageSearch
+            && self.pause_focus != Some(PauseButton::LanguageSearch)
+            && let Some(ui) = &mut self.language_ui
+        {
+            ui.search.reset_focus_at(std::time::Instant::now());
+        }
         self.pause_focus = Some(button);
         self.last_draw = None;
         match button {
@@ -2073,6 +2080,9 @@ impl GameUi {
             PausePage::Font => {
                 self.pause_page = PausePage::Language;
                 self.pause_focus = Some(PauseButton::LanguageSearch);
+                if let Some(ui) = &mut self.language_ui {
+                    ui.search.reset_focus_at(std::time::Instant::now());
+                }
                 PauseAction::None
             }
             PausePage::Controls => {
@@ -2236,6 +2246,12 @@ impl GameUi {
                 (None, false) => 0,
                 (None, true) => buttons.len() - 1,
             };
+            if buttons[index] == PauseButton::LanguageSearch
+                && self.pause_focus != Some(PauseButton::LanguageSearch)
+                && let Some(ui) = &mut self.language_ui
+            {
+                ui.search.reset_focus_at(std::time::Instant::now());
+            }
             self.pause_focus = Some(buttons[index]);
             if self.pause_page == PausePage::Video
                 && matches!(
@@ -3126,6 +3142,12 @@ impl GameUi {
                 .chat_input
                 .is_open()
                 .then(|| self.chat_input.blink_key()),
+            language_search_caret: self
+                .language_search_focused()
+                .then(|| self.language_ui.as_ref())
+                .flatten()
+                .filter(|ui| !ui.search.composing())
+                .map(|ui| ui.search.blink_key() % 2 == 0),
             chat_tooltip_cursor: chat_tooltip.then_some(self.cursor),
             action_bar: crate::action_bar::display_key(self.locked_chest_message.as_deref(), tick),
         };
@@ -3768,6 +3790,7 @@ impl GameUi {
                         &mut canvas,
                         assets,
                         self.pause_focus == Some(PauseButton::LanguageSearch),
+                        key.language_search_caret.unwrap_or(false),
                     );
                 }
                 canvas.button(
@@ -4515,6 +4538,49 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn pause_language_caret_updates_cached_overlay_and_restarts_on_focus() -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&game, &[])?);
+        let mut ui = GameUi::new(assets);
+        ui.resize((1280, 720));
+        assert!(ui.toggle_pause());
+        ui.activate(PauseButton::Options, false);
+        ui.activate(PauseButton::Language, false);
+        let inventory = PlayerInventory::default();
+        ui.language_ui
+            .as_mut()
+            .unwrap()
+            .search
+            .reset_focus_at(Instant::now());
+        assert!(ui.compose((1280, 720), &inventory, 0).is_some());
+        assert_eq!(ui.last_draw.unwrap().language_search_caret, Some(true));
+
+        ui.language_ui
+            .as_mut()
+            .unwrap()
+            .search
+            .reset_focus_at(Instant::now() - Duration::from_millis(350));
+        assert!(ui.compose((1280, 720), &inventory, 0).is_some());
+        assert_eq!(ui.last_draw.unwrap().language_search_caret, Some(false));
+
+        ui.pause_focus = None;
+        ui.activate(PauseButton::LanguageSearch, true);
+        assert_eq!(ui.language_ui.as_ref().unwrap().search.blink_key(), 0);
+        assert!(ui.compose((1280, 720), &inventory, 0).is_some());
+        assert_eq!(ui.last_draw.unwrap().language_search_caret, Some(true));
+
+        ui.language_ime(winit::event::Ime::Preedit("한".into(), None));
+        assert!(ui.compose((1280, 720), &inventory, 0).is_some());
+        assert_eq!(ui.last_draw.unwrap().language_search_caret, None);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

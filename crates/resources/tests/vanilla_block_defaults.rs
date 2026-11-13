@@ -335,6 +335,28 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:barrel"));
     assert!(registry.contains("minecraft:hopper"));
     assert!(registry.contains("minecraft:trial_spawner"));
+    for color in [
+        "white",
+        "orange",
+        "magenta",
+        "light_blue",
+        "yellow",
+        "lime",
+        "pink",
+        "gray",
+        "light_gray",
+        "cyan",
+        "purple",
+        "blue",
+        "brown",
+        "green",
+        "red",
+        "black",
+    ] {
+        let id = format!("minecraft:{color}_concrete");
+        assert!(registry.contains(&id), "missing concrete state: {id}");
+        cases.push(serde_json::json!({"id":id,"properties":{"invalid":"value"}}));
+    }
     for ominous in ["false", "true", "invalid"] {
         for state in [
             "inactive",

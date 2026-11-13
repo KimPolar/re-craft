@@ -918,6 +918,7 @@ impl GeneratedBlockRegistry {
                         "net/minecraft/world/level/block/GlazedTerracottaBlock",
                     )),
                     "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
+                    "CONCRETE" => Some(("concrete", BASE)),
                     "WOOL" => Some(("wool", BASE)),
                     "CARPET" => Some(("carpet", "net/minecraft/world/level/block/WoolCarpetBlock")),
                     "DYED_CANDLE" => {

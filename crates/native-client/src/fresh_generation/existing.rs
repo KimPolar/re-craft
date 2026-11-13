@@ -24,6 +24,15 @@ pub(crate) struct PreparedExistingGenerator {
     feature_entity_evidence: Option<BTreeMap<native_resources::feature_order::FeatureKey, bool>>,
     structure_schedule:
         Option<Arc<native_resources::structure_decoration::StructureDecorationSchedule>>,
+    captured_structure_starts: BTreeMap<
+        native_world::loaded::ChunkPos,
+        Arc<
+            BTreeMap<
+                ResourceId,
+                native_session::worldgen::saved_structure_starts::RestoredStructureStart,
+            >,
+        >,
+    >,
     creature_environment: Option<(
         native_resources::creature_timeline::CreatureSpawnEnvironment,
         native_resources::entity_category::EntityCategoryRegistry,
@@ -4221,6 +4230,7 @@ impl PreparedExistingGenerator {
             batch.schedule.ready(center, GenerationStage::Features),
             "features dependencies are incomplete"
         );
+        self.ensure_captured_features_without_structures(&batch.schedule, center)?;
         let captured = self.context.inputs().sources().chunks();
         let mut positions = Vec::with_capacity(9);
         for dz in -1i32..=1 {
@@ -4561,12 +4571,31 @@ impl PreparedExistingGenerator {
                 );
             }
         }
+        let saved = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target)
+            .and_then(|source| source.terrain.as_ref())
+            .context("saved terrain target is missing")?;
+        let saved_stage = validate_empty_preterrain_target(saved, true)?;
+        let early_structure = if saved_stage < GenerationStage::StructureReferences {
+            Some(Arc::new(self.captured_beardifier(
+                &work.schedule,
+                position,
+                structure_order,
+            )?))
+        } else {
+            None
+        };
         let (terrain, biome) = self.generate_saved_terrain_from_biomes(
             target,
             structure_order,
             evaluator,
             &work.biomes,
             true,
+            early_structure,
         )?;
         let terrain = self.materialize_saved_terrain(target, terrain, &biome)?;
         work.terrain.insert(target, terrain);
@@ -4585,6 +4614,18 @@ impl PreparedExistingGenerator {
         work: &mut CapturedBiomeSchedule,
         evaluator: &mut native_resources::density::DensityEvaluator,
         position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        self.run_captured_new_terrain_with_structure_order(work, evaluator, position, &[])
+    }
+
+    /// Generate an absent chunk using the supplied Java structure-key order.
+    /// Starts generated outside this capture are not yet supported.
+    pub fn run_captured_new_terrain_with_structure_order(
+        &mut self,
+        work: &mut CapturedBiomeSchedule,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        position: native_world::loaded::ChunkPos,
+        structure_order: &[ResourceId],
     ) -> Result<()> {
         use native_session::worldgen::schedule::GenerationStage;
         ensure!(
@@ -4636,7 +4677,13 @@ impl PreparedExistingGenerator {
                 .chunk([position.x, position.z])
                 .context("terrain biome is missing")?,
         );
-        let terrain = self.generate_terrain_from_biomes(target, evaluator, &work.biomes, None)?;
+        let structure = self.captured_beardifier(&work.schedule, position, structure_order)?;
+        let terrain = self.generate_terrain_from_biomes(
+            target,
+            evaluator,
+            &work.biomes,
+            Some(Arc::new(structure)),
+        )?;
         let dimension = self.context.inputs().sources().dimension();
         let dimension = format!("{}:{}", dimension.namespace, dimension.path);
         let registry = &self
@@ -4816,6 +4863,19 @@ impl PreparedExistingGenerator {
             native_session::worldgen::saved_structure_starts::RestoredStructureStart,
         >,
     > {
+        self.restore_captured_structure_starts(position, false)
+    }
+
+    fn restore_captured_structure_starts(
+        &mut self,
+        position: native_persistence::world::ChunkPos,
+        allow_unstarted: bool,
+    ) -> Result<
+        BTreeMap<
+            ResourceId,
+            native_session::worldgen::saved_structure_starts::RestoredStructureStart,
+        >,
+    > {
         use native_session::worldgen::{
             saved_structure_starts::restore_saved_structure_starts_with_templates,
             schedule::GenerationStage,
@@ -4835,6 +4895,10 @@ impl PreparedExistingGenerator {
             .terrain
             .as_ref()
             .context("saved structure chunk is missing")?;
+        ensure!(
+            saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
+            "unsupported saved structure data version"
+        );
         let status = saved
             .status
             .as_ref()
@@ -4842,7 +4906,8 @@ impl PreparedExistingGenerator {
         let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
         ensure!(
             GenerationStage::from_id(&status)
-                .is_some_and(|stage| stage >= GenerationStage::StructureStarts),
+                .is_some_and(|stage| stage >= GenerationStage::StructureStarts
+                    || (allow_unstarted && !self.generate_structures)),
             "saved chunk has not generated structure starts"
         );
         let document = Arc::clone(&saved.document);
@@ -4899,6 +4964,142 @@ impl PreparedExistingGenerator {
                     .transpose()
             },
         )
+    }
+
+    /// Do not run the structure-free feature path when references exist.
+    fn ensure_captured_features_without_structures(
+        &mut self,
+        schedule: &GenerationSchedule,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let target = native_persistence::world::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        let saved_status = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target)
+            .context("feature chunk was not captured")?
+            .terrain
+            .as_ref()
+            .map(|saved| {
+                let status = saved
+                    .status
+                    .as_ref()
+                    .context("saved chunk status is missing")?;
+                let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+                GenerationStage::from_id(&status).context("unknown saved chunk status")
+            })
+            .transpose()?;
+        if saved_status.is_some_and(|stage| stage >= GenerationStage::StructureReferences) {
+            let references = self.restore_saved_structure_references(target)?;
+            validate_saved_decoration_references(&references)?;
+            ensure!(
+                references
+                    .references
+                    .membership()
+                    .values()
+                    .all(BTreeSet::is_empty),
+                "captured structure decoration is not prepared"
+            );
+        } else {
+            self.captured_beardifier(schedule, position, &[])
+                .context("captured structure decoration is not prepared")?;
+        }
+        Ok(())
+    }
+
+    /// Reconstruct the target's reference stage from captured starts. This
+    /// validates every source, including absent chunks, before terrain runs.
+    fn captured_beardifier(
+        &mut self,
+        schedule: &GenerationSchedule,
+        target: native_world::loaded::ChunkPos,
+        structure_order: &[ResourceId],
+    ) -> Result<native_core::beardifier::Beardifier> {
+        use native_session::worldgen::{
+            saved_structure_starts::{RestoredStructureStart, beardifier_for_ordered_references},
+            schedule::GenerationStage,
+            structure_references::collect_ordered_structure_references,
+        };
+        let mut starts = BTreeMap::new();
+        for dx in -8i32..=8 {
+            for dz in -8i32..=8 {
+                let position = native_world::loaded::ChunkPos {
+                    x: target
+                        .x
+                        .checked_add(dx)
+                        .context("structure chunk X overflow")?,
+                    z: target
+                        .z
+                        .checked_add(dz)
+                        .context("structure chunk Z overflow")?,
+                };
+                ensure!(
+                    schedule
+                        .completed(position)
+                        .is_some_and(|stage| stage >= GenerationStage::StructureStarts),
+                    "structure starts are not complete at {},{}",
+                    position.x,
+                    position.z
+                );
+                let saved_position = native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                };
+                let saved = self
+                    .context
+                    .inputs()
+                    .sources()
+                    .chunks()
+                    .get(&saved_position)
+                    .context("structure source was not captured")?
+                    .terrain
+                    .is_some();
+                if !saved {
+                    ensure!(
+                        !self.generate_structures,
+                        "generated structure starts are not captured"
+                    );
+                    continue;
+                }
+                if !self.captured_structure_starts.contains_key(&position) {
+                    let restored = self.restore_captured_structure_starts(saved_position, true)?;
+                    self.captured_structure_starts
+                        .insert(position, Arc::new(restored));
+                }
+                starts.insert(
+                    position,
+                    Arc::clone(&self.captured_structure_starts[&position]),
+                );
+            }
+        }
+        let references = collect_ordered_structure_references(target, |position| {
+            let Some(entries) = starts.get(&position) else {
+                return Ok(Vec::new());
+            };
+            entries
+                .iter()
+                .filter_map(|(id, start)| start.reference_bounds(id).transpose())
+                .collect()
+        })?;
+        beardifier_for_ordered_references(target, &references, structure_order, |id, position| {
+            let start = starts
+                .get(&position)
+                .and_then(|entries| entries.get(id))
+                .context("referenced structure start is missing")?;
+            if let RestoredStructureStart::Present { chunk, .. } = start {
+                ensure!(
+                    *chunk == position,
+                    "saved structure start belongs to another chunk"
+                );
+            }
+            start.terrain_pieces()
+        })
     }
 
     /// Prepare terrain adaptation from captured starts and references. The
@@ -5298,6 +5499,7 @@ impl PreparedExistingGenerator {
             evaluator,
             &neighborhood,
             false,
+            None,
         )
     }
 
@@ -5308,6 +5510,7 @@ impl PreparedExistingGenerator {
         evaluator: &mut native_resources::density::DensityEvaluator,
         neighborhood: &native_session::worldgen::BiomeNeighborhood,
         allow_pre_biomes: bool,
+        early_structure: Option<Arc<native_core::beardifier::Beardifier>>,
     ) -> Result<(
         native_resources::surface_pass::SurfaceStageChunk,
         Arc<native_session::worldgen::QuartBiomeChunk>,
@@ -5336,12 +5539,15 @@ impl PreparedExistingGenerator {
         // Existing references remain effective even if new structure starts
         // have since been disabled in the world's settings.
         let structure = if saved_stage >= GenerationStage::StructureReferences {
+            ensure!(
+                early_structure.is_none(),
+                "unexpected generated structure references"
+            );
             Some(Arc::new(
                 self.restore_saved_beardifier(target, structure_order)?,
             ))
         } else {
-            ensure!(structure_order.is_empty(), "structures are disabled");
-            None
+            Some(early_structure.context("generated structure references are missing")?)
         };
         let terrain =
             self.generate_terrain_from_biomes(target, evaluator, neighborhood, structure)?;
@@ -6235,6 +6441,7 @@ pub(crate) fn prepare_existing_generator(
         feature_schedule: None,
         feature_entity_evidence: None,
         structure_schedule: None,
+        captured_structure_starts: BTreeMap::new(),
         creature_environment: None,
         mob_placement_assets: None,
         farm_variants: [None, None, None],
@@ -6774,6 +6981,43 @@ mod tests {
                     Tag::Compound(vec![("example:map".into(), Tag::Int(37))]),
                 ),
                 (
+                    "structures".into(),
+                    Tag::Compound(vec![(
+                        "starts".into(),
+                        Tag::Compound(vec![(
+                            "minecraft:buried_treasure".into(),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:buried_treasure".into())),
+                                ("ChunkX".into(), Tag::Int(second.x)),
+                                ("ChunkZ".into(), Tag::Int(second.z)),
+                                ("references".into(), Tag::Int(0)),
+                                (
+                                    "Children".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(vec![
+                                            ("id".into(), Tag::String("minecraft:btp".into())),
+                                            (
+                                                "BB".into(),
+                                                Tag::IntArray(vec![
+                                                    -33,
+                                                    lighting.min_y + 8,
+                                                    35,
+                                                    -33,
+                                                    lighting.min_y + 8,
+                                                    35,
+                                                ]),
+                                            ),
+                                            ("O".into(), Tag::Int(-1)),
+                                            ("GD".into(), Tag::Int(0)),
+                                        ])],
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    )]),
+                ),
+                (
                     "sections".into(),
                     Tag::List {
                         element_type: TagType::Compound,
@@ -6840,7 +7084,7 @@ mod tests {
         ];
         let mut early_region = vec![0; 8192];
         for (position, status) in early_positions {
-            let document = NamedTag {
+            let mut document = NamedTag {
                 name: "".into(),
                 value: Tag::Compound(vec![
                     ("DataVersion".into(), Tag::Int(5023)),
@@ -6850,6 +7094,48 @@ mod tests {
                     ("example:unrecognized".into(), Tag::Int(73)),
                 ]),
             };
+            if position.x == 1002 {
+                let Tag::Compound(fields) = &mut document.value else {
+                    unreachable!()
+                };
+                fields.push((
+                    "structures".into(),
+                    Tag::Compound(vec![(
+                        "starts".into(),
+                        Tag::Compound(vec![(
+                            "minecraft:buried_treasure".into(),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:buried_treasure".into())),
+                                ("ChunkX".into(), Tag::Int(position.x)),
+                                ("ChunkZ".into(), Tag::Int(position.z)),
+                                ("references".into(), Tag::Int(0)),
+                                (
+                                    "Children".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(vec![
+                                            ("id".into(), Tag::String("minecraft:btp".into())),
+                                            (
+                                                "BB".into(),
+                                                Tag::IntArray(vec![
+                                                    16000,
+                                                    lighting.min_y + 8,
+                                                    8,
+                                                    16000,
+                                                    lighting.min_y + 8,
+                                                    8,
+                                                ]),
+                                            ),
+                                            ("O".into(), Tag::Int(-1)),
+                                            ("GD".into(), Tag::Int(0)),
+                                        ])],
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    )]),
+                ));
+            }
             let bytes = native_persistence::nbt::write(&document)?;
             let sectors = (bytes.len() + 5).div_ceil(4096);
             let offset = early_region.len() / 4096;
@@ -7144,16 +7430,32 @@ mod tests {
         let early_block_ids = resources.vanilla_block_ids()?;
         let early_tags = CarverBlockTags::load(&mut resources, &early_block_ids)?;
         let early_registry = resources.vanilla_generated_block_registry()?;
+        let early_treasure = ResourceId::parse("minecraft:buried_treasure")?;
         for (position, _) in early_positions {
             let key = native_world::loaded::ChunkPos {
                 x: position.x,
                 z: position.z,
             };
+            let structure_order = if position == first {
+                assert!(scheduled_early.run_captured_saved_terrain(
+                    &mut early_work,
+                    &mut early_evaluator,
+                    key,
+                    &[],
+                ).is_err());
+                assert_eq!(
+                    early_work.schedule().completed(key),
+                    Some(GenerationStage::Biomes)
+                );
+                std::slice::from_ref(&early_treasure)
+            } else {
+                &[]
+            };
             scheduled_early.run_captured_saved_terrain(
                 &mut early_work,
                 &mut early_evaluator,
                 key,
-                &[],
+                structure_order,
             )?;
             let terrain = early_work
                 .terrain_chunk(position)
@@ -7241,7 +7543,8 @@ mod tests {
                 (required >= GenerationStage::InitializeLight).then_some(pos)
             })
             .collect();
-        // With structures disabled these stages produce no starts or references.
+        // New starts are disabled; the saved second chunk retains its start.
+        // Imported stage markers isolate the later terrain tests.
         let completed: Vec<_> = schedule
             .requirements()
             .map(|(pos, required)| {
@@ -7355,9 +7658,37 @@ mod tests {
         }
         actual.run_captured_saved_terrain(&mut work, &mut evaluator, second, &[])?;
         actual.run_captured_saved_terrain(&mut work, &mut evaluator, third, &[])?;
+        let structure_target = native_world::loaded::ChunkPos { x: -3, z: 2 };
+        let treasure = ResourceId::parse("minecraft:buried_treasure")?;
+        assert!(terrain_positions.contains(&structure_target));
         for &position in &terrain_positions {
             if position != target && position != second && position != third {
-                actual.run_captured_new_terrain(&mut work, &mut evaluator, position)?;
+                if position == structure_target {
+                    // The saved start intersects this absent chunk; omitting
+                    // its key must fail without advancing the schedule.
+                    assert!(
+                        actual
+                            .run_captured_new_terrain(&mut work, &mut evaluator, position)
+                            .is_err()
+                    );
+                    assert_eq!(
+                        work.schedule().completed(position),
+                        Some(GenerationStage::Biomes)
+                    );
+                    actual.run_captured_new_terrain_with_structure_order(
+                        &mut work,
+                        &mut evaluator,
+                        position,
+                        std::slice::from_ref(&treasure),
+                    )?;
+                    assert!(
+                        actual
+                            .ensure_captured_features_without_structures(&work.schedule, position)
+                            .is_err()
+                    );
+                } else {
+                    actual.run_captured_new_terrain(&mut work, &mut evaluator, position)?;
+                }
             }
         }
         let sample_y = [lighting.min_y, 0, 63, lighting.min_y + lighting.height - 1];

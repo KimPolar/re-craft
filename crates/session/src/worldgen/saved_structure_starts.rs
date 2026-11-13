@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     SavedMineshaftPiece, SavedSwampHutPiece,
-    structure_references::{SavedStructureReferences, StructureStartBounds},
+    structure_references::{
+        OrderedStructureReferences, SavedStructureReferences, StructureStartBounds,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -112,23 +114,11 @@ pub fn saved_beardifier_for_chunk(
         references.discarded.is_empty(),
         "saved structure references contain discarded data"
     );
-    let keys: BTreeSet<_> = references.references.membership().keys().cloned().collect();
-    let order: BTreeSet<_> = structure_order.iter().cloned().collect();
-    ensure!(
-        order.len() == structure_order.len() && order == keys,
-        "structure order does not cover references exactly"
-    );
-    let mut pieces = Vec::new();
-    for id in structure_order {
-        for &packed in references
-            .references
-            .order(id)
-            .context("missing saved reference order")?
-        {
-            let source = ChunkPos {
-                x: packed as u32 as i32,
-                z: ((packed as u64) >> 32) as u32 as i32,
-            };
+    beardifier_for_ordered_references(
+        target,
+        &references.references,
+        structure_order,
+        |id, source| {
             let start = starts
                 .get(&source)
                 .and_then(|by_id| by_id.get(id))
@@ -144,7 +134,36 @@ pub fn saved_beardifier_for_chunk(
                     "saved structure start belongs to another chunk"
                 );
             }
-            pieces.extend(start.terrain_pieces()?);
+            start.terrain_pieces()
+        },
+    )
+}
+
+/// Build a beardifier from either saved or newly collected references.
+/// The caller resolves each start from the same captured generation inputs.
+pub fn beardifier_for_ordered_references(
+    target: ChunkPos,
+    references: &OrderedStructureReferences,
+    structure_order: &[ResourceId],
+    mut pieces_for_start: impl FnMut(&ResourceId, ChunkPos) -> Result<Vec<StructurePiece>>,
+) -> Result<Beardifier> {
+    let keys: BTreeSet<_> = references.membership().keys().cloned().collect();
+    let order: BTreeSet<_> = structure_order.iter().cloned().collect();
+    ensure!(
+        order.len() == structure_order.len() && order == keys,
+        "structure order does not cover references exactly"
+    );
+    let mut pieces = Vec::new();
+    for id in structure_order {
+        for &packed in references
+            .order(id)
+            .context("missing saved reference order")?
+        {
+            let source = ChunkPos {
+                x: packed as u32 as i32,
+                z: ((packed as u64) >> 32) as u32 as i32,
+            };
+            pieces.extend(pieces_for_start(id, source)?);
         }
     }
     Beardifier::for_chunk([target.x, target.z], &pieces).map_err(anyhow::Error::msg)
@@ -630,6 +649,68 @@ mod tests {
         assert!(
             restore_saved_structure_starts(ChunkPos { x: -2, z: 3 }, Some(&unsupported), config)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collected_references_visit_saved_starts_in_requested_order() -> Result<()> {
+        use super::super::structure_references::collect_ordered_structure_references;
+
+        let target = ChunkPos { x: 0, z: 0 };
+        let a = ResourceId::parse("example:a")?;
+        let b = ResourceId::parse("example:b")?;
+        let bounds = BoundingBox::new([0, 0, 0], [15, 20, 15]).unwrap();
+        let references = collect_ordered_structure_references(target, |source| {
+            let mut found = Vec::new();
+            if source == target || source == (ChunkPos { x: 1, z: 0 }) {
+                found.push(StructureStartBounds {
+                    structure: a.clone(),
+                    bounds,
+                });
+            }
+            if source == target {
+                found.push(StructureStartBounds {
+                    structure: b.clone(),
+                    bounds,
+                });
+            }
+            Ok(found)
+        })?;
+        let mut visited = Vec::new();
+        assert!(
+            beardifier_for_ordered_references(
+                target,
+                &references,
+                std::slice::from_ref(&a),
+                |_, _| {
+                    panic!("incomplete structure order must be rejected before resolving starts")
+                }
+            )
+            .is_err()
+        );
+        beardifier_for_ordered_references(
+            target,
+            &references,
+            &[b.clone(), a.clone()],
+            |id, source| {
+                visited.push((id.clone(), source));
+                Ok(Vec::new())
+            },
+        )?;
+        let expected_a: Vec<_> = references
+            .order(&a)
+            .unwrap()
+            .iter()
+            .map(|&packed| ChunkPos {
+                x: packed as u32 as i32,
+                z: ((packed as u64) >> 32) as u32 as i32,
+            })
+            .collect();
+        assert_eq!(visited[0], (b, target));
+        assert_eq!(
+            visited[1..].iter().map(|(_, pos)| *pos).collect::<Vec<_>>(),
+            expected_a
         );
         Ok(())
     }

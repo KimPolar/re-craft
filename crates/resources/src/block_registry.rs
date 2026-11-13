@@ -34,6 +34,7 @@ enum StateSchema {
     Vault,
     DecoratedPot,
     Barrel,
+    Hopper,
     PotentSulfur,
     SulfurSpike,
     Liquid,
@@ -106,6 +107,12 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("facing".into(), "north".into()),
                     ("open".into(), "false".into()),
+                ]);
+            }
+            Self::Hopper => {
+                return BTreeMap::from([
+                    ("facing".into(), "down".into()),
+                    ("enabled".into(), "true".into()),
                 ]);
             }
             Self::Beehive => {
@@ -361,6 +368,13 @@ impl StateSchema {
                 if (name == "facing"
                     && matches!(value, "north" | "south" | "east" | "west" | "up" | "down"))
                     || (name == "open" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Hopper
+                if (name == "facing"
+                    && matches!(value, "north" | "south" | "east" | "west" | "down"))
+                    || (name == "enabled" && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -1014,6 +1028,7 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::DecoratedPot)
                 }
                 "net/minecraft/world/level/block/BarrelBlock" => Some(StateSchema::Barrel),
+                "net/minecraft/world/level/block/HopperBlock" => Some(StateSchema::Hopper),
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
@@ -1285,6 +1300,7 @@ impl GeneratedBlockRegistry {
                     | StateSchema::Vault
                     | StateSchema::DecoratedPot
                     | StateSchema::Barrel
+                    | StateSchema::Hopper
                     | StateSchema::Ladder
                     | StateSchema::Stairs
                     | StateSchema::Chest
@@ -1308,7 +1324,9 @@ impl GeneratedBlockRegistry {
             );
         }
         let facing = properties["facing"].as_str();
-        if matches!(schema, StateSchema::Barrel) && matches!(facing, "up" | "down") {
+        if matches!(schema, StateSchema::Barrel | StateSchema::Hopper)
+            && matches!(facing, "up" | "down")
+        {
             return Ok(result);
         }
         let affected = match mirror {

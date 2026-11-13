@@ -1500,6 +1500,59 @@ impl CarvedTerrainWorld {
         Ok(())
     }
 
+    /// Import a captured saved chunk into an intermediate terrain world.
+    /// The caller must verify that the source belongs to this generator and
+    /// capture. This does not restore generation stages or authorize a save.
+    pub fn insert_saved_chunk(
+        &mut self,
+        source: &native_world::loaded::World,
+        pos: native_world::loaded::ChunkPos,
+        heightmaps: &native_persistence::heightmap::SavedGenerationHeightmaps,
+        marks: Option<&native_core::postprocessing::PostProcessing>,
+    ) -> Result<()> {
+        ensure!(
+            !self.world.chunks.contains_key(&pos),
+            "terrain chunk already exists"
+        );
+        ensure!(
+            !self.postprocessing.contains_key(&pos)
+                && !self.carver_postprocessing.contains_key(&pos),
+            "terrain metadata already exists"
+        );
+        if let Some(marks) = marks {
+            let mut bounds =
+                native_core::postprocessing::PostProcessing::new(self.min_y, self.height)
+                    .context("invalid generation postprocessing bounds")?;
+            ensure!(bounds.append(marks), "saved postprocessing bounds differ");
+        }
+        let previous = Arc::clone(&self.world);
+        let imported = Arc::make_mut(&mut self.world)
+            .import_chunk(source, pos)
+            .context("cannot import saved terrain chunk");
+        match imported {
+            Ok(true) => {}
+            Ok(false) => {
+                self.world = previous;
+                bail!("terrain chunk already exists");
+            }
+            Err(error) => {
+                self.world = previous;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.restore_saved_heightmaps(pos, heightmaps) {
+            self.world = previous;
+            return Err(error);
+        }
+        // Saved marks are the ordered baseline for later marks, not a claim
+        // that the earlier individual noise/surface stages are known.
+        if let Some(marks) = marks {
+            self.carver_postprocessing
+                .insert(pos, Arc::new(marks.clone()));
+        }
+        Ok(())
+    }
+
     /// A snapshot retains its existing chunks when another chunk is inserted.
     pub fn snapshot(&self) -> Arc<native_world::loaded::World> {
         Arc::clone(&self.world)
@@ -4377,6 +4430,46 @@ mod tests {
         assert_eq!(
             assembled.generated_heightmap_data(first_pos).unwrap(),
             encoded
+        );
+        let third_pos = ChunkPos { x: 1, z: 0 };
+        let saved_chunk = make([1, 0], 42, -16, "minecraft:overworld", false);
+        let mut marks = native_core::postprocessing::PostProcessing::new(-16, 16).unwrap();
+        marks.mark(17, -15, 1);
+        marks.mark(17, -15, 1);
+        let before_failed_import = assembled.snapshot();
+        assert!(
+            assembled
+                .insert_saved_chunk(saved_chunk.world(), third_pos, &wrong_bounds, Some(&marks))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before_failed_import, &assembled.snapshot()));
+        let wrong_marks = native_core::postprocessing::PostProcessing::new(0, 16).unwrap();
+        assert!(
+            assembled
+                .insert_saved_chunk(saved_chunk.world(), third_pos, &saved, Some(&wrong_marks))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before_failed_import, &assembled.snapshot()));
+        assembled
+            .insert_saved_chunk(saved_chunk.world(), third_pos, &saved, Some(&marks))
+            .unwrap();
+        assert_eq!(
+            assembled.generated_heightmap_data(third_pos).unwrap(),
+            encoded
+        );
+        assert_eq!(
+            assembled.postprocessing_marks_to_date(third_pos),
+            Some(marks)
+        );
+        assert!(assembled.fluid_postprocessing(third_pos).is_none());
+        assert_eq!(
+            assembled.snapshot().block(16, -16, 0),
+            saved_chunk.world().block(16, -16, 0)
+        );
+        assert!(
+            assembled
+                .insert_saved_chunk(saved_chunk.world(), third_pos, &saved, None)
+                .is_err()
         );
     }
 

@@ -2242,6 +2242,54 @@ mod tests {
             anyhow::ensure!(Instant::now() < deadline, "cancelled preparation timed out");
             thread::sleep(Duration::from_millis(2));
         }
+        let captured = capture_again()?;
+        let mut prepare_cancelled_terrain =
+            MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared_cancelled_terrain = loop {
+            if let Some(result) = prepare_cancelled_terrain.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "terrain preparation timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut terrain_biomes =
+            MissingGenerationBiomeWorker::start(prepared_cancelled_terrain, &streamer, &session)
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let biomed_for_cancellation = loop {
+            if let Some(result) = terrain_biomes.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "terrain biome preparation timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut cancelled_terrain = MissingGenerationTerrainWorker::start(
+            biomed_for_cancellation,
+            &streamer,
+            &session,
+            1,
+            BTreeMap::new(),
+        )
+        .map_err(|failure| failure.error)?;
+        cancelled_terrain.cancel();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match cancelled_terrain.try_result(&streamer, &session) {
+                Err(error) => {
+                    assert!(error.to_string().contains("cancelled"));
+                    break;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("cancelled terrain was published"),
+            }
+            anyhow::ensure!(Instant::now() < deadline, "terrain cancellation timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
         let stale_capture = capture_again()?;
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!prepared.is_current(&streamer, &session));
@@ -2286,6 +2334,9 @@ mod tests {
         drop(second_terrain_worker);
         drop(terrain_worker);
         drop(cancelled_biomes);
+        drop(cancelled_terrain);
+        drop(terrain_biomes);
+        drop(prepare_cancelled_terrain);
         drop(prepare_cancelled_biomes);
         drop(biome_worker);
         drop(prepare_biomes);
@@ -2357,6 +2408,25 @@ mod tests {
                 ])
             })
             .collect();
+        let stale_surface = [25; 256];
+        let saved_heightmaps = native_persistence::heightmap::encode_generated_heightmaps(
+            native_persistence::heightmap::HeightBounds {
+                min_y: -64,
+                max_y: 320,
+            },
+            &native_persistence::heightmap::GeneratedHeightmaps {
+                world_surface: Some(&stale_surface),
+                ocean_floor: None,
+                motion_blocking: None,
+                motion_blocking_no_leaves: None,
+                world_surface_wg: None,
+                ocean_floor_wg: None,
+            },
+        )?;
+        let mut saved_marks = native_core::postprocessing::PostProcessing::new(-64, 384)
+            .context("invalid test bounds")?;
+        saved_marks.mark(17, 0, 1);
+        saved_marks.mark(17, 0, 1);
         let saved = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![
@@ -2365,6 +2435,11 @@ mod tests {
                 ("zPos".into(), Tag::Int(saved_pos.z)),
                 ("Status".into(), Tag::String("minecraft:full".into())),
                 ("custom".into(), Tag::Int(73)),
+                ("Heightmaps".into(), saved_heightmaps.clone()),
+                (
+                    "PostProcessing".into(),
+                    native_persistence::postprocessing::encode(&saved_marks),
+                ),
                 (
                     "sections".into(),
                     Tag::List {
@@ -2507,25 +2582,47 @@ mod tests {
         );
         assert_eq!(std::fs::read(&region_path)?, region);
         let state = result.into_checked_state(&streamer, &session)?;
-        let mut cancelled =
-            MissingGenerationTerrainWorker::start(state, &streamer, &session, 1, BTreeMap::new())
-                .map_err(|failure| failure.error)?;
-        cancelled.cancel();
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            match cancelled.try_result(&streamer, &session) {
-                Err(error) => {
-                    assert!(error.to_string().contains("cancelled"));
-                    break;
-                }
-                Ok(None) => {}
-                Ok(Some(_)) => anyhow::bail!("cancelled terrain was published"),
-            }
-            anyhow::ensure!(Instant::now() < deadline, "terrain cancellation timed out");
-            thread::sleep(Duration::from_millis(2));
-        }
+        let batch = state.generator.assemble_captured_terrain_with_saved(
+            state.work,
+            &state.terrain,
+            [saved_pos],
+        )?;
+        assert_eq!(
+            batch.schedule().completed(saved_pos),
+            Some(GenerationStage::Biomes)
+        );
+        assert_eq!(
+            batch
+                .terrain()
+                .snapshot()
+                .block(16, 0, 0)
+                .map(|block| block.name.as_str()),
+            Some("minecraft:air")
+        );
+        assert!(batch.terrain().snapshot().chunks.contains_key(&target));
+        assert_eq!(
+            batch.terrain().generated_heightmap_data(saved_pos)?,
+            saved_heightmaps
+        );
+        assert_eq!(
+            batch.terrain().postprocessing_marks_to_date(saved_pos),
+            Some(saved_marks)
+        );
+        assert!(batch.terrain().fluid_postprocessing(saved_pos).is_none());
+        assert!(
+            batch
+                .sources()
+                .get(&SavedChunkPos {
+                    x: saved_pos.x,
+                    z: saved_pos.z
+                })
+                .is_some_and(Option::is_some)
+        );
         assert_eq!(std::fs::read(&region_path)?, region);
-        drop(cancelled);
+        drop(batch);
+        drop(state.generator);
+        drop(state.terrain);
+        drop(state.observed);
         drop(terrain);
         drop(biome);
         drop(prepare);

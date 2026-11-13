@@ -5120,6 +5120,68 @@ impl PreparedExistingGenerator {
         })
     }
 
+    /// Add already-generated saved terrain from the same capture alongside
+    /// generated chunks. Saved statuses are not advanced in the schedule:
+    /// later-stage state and live-session changes still require validation.
+    pub fn assemble_captured_terrain_with_saved(
+        &self,
+        work: CapturedBiomeSchedule,
+        restored: &RestoredSavedTerrain,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+    ) -> Result<CapturedTerrainBatch> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &restored.identity),
+            "saved terrain belongs to another capture"
+        );
+        let mut batch = self.assemble_captured_terrain(work)?;
+        let captured = self.context.inputs().sources().chunks();
+        for position in positions {
+            let key = native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            ensure!(
+                batch
+                    .schedule
+                    .required(position)
+                    .is_some_and(|stage| stage >= GenerationStage::Terrain),
+                "saved terrain is not required"
+            );
+            let saved = captured
+                .get(&key)
+                .and_then(|source| source.terrain.as_ref())
+                .context("saved terrain source is missing")?;
+            let status = saved
+                .status
+                .as_ref()
+                .context("saved chunk status is missing")?;
+            let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+            let stage = GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+            ensure!(
+                stage >= GenerationStage::Terrain,
+                "saved chunk has not generated terrain"
+            );
+            ensure!(!batch.sources.contains_key(&key), "duplicate terrain chunk");
+            let heightmaps = restored
+                .heightmaps
+                .get(&position)
+                .context("saved heightmaps are missing")?;
+            let marks = restored
+                .postprocessing
+                .get(&position)
+                .context("saved postprocessing is missing")?;
+            batch.terrain.insert_saved_chunk(
+                &restored.world,
+                position,
+                heightmaps,
+                marks.as_ref(),
+            )?;
+            batch.sources.insert(key, Some(Arc::clone(&saved.document)));
+        }
+        Ok(batch)
+    }
+
     /// Restore the effective reference sets from one captured saved chunk.
     /// The returned report identifies data Java would discard on loading.
     pub fn restore_saved_structure_references(

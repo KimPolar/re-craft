@@ -10,6 +10,10 @@ use super::super::jigsaw::{
     PreparedTemplatePiece,
 };
 
+#[cfg(test)]
+#[path = "trial_template_tests.rs"]
+mod trial_template_tests;
+
 pub(super) struct JigsawRegion<'r, 'a, 'g> {
     pub(super) region: &'r mut DecorationRegion<'a>,
     pub(super) registry: &'g GeneratedBlockRegistry,
@@ -172,6 +176,13 @@ pub(super) fn jigsaw_speleothem(state: &BlockState) -> bool {
     ) && native_world::block_light::same_light_behavior(state, state).is_some()
 }
 
+pub(super) fn jigsaw_polished_stone(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:polished_andesite" | "minecraft:polished_diorite" | "minecraft:polished_granite"
+    ) && state.properties.is_empty()
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
         ensure!(
@@ -198,6 +209,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::vault_state(state).is_some()
         || native_world::collision::barrel_state(state)
         || native_world::collision::trial_spawner_state(state).is_some()
+        || jigsaw_polished_stone(state)
     {
         return Ok(true);
     }
@@ -552,6 +564,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_glass(state)
                 || native_world::collision::full_terracotta(state)
                 || native_world::collision::full_concrete(state)
+                || jigsaw_polished_stone(state)
                 || native_world::collision::copper_bulb_state(state).is_some()
                 || native_world::collision::full_copper(state)
                 || native_world::collision::full_tuff(state)
@@ -993,6 +1006,20 @@ mod tests {
             properties: BTreeMap::new(),
         };
         assert!(jigsaw_static_full(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn jigsaw_polished_stones_are_full_and_stateless() -> Result<()> {
+        for name in ["polished_andesite", "polished_diorite", "polished_granite"] {
+            let mut state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            assert!(jigsaw_static_full(&state)?);
+            state.properties.insert("extra".into(), "true".into());
+            assert!(!jigsaw_polished_stone(&state));
+        }
         Ok(())
     }
 

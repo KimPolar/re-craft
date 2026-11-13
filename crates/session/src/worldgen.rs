@@ -47,6 +47,7 @@ mod generated_mineshaft_piece;
 mod generated_potent_sulfur;
 mod generated_sheep;
 mod generated_spawner;
+mod generated_vault;
 mod generated_village_villager;
 mod generated_zombie_nautilus;
 pub mod jigsaw;
@@ -91,6 +92,7 @@ pub use generated_mineshaft_piece::SavedMineshaftPiece;
 pub use generated_potent_sulfur::GeneratedPotentSulfur;
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::{GeneratedCaveSpiderSpawner, GeneratedMonsterSpawner};
+pub use generated_vault::GeneratedVault;
 pub use generated_zombie_nautilus::draft_fresh_structure_zombie_nautilus;
 pub use local_difficulty::LocalDifficulty;
 pub use mob_placement::{

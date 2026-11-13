@@ -242,6 +242,10 @@ pub(crate) struct CapturedTerrainBatch {
     biomes: native_session::worldgen::BiomeNeighborhood,
     terrain: native_session::worldgen::CarvedTerrainWorld,
     sources: BTreeMap<native_persistence::world::ChunkPos, Option<Arc<NamedTag>>>,
+    saved_stages: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_session::worldgen::schedule::GenerationStage,
+    >,
     generated_references: BTreeMap<native_world::loaded::ChunkPos, CapturedGeneratedReferences>,
     feature_entity_sources: ResumedFeatureEntitySources,
     revision: Arc<()>,
@@ -810,6 +814,25 @@ impl CapturedTerrainBatch {
 
     pub fn sources(&self) -> &BTreeMap<native_persistence::world::ChunkPos, Option<Arc<NamedTag>>> {
         &self.sources
+    }
+
+    /// Retain the actual disk status separately from the stages whose data
+    /// have been imported into the generation schedule.
+    pub fn saved_stage(
+        &self,
+        position: native_world::loaded::ChunkPos,
+    ) -> Option<native_session::worldgen::schedule::GenerationStage> {
+        self.saved_stages.get(&position).copied()
+    }
+
+    fn require_unfinished_features(&self, position: native_world::loaded::ChunkPos) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            self.saved_stage(position)
+                .is_none_or(|stage| stage < GenerationStage::Features),
+            "saved chunk already completed features"
+        );
+        Ok(())
     }
 
     pub fn has_entity_free_feature_coverage(
@@ -4287,6 +4310,7 @@ impl PreparedExistingGenerator {
             x: context.position.x,
             z: context.position.z,
         };
+        batch.require_unfinished_features(center)?;
         ensure!(
             batch.schedule.ready(center, GenerationStage::Features),
             "features dependencies are incomplete"
@@ -5125,6 +5149,7 @@ impl PreparedExistingGenerator {
             biomes,
             terrain: world,
             sources,
+            saved_stages: BTreeMap::new(),
             generated_references,
             feature_entity_sources: ResumedFeatureEntitySources::default(),
             revision: Arc::new(()),
@@ -5132,8 +5157,8 @@ impl PreparedExistingGenerator {
     }
 
     /// Add already-generated saved terrain from the same capture alongside
-    /// generated chunks. Saved statuses are not advanced in the schedule:
-    /// later-stage state and live-session changes still require validation.
+    /// generated chunks. Only the restored terrain stage is imported into the
+    /// schedule; later-stage state and live changes still require validation.
     pub fn assemble_captured_terrain_with_saved(
         &self,
         work: CapturedBiomeSchedule,
@@ -5160,6 +5185,7 @@ impl PreparedExistingGenerator {
         );
         let mut batch = self.assemble_captured_terrain_checked(work, &mut check)?;
         let captured = self.context.inputs().sources().chunks();
+        let mut imported = Vec::new();
         for position in positions {
             check()?;
             let key = native_persistence::world::ChunkPos {
@@ -5187,6 +5213,10 @@ impl PreparedExistingGenerator {
                 stage >= GenerationStage::Terrain,
                 "saved chunk has not generated terrain"
             );
+            ensure!(
+                batch.schedule.completed(position) == Some(GenerationStage::Biomes),
+                "saved terrain prerequisites are incomplete"
+            );
             ensure!(!batch.sources.contains_key(&key), "duplicate terrain chunk");
             let heightmaps = restored
                 .heightmaps
@@ -5203,7 +5233,11 @@ impl PreparedExistingGenerator {
                 marks.as_ref(),
             )?;
             batch.sources.insert(key, Some(Arc::clone(&saved.document)));
+            batch.saved_stages.insert(position, stage);
+            imported.push((position, GenerationStage::Terrain));
         }
+        check()?;
+        batch.schedule.restore_imported(imported)?;
         check()?;
         Ok(batch)
     }

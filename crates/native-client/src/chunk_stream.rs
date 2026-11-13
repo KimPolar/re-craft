@@ -2777,8 +2777,10 @@ mod tests {
         let batch = assembled.batch();
         assert_eq!(
             batch.schedule().completed(saved_pos),
-            Some(GenerationStage::Biomes)
+            Some(GenerationStage::Terrain)
         );
+        assert_eq!(batch.saved_stage(saved_pos), Some(GenerationStage::Full));
+        assert!(batch.schedule().ready(target, GenerationStage::Features));
         assert_eq!(
             batch
                 .terrain()
@@ -2807,6 +2809,29 @@ mod tests {
                 .is_some_and(Option::is_some)
         );
         assert_eq!(std::fs::read(&region_path)?, region);
+        let (mut batch, mut generator, restored, evaluator, observed) =
+            assembled.into_checked_parts(&streamer, &session)?;
+        let context = generator.prepare_captured_decoration(
+            &batch,
+            SavedChunkPos {
+                x: saved_pos.x,
+                z: saved_pos.z,
+            },
+        )?;
+        let before = batch.terrain().snapshot();
+        let error = generator
+            .run_captured_features(&mut batch, &context)
+            .unwrap_err();
+        assert!(error.to_string().contains("already completed features"));
+        assert!(Arc::ptr_eq(&before, &batch.terrain().snapshot()));
+        drop(before);
+        let assembled = AssembledMissingGeneration {
+            batch,
+            generator,
+            restored,
+            evaluator,
+            observed,
+        };
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!assembled.is_current(&streamer, &session));
         assert!(assembled.into_checked_parts(&streamer, &session).is_err());

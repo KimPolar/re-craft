@@ -695,6 +695,47 @@ impl CapturedPostprocessedSections {
     }
 }
 
+/// Components tied to the same completed pass. Entity sidecars remain unknown.
+pub(crate) struct CapturedPostprocessedComponents {
+    result_identity: Arc<()>,
+    chunks: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_session::worldgen::PostprocessedChunkComponents,
+    >,
+}
+
+impl CapturedPostprocessedComponents {
+    pub fn chunks(
+        &self,
+    ) -> &BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_session::worldgen::PostprocessedChunkComponents,
+    > {
+        &self.chunks
+    }
+
+    pub fn matches_state(
+        &self,
+        completed: &CapturedPostprocessedRegion,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> bool {
+        Arc::ptr_eq(&self.result_identity, &completed.identity)
+            && completed.matches_state(
+                batch,
+                light,
+                spawn_mobs,
+                game_time,
+                next_sub_tick,
+                water_source_conversion,
+            )
+    }
+}
+
 impl CapturedPostprocessedRegion {
     pub fn region(&self) -> &native_session::worldgen::PostprocessedGeneratedRegion {
         &self.region
@@ -2170,6 +2211,80 @@ impl PreparedExistingGenerator {
         Ok(CapturedPostprocessedSections {
             result_identity: Arc::clone(&completed.identity),
             sections,
+        })
+    }
+
+    /// Combine sections, heightmaps, ticks and block entities from the same
+    /// captured pass. Entity sidecars and all save checks remain unresolved.
+    pub fn captured_postprocessed_components(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedPostprocessedRegion,
+        sections: &CapturedPostprocessedSections,
+        spawn_mobs: bool,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<CapturedPostprocessedComponents> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && sections.matches_state(
+                    completed,
+                    batch,
+                    light,
+                    spawn_mobs,
+                    game_time,
+                    next_sub_tick,
+                    water_source_conversion
+                ),
+            "captured postprocessing inputs changed"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let data = batch.terrain.captured_postprocessed_chunk_data(
+            &completed.region,
+            &assets.blocks,
+            &assets.block_ids,
+            sections.sections.keys().copied(),
+        )?;
+        let mut chunks = BTreeMap::new();
+        for (pos, data) in data {
+            let proof = completed
+                .proofs
+                .get(&pos)
+                .context("postprocessing proof is missing")?;
+            let source = batch
+                .sources
+                .get(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+                .context("terrain source was not captured")?;
+            ensure!(
+                proof.matches_source(source.as_deref())?,
+                "postprocessing source differs"
+            );
+            let heightmaps =
+                merge_captured_postprocessed_heightmaps(&proof.other_fields, data.heightmaps)?;
+            chunks.insert(
+                pos,
+                native_session::worldgen::PostprocessedChunkComponents {
+                    sections: sections
+                        .sections
+                        .get(&pos)
+                        .context("postprocessed sections are missing")?
+                        .clone(),
+                    heightmaps,
+                    block_ticks: data.block_ticks,
+                    fluid_ticks: data.fluid_ticks,
+                    block_entities: data.block_entities,
+                    entity_records: None,
+                },
+            );
+        }
+        Ok(CapturedPostprocessedComponents {
+            result_identity: Arc::clone(&completed.identity),
+            chunks,
         })
     }
 
@@ -5616,6 +5731,25 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
+fn merge_captured_postprocessed_heightmaps(
+    original: &[(native_persistence::nbt::JavaString, Tag)],
+    generated: Tag,
+) -> Result<Tag> {
+    let Tag::Compound(generated) = generated else {
+        bail!("invalid postprocessed heightmaps")
+    };
+    let mut names = BTreeSet::new();
+    for (name, _) in original.iter().chain(&generated) {
+        ensure!(
+            names.insert(name.0.clone()),
+            "duplicate postprocessed heightmap"
+        );
+    }
+    let mut maps = original.to_vec();
+    maps.extend(generated);
+    Ok(Tag::Compound(maps))
+}
+
 fn merge_captured_postprocessed_sections(
     source: Option<&NamedTag>,
     generated: &Tag,
@@ -6024,6 +6158,22 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn captured_postprocessed_heightmaps_keep_unknown_fields() -> Result<()> {
+        let original = vec![(
+            JavaString::from("example:extra"),
+            Tag::LongArray(vec![1, -2]),
+        )];
+        let generated = Tag::Compound(vec![("WORLD_SURFACE".into(), Tag::LongArray(vec![3]))]);
+        let merged = merge_captured_postprocessed_heightmaps(&original, generated.clone())?;
+        assert_eq!(merged.get("example:extra"), Some(&original[0].1));
+        assert_eq!(merged.get("WORLD_SURFACE"), generated.get("WORLD_SURFACE"));
+        assert!(merge_captured_postprocessed_heightmaps(&original, Tag::Int(1)).is_err());
+        let duplicate = vec![(JavaString::from("WORLD_SURFACE"), Tag::Int(7))];
+        assert!(merge_captured_postprocessed_heightmaps(&duplicate, generated).is_err());
+        Ok(())
+    }
 
     #[test]
     fn captured_postprocessed_sections_preserve_saved_metadata() -> Result<()> {

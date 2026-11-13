@@ -21,6 +21,15 @@ use super::{
     postprocessing_world::{ConvertedBlockEntities, PostprocessingLightCheckpoint},
 };
 
+/// Non-writable components of a captured postprocessing result. Sections,
+/// entity sidecars, source metadata and live state require separate validation.
+pub struct CapturedPostprocessedChunkData {
+    pub heightmaps: native_persistence::nbt::Tag,
+    pub block_ticks: native_persistence::nbt::Tag,
+    pub fluid_ticks: native_persistence::nbt::Tag,
+    pub block_entities: native_persistence::nbt::Tag,
+}
+
 struct CapturedPostprocessingTags {
     heightmaps: Arc<native_resources::heightmap_tags::HeightmapTags>,
     mushroom: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
@@ -218,6 +227,106 @@ impl CarvedTerrainWorld {
             "postprocessing bounds differ"
         );
         Ok(())
+    }
+
+    /// Encode heightmaps, pending LevelChunk ticks and promoted block entities
+    /// from one sealed pass. This alone does not authorize a chunk save.
+    pub fn captured_postprocessed_chunk_data(
+        &self,
+        completed: &super::PostprocessedGeneratedRegion,
+        registry: &GeneratedBlockRegistry,
+        block_ids: &BTreeSet<String>,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, CapturedPostprocessedChunkData>> {
+        use native_world::loaded::{SavedBlockTick, SavedFluidTick};
+        self.validate_captured_postprocessing(completed)?;
+        let mut selected = BTreeSet::new();
+        for pos in positions {
+            ensure!(selected.insert(pos), "duplicate postprocessed chunk");
+            ensure!(
+                completed.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+        }
+        ensure!(!selected.is_empty(), "no postprocessed chunks selected");
+        for edit in &completed.sealed_edits {
+            if !selected.contains(&edit.chunk()) {
+                continue;
+            }
+            let old = completed
+                .source
+                .block(edit.x, edit.y, edit.z)
+                .context("original edited block is missing")?;
+            let new = completed
+                .world
+                .block(edit.x, edit.y, edit.z)
+                .context("postprocessed edited block is missing")?;
+            if old != new {
+                let has_entity = |state: &native_world::loaded::BlockState| {
+                    registry
+                        .is_canonical_state(&state.name, &state.properties)
+                        .then(|| registry.has_block_entity(&state.name))
+                        .flatten()
+                        .context("edited block entity classification is unavailable")
+                };
+                ensure!(
+                    (!has_entity(old)? && !has_entity(new)?)
+                        || completed.permits_block_entity_edit(*edit, old, new),
+                    "postprocessing changed an unvalidated block entity"
+                );
+            }
+        }
+        let time = completed.ticks().game_time();
+        selected
+            .into_iter()
+            .map(|pos| {
+                let ticks = completed
+                    .ticks()
+                    .chunk(pos)
+                    .context("postprocessed tick container is missing")?;
+                let blocks: Vec<_> = ticks
+                    .blocks
+                    .pack(time)
+                    .into_iter()
+                    .map(|tick| SavedBlockTick {
+                        block: tick.kind,
+                        position: tick.position,
+                        delay: tick.delay,
+                        priority: tick.priority,
+                    })
+                    .collect();
+                let fluids: Vec<_> = ticks
+                    .fluids
+                    .pack(time)
+                    .into_iter()
+                    .map(|tick| SavedFluidTick {
+                        fluid: tick.kind,
+                        position: tick.position,
+                        delay: tick.delay,
+                        priority: tick.priority,
+                    })
+                    .collect();
+                Ok((
+                    pos,
+                    CapturedPostprocessedChunkData {
+                        heightmaps: completed
+                            .heightmaps()
+                            .get(&pos)
+                            .context("postprocessed heightmaps are missing")?
+                            .to_tag()?,
+                        block_ticks: native_persistence::generated_ticks::encode_level_block_ticks(
+                            pos,
+                            &blocks,
+                            |id| block_ids.contains(id),
+                        )?,
+                        fluid_ticks: native_persistence::generated_ticks::encode_level_fluid_ticks(
+                            pos, &fluids,
+                        )?,
+                        block_entities: completed.block_entity_data(pos)?,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Preview the light after pending postprocessing checks at a caller-chosen
@@ -553,6 +662,22 @@ mod tests {
             ]),
             ticks: RegionTicks::new(ticks, 100, 0)?,
         };
+        let bounds = HeightBounds {
+            min_y: 0,
+            max_y: 16,
+        };
+        let surface = [16; 256];
+        let original_maps = native_persistence::heightmap::encode_generated_heightmaps(
+            bounds,
+            &native_persistence::heightmap::GeneratedHeightmaps {
+                world_surface: Some(&surface),
+                ..Default::default()
+            },
+        )?;
+        let maps = FullHeightmaps::from_converted(
+            bounds,
+            &generated_full_heightmaps(bounds, &original_maps)?,
+        )?;
         let tags = CapturedPostprocessingTags::load(&mut resources, &ids)?;
         let mut initial = GeneratedPostprocessing::new(
             terrain.snapshot(),
@@ -561,7 +686,7 @@ mod tests {
             region,
             None,
             tags.mushroom.clone(),
-            BTreeMap::new(),
+            BTreeMap::from([(first, maps.clone()), (second, maps.clone())]),
             Some(Arc::clone(&tags.heightmaps)),
         );
         tags.apply(&mut initial);
@@ -602,6 +727,45 @@ mod tests {
                 )?);
             }
             let mut completed = original.finish()?;
+            let data =
+                terrain.captured_postprocessed_chunk_data(&completed, &registry, &ids, [first])?;
+            let chunk = &data[&first];
+            assert_eq!(chunk.heightmaps, maps.to_tag()?);
+            let Tag::List {
+                values: block_ticks,
+                ..
+            } = &chunk.block_ticks
+            else {
+                unreachable!()
+            };
+            assert_eq!(block_ticks.len(), 1);
+            assert_eq!(
+                block_ticks[0].get("i"),
+                Some(&Tag::String("minecraft:sand".into()))
+            );
+            assert_eq!(block_ticks[0].get("t"), Some(&Tag::Int(2)));
+            assert!(matches!(&chunk.fluid_ticks, Tag::List { values, .. } if values.is_empty()));
+            assert!(matches!(&chunk.block_entities, Tag::List { values, .. } if values.is_empty()));
+            assert!(
+                terrain
+                    .captured_postprocessed_chunk_data(&completed, &registry, &ids, [second])
+                    .is_err()
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_chunk_data(&completed, &registry, &ids, [first, first])
+                    .is_err()
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_chunk_data(
+                        &completed,
+                        &registry,
+                        &BTreeSet::new(),
+                        [first]
+                    )
+                    .is_err()
+            );
             let preview = terrain.captured_postprocessed_light_snapshot(
                 &completed,
                 &engine,
@@ -658,6 +822,11 @@ mod tests {
                 vec![second]
             );
             completed.edits.push(BlockPosition { x: 8, y: 8, z: 8 });
+            assert!(
+                terrain
+                    .captured_postprocessed_chunk_data(&completed, &registry, &ids, [first])
+                    .is_err()
+            );
             assert!(
                 terrain
                     .captured_postprocessed_light_snapshot(&completed, &engine, &registry, [first])

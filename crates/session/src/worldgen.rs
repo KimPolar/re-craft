@@ -82,6 +82,7 @@ mod template_entities;
 pub mod template_feature;
 mod terrain_batch;
 pub mod tick_index;
+pub use captured_postprocessing::CapturedPostprocessedChunkData;
 pub use carving::CarverBlockState;
 pub use generated_barrel::GeneratedBarrel;
 pub use generated_beehive::GeneratedBeeNest;
@@ -1799,7 +1800,10 @@ impl CarvedTerrainWorld {
                     (hopper.state.clone(), hopper.block_entity())
                 }
                 GeneratedMonsterRoomEntity::Dispenser(dispenser) => {
-                    ensure!(p == dispenser.position, "generated dispenser position mismatch");
+                    ensure!(
+                        p == dispenser.position,
+                        "generated dispenser position mismatch"
+                    );
                     (dispenser.state.clone(), dispenser.block_entity())
                 }
                 GeneratedMonsterRoomEntity::TrialSpawner(spawner) => {

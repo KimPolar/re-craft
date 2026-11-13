@@ -209,6 +209,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         }
         "minecraft:jigsaw" if crate::collision::jigsaw_state(state) => (15, 0),
         "minecraft:barrel" if crate::collision::barrel_state(state) => (15, 0),
+        "minecraft:dispenser" if crate::collision::dispenser_state(state) => (15, 0),
         "minecraft:hopper" if crate::collision::hopper_facing(state).is_some() => (0, 0),
         "minecraft:trial_spawner" if crate::collision::trial_spawner_state(state).is_some() => (
             1,

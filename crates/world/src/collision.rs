@@ -47,6 +47,20 @@ pub fn barrel_state(state: &BlockState) -> bool {
         )
 }
 
+/// Validate the complete built-in dispenser state.
+pub fn dispenser_state(state: &BlockState) -> bool {
+    state.name == "minecraft:dispenser"
+        && state.properties.len() == 2
+        && matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west" | "up" | "down")
+        )
+        && matches!(
+            state.properties.get("triggered").map(String::as_str),
+            Some("true" | "false")
+        )
+}
+
 /// Validate a hopper and return its output direction.
 pub fn hopper_facing(state: &BlockState) -> Option<&str> {
     if state.name != "minecraft:hopper"
@@ -1346,6 +1360,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         || copper_grate_waterlogged(state).is_some()
         || vault_state(state).is_some()
         || barrel_state(state)
+        || dispenser_state(state)
         || trial_spawner_state(state).is_some()
     {
         return Some(FULL.to_vec());

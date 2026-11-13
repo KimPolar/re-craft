@@ -65,6 +65,14 @@ pub(super) fn place_block_for_light_test(
                 },
             ),
         ]))
+    } else if state.name == "minecraft:dispenser" {
+        Some(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:dispenser".into())),
+            (
+                "LootTable".into(),
+                Tag::String("minecraft:dispensers/trial_chambers/chamber".into()),
+            ),
+        ]))
     } else if state.name == "minecraft:decorated_pot" {
         let sherds = ["back", "front", "left", "right"]
             .into_iter()
@@ -161,6 +169,11 @@ pub(super) fn jigsaw_ladder(state: &BlockState) -> bool {
     native_world::collision::ladder_state(state).is_some()
 }
 
+pub(super) fn jigsaw_button(state: &BlockState) -> bool {
+    native_core::button::Button::from_id(&state.name).is_some()
+        && native_world::collision::block_outline(state).is_some()
+}
+
 pub(super) fn jigsaw_cobweb(state: &BlockState) -> bool {
     state.name == "minecraft:cobweb" && state.properties.is_empty()
 }
@@ -208,6 +221,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::copper_grate_waterlogged(state).is_some()
         || native_world::collision::vault_state(state).is_some()
         || native_world::collision::barrel_state(state)
+        || native_world::collision::dispenser_state(state)
         || native_world::collision::trial_spawner_state(state).is_some()
         || jigsaw_polished_stone(state)
     {
@@ -218,6 +232,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || jigsaw_candle(state)
         || jigsaw_carpet(state)
         || jigsaw_ladder(state)
+        || jigsaw_button(state)
         || native_world::collision::flower_pot(state)
         || native_world::collision::decorated_pot_waterlogged(state).is_some()
         || native_world::collision::hopper_facing(state).is_some()
@@ -406,10 +421,25 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         } else {
             None
         };
+        let mut dispenser_random = None;
+        let dispenser = if state.name == "minecraft:dispenser" {
+            let mut next = random.clone();
+            let dispenser = super::super::GeneratedDispenser::from_template(
+                pos,
+                state.clone(),
+                nbt.context("dispenser template data is missing")?,
+                next.next_long(),
+            )?;
+            dispenser_random = Some(next);
+            Some(dispenser)
+        } else {
+            None
+        };
         let chest_table = if vault.is_some()
             || pot.is_some()
             || barrel.is_some()
             || hopper.is_some()
+            || dispenser.is_some()
             || trial_spawner.is_some()
         {
             None
@@ -475,6 +505,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                             || pot.is_some()
                             || barrel.is_some()
                             || hopper.is_some()
+                            || dispenser.is_some()
                             || trial_spawner.is_some()
                     )
                 && jigsaw_static_full(state).is_ok(),
@@ -518,6 +549,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             || pot.is_some()
             || barrel.is_some()
             || hopper.is_some()
+            || dispenser.is_some()
             || trial_spawner.is_some()
         {
             self.region.jigsaw_block_write = true;
@@ -544,6 +576,9 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             } else if let Some(hopper) = hopper {
                 *random = hopper_random.expect("hopper random state present");
                 super::super::GeneratedMonsterRoomEntity::Hopper(hopper)
+            } else if let Some(dispenser) = dispenser {
+                *random = dispenser_random.expect("dispenser random state present");
+                super::super::GeneratedMonsterRoomEntity::Dispenser(dispenser)
             } else {
                 *random = pot_random.expect("pot random state present");
                 super::super::GeneratedMonsterRoomEntity::DecoratedPot(
@@ -578,6 +613,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || jigsaw_candle(state)
                 || jigsaw_carpet(state)
                 || jigsaw_ladder(state)
+                || jigsaw_button(state)
                 || jigsaw_cobweb(state)
                 || jigsaw_chain(state)
                 || jigsaw_speleothem(state);
@@ -690,6 +726,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                         | super::super::GeneratedMonsterRoomEntity::DecoratedPot(_)
                         | super::super::GeneratedMonsterRoomEntity::Barrel(_)
                         | super::super::GeneratedMonsterRoomEntity::Hopper(_)
+                        | super::super::GeneratedMonsterRoomEntity::Dispenser(_)
                         | super::super::GeneratedMonsterRoomEntity::TrialSpawner(_)
                 ))
             ),

@@ -38,6 +38,7 @@ mod generated_chest;
 mod generated_creature_random;
 mod generated_cushion;
 mod generated_decorated_pot;
+mod generated_dispenser;
 mod generated_donkey;
 mod generated_drowned;
 mod generated_farm_animal;
@@ -87,6 +88,7 @@ pub use generated_brushable::GeneratedBrushable;
 pub use generated_chest::{GeneratedEmptyChest, GeneratedLootChest};
 pub use generated_creature_random::{FreshCreatureRandom, fresh_entity_uuid_from_entropy};
 pub use generated_decorated_pot::GeneratedDecoratedPot;
+pub use generated_dispenser::GeneratedDispenser;
 pub use generated_donkey::draft_fresh_donkey;
 pub use generated_drowned::draft_fresh_structure_drowned;
 pub use generated_farm_animal::{draft_fresh_farm_animal, draft_fresh_jockey_chicken};
@@ -138,6 +140,7 @@ pub enum GeneratedMonsterRoomEntity {
     DecoratedPot(GeneratedDecoratedPot),
     Barrel(GeneratedBarrel),
     Hopper(GeneratedHopper),
+    Dispenser(GeneratedDispenser),
     TrialSpawner(GeneratedTrialSpawner),
     /// A protochunk DUMMY chest not yet materialized by getBlockEntity.
     PendingChest {
@@ -1793,6 +1796,10 @@ impl CarvedTerrainWorld {
                 GeneratedMonsterRoomEntity::Hopper(hopper) => {
                     ensure!(p == hopper.position, "generated hopper position mismatch");
                     (hopper.state.clone(), hopper.block_entity())
+                }
+                GeneratedMonsterRoomEntity::Dispenser(dispenser) => {
+                    ensure!(p == dispenser.position, "generated dispenser position mismatch");
+                    (dispenser.state.clone(), dispenser.block_entity())
                 }
                 GeneratedMonsterRoomEntity::TrialSpawner(spawner) => {
                     ensure!(

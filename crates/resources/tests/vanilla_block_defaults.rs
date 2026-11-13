@@ -334,6 +334,7 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:decorated_pot"));
     assert!(registry.contains("minecraft:barrel"));
     assert!(registry.contains("minecraft:hopper"));
+    assert!(registry.contains("minecraft:dispenser"));
     assert!(registry.contains("minecraft:trial_spawner"));
     for button in native_core::button::Button::ALL {
         assert!(
@@ -389,6 +390,11 @@ fn generated_block_defaults_match_java() {
     for facing in ["north", "south", "east", "west", "up", "down", "invalid"] {
         for enabled in ["false", "true", "invalid"] {
             cases.push(serde_json::json!({"id":"minecraft:hopper","properties":{"facing":facing,"enabled":enabled}}));
+        }
+    }
+    for facing in ["north", "south", "east", "west", "up", "down", "invalid"] {
+        for triggered in ["false", "true", "invalid"] {
+            cases.push(serde_json::json!({"id":"minecraft:dispenser","properties":{"facing":facing,"triggered":triggered}}));
         }
     }
     for facing in ["north", "south", "east", "west", "up", "down", "invalid"] {

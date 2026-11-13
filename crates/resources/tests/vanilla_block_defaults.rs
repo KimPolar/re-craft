@@ -331,6 +331,14 @@ fn generated_block_defaults_match_java() {
         }
     }
     assert!(registry.contains("minecraft:vault"));
+    assert!(registry.contains("minecraft:decorated_pot"));
+    for facing in ["north", "south", "east", "west", "invalid"] {
+        for cracked in ["false", "true", "invalid"] {
+            for waterlogged in ["false", "true", "invalid"] {
+                cases.push(serde_json::json!({"id":"minecraft:decorated_pot","properties":{"facing":facing,"cracked":cracked,"waterlogged":waterlogged}}));
+            }
+        }
+    }
     for facing in ["north", "south", "east", "west", "invalid"] {
         for ominous in ["false", "true", "invalid"] {
             for vault_state in ["inactive", "active", "unlocking", "ejecting", "invalid"] {

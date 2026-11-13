@@ -32,6 +32,7 @@ enum StateSchema {
     Lit,
     CopperBulb,
     Vault,
+    DecoratedPot,
     PotentSulfur,
     SulfurSpike,
     Liquid,
@@ -91,6 +92,13 @@ impl StateSchema {
                     ("facing".into(), "north".into()),
                     ("ominous".into(), "false".into()),
                     ("vault_state".into(), "inactive".into()),
+                ]);
+            }
+            Self::DecoratedPot => {
+                return BTreeMap::from([
+                    ("cracked".into(), "false".into()),
+                    ("facing".into(), "north".into()),
+                    ("waterlogged".into(), "false".into()),
                 ]);
             }
             Self::Beehive => {
@@ -332,6 +340,13 @@ impl StateSchema {
                     || (name == "ominous" && matches!(value, "true" | "false"))
                     || (name == "vault_state"
                         && matches!(value, "inactive" | "active" | "unlocking" | "ejecting")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::DecoratedPot
+                if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
+                    || (matches!(name, "cracked" | "waterlogged")
+                        && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -981,6 +996,9 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::CopperBulb)
                 }
                 "net/minecraft/world/level/block/VaultBlock" => Some(StateSchema::Vault),
+                "net/minecraft/world/level/block/DecoratedPotBlock" => {
+                    Some(StateSchema::DecoratedPot)
+                }
                 "net/minecraft/world/level/block/PotentSulfurBlock" => {
                     Some(StateSchema::PotentSulfur)
                 }
@@ -1250,6 +1268,7 @@ impl GeneratedBlockRegistry {
                 schema,
                 StateSchema::HorizontalFacing
                     | StateSchema::Vault
+                    | StateSchema::DecoratedPot
                     | StateSchema::Ladder
                     | StateSchema::Stairs
                     | StateSchema::Chest

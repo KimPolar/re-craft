@@ -805,14 +805,12 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             "seed 1 did not exercise streaming a saved pending chunk"
         );
         eprintln!("Fence updates await {waiting:?}; saved terrain is available for {available:?}");
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while available
-            .iter()
-            .any(|&pos| !session.has_resident_or_parked_chunk(pos))
-        {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut settled_ticks = 0;
+        while settled_ticks < 10 {
             ensure!(
                 std::time::Instant::now() < deadline,
-                "streaming pending fence chunks timed out"
+                "streaming saved shape dependencies timed out"
             );
             streamer.service(session)?;
             session.update(Duration::from_millis(50));
@@ -821,24 +819,27 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
                 errors.is_empty(),
                 "generated session streaming errors: {errors:?}"
             );
+            // Updates may expose more dependencies as chunks arrive. Wait for
+            // all saved ones, including the fence and source chunks, rather
+            // than only the chunks originally listed as waiting.
+            let saved_pending = session
+                .required_shape_update_chunks()
+                .into_iter()
+                .any(|pos| {
+                    positions.contains(&ChunkPos { x: pos.x, z: pos.z })
+                        && !session.has_resident_or_parked_chunk(pos)
+                });
+            settled_ticks = if saved_pending { 0 } else { settled_ticks + 1 };
             std::thread::sleep(Duration::from_millis(10));
         }
-        // The saved chunks can already be resident before this loop starts.
-        // Still service tick boundaries so parked shape dependencies get a
-        // chance to run while other neighbors remain unavailable.
-        for _ in 0..10 {
-            streamer.service(session)?;
-            session.update(Duration::from_millis(50));
-            let errors = session.take_stream_errors();
-            ensure!(
-                errors.is_empty(),
-                "generated session streaming errors: {errors:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let missing_dependencies: Vec<_> = session
+            .required_shape_update_chunks()
+            .into_iter()
+            .filter(|pos| !positions.contains(&ChunkPos { x: pos.x, z: pos.z }))
+            .collect();
         eprintln!(
-            "Fence updates still waiting after streaming: {:?}",
-            session.pending_fence_update_chunks().collect::<Vec<_>>()
+            "Fence updates still waiting after streaming: {:?}; dependencies not staged: {missing_dependencies:?}",
+            session.pending_fence_update_chunks().collect::<Vec<_>>(),
         );
         match session.draft_new_player_state() {
             Ok(draft) => {
@@ -872,6 +873,10 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
                         && message.contains("unresolved: false")
                         && message.contains("waiting for chunks: [ChunkPos"),
                     "unexpected generated player save refusal: {error:#}"
+                );
+                ensure!(
+                    !missing_dependencies.is_empty(),
+                    "player save refused after all saved shape dependencies were loaded: {error:#}"
                 );
                 eprintln!("Ticked player save correctly refused: {error:#}");
             }

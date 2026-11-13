@@ -26,27 +26,47 @@ pub(super) fn place_block_for_light_test(
     let mut random = DecorationRandom::new(42);
     let mut draft = JigsawRegion { region, registry };
     let fluid = if waterlog { draft.fluid_at(pos)? } else { None };
-    let nbt = (state.name == "minecraft:vault").then(|| {
-        Tag::Compound(vec![
-            ("id".into(), Tag::String("minecraft:vault".into())),
+    let nbt = if state.name == "minecraft:decorated_pot" {
+        let sherds = ["back", "front", "left", "right"]
+            .into_iter()
+            .map(|face| {
+                (
+                    face.into(),
+                    Tag::Compound(vec![("id".into(), Tag::String("minecraft:brick".into()))]),
+                )
+            })
+            .collect();
+        Some(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:decorated_pot".into())),
+            ("sherds".into(), Tag::Compound(sherds)),
             (
-                "config".into(),
-                Tag::Compound(vec![
-                    (
-                        "key_item".into(),
-                        Tag::Compound(vec![
-                            ("id".into(), Tag::String("minecraft:trial_key".into())),
-                            ("count".into(), Tag::Int(1)),
-                        ]),
-                    ),
-                    (
-                        "loot_table".into(),
-                        Tag::String("minecraft:chests/trial_chambers/reward".into()),
-                    ),
-                ]),
+                "LootTable".into(),
+                Tag::String("minecraft:pots/trial_chambers/corridor".into()),
             ),
-        ])
-    });
+        ]))
+    } else {
+        (state.name == "minecraft:vault").then(|| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:vault".into())),
+                (
+                    "config".into(),
+                    Tag::Compound(vec![
+                        (
+                            "key_item".into(),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:trial_key".into())),
+                                ("count".into(), Tag::Int(1)),
+                            ]),
+                        ),
+                        (
+                            "loot_table".into(),
+                            Tag::String("minecraft:chests/trial_chambers/reward".into()),
+                        ),
+                    ]),
+                ),
+            ])
+        })
+    };
     ensure!(draft.place_template_block(pos, state, nbt.as_ref(), &mut random)?);
     if waterlog {
         draft.place_liquid(pos, state, fluid)?;
@@ -135,6 +155,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || jigsaw_carpet(state)
         || jigsaw_ladder(state)
         || native_world::collision::flower_pot(state)
+        || native_world::collision::decorated_pot_waterlogged(state).is_some()
     {
         return Ok(false);
     }
@@ -264,7 +285,21 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         } else {
             None
         };
-        let chest_table = if vault.is_some() {
+        let mut pot_random = None;
+        let pot = if state.name == "minecraft:decorated_pot" {
+            let mut next = random.clone();
+            let pot = super::super::GeneratedDecoratedPot::from_template(
+                pos,
+                state.clone(),
+                nbt.context("decorated pot template data is missing")?,
+                next.next_long(),
+            )?;
+            pot_random = Some(next);
+            Some(pot)
+        } else {
+            None
+        };
+        let chest_table = if vault.is_some() || pot.is_some() {
             None
         } else if let Some(nbt) = nbt {
             let Tag::Compound(fields) = nbt else {
@@ -322,7 +357,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             self.registry
                 .is_canonical_state(&state.name, &state.properties)
                 && self.registry.has_block_entity(&state.name)
-                    == Some(chest_table.is_some() || vault.is_some())
+                    == Some(chest_table.is_some() || vault.is_some() || pot.is_some())
                 && jigsaw_static_full(state).is_ok(),
             "unsupported jigsaw block effects at {pos:?}: {state:?}"
         );
@@ -360,7 +395,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             };
             Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
-        } else if let Some(vault) = vault {
+        } else if vault.is_some() || pot.is_some() {
             self.region.jigsaw_block_write = true;
             let barrier = BlockState {
                 name: "minecraft:barrier".into(),
@@ -375,10 +410,15 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             let pending = self.region.pending_order.entry(chunk(pos)).or_default();
             Arc::make_mut(pending).insert(pos);
             Arc::make_mut(pending).remove(pos);
-            Arc::make_mut(&mut self.region.monster_entities).insert(
-                pos,
-                Some(super::super::GeneratedMonsterRoomEntity::Vault(vault)),
-            );
+            let entity = if let Some(vault) = vault {
+                super::super::GeneratedMonsterRoomEntity::Vault(vault)
+            } else {
+                *random = pot_random.expect("pot random state present");
+                super::super::GeneratedMonsterRoomEntity::DecoratedPot(
+                    pot.expect("pot entity present"),
+                )
+            };
+            Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         } else {
             self.region.jigsaw_block_write = jigsaw_wood(state)
@@ -395,6 +435,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_copper(state)
                 || native_world::collision::full_tuff(state)
                 || native_world::collision::copper_grate_waterlogged(state).is_some()
+                || native_world::collision::decorated_pot_waterlogged(state).is_some()
                 || native_world::collision::flower_pot(state)
                 || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
                 || native_world::collision::pane_waterlogged(state).is_some()
@@ -418,6 +459,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || native_world::collision::trapdoor_state(state).is_some()
                 || native_world::collision::copper_grate_waterlogged(state).is_some()
+                || native_world::collision::decorated_pot_waterlogged(state).is_some()
                 || jigsaw_lantern(state)
                 || jigsaw_candle(state)
                 || jigsaw_ladder(state)
@@ -445,11 +487,14 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 wet.properties.insert("lit".into(), "false".into());
             }
             if self.region.writable.contains(&chunk(pos)) && !self.region.is_outside(pos[1]) {
-                let chest = if state.name == "minecraft:chest" {
+                let entity = if matches!(
+                    state.name.as_str(),
+                    "minecraft:chest" | "minecraft:decorated_pot"
+                ) {
                     let Some(Some(chest)) =
                         Arc::make_mut(&mut self.region.monster_entities).remove(&pos)
                     else {
-                        bail!("jigsaw chest entity is missing")
+                        bail!("jigsaw liquid container entity is missing")
                     };
                     Some(chest)
                 } else {
@@ -462,23 +507,27 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     || native_world::collision::trapdoor_state(state).is_some()
                     || native_world::collision::pane_waterlogged(state).is_some()
                     || native_world::collision::copper_grate_waterlogged(state).is_some()
+                    || native_world::collision::decorated_pot_waterlogged(state).is_some()
                     || jigsaw_lantern(state)
                     || jigsaw_candle(state)
                     || jigsaw_ladder(state);
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
                 result?;
-                if let Some(mut chest) = chest {
-                    match &mut chest {
+                if let Some(mut entity) = entity {
+                    match &mut entity {
                         super::super::GeneratedMonsterRoomEntity::Chest(chest) => {
                             chest.update_state(wet)?
                         }
                         super::super::GeneratedMonsterRoomEntity::EmptyChest(chest) => {
                             chest.state = wet
                         }
-                        _ => bail!("unsupported waterlogged chest entity"),
+                        super::super::GeneratedMonsterRoomEntity::DecoratedPot(pot) => {
+                            pot.state = wet
+                        }
+                        _ => bail!("unsupported waterlogged block entity"),
                     }
-                    Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(chest));
+                    Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
                 }
             }
             SpringWorld::schedule_spring_tick(
@@ -497,6 +546,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     super::super::GeneratedMonsterRoomEntity::Chest(_)
                         | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
                         | super::super::GeneratedMonsterRoomEntity::Vault(_)
+                        | super::super::GeneratedMonsterRoomEntity::DecoratedPot(_)
                 ))
             ),
             "jigsaw block entity marking is not yet supported"
@@ -837,6 +887,115 @@ mod tests {
             let expected = super::super::super::GeneratedVault::from_template(pos, state, &nbt)?
                 .block_entity();
             assert_eq!(values[0], expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_decorated_pot_preserves_loot_seed_and_waterlogging() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for waterlogged in [false, true] {
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let (id, properties) = registry.resolve(
+                &serde_json::json!({"id":"minecraft:decorated_pot","properties":{"facing":"west"}}),
+            )?;
+            let state = BlockState {
+                name: id,
+                properties,
+            };
+            let sherds = ["back", "front", "left", "right"]
+                .into_iter()
+                .map(|face| {
+                    (
+                        face.into(),
+                        Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String(
+                                if face == "back" {
+                                    "minecraft:flow_pottery_sherd"
+                                } else {
+                                    "minecraft:brick"
+                                }
+                                .into(),
+                            ),
+                        )]),
+                    )
+                })
+                .collect();
+            let nbt = Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:decorated_pot".into())),
+                ("sherds".into(), Tag::Compound(sherds)),
+                (
+                    "LootTable".into(),
+                    Tag::String("minecraft:pots/trial_chambers/corridor".into()),
+                ),
+            ]);
+            let pos = [1, 8, 1];
+            let mut random = DecorationRandom::new(42);
+            let mut original = random.clone();
+            let seed = original.next_long();
+            {
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(pos, &state, Some(&nbt), &mut random)?);
+                assert!(draft.is_liquid_container(&state)?);
+                if waterlogged {
+                    draft.place_liquid(
+                        pos,
+                        &state,
+                        Some(FluidState {
+                            kind: FluidKind::Water,
+                            source: true,
+                            falling: false,
+                            amount: 8,
+                        }),
+                    )?;
+                }
+                draft.mark_block_entity_changed(pos)?;
+            }
+            region.finish()?;
+            assert_eq!(random.next_long(), original.next_long());
+            let world = terrain.snapshot();
+            let saved_state = world
+                .block(pos[0], pos[1], pos[2])
+                .context("missing decorated pot")?;
+            assert_eq!(
+                saved_state.properties["waterlogged"],
+                waterlogged.to_string()
+            );
+            let Tag::List { values, .. } =
+                terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+            else {
+                bail!("missing entity list")
+            };
+            let expected = super::super::super::GeneratedDecoratedPot::from_template(
+                pos,
+                saved_state.clone(),
+                &nbt,
+                seed,
+            )?
+            .block_entity();
+            assert_eq!(values, vec![expected]);
+            let ticks = world.saved_fluid_ticks.get(&ChunkPos { x: 0, z: 0 });
+            if waterlogged {
+                let ticks = ticks.context("waterlogged decorated pot tick missing")?;
+                assert_eq!(ticks.len(), 1);
+                assert_eq!(ticks[0].position, pos);
+                assert_eq!(ticks[0].fluid, "minecraft:water");
+                assert_eq!(ticks[0].delay, 0);
+            } else {
+                assert!(ticks.is_none_or(|ticks| ticks.is_empty()));
+            }
         }
         Ok(())
     }

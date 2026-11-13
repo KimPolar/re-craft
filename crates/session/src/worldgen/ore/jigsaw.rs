@@ -26,7 +26,19 @@ pub(super) fn place_block_for_light_test(
     let mut random = DecorationRandom::new(42);
     let mut draft = JigsawRegion { region, registry };
     let fluid = if waterlog { draft.fluid_at(pos)? } else { None };
-    let nbt = if state.name == "minecraft:hopper" {
+    let nbt = if state.name == "minecraft:trial_spawner" {
+        Some(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:trial_spawner".into())),
+            (
+                "normal_config".into(),
+                Tag::String("minecraft:trial_chamber/breeze/normal".into()),
+            ),
+            (
+                "ominous_config".into(),
+                Tag::String("minecraft:trial_chamber/breeze/ominous".into()),
+            ),
+        ]))
+    } else if state.name == "minecraft:hopper" {
         Some(Tag::Compound(vec![
             ("id".into(), Tag::String("minecraft:hopper".into())),
             (
@@ -170,6 +182,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         || native_world::collision::copper_grate_waterlogged(state).is_some()
         || native_world::collision::vault_state(state).is_some()
         || native_world::collision::barrel_state(state)
+        || native_world::collision::trial_spawner_state(state).is_some()
     {
         return Ok(true);
     }
@@ -310,6 +323,15 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         } else {
             None
         };
+        let trial_spawner = if state.name == "minecraft:trial_spawner" {
+            Some(super::super::GeneratedTrialSpawner::from_template(
+                pos,
+                state.clone(),
+                nbt.context("trial spawner template data is missing")?,
+            )?)
+        } else {
+            None
+        };
         let mut pot_random = None;
         let pot = if state.name == "minecraft:decorated_pot" {
             let mut next = random.clone();
@@ -356,6 +378,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             || pot.is_some()
             || barrel.is_some()
             || hopper.is_some()
+            || trial_spawner.is_some()
         {
             None
         } else if let Some(nbt) = nbt {
@@ -420,6 +443,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                             || pot.is_some()
                             || barrel.is_some()
                             || hopper.is_some()
+                            || trial_spawner.is_some()
                     )
                 && jigsaw_static_full(state).is_ok(),
             "unsupported jigsaw block effects at {pos:?}: {state:?}"
@@ -458,7 +482,12 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             };
             Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
-        } else if vault.is_some() || pot.is_some() || barrel.is_some() || hopper.is_some() {
+        } else if vault.is_some()
+            || pot.is_some()
+            || barrel.is_some()
+            || hopper.is_some()
+            || trial_spawner.is_some()
+        {
             self.region.jigsaw_block_write = true;
             let barrier = BlockState {
                 name: "minecraft:barrier".into(),
@@ -475,6 +504,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             Arc::make_mut(pending).remove(pos);
             let entity = if let Some(vault) = vault {
                 super::super::GeneratedMonsterRoomEntity::Vault(vault)
+            } else if let Some(spawner) = trial_spawner {
+                super::super::GeneratedMonsterRoomEntity::TrialSpawner(spawner)
             } else if let Some(barrel) = barrel {
                 *random = barrel_random.expect("barrel random state present");
                 super::super::GeneratedMonsterRoomEntity::Barrel(barrel)
@@ -618,6 +649,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                         | super::super::GeneratedMonsterRoomEntity::DecoratedPot(_)
                         | super::super::GeneratedMonsterRoomEntity::Barrel(_)
                         | super::super::GeneratedMonsterRoomEntity::Hopper(_)
+                        | super::super::GeneratedMonsterRoomEntity::TrialSpawner(_)
                 ))
             ),
             "jigsaw block entity marking is not yet supported"
@@ -1203,6 +1235,65 @@ mod tests {
                 ]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_trial_spawner_preserves_configuration_without_consuming_random() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let (name, properties) =
+            registry.resolve(&serde_json::json!({"id":"minecraft:trial_spawner"}))?;
+        let state = BlockState { name, properties };
+        let nbt = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:trial_spawner".into())),
+            (
+                "normal_config".into(),
+                Tag::String("minecraft:trial_chamber/breeze/normal".into()),
+            ),
+            (
+                "ominous_config".into(),
+                Tag::String("minecraft:trial_chamber/breeze/ominous".into()),
+            ),
+        ]);
+        let pos = [1, 8, 1];
+        let mut random = DecorationRandom::new(42);
+        let mut expected_random = random.clone();
+        {
+            let mut draft = JigsawRegion {
+                region: &mut region,
+                registry: &registry,
+            };
+            assert!(draft.place_template_block(pos, &state, Some(&nbt), &mut random)?);
+            assert!(!draft.is_liquid_container(&state)?);
+            draft.mark_block_entity_changed(pos)?;
+        }
+        region.finish()?;
+        assert_eq!(random.next_long(), expected_random.next_long());
+        assert_eq!(
+            terrain.snapshot().block(pos[0], pos[1], pos[2]),
+            Some(&state)
+        );
+        let Tag::List { values, .. } =
+            terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+        else {
+            bail!("missing trial spawner entity list")
+        };
+        assert_eq!(
+            values,
+            vec![
+                super::super::super::GeneratedTrialSpawner::from_template(pos, state, &nbt)?
+                    .block_entity()
+            ]
+        );
         Ok(())
     }
 

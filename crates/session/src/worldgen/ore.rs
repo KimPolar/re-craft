@@ -8044,6 +8044,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::vault_state(state).is_some()
                             || native_world::collision::barrel_state(state)
                             || native_world::collision::hopper_facing(state).is_some()
+                            || native_world::collision::trial_spawner_state(state).is_some()
                             || native_world::collision::decorated_pot_waterlogged(state).is_some()
                             || native_world::collision::barrier_waterlogged(state).is_some()
                             || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
@@ -8081,6 +8082,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                         && (native_world::collision::vault_state(state).is_some()
                                             || native_world::collision::barrel_state(state)
                                             || native_world::collision::hopper_facing(state).is_some()
+                                            || native_world::collision::trial_spawner_state(state).is_some()
                                             || native_world::collision::decorated_pot_waterlogged(state).is_some()))
                                     || ((jigsaw::jigsaw_carpet(state) || jigsaw::jigsaw_ladder(state))
                                         && (disk_safe_solid(&old.name).is_some()
@@ -12913,6 +12915,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_trial_spawners_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_trialspawner",
+            "vine_active_self_jigsaw_active_trialspawner",
+            "vine_active_empty_jigsaw_active_trialspawner",
+            "vine_active_self_empty_jigsaw_trialspawner",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_flower_pots_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_flowerpot",
@@ -13404,6 +13417,8 @@ mod tests {
                         "lava"
                     } else if mode.ends_with("_vault") {
                         "vault"
+                    } else if mode.ends_with("_trialspawner") {
+                        "trial_spawner"
                     } else if mode.ends_with("_flowerpot") {
                         "flower_pot"
                     } else if mode.ends_with("_pottedbush") {
@@ -13507,6 +13522,11 @@ mod tests {
                         block.properties = BTreeMap::from([("waterlogged".into(), "false".into())]);
                     } else if mode.ends_with("_liquidwater") || mode.ends_with("_liquidlava") {
                         block.properties = BTreeMap::from([("level".into(), "0".into())]);
+                    } else if mode.ends_with("_trialspawner") {
+                        block.properties = BTreeMap::from([
+                            ("ominous".into(), "false".into()),
+                            ("trial_spawner_state".into(), if mode.contains("_jigsaw_active_") { "active".into() } else { "inactive".into() }),
+                        ]);
                     } else if mode.ends_with("_vault") {
                         block.properties = BTreeMap::from([
                             ("facing".into(), "north".into()),
@@ -20638,6 +20658,7 @@ mod tests {
                         | super::super::GeneratedMonsterRoomEntity::DecoratedPot(_)
                         | super::super::GeneratedMonsterRoomEntity::Barrel(_)
                         | super::super::GeneratedMonsterRoomEntity::Hopper(_)
+                        | super::super::GeneratedMonsterRoomEntity::TrialSpawner(_)
                         | super::super::GeneratedMonsterRoomEntity::Brushable(_) => {
                             panic!("monster rooms should resolve generated chests")
                         }

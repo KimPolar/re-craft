@@ -3527,10 +3527,9 @@ impl PreparedExistingGenerator {
             .run_biomes(&mut self.generator, evaluator, &mut work.biomes, position)
     }
 
-    /// Resume a captured BIOMES-stage protochunk using the schedule's already
-    /// restored/generated neighborhood. Store the materialized terrain before
-    /// completing TERRAIN. Other saved stage data, live state and eventual
-    /// world writes remain the caller's responsibility.
+    /// Resume a captured protochunk using the schedule's already restored or
+    /// generated biome neighborhood. Earlier saved stages require structures
+    /// to be disabled. The result is intermediate and is not a writable chunk.
     pub fn run_captured_saved_terrain(
         &mut self,
         work: &mut CapturedBiomeSchedule,
@@ -3576,6 +3575,7 @@ impl PreparedExistingGenerator {
             structure_order,
             evaluator,
             &work.biomes,
+            true,
         )?;
         let terrain = self.materialize_saved_terrain(target, terrain, &biome)?;
         work.terrain.insert(target, terrain);
@@ -4299,7 +4299,13 @@ impl PreparedExistingGenerator {
             &positions
         };
         let neighborhood = self.prepare_captured_biomes(order.iter().copied(), evaluator)?;
-        self.generate_saved_terrain_from_biomes(target, structure_order, evaluator, &neighborhood)
+        self.generate_saved_terrain_from_biomes(
+            target,
+            structure_order,
+            evaluator,
+            &neighborhood,
+            false,
+        )
     }
 
     fn generate_saved_terrain_from_biomes(
@@ -4308,10 +4314,12 @@ impl PreparedExistingGenerator {
         structure_order: &[ResourceId],
         evaluator: &mut native_resources::density::DensityEvaluator,
         neighborhood: &native_session::worldgen::BiomeNeighborhood,
+        allow_pre_biomes: bool,
     ) -> Result<(
         native_resources::surface_pass::SurfaceStageChunk,
         Arc<native_session::worldgen::QuartBiomeChunk>,
     )> {
+        use native_session::worldgen::schedule::GenerationStage;
         let source = self
             .context
             .inputs()
@@ -4322,7 +4330,11 @@ impl PreparedExistingGenerator {
             .terrain
             .as_ref()
             .context("saved terrain target is missing")?;
-        validate_empty_biomes_target(source)?;
+        let saved_stage = validate_empty_preterrain_target(source, allow_pre_biomes)?;
+        ensure!(
+            saved_stage == GenerationStage::Biomes || !self.generate_structures,
+            "earlier saved stages require generated structure references"
+        );
         let biome = Arc::clone(
             neighborhood
                 .chunk([target.x, target.z])
@@ -4789,6 +4801,13 @@ fn reject_saved_lighting(saved: &native_persistence::world::LoadedChunk) -> Resu
 }
 
 fn validate_empty_biomes_target(saved: &native_persistence::world::LoadedChunk) -> Result<()> {
+    validate_empty_preterrain_target(saved, false).map(|_| ())
+}
+
+fn validate_empty_preterrain_target(
+    saved: &native_persistence::world::LoadedChunk,
+    allow_pre_biomes: bool,
+) -> Result<native_session::worldgen::schedule::GenerationStage> {
     use native_session::worldgen::schedule::GenerationStage;
     ensure!(
         saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
@@ -4799,9 +4818,10 @@ fn validate_empty_biomes_target(saved: &native_persistence::world::LoadedChunk) 
         .as_ref()
         .context("saved chunk status is missing")?;
     let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+    let stage = GenerationStage::from_id(&status).context("unknown saved chunk status")?;
     ensure!(
-        GenerationStage::from_id(&status) == Some(GenerationStage::Biomes),
-        "saved chunk must be at the biomes stage"
+        stage == GenerationStage::Biomes || (allow_pre_biomes && stage < GenerationStage::Biomes),
+        "saved chunk must be at or before the biomes stage"
     );
     reject_saved_blending(&saved.document)?;
     for section in native_persistence::palette::decode_sections(&saved.document.value)? {
@@ -4849,7 +4869,7 @@ fn validate_empty_biomes_target(saved: &native_persistence::world::LoadedChunk) 
             ensure!(empty, "saved biome-stage chunk contains {name}");
         }
     }
-    Ok(())
+    Ok(stage)
 }
 
 fn numeric_bool(tag: &Tag) -> Option<bool> {
@@ -5467,9 +5487,13 @@ mod tests {
                     x: position.x,
                     z: position.z,
                 },
-                GenerationStage::Biomes,
+                GenerationStage::Terrain,
             )?;
         }
+        let early_biome_positions: Vec<_> = early_schedule
+            .requirements()
+            .filter_map(|(pos, required)| (required >= GenerationStage::Biomes).then_some(pos))
+            .collect();
         let imported: Vec<_> = early_schedule
             .requirements()
             .map(|(pos, required)| {
@@ -5536,6 +5560,96 @@ mod tests {
                     .run_captured_biomes(&mut early_work, &mut early_evaluator, key)
                     .is_err()
             );
+        }
+        for position in early_biome_positions {
+            if !early_positions
+                .iter()
+                .any(|(saved, _)| saved.x == position.x && saved.z == position.z)
+            {
+                scheduled_early.run_captured_biomes(
+                    &mut early_work,
+                    &mut early_evaluator,
+                    position,
+                )?;
+            }
+        }
+        let first = early_positions[0].0;
+        let first_key = native_world::loaded::ChunkPos {
+            x: first.x,
+            z: first.z,
+        };
+        scheduled_early.generate_structures = true;
+        assert!(
+            scheduled_early
+                .run_captured_saved_terrain(&mut early_work, &mut early_evaluator, first_key, &[])
+                .is_err()
+        );
+        assert_eq!(
+            early_work.schedule().completed(first_key),
+            Some(GenerationStage::Biomes)
+        );
+        scheduled_early.generate_structures = false;
+        let early_block_ids = resources.vanilla_block_ids()?;
+        let early_tags = CarverBlockTags::load(&mut resources, &early_block_ids)?;
+        let early_registry = resources.vanilla_generated_block_registry()?;
+        for (position, _) in early_positions {
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            scheduled_early.run_captured_saved_terrain(
+                &mut early_work,
+                &mut early_evaluator,
+                key,
+                &[],
+            )?;
+            let terrain = early_work
+                .terrain_chunk(position)
+                .context("resumed terrain missing")?;
+            assert_eq!(
+                early_work.schedule().completed(key),
+                Some(GenerationStage::Terrain)
+            );
+            let expected = early_reference.generate_carved_surface(
+                &mut resources,
+                &mut early_reference_evaluator,
+                &mut native_resources::carver::schedule::CarverCache::default(),
+                [key.x, key.z],
+                early_work.biomes(),
+                &early_tags,
+                |value| {
+                    let state = resolve_generated_terrain_state(value, &early_registry)?;
+                    Ok(CarverBlockState {
+                        is_air: matches!(
+                            state.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        has_fluid: FluidState::from_block(&state)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    })
+                },
+            )?;
+            for z in [0usize, 15] {
+                for x in [0usize, 15] {
+                    for y in 0..lighting.height as usize {
+                        let index = (z * 16 + x) * lighting.height as usize + y;
+                        let state = resolve_generated_terrain_state(
+                            &expected.states[index],
+                            &early_registry,
+                        )?;
+                        assert_eq!(
+                            terrain.materialized().world().block(
+                                key.x * 16 + x as i32,
+                                lighting.min_y + y as i32,
+                                key.z * 16 + z as i32
+                            ),
+                            Some(&state)
+                        );
+                    }
+                }
+            }
+            assert!(scheduled_early.draft_resumed_sections(terrain).is_err());
         }
         let biome_positions: Vec<_> = schedule
             .requirements()
@@ -6266,6 +6380,7 @@ mod tests {
             palette::decode_sections,
             world::{ChunkPos, LoadedChunk},
         };
+        use native_session::worldgen::schedule::GenerationStage;
         let mut document = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![(
@@ -6298,6 +6413,27 @@ mod tests {
             })
         };
         assert!(validate_empty_biomes_target(&loaded(&document)?).is_ok());
+        for (status, stage) in [
+            ("minecraft:empty", GenerationStage::Empty),
+            (
+                "minecraft:structure_starts",
+                GenerationStage::StructureStarts,
+            ),
+            (
+                "minecraft:structure_references",
+                GenerationStage::StructureReferences,
+            ),
+        ] {
+            let mut earlier = loaded(&document)?;
+            earlier.status = Some(status.into());
+            assert!(validate_empty_biomes_target(&earlier).is_err());
+            assert_eq!(validate_empty_preterrain_target(&earlier, true)?, stage);
+            earlier.data_version -= 1;
+            assert!(validate_empty_preterrain_target(&earlier, true).is_err());
+        }
+        let mut unknown = loaded(&document)?;
+        unknown.status = Some("example:unknown".into());
+        assert!(validate_empty_preterrain_target(&unknown, true).is_err());
         assert!(reject_saved_lighting(&loaded(&document)?).is_ok());
         for (marker, allowed) in [
             (Tag::Byte(0), true),
@@ -6336,6 +6472,7 @@ mod tests {
         let mut later = loaded(&document)?;
         later.status = Some("minecraft:terrain".into());
         assert!(validate_empty_biomes_target(&later).is_err());
+        assert!(validate_empty_preterrain_target(&later, true).is_err());
         let Tag::Compound(fields) = &mut document.value else {
             unreachable!()
         };

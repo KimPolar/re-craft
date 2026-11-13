@@ -66,7 +66,7 @@ pub struct StagingStartError {
 }
 
 /// Keep ownership on the caller until a worker has actually started.
-fn spawn_with_payload<T: Send + 'static>(
+pub(crate) fn spawn_with_payload<T: Send + 'static>(
     payload: T,
     task: impl FnOnce(T) + Send + 'static,
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,

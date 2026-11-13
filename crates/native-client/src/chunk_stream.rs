@@ -102,8 +102,8 @@ pub(crate) struct MissingGenerationTargets {
 /// A captured disk snapshot only. Live-state and generation completeness must
 /// still be checked before the result can affect gameplay or be saved.
 pub(crate) struct CapturedMissingGeneration {
-    pub schedule: native_session::worldgen::schedule::GenerationSchedule,
-    pub context: native_persistence::world::GenerationContextSnapshot,
+    schedule: native_session::worldgen::schedule::GenerationSchedule,
+    context: native_persistence::world::GenerationContextSnapshot,
     observed: MissingGenerationTargets,
 }
 
@@ -250,6 +250,175 @@ impl MissingGenerationCaptureWorker {
 }
 
 impl Drop for MissingGenerationCaptureWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
+/// Generator and restored saved terrain are still read-only. Live inputs,
+/// lighting, generation completeness and save dependencies remain unchecked.
+pub(crate) struct PreparedMissingGeneration {
+    schedule: native_session::worldgen::schedule::GenerationSchedule,
+    generator: crate::fresh_generation::existing::PreparedExistingGenerator,
+    terrain: crate::fresh_generation::existing::RestoredSavedTerrain,
+    observed: MissingGenerationTargets,
+}
+
+impl PreparedMissingGeneration {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.observed.is_current(streamer, session)
+    }
+
+    pub fn targets(&self) -> &[ChunkPos] {
+        self.observed.targets()
+    }
+
+    /// The returned observation must be rechecked alongside the independent
+    /// live-state and disk guards before generated data is applied or saved.
+    pub fn into_checked_parts(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<(
+        native_session::worldgen::schedule::GenerationSchedule,
+        crate::fresh_generation::existing::PreparedExistingGenerator,
+        crate::fresh_generation::existing::RestoredSavedTerrain,
+        MissingGenerationTargets,
+    )> {
+        if !self.is_current(streamer, session) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("prepared missing generation is stale");
+        }
+        Ok((self.schedule, self.generator, self.terrain, self.observed))
+    }
+}
+
+pub(crate) struct MissingGenerationPrepareStartError {
+    pub captured: CapturedMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationPrepareWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<PreparedMissingGeneration>>,
+    finished: bool,
+}
+
+impl MissingGenerationPrepareWorker {
+    /// Keep the input available for retry if a worker cannot be started.
+    pub fn start(
+        captured: CapturedMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        minecraft_dir: std::path::PathBuf,
+    ) -> std::result::Result<Self, MissingGenerationPrepareStartError> {
+        if !captured.is_current(streamer, session) {
+            return Err(MissingGenerationPrepareStartError {
+                captured,
+                error: anyhow::anyhow!("missing generation capture is stale"),
+            });
+        }
+        let observed = captured.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            captured,
+            move |captured| {
+                let work = (|| -> Result<PreparedMissingGeneration> {
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "generation preparation cancelled"
+                    );
+                    anyhow::ensure!(
+                        captured.observed.stamp.is_current(),
+                        "missing generation capture is stale"
+                    );
+                    let CapturedMissingGeneration {
+                        schedule,
+                        context,
+                        observed,
+                    } = captured;
+                    let mut generator =
+                        crate::fresh_generation::existing::prepare_existing_generator(
+                            context,
+                            &minecraft_dir,
+                        )?;
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "generation preparation cancelled"
+                    );
+                    let terrain = generator.restore_captured_terrain()?;
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "generation preparation cancelled"
+                    );
+                    anyhow::ensure!(
+                        observed.stamp.is_current(),
+                        "missing generation capture is stale"
+                    );
+                    Ok(PreparedMissingGeneration {
+                        schedule,
+                        generator,
+                        terrain,
+                        observed,
+                    })
+                })();
+                let _ = sender.send(work);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-prepare".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(captured, error)| MissingGenerationPrepareStartError {
+            captured,
+            error: anyhow::Error::new(error).context("cannot start missing generation preparation"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<PreparedMissingGeneration>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("missing generation preparation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(prepared) = result {
+                crate::generation_staging::discard_async(prepared);
+            }
+            anyhow::bail!("missing generation preparation was cancelled or became stale");
+        }
+        Ok(Some(result?))
+    }
+}
+
+impl Drop for MissingGenerationPrepareWorker {
     fn drop(&mut self) {
         self.cancel();
         crate::generation_staging::discard_receiver(&mut self.result);
@@ -1296,6 +1465,187 @@ mod tests {
         drop(streamer);
         drop(guard);
         wait_for_world_unlock(world.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn missing_generation_prepares_captured_world_off_thread() -> Result<()> {
+        use native_persistence::{
+            nbt,
+            world::DimensionId,
+            worldgen_settings::{NewWorldOptions, draft_baked_worldgen_settings},
+        };
+        use native_session::worldgen::schedule::GenerationStage;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let (world, reader) = locked_world_fixture();
+        let guard = reader.session_guard().context("session guard missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let worldgen = draft_baked_worldgen_settings(
+            &mut resources,
+            "minecraft:normal",
+            NewWorldOptions {
+                seed: 42,
+                generate_structures: false,
+                bonus_chest: false,
+            },
+        )?;
+        std::fs::create_dir_all(world.path().join("data/minecraft"))?;
+        std::fs::create_dir_all(world.path().join("datapacks"))?;
+        std::fs::write(
+            world.path().join("data/minecraft/world_gen_settings.dat"),
+            nbt::write(&worldgen)?,
+        )?;
+        let player = PlayerState {
+            position: Vec3::new(8.5, 80.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            World::new("minecraft:overworld"),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: -64,
+                max_y: 320,
+            },
+            player,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut streamer = ChunkStreamer::start(reader, BTreeMap::new(), 1, BTreeSet::new(), None)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            streamer.service(&mut session)?;
+            session.update(Duration::from_millis(50));
+            if streamer.pending.is_empty() && streamer.missing.len() == 9 {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "missing chunk reads timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let targets = streamer
+            .missing_generation_targets(&session, 1)
+            .context("targets missing")?;
+        let target = targets.targets()[0];
+        let reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld")?,
+            guard.clone(),
+        )?;
+        let mut capture =
+            MissingGenerationCaptureWorker::start(targets, &streamer, &session, reader)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let captured = loop {
+            if let Some(result) = capture.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "generation capture timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut prepare =
+            MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared = loop {
+            if let Some(result) = prepare.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "generation preparation timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(prepared.targets(), &[target]);
+        assert_eq!(
+            prepared.schedule.required(target),
+            Some(GenerationStage::Full)
+        );
+        assert_eq!(prepared.generator.inputs().settings().seed(), 42);
+        assert!(prepared.terrain.world().chunks.is_empty());
+        assert!(prepared.is_current(&streamer, &session));
+        let (schedule, generator, terrain, observed) =
+            prepared.into_checked_parts(&streamer, &session)?;
+        let prepared = PreparedMissingGeneration {
+            schedule,
+            generator,
+            terrain,
+            observed,
+        };
+        let live = prepared
+            .generator
+            .capture_live_inputs(&session, &prepared.terrain)?;
+        prepared.generator.verify_live_inputs(&session, &live)?;
+        let capture_again = || -> Result<CapturedMissingGeneration> {
+            let targets = streamer
+                .missing_generation_targets(&session, 1)
+                .context("targets missing")?;
+            let reader = WorldReader::open_with_session(
+                world.path(),
+                DimensionId::parse("overworld")?,
+                guard.clone(),
+            )?;
+            let mut worker =
+                MissingGenerationCaptureWorker::start(targets, &streamer, &session, reader)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(result) = worker.try_result(&streamer, &session)? {
+                    return Ok(result);
+                }
+                anyhow::ensure!(Instant::now() < deadline, "generation capture timed out");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let captured = capture_again()?;
+        let mut cancelled =
+            MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+                .map_err(|failure| failure.error)?;
+        cancelled.cancel();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match cancelled.try_result(&streamer, &session) {
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("cancelled preparation was accepted"),
+                Err(error) => {
+                    anyhow::ensure!(
+                        error.to_string().contains("cancelled"),
+                        "unexpected cancellation error: {error:#}"
+                    );
+                    break;
+                }
+            }
+            anyhow::ensure!(Instant::now() < deadline, "cancelled preparation timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let stale_capture = capture_again()?;
+        session.queue_loaded_chunk(target, chunk_world(target));
+        assert!(!prepared.is_current(&streamer, &session));
+        assert!(
+            prepared
+                .generator
+                .verify_live_inputs(&session, &live)
+                .is_err()
+        );
+        let failure =
+            match MissingGenerationPrepareWorker::start(stale_capture, &streamer, &session, game) {
+                Ok(_) => anyhow::bail!("stale capture was accepted"),
+                Err(failure) => failure,
+            };
+        assert!(failure.error.to_string().contains("stale"));
+        assert!(!failure.captured.is_current(&streamer, &session));
+        drop(failure);
+        assert!(prepared.into_checked_parts(&streamer, &session).is_err());
+        drop(cancelled);
+        drop(prepare);
+        drop(capture);
+        drop(streamer);
+        drop(guard);
+        wait_for_world_unlock(world.path());
+        Ok(())
     }
 
     #[cfg(windows)]

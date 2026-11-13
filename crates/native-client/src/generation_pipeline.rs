@@ -321,13 +321,23 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
     fn structured_seed_one_reaches_initial_world_stage() -> Result<()> {
+        structured_seed_reaches_initial_world_stage(1)
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
+    fn structured_seed_negative_one_reaches_initial_world_stage() -> Result<()> {
+        structured_seed_reaches_initial_world_stage(-1)
+    }
+
+    fn structured_seed_reaches_initial_world_stage(seed: i64) -> Result<()> {
         let game = match std::env::var_os("MINECRAFT_DIR") {
             Some(path) => PathBuf::from(path),
             None => native_resources::default_minecraft_dir()?,
         };
         let parent = tempfile::tempdir()?;
         let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
-        settings.seed = crate::chat_input::ChatInput::field("1");
+        settings.seed = crate::chat_input::ChatInput::field(&seed.to_string());
         settings.generate_structures = true;
         let mut pipeline = InitialWorldPipeline::start(
             settings.freeze(game, None),
@@ -343,7 +353,7 @@ mod tests {
                     path,
                     native_persistence::world::DimensionId::parse("overworld")?,
                 )?;
-                assert_eq!(reader.saved_world_seed()?, Some(1));
+                assert_eq!(reader.saved_world_seed()?, Some(seed));
                 assert_eq!(reader.singleplayer_uuid_words()?, Some(uuid));
                 assert_eq!(
                     reader

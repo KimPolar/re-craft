@@ -1151,6 +1151,76 @@ impl StagedGenerationLightEngine {
 }
 
 impl CarvedTerrainWorld {
+    /// Import saved maps as they were decoded, including stale values and
+    /// absent maps. Missing maps are left for Java-style lazy priming.
+    pub fn restore_saved_heightmaps(
+        &mut self,
+        pos: native_world::loaded::ChunkPos,
+        saved: &native_persistence::heightmap::SavedGenerationHeightmaps,
+    ) -> Result<()> {
+        use native_persistence::heightmap::{HeightBounds, SavedGenerationHeightmapKind as Kind};
+
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "generation chunk is missing"
+        );
+        ensure!(
+            saved.bounds()
+                == (HeightBounds {
+                    min_y: self.min_y,
+                    max_y: self
+                        .min_y
+                        .checked_add(self.height)
+                        .context("generation height overflow")?,
+                }),
+            "saved heightmap bounds differ"
+        );
+        ensure!(
+            !self.ore_ocean_floor_heights.contains_key(&pos)
+                && !self.feature_world_surface_heights.contains_key(&pos)
+                && !self.final_heightmaps.contains_key(&pos),
+            "generation heightmaps were already initialized"
+        );
+        let read = |kind| {
+            saved.first_available(kind, 0, 0).map(|_| {
+                std::array::from_fn(|index| {
+                    saved
+                        .first_available(kind, (index % 16) as i32, (index / 16) as i32)
+                        .expect("a saved heightmap contains every column")
+                })
+            })
+        };
+        let mut final_maps = ore::FinalHeightmaps {
+            values: Box::new([[self.min_y; 256]; 4]),
+            primed: 0,
+        };
+        for (index, kind) in [
+            Kind::WorldSurface,
+            Kind::OceanFloor,
+            Kind::MotionBlocking,
+            Kind::MotionBlockingNoLeaves,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(values) = read(kind) {
+                final_maps.values[index] = values;
+                final_maps.primed |= 1 << index;
+            }
+        }
+        if final_maps.primed != 0 {
+            self.final_heightmaps.insert(pos, Arc::new(final_maps));
+        }
+        if let Some(values) = read(Kind::WorldSurfaceWorldgen) {
+            self.feature_world_surface_heights
+                .insert(pos, Arc::new(values));
+        }
+        if let Some(values) = read(Kind::OceanFloorWorldgen) {
+            self.ore_ocean_floor_heights.insert(pos, Arc::new(values));
+        }
+        Ok(())
+    }
+
     /// Capture both world-generation maps and the four final maps immediately
     /// after terrain, before neighboring features can mutate this chunk.
     /// Direct feature section writes intentionally leave all six maps stale.
@@ -4229,6 +4299,85 @@ mod tests {
                 Some(second_flags.as_slice())
             );
         }
+
+        use native_persistence::{
+            heightmap::{
+                GeneratedHeightmaps, HeightBounds, SavedGenerationHeightmaps,
+                encode_generated_heightmaps,
+            },
+            nbt::{NamedTag, Tag},
+        };
+        use native_resources::mob_spawn_placement::MobSpawnHeightmap;
+        let bounds = HeightBounds {
+            min_y: -16,
+            max_y: 0,
+        };
+        let mut surface = [-12; 256];
+        surface[33] = -3;
+        let ocean_wg = [-7; 256];
+        let encoded = encode_generated_heightmaps(
+            bounds,
+            &GeneratedHeightmaps {
+                world_surface: Some(&surface),
+                ocean_floor: None,
+                motion_blocking: None,
+                motion_blocking_no_leaves: None,
+                world_surface_wg: None,
+                ocean_floor_wg: Some(&ocean_wg),
+            },
+        )
+        .unwrap();
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("Heightmaps".into(), encoded.clone())]),
+        };
+        let saved = SavedGenerationHeightmaps::read(&document, bounds).unwrap();
+        let wrong_bounds = SavedGenerationHeightmaps::read(
+            &document,
+            HeightBounds {
+                min_y: -32,
+                max_y: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            assembled
+                .restore_saved_heightmaps(first_pos, &wrong_bounds)
+                .is_err()
+        );
+        assert!(
+            assembled
+                .restore_saved_heightmaps(ChunkPos { x: 3, z: 0 }, &saved)
+                .is_err()
+        );
+        assembled
+            .restore_saved_heightmaps(first_pos, &saved)
+            .unwrap();
+        assert_eq!(
+            assembled.generated_heightmap_data(first_pos).unwrap(),
+            encoded
+        );
+        assert_eq!(
+            assembled
+                .primed_mob_spawn_height(-15, 2, MobSpawnHeightmap::WorldSurface)
+                .unwrap(),
+            Some(-3)
+        );
+        assert_eq!(
+            assembled
+                .primed_mob_spawn_height(-15, 2, MobSpawnHeightmap::OceanFloor)
+                .unwrap(),
+            None
+        );
+        assert!(
+            assembled
+                .restore_saved_heightmaps(first_pos, &saved)
+                .is_err()
+        );
+        assert_eq!(
+            assembled.generated_heightmap_data(first_pos).unwrap(),
+            encoded
+        );
     }
 
     #[test]

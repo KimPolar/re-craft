@@ -492,6 +492,7 @@ pub enum SavedGenerationHeightmapKind {
 /// absent, while correctly sized values are retained even when stale.
 pub struct SavedGenerationHeightmaps {
     min_y: i32,
+    max_y: i32,
     maps: [Option<Box<[u32; 256]>>; 6],
 }
 
@@ -523,8 +524,17 @@ impl SavedGenerationHeightmaps {
         }
         Ok(Self {
             min_y: bounds.min_y,
+            max_y: bounds.max_y,
             maps,
         })
+    }
+
+    /// Bounds used to decode the stored packed values.
+    pub fn bounds(&self) -> HeightBounds {
+        HeightBounds {
+            min_y: self.min_y,
+            max_y: self.max_y,
+        }
     }
 
     /// Return the stored first-available Y, or None if the map needs priming.

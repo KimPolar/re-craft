@@ -1079,6 +1079,63 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
     Some(f32::from(2 + step * age) / 16.0)
 }
 
+/// Vanilla 26.3 flower-pot states verified against the block registry.
+pub fn flower_pot(state: &BlockState) -> bool {
+    if !state.properties.is_empty() {
+        return false;
+    }
+    let Some(id) = state.name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    if id == "flower_pot" {
+        return true;
+    }
+    matches!(
+        id.strip_prefix("potted_"),
+        Some(
+            "acacia_sapling"
+                | "allium"
+                | "azalea_bush"
+                | "azure_bluet"
+                | "bamboo"
+                | "birch_sapling"
+                | "blue_orchid"
+                | "brown_mushroom"
+                | "cactus"
+                | "cherry_sapling"
+                | "closed_eyeblossom"
+                | "cornflower"
+                | "crimson_fungus"
+                | "crimson_roots"
+                | "dandelion"
+                | "dark_oak_sapling"
+                | "dead_bush"
+                | "fern"
+                | "flowering_azalea_bush"
+                | "golden_dandelion"
+                | "jungle_sapling"
+                | "lily_of_the_valley"
+                | "mangrove_propagule"
+                | "oak_sapling"
+                | "open_eyeblossom"
+                | "orange_tulip"
+                | "oxeye_daisy"
+                | "pale_oak_sapling"
+                | "pink_tulip"
+                | "poplar_sapling"
+                | "poppy"
+                | "red_mushroom"
+                | "red_tulip"
+                | "spruce_sapling"
+                | "torchflower"
+                | "warped_fungus"
+                | "warped_roots"
+                | "white_tulip"
+                | "wither_rose"
+        )
+    )
+}
+
 pub fn full_tuff(state: &BlockState) -> bool {
     state.properties.is_empty()
         && matches!(
@@ -1451,7 +1508,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if id.ends_with("_bed") {
         return bed(state);
     }
-    if id == "flower_pot" || id.starts_with("potted_") {
+    if flower_pot(state) {
         return Some(FLOWER_POT.to_vec());
     }
     if matches!(
@@ -1709,7 +1766,7 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     if matches!(id, "air" | "cave_air" | "void_air" | "water" | "lava") {
         return Some(Vec::new());
     }
-    if id == "flower_pot" || id.starts_with("potted_") {
+    if flower_pot(state) {
         return Some(FLOWER_POT.to_vec());
     }
     if matches!(id, "short_grass" | "fern" | "dead_bush") {

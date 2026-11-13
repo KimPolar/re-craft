@@ -194,6 +194,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         {
             (0, 0)
         }
+        _ if crate::collision::flower_pot(state) => (0, 0),
         name if shape_family(name) => {
             crate::collision::slab_stair_solid(state)?;
             if state.properties.get("type").is_some_and(|v| v == "double") {
@@ -1451,6 +1452,19 @@ mod tests {
     }
 
     #[test]
+    fn flower_pot_validation_rejects_unknown_or_stateful_entries() {
+        let mut pot = state("flower_pot", None);
+        assert_eq!(properties(&pot), Some((0, 0)));
+        assert!(crate::collision::block_shape(&pot).is_some());
+        pot.properties.insert("extra".into(), "true".into());
+        assert!(properties(&pot).is_none());
+        assert!(crate::collision::block_shape(&pot).is_none());
+        let unknown = state("potted_unknown", None);
+        assert!(properties(&unknown).is_none());
+        assert!(crate::collision::block_shape(&unknown).is_none());
+    }
+
+    #[test]
     fn copper_grate_transmits_light_in_both_fluid_states() {
         let mut grate = state("waxed_oxidized_copper_grate", None);
         for wet in [false, true] {
@@ -2683,6 +2697,7 @@ mod tests {
                 .map(|planks| planks.id().to_owned()),
         );
         requested.push("@vanilla_slabs_stairs".into());
+        requested.push("@flower_pots".into());
         std::fs::write(&input, serde_json::to_vec(&requested).unwrap()).unwrap();
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
@@ -2701,6 +2716,7 @@ mod tests {
             })
             .collect();
         assert_eq!(shaped_names.len(), 198);
+        let mut pots_checked = 0;
         for row in rows {
             let s = BlockState {
                 name: row["name"].as_str().unwrap().into(),
@@ -2715,6 +2731,15 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
+            if row["flower_pot"] == true {
+                assert!(
+                    crate::collision::flower_pot(&s),
+                    "unsupported flower pot {s:?}"
+                );
+                assert_eq!(row["entity"], false, "{s:?}");
+                assert_eq!(row["postprocess"], false, "{s:?}");
+                pots_checked += 1;
+            }
             if matches!(s.name.as_str(), "minecraft:water" | "minecraft:lava") {
                 assert_eq!(row["postprocess"], false, "{s:?}");
             }
@@ -2724,6 +2749,7 @@ mod tests {
                 || crate::collision::copper_grate_waterlogged(&s).is_some()
                 || crate::collision::full_tuff(&s)
                 || crate::collision::vault_state(&s).is_some()
+                || crate::collision::flower_pot(&s)
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
@@ -2766,6 +2792,7 @@ mod tests {
                 "{s:?}"
             );
         }
+        assert_eq!(pots_checked, 40);
     }
 
     #[test]

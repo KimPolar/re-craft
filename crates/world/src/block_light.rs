@@ -195,6 +195,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (0, 0)
         }
         _ if crate::collision::flower_pot(state) => (0, 0),
+        _ if crate::collision::decorated_pot_waterlogged(state).is_some() => (
+            u8::from(crate::collision::decorated_pot_waterlogged(state)?),
+            0,
+        ),
         name if shape_family(name) => {
             crate::collision::slab_stair_solid(state)?;
             if state.properties.get("type").is_some_and(|v| v == "double") {
@@ -1465,6 +1469,22 @@ mod tests {
     }
 
     #[test]
+    fn decorated_pot_light_requires_all_valid_properties() {
+        let mut pot = state("decorated_pot", None);
+        pot.properties = BTreeMap::from([
+            ("facing".into(), "north".into()),
+            ("cracked".into(), "false".into()),
+            ("waterlogged".into(), "false".into()),
+        ]);
+        assert_eq!(properties(&pot), Some((0, 0)));
+        pot.properties.insert("waterlogged".into(), "true".into());
+        assert_eq!(properties(&pot), Some((1, 0)));
+        pot.properties.insert("cracked".into(), "invalid".into());
+        assert!(properties(&pot).is_none());
+        assert!(crate::collision::block_shape(&pot).is_none());
+    }
+
+    #[test]
     fn copper_grate_transmits_light_in_both_fluid_states() {
         let mut grate = state("waxed_oxidized_copper_grate", None);
         for wet in [false, true] {
@@ -2595,6 +2615,7 @@ mod tests {
             "redstone_wall_torch",
             "redstone_lamp",
             "vault",
+            "decorated_pot",
             "copper_bulb",
             "exposed_copper_bulb",
             "weathered_copper_bulb",
@@ -2750,6 +2771,7 @@ mod tests {
                 || crate::collision::full_tuff(&s)
                 || crate::collision::vault_state(&s).is_some()
                 || crate::collision::flower_pot(&s)
+                || crate::collision::decorated_pot_waterlogged(&s).is_some()
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);

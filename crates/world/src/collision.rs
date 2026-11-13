@@ -595,6 +595,7 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
         || matches!(id, "chest" | "trapped_chest")
         || id == "flower_pot"
         || id.starts_with("potted_")
+        || decorated_pot_waterlogged(state).is_some()
         || id == "glass_pane"
         || id == "iron_bars"
         || matches!(id, "lantern" | "soul_lantern")
@@ -1184,6 +1185,27 @@ pub fn copper_grate_waterlogged(state: &BlockState) -> Option<bool> {
     }
 }
 
+pub fn decorated_pot_waterlogged(state: &BlockState) -> Option<bool> {
+    if state.name != "minecraft:decorated_pot"
+        || state.properties.len() != 3
+        || !matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west")
+        )
+        || !matches!(
+            state.properties.get("cracked").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    match state.properties.get("waterlogged")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn vault_state(state: &BlockState) -> Option<&str> {
     if state.name != "minecraft:vault"
         || state.properties.len() != 3
@@ -1229,6 +1251,9 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if decorated_pot_waterlogged(state).is_some() {
+        return Some(vec![pixel_box(1.0, 0.0, 1.0, 15.0, 16.0, 15.0)]);
+    }
     if copper_bulb_state(state).is_some()
         || full_copper(state)
         || full_tuff(state)

@@ -218,7 +218,9 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::collision::full_glass(state) {
         return Ok(true);
     }
-    if native_world::collision::full_terracotta(state) {
+    if native_world::collision::full_terracotta(state)
+        || native_world::collision::full_concrete(state)
+    {
         return Ok(true);
     }
     if native_world::collision::pane_waterlogged(state).is_some() {
@@ -549,6 +551,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::bed_leg_end(state).is_some()
                 || native_world::collision::full_glass(state)
                 || native_world::collision::full_terracotta(state)
+                || native_world::collision::full_concrete(state)
                 || native_world::collision::copper_bulb_state(state).is_some()
                 || native_world::collision::full_copper(state)
                 || native_world::collision::full_tuff(state)
@@ -954,6 +957,42 @@ mod tests {
         assert!(!jigsaw_static_full(&state)?);
         state.properties.insert("extra".into(), "true".into());
         assert!(jigsaw_static_full(&state).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn jigsaw_concrete_is_full_and_requires_a_known_stateless_color() -> Result<()> {
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            let mut state = BlockState {
+                name: format!("minecraft:{color}_concrete"),
+                properties: BTreeMap::new(),
+            };
+            assert!(jigsaw_static_full(&state)?);
+            state.properties.insert("extra".into(), "true".into());
+            assert!(jigsaw_static_full(&state).is_err());
+        }
+        let invalid = BlockState {
+            name: "minecraft:unknown_concrete".into(),
+            properties: BTreeMap::new(),
+        };
+        assert!(jigsaw_static_full(&invalid).is_err());
         Ok(())
     }
 

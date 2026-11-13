@@ -8063,6 +8063,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::bed_leg_end(state).is_some()
                             || native_world::collision::full_glass(state)
                             || native_world::collision::full_terracotta(state)
+                            || native_world::collision::full_concrete(state)
                             || native_world::collision::copper_bulb_state(state).is_some()
                             || native_world::collision::full_copper(state)
                             || native_world::collision::full_tuff(state)
@@ -12831,6 +12832,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_concrete_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_concrete", "vine_active_self_empty_jigsaw_concrete",
+            "vine_active_jigsaw_water_concrete", "vine_active_self_jigsaw_water_concrete",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_torches_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_torch",
@@ -13453,6 +13463,8 @@ mod tests {
                         "white_bed"
                     } else if mode.ends_with("_terracotta") {
                         "white_terracotta"
+                    } else if mode.ends_with("_concrete") {
+                        "red_concrete"
                     } else if mode.ends_with("_walltorch") {
                         "wall_torch"
                     } else if mode.ends_with("_torch") {

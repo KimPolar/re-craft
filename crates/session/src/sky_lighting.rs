@@ -21,7 +21,7 @@ type AppliedLighting = (
     BTreeMap<ChunkPos, Arc<Chunk>>,
 );
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Edit {
     position: BlockPosition,
     old: Option<BlockStateId>,
@@ -38,6 +38,18 @@ struct Reply {
     generation: u64,
     result: Option<(Computed, Vec<usize>)>,
     missing_chunks: BTreeSet<ChunkPos>,
+}
+
+/// Identifies the pending work and source history used by a terrain-only
+/// generation snapshot. It does not certify that sky light is complete.
+pub(crate) struct SkyGenerationGuard {
+    enabled: bool,
+    configured: bool,
+    generation: u64,
+    pending: Vec<Edit>,
+    required_chunks: Arc<BTreeSet<ChunkPos>>,
+    originals: BTreeMap<ChunkPos, Arc<Chunk>>,
+    sources: SkySources,
 }
 
 #[derive(Default)]
@@ -61,6 +73,34 @@ pub(crate) struct SkyLighting {
 }
 
 impl SkyLighting {
+    pub(crate) fn capture_generation_guard(&self) -> SkyGenerationGuard {
+        SkyGenerationGuard {
+            enabled: self.enabled,
+            configured: self.configured,
+            generation: self.generation,
+            pending: self.pending.clone(),
+            required_chunks: Arc::clone(&self.required_chunks),
+            originals: self.originals.clone(),
+            sources: self.sources.clone(),
+        }
+    }
+
+    pub(crate) fn matches_generation_guard(&self, guard: &SkyGenerationGuard) -> bool {
+        self.enabled == guard.enabled
+            && self.configured == guard.configured
+            && self.generation == guard.generation
+            && self.pending == guard.pending
+            && self.required_chunks == guard.required_chunks
+            && self.sources == guard.sources
+            && self.originals.len() == guard.originals.len()
+            && self.originals.iter().all(|(position, current)| {
+                guard
+                    .originals
+                    .get(position)
+                    .is_some_and(|expected| Arc::ptr_eq(current, expected))
+            })
+    }
+
     pub(crate) fn capability(&self) -> Option<bool> {
         self.configured.then_some(self.enabled)
     }

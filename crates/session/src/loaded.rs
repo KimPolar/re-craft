@@ -177,6 +177,103 @@ pub struct GenerationTerrainGuard {
     deferred_shapes: Option<GenerationDeferredShapes>,
 }
 
+struct StagedTerrainChunk {
+    live: Option<Arc<native_world::loaded::Chunk>>,
+    edits: BTreeMap<(i32, i32, i32), RecordedBlockEdit>,
+    saved_source: Option<[u8; 32]>,
+}
+
+/// Block and biome inputs for intermediate generation while live edits and
+/// light updates remain pending. This type cannot authorize publication or a
+/// save; ticks, block entities, POIs, entities and lighting need other proofs.
+pub struct GenerationTerrainStage {
+    session: Arc<()>,
+    live_world: Arc<World>,
+    saved_world: Arc<World>,
+    chunks: BTreeMap<ChunkPos, StagedTerrainChunk>,
+    deferred_shapes: Option<GenerationDeferredShapes>,
+    block_light_generation: u64,
+    block_light: BTreeMap<BlockPosition, native_world::block_light::LightChange>,
+    sky_light: crate::sky_lighting::SkyGenerationGuard,
+}
+
+/// Immutable inputs captured on the simulation thread. Comparing every block
+/// is deferred so callers can validate the draft on a worker thread.
+pub struct GenerationTerrainStageDraft {
+    stage: GenerationTerrainStage,
+}
+
+impl GenerationTerrainStageDraft {
+    pub fn validate(self) -> anyhow::Result<GenerationTerrainStage> {
+        self.validate_checked(|| Ok(()))
+    }
+
+    pub fn validate_checked(
+        self,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<GenerationTerrainStage> {
+        use anyhow::Context;
+        for (&position, captured) in &self.stage.chunks {
+            check()?;
+            if let Some(current) = &captured.live {
+                let saved = self
+                    .stage
+                    .saved_world
+                    .chunks
+                    .get(&position)
+                    .context("captured terrain source is missing")?;
+                validate_staged_terrain_chunk(
+                    &self.stage.saved_world,
+                    saved,
+                    &self.stage.live_world,
+                    current,
+                    &captured.edits,
+                )?;
+            }
+        }
+        check()?;
+        Ok(self.stage)
+    }
+}
+
+impl GenerationTerrainStage {
+    fn chunk_at(&self, x: i32, z: i32) -> Option<(&World, &native_world::loaded::Chunk)> {
+        let pos = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        let captured = self.chunks.get(&pos)?;
+        match &captured.live {
+            Some(chunk) => Some((self.live_world.as_ref(), chunk.as_ref())),
+            None => Some((
+                self.saved_world.as_ref(),
+                self.saved_world.chunks.get(&pos)?.as_ref(),
+            )),
+        }
+    }
+
+    /// Read only positions covered by this snapshot. Unavailable data remains
+    /// absent rather than being treated as air.
+    pub fn block(&self, x: i32, y: i32, z: i32) -> Option<&BlockState> {
+        let (world, chunk) = self.chunk_at(x, z)?;
+        let section = chunk.sections.get(&i8::try_from(y.div_euclid(16)).ok()?)?;
+        let index = x.rem_euclid(16) as usize
+            + z.rem_euclid(16) as usize * 16
+            + y.rem_euclid(16) as usize * 256;
+        world.state(*section.blocks.as_ref()?.get(index)?)
+    }
+
+    /// Read the unzoomed saved biome volume at a block position.
+    pub fn biome(&self, x: i32, y: i32, z: i32) -> Option<&str> {
+        let (world, chunk) = self.chunk_at(x, z)?;
+        let section = chunk.sections.get(&i8::try_from(y.div_euclid(16)).ok()?)?;
+        let index = (x.rem_euclid(16) as usize / 4)
+            + (z.rem_euclid(16) as usize / 4) * 4
+            + (y.rem_euclid(16) as usize / 4) * 16;
+        world.biome_by_id(*section.biomes.as_ref()?.get(index)?)
+    }
+}
+
 /// POI inputs observed in one session. Disk and data-pack snapshots still
 /// need their own validation before generated results can be applied.
 pub struct GenerationPoiGuard {
@@ -254,6 +351,138 @@ fn matching_terrain_chunks(
         }
     }
     true
+}
+
+fn staged_chunk_block(
+    chunk: &native_world::loaded::Chunk,
+    position: BlockPosition,
+) -> Option<BlockStateId> {
+    if position.chunk() != chunk.position {
+        return None;
+    }
+    let section = chunk
+        .sections
+        .get(&i8::try_from(position.y.div_euclid(16)).ok()?)?;
+    let index = position.x.rem_euclid(16) as usize
+        + position.z.rem_euclid(16) as usize * 16
+        + position.y.rem_euclid(16) as usize * 256;
+    section.blocks.as_ref()?.get(index).copied()
+}
+
+/// Compare blocks and biomes independently of lighting, allowing only the
+/// exact original/current block changes recorded by this session.
+fn validate_staged_terrain_chunk(
+    saved_world: &World,
+    saved: &native_world::loaded::Chunk,
+    live_world: &World,
+    live: &native_world::loaded::Chunk,
+    edits: &BTreeMap<(i32, i32, i32), RecordedBlockEdit>,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    ensure!(
+        saved.position == live.position,
+        "generation terrain chunk position differs: saved {:?}, live {:?}",
+        saved.position,
+        live.position
+    );
+    // This intermediate view exposes only blocks and biomes. A generated
+    // render snapshot can retain its TERRAIN status while the corresponding
+    // saved draft is FULL. Status, lighting and the remaining chunk data must
+    // still pass their separate guards before anything can be published.
+    for (&(x, y, z), edit) in edits {
+        let position = BlockPosition { x, y, z };
+        let saved_id =
+            staged_chunk_block(saved, position).context("edited source block is missing")?;
+        let live_id = staged_chunk_block(live, position).context("edited live block is missing")?;
+        let original = edit.original.context("edited source block is unknown")?;
+        ensure!(
+            saved_world
+                .state(saved_id)
+                .context("saved block state is unknown")?
+                == live_world
+                    .state(original)
+                    .context("original block state is unknown")?
+                && live_id == edit.current
+                && live_world.state(live_id).is_some(),
+            "recorded generation block edit differs at {position:?}"
+        );
+    }
+    let section_ids: BTreeSet<_> = saved
+        .sections
+        .keys()
+        .chain(live.sections.keys())
+        .copied()
+        .collect();
+    let mut equal_blocks = BTreeSet::new();
+    let mut equal_biomes = BTreeSet::new();
+    for section_y in section_ids {
+        let old = saved.sections.get(&section_y);
+        let new = live.sections.get(&section_y);
+        match (
+            old.and_then(|section| section.blocks.as_ref()),
+            new.and_then(|section| section.blocks.as_ref()),
+        ) {
+            (None, None) => {}
+            (Some(before), Some(after)) => {
+                for (index, (&old_id, &new_id)) in before.iter().zip(after.iter()).enumerate() {
+                    if equal_blocks.contains(&(old_id, new_id)) {
+                        continue;
+                    }
+                    let old_state = saved_world
+                        .state(old_id)
+                        .context("saved block state is unknown")?;
+                    let new_state = live_world
+                        .state(new_id)
+                        .context("live block state is unknown")?;
+                    if old_state == new_state {
+                        equal_blocks.insert((old_id, new_id));
+                        continue;
+                    }
+                    let x = live
+                        .position
+                        .x
+                        .checked_mul(16)
+                        .and_then(|v| v.checked_add((index % 16) as i32))
+                        .context("block X overflow")?;
+                    let y = i32::from(section_y) * 16 + (index / 256) as i32;
+                    let z = live
+                        .position
+                        .z
+                        .checked_mul(16)
+                        .and_then(|v| v.checked_add(((index / 16) % 16) as i32))
+                        .context("block Z overflow")?;
+                    ensure!(
+                        edits.contains_key(&(x, y, z)),
+                        "unrecorded live block change at {x},{y},{z}"
+                    );
+                }
+            }
+            _ => anyhow::bail!("generation block data differs"),
+        }
+        match (
+            old.and_then(|section| section.biomes.as_ref()),
+            new.and_then(|section| section.biomes.as_ref()),
+        ) {
+            (None, None) => {}
+            (Some(before), Some(after)) => {
+                for (&old_id, &new_id) in before.iter().zip(after.iter()) {
+                    if equal_biomes.insert((old_id, new_id)) {
+                        ensure!(
+                            saved_world
+                                .biome_by_id(old_id)
+                                .context("saved biome is unknown")?
+                                == live_world
+                                    .biome_by_id(new_id)
+                                    .context("live biome is unknown")?,
+                            "generation biome differs"
+                        );
+                    }
+                }
+            }
+            _ => anyhow::bail!("generation biome data differs"),
+        }
+    }
+    Ok(())
 }
 
 struct IncomingChunk {
@@ -1800,7 +2029,7 @@ impl CreatedFallingSand {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RecordedBlockEdit {
     /// None means the source section had no known block data.
     original: Option<BlockStateId>,
@@ -6202,7 +6431,7 @@ impl LoadedSession {
         }
     }
 
-    fn validate_generation_terrain_readiness(&self) -> anyhow::Result<()> {
+    fn validate_generation_block_readiness(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.unresolved_lichen_shape
                 && !self.unresolved_fence_shape
@@ -6216,6 +6445,11 @@ impl LoadedSession {
                 && !self.unresolved_bubble_tick,
             "a block update could not be resolved before generation"
         );
+        Ok(())
+    }
+
+    fn validate_generation_terrain_readiness(&self) -> anyhow::Result<()> {
+        self.validate_generation_block_readiness()?;
         anyhow::ensure!(
             self.sky_lighting.settled(),
             "sky lighting is not settled before generation"
@@ -6235,6 +6469,174 @@ impl LoadedSession {
             block_ticks: self.world.saved_block_ticks.get(&position).cloned(),
             fluid_ticks: self.world.saved_fluid_ticks.get(&position).cloned(),
         }
+    }
+
+    fn generation_stage_pending(
+        &self,
+        deferred: Option<&GenerationDeferredShapes>,
+    ) -> anyhow::Result<BTreeSet<ChunkPos>> {
+        let mut pending: BTreeSet<_> = self.incoming.iter().map(|entry| entry.pos).collect();
+        if let Some(deferred) = deferred {
+            anyhow::ensure!(
+                deferred.stairs == self.pending_stair_updates
+                    && deferred.fences == self.pending_fence_updates
+                    && deferred.lichen == self.pending_lichen_updates,
+                "queued shape updates changed during generation"
+            );
+            anyhow::ensure!(
+                self.ready_shape_update_chunks().is_empty(),
+                "a queued shape update became ready during generation"
+            );
+            anyhow::ensure!(
+                self.generation_shape_positions()
+                    .all(|position| !pending.contains(&position)),
+                "a queued shape dependency has pending streaming"
+            );
+        } else {
+            pending.extend(self.generation_shape_positions());
+        }
+        Ok(pending)
+    }
+
+    /// Capture block and biome inputs for intermediate generation, retaining
+    /// exact pending light and blocked shape work on the live session. This is
+    /// not a lighting snapshot and cannot authorize publication or saving.
+    pub fn capture_generation_terrain_stage(
+        &self,
+        source: Arc<World>,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<GenerationTerrainStage> {
+        self.capture_generation_terrain_stage_draft(source, positions)?
+            .validate()
+    }
+
+    /// Capture cheap shared inputs on the simulation thread; the returned
+    /// draft must be validated before its terrain can be read.
+    pub fn capture_generation_terrain_stage_draft(
+        &self,
+        source: Arc<World>,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<GenerationTerrainStageDraft> {
+        use anyhow::Context;
+        self.validate_generation_block_readiness()?;
+        anyhow::ensure!(
+            source.dimension == self.world.dimension,
+            "generation terrain dimension differs"
+        );
+        anyhow::ensure!(
+            source.block_edits().next().is_none() && source.live_block_entities.is_empty(),
+            "generation terrain source contains live edits"
+        );
+        let deferred_shapes = self.capture_deferred_generation_shapes()?;
+        let pending = self.generation_stage_pending(deferred_shapes.as_ref())?;
+        let mut chunks = BTreeMap::new();
+        for position in positions {
+            anyhow::ensure!(
+                !chunks.contains_key(&position),
+                "duplicate generation terrain input"
+            );
+            anyhow::ensure!(
+                !pending.contains(&position),
+                "generation terrain has pending streaming or shape changes at {position:?}"
+            );
+            let live = self.generation_terrain_chunk(position).chunk;
+            let edits = self.block_edits.get(&position).cloned().unwrap_or_default();
+            let saved_source = self.world.saved_chunk_source(position);
+            if live.is_some() {
+                source.chunks.get(&position).with_context(|| {
+                    format!("live terrain is absent from captured input at {position:?}")
+                })?;
+                let source_fingerprint = source.saved_chunk_source(position);
+                if self.require_saved_chunk_sources || saved_source.is_some() {
+                    anyhow::ensure!(
+                        saved_source.is_some() && saved_source == source_fingerprint,
+                        "saved terrain source differs at {position:?}"
+                    );
+                }
+            } else {
+                anyhow::ensure!(
+                    !self.has_unsaved_chunk_changes(position) && edits.is_empty(),
+                    "changed generation terrain is not resident at {position:?}"
+                );
+                if saved_source.is_some() {
+                    anyhow::ensure!(
+                        source.chunks.contains_key(&position)
+                            && source.saved_chunk_source(position) == saved_source,
+                        "saved terrain source differs at {position:?}"
+                    );
+                }
+            }
+            chunks.insert(
+                position,
+                StagedTerrainChunk {
+                    live,
+                    edits,
+                    saved_source,
+                },
+            );
+        }
+        anyhow::ensure!(!chunks.is_empty(), "no generation terrain inputs");
+        Ok(GenerationTerrainStageDraft {
+            stage: GenerationTerrainStage {
+                session: Arc::clone(&self.generation_identity),
+                live_world: Arc::clone(&self.world),
+                saved_world: source,
+                chunks,
+                deferred_shapes,
+                block_light_generation: self.light_generation,
+                block_light: self
+                    .pending_light
+                    .iter()
+                    .map(|(&pos, value)| (pos, value.change))
+                    .collect(),
+                sky_light: self.sky_lighting.capture_generation_guard(),
+            },
+        })
+    }
+
+    /// Recheck an intermediate snapshot without treating it as save approval.
+    pub fn verify_generation_terrain_stage(
+        &self,
+        stage: &GenerationTerrainStage,
+    ) -> anyhow::Result<()> {
+        self.validate_generation_block_readiness()?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.generation_identity, &stage.session),
+            "generation terrain belongs to another session"
+        );
+        anyhow::ensure!(
+            self.light_generation == stage.block_light_generation
+                && self.pending_light.len() == stage.block_light.len()
+                && self
+                    .pending_light
+                    .iter()
+                    .all(|(position, value)| stage.block_light.get(position) == Some(&value.change))
+                && self.sky_lighting.matches_generation_guard(&stage.sky_light),
+            "pending light work changed during generation"
+        );
+        let pending = self.generation_stage_pending(stage.deferred_shapes.as_ref())?;
+        for (&position, expected) in &stage.chunks {
+            anyhow::ensure!(
+                !pending.contains(&position),
+                "generation terrain acquired pending streaming or shape changes at {position:?}"
+            );
+            let current = self.generation_terrain_chunk(position).chunk;
+            let same_chunk = match (&expected.live, &current) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            anyhow::ensure!(
+                same_chunk
+                    && self.world.saved_chunk_source(position) == expected.saved_source
+                    && self
+                        .block_edits
+                        .get(&position)
+                        .map_or(expected.edits.is_empty(), |edits| edits == &expected.edits),
+                "live generation terrain changed at {position:?}"
+            );
+        }
+        Ok(())
     }
 
     /// Check a disk-derived terrain view against the live session. Missing
@@ -30997,6 +31399,245 @@ pub(crate) mod tests {
             .set_block_id(origin.x, 0, origin.z, stone)
             .unwrap();
         assert!(live.verify_generation_terrain(&guard).is_err());
+    }
+
+    #[test]
+    fn staged_generation_terrain_does_not_certify_chunk_status() {
+        let (mut source, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        source
+            .saved_block_entities
+            .insert(home, native_world::loaded::SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            source.clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert!(session.capture_generation_terrain(&source, [home]).is_ok());
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .status = Some("minecraft:terrain".into());
+        assert!(session.capture_generation_terrain(&source, [home]).is_err());
+        let stage = session
+            .capture_generation_terrain_stage(Arc::new(source), [home])
+            .unwrap();
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        assert_eq!(
+            stage.block(origin.x, 0, origin.z).unwrap().name,
+            "minecraft:stone"
+        );
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .status = Some("minecraft:full".into());
+        assert!(session.verify_generation_terrain_stage(&stage).is_err());
+    }
+
+    #[test]
+    fn staged_generation_terrain_keeps_live_edits_and_pending_light() {
+        let (mut saved, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let absent = ChunkPos {
+            x: home.x + 2,
+            z: home.z,
+        };
+        let plains = saved.intern_biome("minecraft:plains".into());
+        let section = Arc::make_mut(
+            Arc::make_mut(saved.chunks.get_mut(&home).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.biomes = Some(Box::new([plains; native_world::loaded::BIOME_COUNT]));
+        let mut neighbor_chunk = saved.chunks[&home].as_ref().clone();
+        neighbor_chunk.position = neighbor;
+        saved.chunks.insert(neighbor, Arc::new(neighbor_chunk));
+        saved.remember_saved_chunk_source(home, [1; 32]);
+        saved.remember_saved_chunk_source(neighbor, [2; 32]);
+        let saved = Arc::new(saved);
+        let mut session = LoadedSession::new(
+            saved.as_ref().clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_has_skylight(true).unwrap();
+        Arc::make_mut(&mut session.world).chunks.remove(&neighbor);
+        let edit = IVec3::new(8, 2, 6);
+        assert!(session.set(edit, session.states[0]));
+        assert!(!session.sky_lighting.settled());
+        let home_block = BlockPosition {
+            x: origin.x + 15,
+            y: 2,
+            z: origin.z + 8,
+        };
+        let neighbor_block = BlockPosition {
+            x: origin.x + 16,
+            ..home_block
+        };
+        session
+            .pending_fence_updates
+            .insert(neighbor, BTreeSet::from([(home_block, neighbor_block)]));
+        assert!(
+            session
+                .capture_generation_terrain_with_deferred_shapes(&saved, [home, neighbor])
+                .is_err()
+        );
+        let draft = session
+            .capture_generation_terrain_stage_draft(Arc::clone(&saved), [home, neighbor])
+            .unwrap();
+        let mut checks = 0;
+        assert!(
+            draft
+                .validate_checked(|| {
+                    checks += 1;
+                    anyhow::ensure!(checks < 2, "cancel stage validation");
+                    Ok(())
+                })
+                .is_err()
+        );
+        let draft = session
+            .capture_generation_terrain_stage_draft(Arc::clone(&saved), [home])
+            .unwrap();
+        let edits = session.block_edits.remove(&home).unwrap();
+        let stale = draft.validate().unwrap();
+        assert!(session.verify_generation_terrain_stage(&stale).is_err());
+        session.block_edits.insert(home, edits);
+        let stage = session
+            .capture_generation_terrain_stage(Arc::clone(&saved), [home, neighbor, absent])
+            .unwrap();
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        assert_eq!(
+            stage
+                .block(origin.x + edit.x, edit.y, origin.z + edit.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            saved
+                .block(origin.x + edit.x, edit.y, origin.z + edit.z)
+                .unwrap()
+                .name,
+            "minecraft:stone"
+        );
+        assert_eq!(
+            stage.block(origin.x + 16, 0, origin.z).unwrap().name,
+            "minecraft:stone"
+        );
+        assert_eq!(stage.biome(origin.x, 0, origin.z), Some("minecraft:plains"));
+        assert_eq!(
+            stage.biome(origin.x + 16, 0, origin.z),
+            Some("minecraft:plains")
+        );
+        assert!(stage.biome(origin.x + 32, 0, origin.z).is_none());
+        assert!(stage.block(origin.x + 32, 0, origin.z).is_none());
+        assert!(stage.block(origin.x - 1, 0, origin.z).is_none());
+
+        if let Some(pending) = session.pending_light.values_mut().next() {
+            pending.last_attempt = Some(123);
+            session.verify_generation_terrain_stage(&stage).unwrap();
+        }
+        let recorded = session.block_edits.remove(&home).unwrap();
+        assert!(session.verify_generation_terrain_stage(&stage).is_err());
+        session.block_edits.insert(home, recorded);
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        let parked = Arc::make_mut(&mut session.world)
+            .chunks
+            .remove(&home)
+            .unwrap();
+        session.parked_chunks.insert(home, parked);
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        assert_eq!(
+            stage
+                .block(origin.x + edit.x, edit.y, origin.z + edit.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        let parked = session.parked_chunks.remove(&home).unwrap();
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(home, parked);
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        let extra_light = BlockPosition {
+            x: origin.x + 128,
+            y: 2,
+            z: origin.z,
+        };
+        session.pending_light.insert(
+            extra_light,
+            PendingLight {
+                change: native_world::block_light::LightChange::unknown(),
+                last_attempt: None,
+            },
+        );
+        assert!(session.verify_generation_terrain_stage(&stage).is_err());
+        session.pending_light.remove(&extra_light);
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        session.pending_fence_updates.clear();
+        assert!(session.verify_generation_terrain_stage(&stage).is_err());
+        session
+            .pending_fence_updates
+            .insert(neighbor, BTreeSet::from([(home_block, neighbor_block)]));
+        session.verify_generation_terrain_stage(&stage).unwrap();
+        session.sky_lighting.streaming_changed();
+        assert!(session.verify_generation_terrain_stage(&stage).is_err());
+
+        let mut wrong_source = saved.as_ref().clone();
+        wrong_source.remember_saved_chunk_source(home, [3; 32]);
+        assert!(
+            session
+                .capture_generation_terrain_stage(Arc::new(wrong_source), [home])
+                .is_err()
+        );
+        let mut wrong_biome = saved.as_ref().clone();
+        let forest = wrong_biome.intern_biome("minecraft:forest".into());
+        let section = Arc::make_mut(
+            Arc::make_mut(wrong_biome.chunks.get_mut(&home).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.biomes.as_mut().unwrap()[0] = forest;
+        let invalid_draft = session
+            .capture_generation_terrain_stage_draft(Arc::new(wrong_biome), [home])
+            .unwrap();
+        assert!(invalid_draft.validate().is_err());
+        Arc::make_mut(&mut session.world)
+            .set_block_id(origin.x, 0, origin.z, session.states[0])
+            .unwrap();
+        assert!(
+            session
+                .capture_generation_terrain_stage(Arc::clone(&saved), [home])
+                .is_err()
+        );
     }
 
     #[test]

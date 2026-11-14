@@ -1079,7 +1079,7 @@ fn dense_offset(index: usize, radius: i32, side: usize) -> (i32, i32, i32) {
 }
 
 /// A validated change to a block's light emission or attenuation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LightChange {
     radius: u8,
     allow_dark_skip: bool,

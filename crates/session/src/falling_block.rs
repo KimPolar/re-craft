@@ -189,6 +189,31 @@ impl FallingStalactite {
         Some(body)
     }
 
+    /// Restore an explicitly saved downward speleothem and its damage settings.
+    /// Java's client initializes the model seed from the received position.
+    pub(crate) fn from_saved(
+        block: &native_world::loaded::BlockState,
+        hurt_entities: bool,
+        damage: FallingDamage,
+        position: IVec3,
+    ) -> Option<Self> {
+        native_world::collision::positioned_speleothem_shape(block, position)?;
+        if block.properties.get("vertical_direction")?.as_str() != "down"
+            || (hurt_entities
+                && (!damage.per_distance.is_finite()
+                    || damage.per_distance < 0.0
+                    || damage.maximum < 0))
+        {
+            return None;
+        }
+        Some(Self {
+            block: Arc::new(block.clone()),
+            source_waterlogged: block.properties.get("waterlogged")? == "true",
+            damage: hurt_entities.then_some(damage),
+            start_position: Some(position),
+        })
+    }
+
     pub fn block(&self) -> &native_world::loaded::BlockState {
         &self.block
     }

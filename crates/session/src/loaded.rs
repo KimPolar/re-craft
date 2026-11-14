@@ -12646,27 +12646,66 @@ impl LoadedSession {
                         continue;
                     }
                 };
-                let kind = match FallingKind::from_id(&saved.block.name) {
-                    Some(kind) => kind,
-                    None => {
-                        self.stream_errors.push(format!(
-                            "unsupported falling block {} in chunk {}, {}",
-                            saved.block.name, pos.x, pos.z
-                        ));
-                        continue;
-                    }
-                };
-                if !saved.block.properties.is_empty()
-                    || entity.get("TileEntityData").is_some()
-                    || entity.get("Passengers").is_some()
-                    || saved.hurt_entities.unwrap_or(false)
-                {
+                if matches!(
+                    saved.block.name.as_str(),
+                    "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"
+                ) {
+                    // Unsupported saved cases must also prevent a world write:
+                    // their possible movement and effects have not been tracked.
+                    self.unresolved_stalactite_lifecycle = true;
+                }
+                if entity.get("TileEntityData").is_some() || entity.get("Passengers").is_some() {
                     self.stream_errors.push(format!(
                         "unsupported saved falling block in chunk {}, {}",
                         pos.x, pos.z
                     ));
                     continue;
                 }
+                let (kind, stalactite) = if let Some(kind) = FallingKind::from_id(&saved.block.name)
+                {
+                    if !saved.block.properties.is_empty() || saved.hurt_entities.unwrap_or(false) {
+                        self.stream_errors.push(format!(
+                            "unsupported saved falling block in chunk {}, {}",
+                            pos.x, pos.z
+                        ));
+                        continue;
+                    }
+                    (kind, None)
+                } else {
+                    let kind = match saved.block.name.as_str() {
+                        "minecraft:pointed_dripstone" => FallingKind::PointedDripstone,
+                        "minecraft:sulfur_spike" => FallingKind::SulfurSpike,
+                        _ => {
+                            self.stream_errors.push(format!(
+                                "unsupported falling block {} in chunk {}, {}",
+                                saved.block.name, pos.x, pos.z
+                            ));
+                            continue;
+                        }
+                    };
+                    // A missing flag depends on the active anvil tag. Keep it
+                    // unsupported until that tag is available to this loader.
+                    let Some(hurts) = saved.hurt_entities else {
+                        self.stream_errors.push(format!(
+                            "saved falling speleothem has unresolved damage in chunk {}, {}",
+                            pos.x, pos.z
+                        ));
+                        continue;
+                    };
+                    let Some(body) = crate::falling_block::FallingStalactite::from_saved(
+                        &saved.block,
+                        hurts,
+                        saved.fall_damage,
+                        saved.position.floor().as_ivec3(),
+                    ) else {
+                        self.stream_errors.push(format!(
+                            "unsupported saved falling speleothem in chunk {}, {}",
+                            pos.x, pos.z
+                        ));
+                        continue;
+                    };
+                    (kind, Some(body))
+                };
                 if let Some(uuid) = saved.uuid {
                     if self.saved_falling_uuids.contains_key(&uuid) {
                         self.stream_errors.push(format!(
@@ -12687,7 +12726,7 @@ impl LoadedSession {
                     previous: saved.position,
                     fall_distance: saved.fall_distance,
                     fall_distance_verified: true,
-                    stalactite: None,
+                    stalactite,
                     kind,
                     drop_item: saved.drop_item,
                     cancel_drop: saved.cancel_drop,
@@ -80020,7 +80059,8 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-    fn spawned_stalactite_entity_drafts_are_decoded_by_java() {
+    fn stalactite_session_drafts_round_trip_with_java() {
+        use native_persistence::nbt::{Tag, TagType};
         use std::{path::PathBuf, process::Command};
 
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -80056,6 +80096,12 @@ pub(crate) mod tests {
             include_str!("../tests/java/StalactiteSessionDraftOracle.java"),
         )
         .unwrap();
+        let saved_source = temp.path().join("SavedStalactiteOracle.java");
+        std::fs::write(
+            &saved_source,
+            include_str!("../tests/java/SavedStalactiteOracle.java"),
+        )
+        .unwrap();
         let check = |output: std::process::Output| {
             assert!(
                 output.status.success(),
@@ -80069,6 +80115,7 @@ pub(crate) mod tests {
                 .arg("-cp")
                 .arg(&classpath)
                 .arg(&source)
+                .arg(&saved_source)
                 .output()
                 .unwrap(),
         );
@@ -80094,6 +80141,205 @@ pub(crate) mod tests {
                     .unwrap(),
             );
         }
+        check(
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SavedStalactiteOracle")
+                .arg(temp.path())
+                .arg("generate")
+                .output()
+                .unwrap(),
+        );
+        let mut index = 0;
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for thickness in ["tip", "tip_merge", "frustum", "middle", "base"] {
+                let mut session = session();
+                let mut entity = native_persistence::nbt::read(
+                    &std::fs::read(temp.path().join(format!("java-{index}.nbt"))).unwrap(),
+                )
+                .unwrap()
+                .value;
+                let Tag::Compound(fields) = &mut entity else {
+                    unreachable!()
+                };
+                let position = session.origin.as_dvec3() + DVec3::new(8.5, 5.0, 8.5);
+                let pos = fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("Pos"))
+                    .unwrap();
+                pos.1 = Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                };
+                fields.push(("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])));
+                activate_test_falling_entity(&mut session, entity);
+                assert_eq!(session.falling_sand.len(), 1, "Java case {index}");
+                let body = session.falling_sand[0].stalactite.as_ref().unwrap();
+                assert_eq!(body.block().name, name);
+                assert_eq!(body.block().properties["thickness"], thickness);
+                assert_eq!(body.block().properties["waterlogged"], "false");
+                assert_eq!(body.start_position(), Some(position.floor().as_ivec3()));
+                assert_eq!(
+                    body.damage().map(|damage| damage.per_distance),
+                    matches!(thickness, "tip" | "tip_merge").then_some(7.0)
+                );
+                index += 1;
+            }
+        }
+    }
+
+    fn activate_test_falling_entity(
+        session: &mut LoadedSession,
+        entity: native_persistence::nbt::Tag,
+    ) {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+
+        let home = session.player_chunk().unwrap();
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![entity],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document,
+                })),
+            )
+            .unwrap();
+        session.activate_saved_falling_sand();
+    }
+
+    #[test]
+    fn saved_stalactites_restore_state_and_damage_on_landing() {
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for thickness in ["tip", "tip_merge", "frustum", "middle", "base"] {
+                let mut session = session();
+                session.set_speleothem_tags(test_speleothem_tags());
+                session.motion.position = DVec3::new(8.5, 1.0, 8.5);
+                let block = state(
+                    name,
+                    &[
+                        ("vertical_direction", "down"),
+                        ("thickness", thickness),
+                        ("waterlogged", "false"),
+                    ],
+                );
+                let body =
+                    crate::falling_block::FallingStalactite::from_source(&block, 20, 14).unwrap();
+                let position = session.origin.as_dvec3() + DVec3::new(8.5, 1.1, 8.5);
+                let draft = crate::saved_falling_block::draft_created_stalactite(
+                    [1, 2, 3, 4],
+                    &body,
+                    crate::saved_falling_block::FallingSaveState {
+                        position,
+                        velocity: DVec3::new(0.0, -0.2, 0.0),
+                        fall_distance: 2.0,
+                        on_ground: false,
+                        no_gravity: true,
+                        time: 12,
+                        drop_item: false,
+                        cancel_drop: false,
+                    },
+                )
+                .unwrap();
+                activate_test_falling_entity(&mut session, draft.document().value.clone());
+                session.activate_saved_falling_sand();
+                assert_eq!(session.falling_sand.len(), 1, "{name} {thickness}");
+                let restored = &session.falling_sand[0];
+                let restored_body = restored.stalactite.as_ref().unwrap();
+                assert_eq!(restored_body.block(), &block);
+                assert_eq!(restored_body.damage(), body.damage());
+                assert_eq!(
+                    restored_body.start_position(),
+                    Some(position.floor().as_ivec3())
+                );
+                assert_eq!(restored.motion.position, position);
+                assert_eq!(restored.motion.velocity, DVec3::new(0.0, -0.2, 0.0));
+                assert_eq!(restored.motion.age, 12);
+                assert!(!restored.drop_item);
+                assert_eq!(
+                    session.falling_sand_snapshot()[0].block_state.as_deref(),
+                    Some(&block)
+                );
+                assert!(session.validate_speleothem_updates().is_err());
+                assert!(session.draft_saved_falling_entity([1, 2, 3, 4]).is_err());
+                session.advance_falling_sand();
+                assert!(session.falling_sand.is_empty());
+                assert_eq!(
+                    session.vitals.health,
+                    if body.damage().is_some() { 6.0 } else { 20.0 },
+                    "{name} {thickness}"
+                );
+                assert_eq!(session.removed_falling_sand.len(), 1);
+                assert!(session.validate_speleothem_updates().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn saved_stalactite_with_unresolved_damage_is_not_activated() {
+        use native_persistence::nbt::Tag;
+
+        let mut session = session();
+        let block = state(
+            "minecraft:pointed_dripstone",
+            &[
+                ("vertical_direction", "down"),
+                ("thickness", "tip"),
+                ("waterlogged", "false"),
+            ],
+        );
+        let body = crate::falling_block::FallingStalactite::from_source(&block, 20, 14).unwrap();
+        let draft = crate::saved_falling_block::draft_created_stalactite(
+            [1, 2, 3, 4],
+            &body,
+            crate::saved_falling_block::FallingSaveState {
+                position: session.origin.as_dvec3() + DVec3::new(8.5, 5.0, 8.5),
+                velocity: DVec3::ZERO,
+                fall_distance: 0.0,
+                on_ground: false,
+                no_gravity: false,
+                time: 0,
+                drop_item: true,
+                cancel_drop: false,
+            },
+        )
+        .unwrap();
+        let mut entity = draft.document().value.clone();
+        let Tag::Compound(fields) = &mut entity else {
+            unreachable!()
+        };
+        fields.retain(|(name, _)| !name.matches("HurtEntities"));
+        activate_test_falling_entity(&mut session, entity);
+        assert!(session.falling_sand.is_empty());
+        assert!(
+            session
+                .stream_errors
+                .iter()
+                .any(|error| error.contains("unresolved damage"))
+        );
+        assert!(session.validate_speleothem_updates().is_err());
+        assert!(
+            session
+                .draft_existing_entity_chunk(session.player_chunk().unwrap())
+                .is_err()
+        );
     }
 
     #[test]

@@ -58,12 +58,27 @@ public class GeneratedInertPostprocessingOracle {
         var level=(FakeLevel)unsafe.allocateInstance(FakeLevel.class);
         var chunk=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
-        var names=List.of("stone","sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","dripstone_block",
+        var names=new ArrayList<>(List.of("stone","sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","dripstone_block",
             "cobblestone","mossy_cobblestone","dirt","coarse_dirt","rooted_dirt","moss_block","clay","bedrock",
             "netherrack","end_stone","blackstone","obsidian","crying_obsidian","coal_ore","iron_ore",
             "copper_ore","gold_ore","lapis_ore","diamond_ore","emerald_ore","deepslate_coal_ore",
             "deepslate_iron_ore","deepslate_copper_ore","deepslate_gold_ore","deepslate_lapis_ore",
-            "deepslate_diamond_ore","deepslate_emerald_ore","nether_gold_ore","nether_quartz_ore","ancient_debris");
+            "deepslate_diamond_ore","deepslate_emerald_ore","nether_gold_ore","nether_quartz_ore","ancient_debris",
+            "polished_granite","polished_diorite","polished_andesite","cobbled_deepslate","polished_deepslate",
+            "deepslate_bricks","cracked_deepslate_bricks","deepslate_tiles","cracked_deepslate_tiles","chiseled_deepslate",
+            "polished_tuff","tuff_bricks","chiseled_tuff","chiseled_tuff_bricks","smooth_stone","stone_bricks",
+            "mossy_stone_bricks","cracked_stone_bricks","chiseled_stone_bricks","bricks","packed_mud","mud_bricks",
+            "sandstone","chiseled_sandstone","cut_sandstone","smooth_sandstone","red_sandstone",
+            "chiseled_red_sandstone","cut_red_sandstone","smooth_red_sandstone","prismarine","prismarine_bricks",
+            "dark_prismarine","nether_bricks","cracked_nether_bricks","chiseled_nether_bricks","red_nether_bricks",
+            "polished_blackstone","polished_blackstone_bricks","cracked_polished_blackstone_bricks",
+            "chiseled_polished_blackstone","smooth_basalt","end_stone_bricks","purpur_block","terracotta",
+            "packed_ice","blue_ice","coal_block","iron_block","gold_block","diamond_block","emerald_block",
+            "lapis_block","quartz_block","chiseled_quartz_block"));
+        for(var wood:List.of("oak","spruce","birch","jungle","acacia","dark_oak","mangrove","cherry","pale_oak","bamboo","crimson","warped"))
+            names.add(wood+"_planks");
+        for(var color:List.of("white","orange","magenta","light_blue","yellow","lime","pink","gray","light_gray","cyan","purple","blue","brown","green","red","black"))
+            for(var material:List.of("wool","concrete","terracotta"))names.add(color+"_"+material);
         out.println("BEGIN_RESULT");
         for(var name:names) for(var adjacent:List.of(Blocks.STONE,Blocks.AIR,Blocks.WATER)) {
             var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
@@ -71,7 +86,7 @@ public class GeneratedInertPostprocessingOracle {
             if(block.getStateDefinition().getPossibleStates().size()!=1 || !state.getFluidState().isEmpty()
                 || !Block.isShapeFullBlock(state.getCollisionShape(EmptyBlockGetter.INSTANCE,POS)))
                 throw new AssertionError("not an inert full-cube candidate: "+name);
-            if(List.of("moss_block","sulfur","cinnabar").contains(name)) {
+            {
                 if(state.canBeReplaced() || state.hasBlockEntity())throw new AssertionError("unexpected block properties: "+name);
                 for(var direction:Direction.values())
                     if(!Block.isShapeFullBlock(state.getFaceOcclusionShape(direction)))

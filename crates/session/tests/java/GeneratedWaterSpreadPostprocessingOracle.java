@@ -5,6 +5,7 @@ import net.minecraft.SharedConstants;
 import net.minecraft.core.*;
 import net.minecraft.core.registries.*;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.*;
@@ -133,6 +134,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
+        if(args.length>0 && args[0].equals("building_barriers")){
+            scenarios.clear();for(var name:List.of("oak_planks","deepslate_bricks","light_blue_concrete","white_wool","blue_ice"))scenarios.add("barrier_"+name);
+        }
         if(args.length>0 && args[0].equals("down_containers")){
             scenarios.clear();
             for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
@@ -178,7 +182,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 else {blocks.put(pos,Blocks.OAK_FENCE.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true).setValue(FenceBlock.EAST,true));blocks.put(pos.east(),Blocks.AIR.defaultBlockState());blocks.put(pos.below(),snowy);}
             }
             if(scenario.startsWith("barrier_")) {
-                var barrier=(scenario.equals("barrier_sulfur")?Blocks.SULFUR:Blocks.CINNABAR).defaultBlockState();
+                var barrier=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+scenario.substring("barrier_".length()))).defaultBlockState();
                 for(var p:List.of(pos.below(),pos.north(),pos.south(),pos.west()))blocks.put(p,barrier);
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
             }

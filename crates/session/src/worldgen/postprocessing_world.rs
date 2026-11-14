@@ -1375,7 +1375,104 @@ fn inert_generated_full_cube(name: &str) -> bool {
             | "minecraft:nether_gold_ore"
             | "minecraft:nether_quartz_ore"
             | "minecraft:ancient_debris"
-    )
+            | "minecraft:polished_granite"
+            | "minecraft:polished_diorite"
+            | "minecraft:polished_andesite"
+            | "minecraft:cobbled_deepslate"
+            | "minecraft:polished_deepslate"
+            | "minecraft:deepslate_bricks"
+            | "minecraft:cracked_deepslate_bricks"
+            | "minecraft:deepslate_tiles"
+            | "minecraft:cracked_deepslate_tiles"
+            | "minecraft:chiseled_deepslate"
+            | "minecraft:polished_tuff"
+            | "minecraft:tuff_bricks"
+            | "minecraft:chiseled_tuff"
+            | "minecraft:chiseled_tuff_bricks"
+            | "minecraft:smooth_stone"
+            | "minecraft:stone_bricks"
+            | "minecraft:mossy_stone_bricks"
+            | "minecraft:cracked_stone_bricks"
+            | "minecraft:chiseled_stone_bricks"
+            | "minecraft:bricks"
+            | "minecraft:packed_mud"
+            | "minecraft:mud_bricks"
+            | "minecraft:sandstone"
+            | "minecraft:chiseled_sandstone"
+            | "minecraft:cut_sandstone"
+            | "minecraft:smooth_sandstone"
+            | "minecraft:red_sandstone"
+            | "minecraft:chiseled_red_sandstone"
+            | "minecraft:cut_red_sandstone"
+            | "minecraft:smooth_red_sandstone"
+            | "minecraft:prismarine"
+            | "minecraft:prismarine_bricks"
+            | "minecraft:dark_prismarine"
+            | "minecraft:nether_bricks"
+            | "minecraft:cracked_nether_bricks"
+            | "minecraft:chiseled_nether_bricks"
+            | "minecraft:red_nether_bricks"
+            | "minecraft:polished_blackstone"
+            | "minecraft:polished_blackstone_bricks"
+            | "minecraft:cracked_polished_blackstone_bricks"
+            | "minecraft:chiseled_polished_blackstone"
+            | "minecraft:smooth_basalt"
+            | "minecraft:end_stone_bricks"
+            | "minecraft:purpur_block"
+            | "minecraft:terracotta"
+            | "minecraft:packed_ice"
+            | "minecraft:blue_ice"
+            | "minecraft:coal_block"
+            | "minecraft:iron_block"
+            | "minecraft:gold_block"
+            | "minecraft:diamond_block"
+            | "minecraft:emerald_block"
+            | "minecraft:lapis_block"
+            | "minecraft:quartz_block"
+            | "minecraft:chiseled_quartz_block"
+    ) || name.strip_prefix("minecraft:").is_some_and(|name| {
+        if let Some(wood) = name.strip_suffix("_planks") {
+            return matches!(
+                wood,
+                "oak"
+                    | "spruce"
+                    | "birch"
+                    | "jungle"
+                    | "acacia"
+                    | "dark_oak"
+                    | "mangrove"
+                    | "cherry"
+                    | "pale_oak"
+                    | "bamboo"
+                    | "crimson"
+                    | "warped"
+            );
+        }
+        ["_wool", "_concrete", "_terracotta"]
+            .into_iter()
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .is_some_and(|color| {
+                matches!(
+                    color,
+                    "white"
+                        | "orange"
+                        | "magenta"
+                        | "light_blue"
+                        | "yellow"
+                        | "lime"
+                        | "pink"
+                        | "gray"
+                        | "light_gray"
+                        | "cyan"
+                        | "purple"
+                        | "blue"
+                        | "brown"
+                        | "green"
+                        | "red"
+                        | "black"
+                )
+            })
+    })
 }
 
 // Snowy surfaces have full fluid-occlusion faces in either state. This only
@@ -4957,7 +5054,7 @@ mod tests {
     }
 
     fn inert_cube_postprocessing_trace() -> Vec<String> {
-        let names = [
+        let mut names: Vec<String> = [
             "stone",
             "sulfur",
             "cinnabar",
@@ -4997,7 +5094,93 @@ mod tests {
             "nether_gold_ore",
             "nether_quartz_ore",
             "ancient_debris",
-        ];
+            "polished_granite",
+            "polished_diorite",
+            "polished_andesite",
+            "cobbled_deepslate",
+            "polished_deepslate",
+            "deepslate_bricks",
+            "cracked_deepslate_bricks",
+            "deepslate_tiles",
+            "cracked_deepslate_tiles",
+            "chiseled_deepslate",
+            "polished_tuff",
+            "tuff_bricks",
+            "chiseled_tuff",
+            "chiseled_tuff_bricks",
+            "smooth_stone",
+            "stone_bricks",
+            "mossy_stone_bricks",
+            "cracked_stone_bricks",
+            "chiseled_stone_bricks",
+            "bricks",
+            "packed_mud",
+            "mud_bricks",
+            "sandstone",
+            "chiseled_sandstone",
+            "cut_sandstone",
+            "smooth_sandstone",
+            "red_sandstone",
+            "chiseled_red_sandstone",
+            "cut_red_sandstone",
+            "smooth_red_sandstone",
+            "prismarine",
+            "prismarine_bricks",
+            "dark_prismarine",
+            "nether_bricks",
+            "cracked_nether_bricks",
+            "chiseled_nether_bricks",
+            "red_nether_bricks",
+            "polished_blackstone",
+            "polished_blackstone_bricks",
+            "cracked_polished_blackstone_bricks",
+            "chiseled_polished_blackstone",
+            "smooth_basalt",
+            "end_stone_bricks",
+            "purpur_block",
+            "terracotta",
+            "packed_ice",
+            "blue_ice",
+            "coal_block",
+            "iron_block",
+            "gold_block",
+            "diamond_block",
+            "emerald_block",
+            "lapis_block",
+            "quartz_block",
+            "chiseled_quartz_block",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for wood in [
+            "oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry",
+            "pale_oak", "bamboo", "crimson", "warped",
+        ] {
+            names.push(format!("{wood}_planks"));
+        }
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            for material in ["wool", "concrete", "terracotta"] {
+                names.push(format!("{color}_{material}"));
+            }
+        }
         let mut trace = Vec::new();
         for name in names {
             for adjacent in ["stone", "air", "water"] {
@@ -5185,8 +5368,18 @@ mod tests {
 
     #[test]
     fn inert_natural_cubes_complete_postprocessing_without_side_effects() {
-        assert_eq!(inert_cube_postprocessing_trace().len(), 117);
-        assert!(!inert_generated_full_cube("minecraft:oak_log"));
+        assert_eq!(inert_cube_postprocessing_trace().len(), 462);
+        for unsupported in [
+            "minecraft:oak_log",
+            "minecraft:oak_slab",
+            "minecraft:blue_concrete_powder",
+            "minecraft:blue_carpet",
+            "minecraft:mud",
+            "example:oak_planks",
+            "minecraft:ultraviolet_wool",
+        ] {
+            assert!(!inert_generated_full_cube(unsupported), "{unsupported}");
+        }
         let invalid = BlockState {
             name: "minecraft:stone".into(),
             properties: BTreeMap::from([("extra".into(), "true".into())]),
@@ -5201,6 +5394,11 @@ mod tests {
             ("nether_quartz_ore", None),
             ("obsidian", None),
             ("moss_block", None),
+            ("oak_planks", None),
+            ("deepslate_bricks", None),
+            ("light_blue_concrete", None),
+            ("white_wool", None),
+            ("blue_ice", None),
             ("deepslate", Some("y")),
             ("oak_log", Some("x")),
             ("warped_hyphae", Some("z")),
@@ -7600,7 +7798,13 @@ mod tests {
                     world.set_block_id(x, y, z, air).unwrap();
                 }
             }
-            "barrier_sulfur" | "barrier_cinnabar" => {
+            "barrier_sulfur"
+            | "barrier_cinnabar"
+            | "barrier_oak_planks"
+            | "barrier_deepslate_bricks"
+            | "barrier_light_blue_concrete"
+            | "barrier_white_wool"
+            | "barrier_blue_ice" => {
                 let name = case.strip_prefix("barrier_").unwrap();
                 let barrier = world.intern_state(BlockState {
                     name: format!("minecraft:{name}"),
@@ -10039,6 +10243,27 @@ mod tests {
         );
         let mut expected = water_spread_trace("barrier_sulfur");
         expected.extend(water_spread_trace("barrier_cinnabar"));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn building_barriers_match_java_water_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["building_barriers"],
+        );
+        let expected = [
+            "oak_planks",
+            "deepslate_bricks",
+            "light_blue_concrete",
+            "white_wool",
+            "blue_ice",
+        ]
+        .into_iter()
+        .flat_map(|name| water_spread_trace(&format!("barrier_{name}")))
+        .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
 

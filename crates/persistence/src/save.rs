@@ -1247,6 +1247,7 @@ pub struct RewriteResult {
 #[derive(Default)]
 pub struct WorldSavePlan {
     chunks: Vec<PlannedChunk>,
+    treasure_sources: Vec<PlannedTreasureSource>,
     generated_chunks: Vec<PlannedGeneratedChunk>,
     entity_chunks: Vec<PlannedEntityChunk>,
     poi_chunks: Vec<PlannedEntityChunk>,
@@ -1259,6 +1260,100 @@ pub struct WorldSavePlan {
     weather: Option<PlannedSharedData>,
     random_sequences: Option<PlannedSharedData>,
     level_time: Option<PlannedLevelTime>,
+}
+
+/// One already generated buried-treasure piece whose vertical position changed.
+pub struct SavedTreasureMove {
+    pub structure_id: native_resources::packs::ResourceId,
+    pub new_y: i32,
+}
+
+/// Original captured terrain and all treasure-piece moves for one source chunk.
+pub struct SavedTreasureSource<'a> {
+    pub position: crate::world::ChunkPos,
+    pub source: &'a nbt::NamedTag,
+    pub moves: &'a [SavedTreasureMove],
+    /// Complete source-preserving draft produced by the generation pass.
+    pub expected: &'a nbt::NamedTag,
+    pub region_timestamp_seconds: u32,
+}
+
+struct PlannedTreasureSource {
+    dimension: DimensionId,
+    position: crate::world::ChunkPos,
+    source_nbt: Vec<u8>,
+    replacement: Vec<u8>,
+    region_timestamp_seconds: u32,
+}
+
+fn unique_treasure_field_mut<'a>(value: &'a mut Tag, name: &str) -> Result<&'a mut Tag> {
+    let Tag::Compound(fields) = value else {
+        anyhow::bail!("{name} parent is not a compound")
+    };
+    let mut matches = fields.iter_mut().filter(|(key, _)| key.matches(name));
+    let (_, value) = matches.next().with_context(|| format!("missing {name}"))?;
+    ensure!(matches.next().is_none(), "duplicate {name}");
+    Ok(value)
+}
+
+fn draft_treasure_source(
+    source: &nbt::NamedTag,
+    position: crate::world::ChunkPos,
+    moves: &[SavedTreasureMove],
+) -> Result<nbt::NamedTag> {
+    use crate::nbt::TagType;
+
+    validate_generation_chunk(&source.value, position.x, position.z)?;
+    ensure!(!moves.is_empty(), "no treasure moves provided");
+    let mut document = source.clone();
+    let structures = unique_treasure_field_mut(&mut document.value, "structures")?;
+    let starts = unique_treasure_field_mut(structures, "starts")?;
+    let mut seen = BTreeSet::new();
+    for change in moves {
+        ensure!(seen.insert(&change.structure_id), "duplicate treasure move");
+        let name = format!(
+            "{}:{}",
+            change.structure_id.namespace, change.structure_id.path
+        );
+        let start = unique_treasure_field_mut(starts, &name)?;
+        ensure!(
+            matches!(unique_treasure_field_mut(start, "id")?, Tag::String(id) if id.matches(&name))
+                && matches!(unique_treasure_field_mut(start, "ChunkX")?, Tag::Int(x) if *x == position.x)
+                && matches!(unique_treasure_field_mut(start, "ChunkZ")?, Tag::Int(z) if *z == position.z)
+                && matches!(unique_treasure_field_mut(start, "references")?, Tag::Int(_)),
+            "saved treasure start identity differs"
+        );
+        let Tag::List {
+            element_type: TagType::Compound,
+            values,
+        } = unique_treasure_field_mut(start, "Children")?
+        else {
+            anyhow::bail!("saved treasure pieces are missing")
+        };
+        let [piece] = values.as_mut_slice() else {
+            anyhow::bail!("expected one saved treasure piece")
+        };
+        let Tag::Compound(fields) = piece else {
+            anyhow::bail!("treasure piece is not a compound")
+        };
+        ensure!(fields.len() == 4, "unsupported treasure piece fields");
+        ensure!(
+            matches!(unique_treasure_field_mut(piece, "id")?, Tag::String(id) if id.matches("minecraft:btp"))
+                && matches!(unique_treasure_field_mut(piece, "O")?, Tag::Int(-1))
+                && matches!(unique_treasure_field_mut(piece, "GD")?, Tag::Int(0)),
+            "unsupported treasure piece"
+        );
+        let Tag::IntArray(bounds) = unique_treasure_field_mut(piece, "BB")? else {
+            anyhow::bail!("missing treasure bounds")
+        };
+        ensure!(
+            bounds.len() == 6 && bounds[0..3] == bounds[3..6],
+            "unsupported treasure bounds"
+        );
+        bounds[1] = change.new_y;
+        bounds[4] = change.new_y;
+    }
+    Ok(document)
 }
 
 struct PlannedChunk {
@@ -1343,6 +1438,8 @@ struct RegionChange {
     replacement: Option<Vec<u8>>,
     timestamp: u32,
     check_only: bool,
+    /// Only validated saved treasure-start edits may rewrite protochunks.
+    treasure_source: bool,
 }
 
 struct PlannedPlayerData {
@@ -1379,7 +1476,11 @@ impl WorldSavePlan {
             }) && !self
                 .generated_chunks
                 .iter()
-                .any(|entry| { entry.dimension == dimension && entry.position == position }),
+                .any(|entry| { entry.dimension == dimension && entry.position == position })
+                && !self
+                    .treasure_sources
+                    .iter()
+                    .any(|entry| { entry.dimension == dimension && entry.position == position }),
             "world save plan contains a duplicate chunk"
         );
         self.chunks.push(PlannedChunk {
@@ -1391,7 +1492,59 @@ impl WorldSavePlan {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len() + self.generated_chunks.len()
+        self.chunks.len() + self.generated_chunks.len() + self.treasure_sources.len()
+    }
+
+    /// Stage saved treasure start moves without changing any other NBT fields.
+    /// All sources are validated before the plan changes. Generation, live
+    /// inputs and cross-chunk effects still require independent validation.
+    fn add_saved_treasure_sources(
+        &mut self,
+        dimension: DimensionId,
+        sources: &[SavedTreasureSource<'_>],
+    ) -> Result<()> {
+        ensure!(!sources.is_empty(), "no treasure sources provided");
+        let mut seen = BTreeSet::new();
+        let mut pending = Vec::with_capacity(sources.len());
+        for source in sources {
+            let position = source.position;
+            ensure!(seen.insert(position), "duplicate treasure source");
+            ensure!(
+                !self
+                    .chunks
+                    .iter()
+                    .any(|entry| entry.dimension == dimension && entry.draft.position() == position)
+                    && !self
+                        .generated_chunks
+                        .iter()
+                        .any(|entry| entry.dimension == dimension && entry.position == position)
+                    && !self
+                        .treasure_sources
+                        .iter()
+                        .any(|entry| entry.dimension == dimension && entry.position == position),
+                "world save plan contains a duplicate chunk"
+            );
+            let document = draft_treasure_source(source.source, position, source.moves)?;
+            ensure!(
+                &document == source.expected,
+                "treasure source draft differs from validated moves"
+            );
+            let source_nbt = nbt::write(source.source)?;
+            let replacement = nbt::write(&document)?;
+            ensure!(
+                source_nbt.len() <= nbt::MAX_NBT_BYTES && replacement.len() <= nbt::MAX_NBT_BYTES,
+                "treasure source exceeds NBT limit"
+            );
+            pending.push(PlannedTreasureSource {
+                dimension: dimension.clone(),
+                position,
+                source_nbt,
+                replacement,
+                region_timestamp_seconds: source.region_timestamp_seconds,
+            });
+        }
+        self.treasure_sources.extend(pending);
+        Ok(())
     }
 
     /// Require the exact generator settings used for generation to remain on
@@ -1578,6 +1731,10 @@ impl WorldSavePlan {
                 && !self
                     .generated_chunks
                     .iter()
+                    .any(|entry| entry.dimension == dimension && entry.position == position)
+                && !self
+                    .treasure_sources
+                    .iter()
                     .any(|entry| entry.dimension == dimension && entry.position == position),
             "world save plan contains a duplicate chunk"
         );
@@ -1687,6 +1844,12 @@ impl WorldSavePlan {
                     .map(|entry| entry.position),
             )
             .chain(
+                self.treasure_sources
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
                 self.entity_chunks
                     .iter()
                     .filter(|entry| entry.dimension == dimension)
@@ -1729,6 +1892,68 @@ impl WorldSavePlan {
                 replacement: point.map(|(bytes, _)| bytes),
             });
         }
+        Ok(())
+    }
+
+    /// Add generated regions and all changed saved treasure sources as one
+    /// in-memory operation. The caller must prove generation completeness and
+    /// bind every captured disk, pack and live-session dependency separately.
+    pub fn add_generated_regions_with_treasure_sources(
+        &mut self,
+        dimension: DimensionId,
+        regions: impl IntoIterator<Item = FreshRegionDraft>,
+        sources: &[SavedTreasureSource<'_>],
+    ) -> Result<()> {
+        let mut pending = WorldSavePlan::new();
+        pending.add_generated_regions(dimension.clone(), regions)?;
+        if !sources.is_empty() {
+            pending.add_saved_treasure_sources(dimension.clone(), sources)?;
+        }
+        let occupied_terrain: BTreeSet<_> = self
+            .chunks
+            .iter()
+            .filter(|entry| entry.dimension == dimension)
+            .map(|entry| entry.draft.position())
+            .chain(
+                self.generated_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
+                self.treasure_sources
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .collect();
+        ensure!(
+            pending
+                .generated_chunks
+                .iter()
+                .map(|entry| entry.position)
+                .chain(pending.treasure_sources.iter().map(|entry| entry.position))
+                .all(|pos| !occupied_terrain.contains(&pos)),
+            "world save plan contains a duplicate chunk"
+        );
+        let occupied_sidecars: BTreeSet<_> = self
+            .entity_chunks
+            .iter()
+            .chain(&self.poi_chunks)
+            .filter(|entry| entry.dimension == dimension)
+            .map(|entry| entry.position)
+            .collect();
+        ensure!(
+            pending
+                .generated_chunks
+                .iter()
+                .all(|entry| !occupied_sidecars.contains(&entry.position)),
+            "world save plan contains duplicate chunk sidecars"
+        );
+        self.generated_chunks.extend(pending.generated_chunks);
+        self.treasure_sources.extend(pending.treasure_sources);
+        self.entity_chunks.extend(pending.entity_chunks);
+        self.poi_chunks.extend(pending.poi_chunks);
         Ok(())
     }
 
@@ -2764,6 +2989,7 @@ impl WorldWriteGuard {
         ensure!(
             !plan.chunks.is_empty()
                 || !plan.generated_chunks.is_empty()
+                || !plan.treasure_sources.is_empty()
                 || !plan.entity_chunks.is_empty()
                 || !plan.poi_chunks.is_empty()
                 || !plan.players.is_empty()
@@ -2773,6 +2999,39 @@ impl WorldWriteGuard {
                 || plan.level_time.is_some(),
             "world save plan is empty"
         );
+        if !plan.treasure_sources.is_empty() {
+            ensure!(
+                !plan.generated_chunks.is_empty()
+                    && plan.generation_settings.is_some()
+                    && plan.generation_packs.is_some(),
+                "treasure source changes require generated chunks and a complete generation context"
+            );
+            let captured: BTreeMap<_, _> = plan
+                .generation_dependencies
+                .iter()
+                .map(|dependency| {
+                    (
+                        (&dependency.dimension, dependency.kind, dependency.position),
+                        dependency.source_nbt.as_deref(),
+                    )
+                })
+                .collect();
+            for source in &plan.treasure_sources {
+                ensure!(
+                    captured.get(&(&source.dimension, RegionKind::Blocks, source.position))
+                        == Some(&Some(source.source_nbt.as_slice())),
+                    "treasure source is absent from generation capture"
+                );
+            }
+            for chunk in &plan.generated_chunks {
+                for kind in [RegionKind::Blocks, RegionKind::Entities, RegionKind::Poi] {
+                    ensure!(
+                        captured.get(&(&chunk.dimension, kind, chunk.position)) == Some(&None),
+                        "generated chunk and sidecars must be absent in generation capture"
+                    );
+                }
+            }
+        }
         let chest_changes: Vec<_> = plan
             .chunks
             .iter()
@@ -2824,6 +3083,7 @@ impl WorldWriteGuard {
                     replacement: Some(replacement),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    treasure_source: false,
                 });
         }
         for chunk in &plan.generated_chunks {
@@ -2842,6 +3102,26 @@ impl WorldWriteGuard {
                     replacement: Some(chunk.document.clone()),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    treasure_source: false,
+                });
+        }
+        for chunk in &plan.treasure_sources {
+            let position = chunk.position;
+            groups
+                .entry((
+                    RegionKind::Blocks,
+                    chunk.dimension.clone(),
+                    position.x.div_euclid(REGION_SIDE),
+                    position.z.div_euclid(REGION_SIDE),
+                ))
+                .or_default()
+                .push(RegionChange {
+                    position,
+                    source_nbt: Some(chunk.source_nbt.clone()),
+                    replacement: Some(chunk.replacement.clone()),
+                    timestamp: chunk.region_timestamp_seconds,
+                    check_only: false,
+                    treasure_source: true,
                 });
         }
         for chunk in &plan.entity_chunks {
@@ -2860,6 +3140,7 @@ impl WorldWriteGuard {
                     replacement: chunk.replacement.clone(),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    treasure_source: false,
                 });
         }
         for chunk in &plan.poi_chunks {
@@ -2878,6 +3159,7 @@ impl WorldWriteGuard {
                     replacement: chunk.replacement.clone(),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    treasure_source: false,
                 });
         }
         for observed in &plan.generation_dependencies {
@@ -2902,6 +3184,7 @@ impl WorldWriteGuard {
                     replacement: None,
                     timestamp: 0,
                     check_only: true,
+                    treasure_source: false,
                 });
             }
         }
@@ -3147,7 +3430,7 @@ impl WorldWriteGuard {
                 if let Some(original) = &original_nbt {
                     let source = nbt::read(original)?;
                     match kind {
-                        RegionKind::Blocks if planned.check_only => {
+                        RegionKind::Blocks if planned.check_only || planned.treasure_source => {
                             validate_generation_chunk(&source.value, position.x, position.z)?
                         }
                         RegionKind::Blocks => {
@@ -3168,6 +3451,9 @@ impl WorldWriteGuard {
                 if let Some(replacement) = &planned.replacement {
                     let draft = nbt::read(replacement).context("invalid chunk draft NBT")?;
                     match kind {
+                        RegionKind::Blocks if planned.treasure_source => {
+                            validate_generation_chunk(&draft.value, position.x, position.z)?
+                        }
                         RegionKind::Blocks => validate_chunk(&draft.value, position.x, position.z)?,
                         RegionKind::Entities => {
                             validate_entity_document(&draft, position)?;
@@ -8911,6 +9197,234 @@ mod tests {
             player_replacement
         );
         assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn generated_regions_and_saved_treasure_sources_commit_together() -> Result<()> {
+        use native_resources::packs::ResourceId;
+
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld")?;
+        let source_pos = ChunkPos { x: 1, z: 0 };
+        let generated_pos = ChunkPos { x: 32, z: 0 };
+        let generated_region = region_path.parent().unwrap().join("r.1.0.mca");
+        let mut source = editable_chunk(source_pos.x);
+        let Tag::Compound(root) = &mut source.value else {
+            unreachable!()
+        };
+        root.iter_mut()
+            .find(|(name, _)| name.matches("Status"))
+            .unwrap()
+            .1 = Tag::String("minecraft:biomes".into());
+        root.push((
+            "structures".into(),
+            Tag::Compound(vec![(
+                "starts".into(),
+                Tag::Compound(vec![(
+                    "minecraft:buried_treasure".into(),
+                    Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:buried_treasure".into())),
+                        ("ChunkX".into(), Tag::Int(source_pos.x)),
+                        ("ChunkZ".into(), Tag::Int(source_pos.z)),
+                        ("references".into(), Tag::Int(2)),
+                        ("future_start".into(), Tag::String("keep".into())),
+                        (
+                            "Children".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("id".into(), Tag::String("minecraft:btp".into())),
+                                    ("BB".into(), Tag::IntArray(vec![25, 90, 8, 25, 90, 8])),
+                                    ("O".into(), Tag::Int(-1)),
+                                    ("GD".into(), Tag::Int(0)),
+                                ])],
+                            },
+                        ),
+                    ]),
+                )]),
+            )]),
+        ));
+        store_record(&mut region, 1, 3, &source, 1_001);
+        fs::write(&region_path, &region)?;
+        let settings_dir = world.path().join("data/minecraft");
+        fs::create_dir_all(&settings_dir)?;
+        let settings = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                ),
+            ]),
+        };
+        fs::write(
+            settings_dir.join("world_gen_settings.dat"),
+            nbt::write(&settings)?,
+        )?;
+        let moves = [SavedTreasureMove {
+            structure_id: ResourceId::parse("minecraft:buried_treasure")?,
+            new_y: 64,
+        }];
+        assert!(draft_treasure_source(&source, generated_pos, &moves).is_err());
+        let duplicate_moves = [
+            SavedTreasureMove {
+                structure_id: moves[0].structure_id.clone(),
+                new_y: 64,
+            },
+            SavedTreasureMove {
+                structure_id: moves[0].structure_id.clone(),
+                new_y: 65,
+            },
+        ];
+        assert!(draft_treasure_source(&source, source_pos, &duplicate_moves).is_err());
+        let mut unsupported = source.clone();
+        let starts = unique_treasure_field_mut(
+            unique_treasure_field_mut(&mut unsupported.value, "structures")?,
+            "starts",
+        )?;
+        let start = unique_treasure_field_mut(starts, "minecraft:buried_treasure")?;
+        let Tag::List { values, .. } = unique_treasure_field_mut(start, "Children")? else {
+            unreachable!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            unreachable!()
+        };
+        fields.push(("unknown_piece".into(), Tag::Int(1)));
+        assert!(draft_treasure_source(&unsupported, source_pos, &moves).is_err());
+        let mut expected = source.clone();
+        let starts = unique_treasure_field_mut(
+            unique_treasure_field_mut(&mut expected.value, "structures")?,
+            "starts",
+        )?;
+        let start = unique_treasure_field_mut(starts, "minecraft:buried_treasure")?;
+        let Tag::List { values, .. } = unique_treasure_field_mut(start, "Children")? else {
+            unreachable!()
+        };
+        *unique_treasure_field_mut(&mut values[0], "BB")? =
+            Tag::IntArray(vec![25, 64, 8, 25, 64, 8]);
+        let entry = || SavedTreasureSource {
+            position: source_pos,
+            source: &source,
+            moves: &moves,
+            expected: &expected,
+            region_timestamp_seconds: 10,
+        };
+        let make_regions = || -> Result<Vec<FreshRegionDraft>> {
+            let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 1, 0);
+            terrain.add(generated_pos, &editable_chunk(generated_pos.x), 11)?;
+            Ok(vec![terrain])
+        };
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone())?;
+        let session = reader.session_guard().context("session missing")?;
+        let capture = reader.capture_generation_context([source_pos, generated_pos])?;
+        let mut no_context = WorldSavePlan::new();
+        no_context.add_generated_regions_with_treasure_sources(
+            dimension.clone(),
+            make_regions()?,
+            &[entry()],
+        )?;
+        let mut writer = session.acquire_write()?;
+        assert!(writer.write_plan(no_context, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path)?, region);
+        drop(writer);
+        let incomplete_capture = reader.capture_generation_context([source_pos])?;
+        let mut incomplete = WorldSavePlan::new();
+        incomplete.add_generation_context(&incomplete_capture)?;
+        incomplete.add_generated_regions_with_treasure_sources(
+            dimension.clone(),
+            make_regions()?,
+            &[entry()],
+        )?;
+        let mut writer = session.acquire_write()?;
+        assert!(writer.write_plan(incomplete, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path)?, region);
+        drop(writer);
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_context(&capture)?;
+        assert!(
+            plan.add_generated_regions_with_treasure_sources(
+                dimension.clone(),
+                make_regions()?,
+                &[entry(), entry()],
+            )
+            .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 0);
+        let mut wrong = expected.clone();
+        let Tag::Compound(fields) = &mut wrong.value else {
+            unreachable!()
+        };
+        fields.push(("unsupported_change".into(), Tag::Int(1)));
+        let invalid = SavedTreasureSource {
+            expected: &wrong,
+            ..entry()
+        };
+        assert!(
+            plan.add_generated_regions_with_treasure_sources(
+                dimension.clone(),
+                make_regions()?,
+                &[invalid]
+            )
+            .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 0);
+        plan.add_generated_regions_with_treasure_sources(
+            dimension.clone(),
+            make_regions()?,
+            &[entry()],
+        )?;
+        assert_eq!(plan.chunk_count(), 2);
+        assert!(
+            plan.add_generated_regions_with_treasure_sources(
+                dimension.clone(),
+                make_regions()?,
+                &[entry()]
+            )
+            .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 2);
+        let mut changed = source.clone();
+        let Tag::Compound(fields) = &mut changed.value else {
+            unreachable!()
+        };
+        fields.push(("intervening".into(), Tag::Int(1)));
+        store_record(&mut region, 1, 3, &changed, 1_002);
+        fs::write(&region_path, &region)?;
+        let mut writer = session.acquire_write()?;
+        assert!(writer.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path)?, region);
+        assert!(!generated_region.exists());
+        store_record(&mut region, 1, 3, &source, 1_001);
+        fs::write(&region_path, &region)?;
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_context(&capture)?;
+        plan.add_generated_regions_with_treasure_sources(
+            dimension.clone(),
+            make_regions()?,
+            &[entry()],
+        )?;
+        writer.write_plan(plan, |_, _| Ok(()))?;
+        assert!(generated_region.exists());
+        drop(writer);
+        let mut check = crate::world::WorldReader::open(world.path(), dimension)?;
+        assert_eq!(
+            *check
+                .read_chunk(source_pos.x, source_pos.z)?
+                .unwrap()
+                .document,
+            expected
+        );
+        assert_eq!(
+            *check
+                .read_chunk(generated_pos.x, generated_pos.z)?
+                .unwrap()
+                .document,
+            editable_chunk(generated_pos.x)
+        );
+        Ok(())
     }
 
     #[test]

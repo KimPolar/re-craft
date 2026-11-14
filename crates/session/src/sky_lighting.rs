@@ -48,6 +48,9 @@ pub(crate) struct SkyLighting {
     retry_delay: u8,
     worker: Option<(u64, Receiver<Reply>)>,
     pending: Vec<Edit>,
+    // Restoration inspects a one-chunk allocation halo around the light
+    // update's own at-most-one-chunk propagation halo.
+    required_chunks: Arc<BTreeSet<ChunkPos>>,
     // The original section contents are needed to reproduce Java's initial
     // source scan for columns first encountered after another column changed.
     originals: BTreeMap<ChunkPos, Arc<Chunk>>,
@@ -80,6 +83,10 @@ impl SkyLighting {
         self.retry_delay = 0;
     }
 
+    pub(crate) fn required_chunks(&self) -> Arc<BTreeSet<ChunkPos>> {
+        Arc::clone(&self.required_chunks)
+    }
+
     pub(crate) fn record(
         &mut self,
         position: BlockPosition,
@@ -94,6 +101,7 @@ impl SkyLighting {
             .entry(position.chunk())
             .or_insert_with(|| Arc::clone(original));
         self.pending.push(Edit { position, old, new });
+        extend_required_chunks(Arc::make_mut(&mut self.required_chunks), position);
         self.invalidate();
     }
 
@@ -120,14 +128,16 @@ impl SkyLighting {
         if column.update(world, position.y) == Some(false) {
             self.sources.insert((position.x, position.z), column);
             self.pending.clear();
+            Arc::make_mut(&mut self.required_chunks).clear();
         }
     }
 
     /// Poll results and start at most one background job. Any block or stream
     /// change while it runs invalidates the result; the edits stay pending.
-    pub(crate) fn advance(
+    pub(crate) fn advance_with_parked(
         &mut self,
         world: &mut Arc<World>,
+        parked: &mut BTreeMap<ChunkPos, Arc<Chunk>>,
         bounds: Option<LightBounds>,
     ) -> BTreeSet<ChunkPos> {
         let mut changed = BTreeSet::new();
@@ -147,7 +157,7 @@ impl SkyLighting {
                             {
                                 return None;
                             }
-                            apply(world, result).map(|updated| (updated, completed))
+                            apply(world, parked, result).map(|updated| (updated, completed))
                         });
                         match result {
                             Some(((updated, sources, originals), completed)) => {
@@ -161,6 +171,11 @@ impl SkyLighting {
                                     index += 1;
                                     !finished
                                 });
+                                let mut required = BTreeSet::new();
+                                for edit in &self.pending {
+                                    extend_required_chunks(&mut required, edit.position);
+                                }
+                                self.required_chunks = Arc::new(required);
                                 self.sources = sources;
                                 self.failed_generation =
                                     (!self.pending.is_empty()).then_some(self.generation);
@@ -200,6 +215,11 @@ impl SkyLighting {
         };
         let generation = self.generation;
         let snapshot = Arc::clone(world);
+        let parked_snapshot: Vec<_> = parked
+            .iter()
+            .filter(|(position, _)| self.required_chunks.contains(position))
+            .map(|(&position, chunk)| (position, Arc::clone(chunk)))
+            .collect();
         let edits = self.pending.clone();
         let originals = self.originals.clone();
         let sources = self.sources.clone();
@@ -207,6 +227,15 @@ impl SkyLighting {
         let spawned = std::thread::Builder::new()
             .name("sky-light".into())
             .spawn(move || {
+                let snapshot = if parked_snapshot.is_empty() {
+                    snapshot
+                } else {
+                    let mut with_parked = snapshot.as_ref().clone();
+                    for (position, chunk) in parked_snapshot {
+                        with_parked.chunks.insert(position, chunk);
+                    }
+                    Arc::new(with_parked)
+                };
                 let result = compute_available(&snapshot, bounds, &edits, &originals, sources);
                 let _ = tx.send(Reply { generation, result });
             });
@@ -217,6 +246,15 @@ impl SkyLighting {
             self.retry_delay = 20;
         }
         changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance(
+        &mut self,
+        world: &mut Arc<World>,
+        bounds: Option<LightBounds>,
+    ) -> BTreeSet<ChunkPos> {
+        self.advance_with_parked(world, &mut BTreeMap::new(), bounds)
     }
 
     pub(crate) fn settled(&self) -> bool {
@@ -247,6 +285,18 @@ impl SkyLighting {
         let (tx, rx) = mpsc::sync_channel(1);
         assert!(tx.send(reply).is_ok());
         self.worker = Some((generation, rx));
+    }
+}
+
+fn extend_required_chunks(required: &mut BTreeSet<ChunkPos>, position: BlockPosition) {
+    let min_x = position.x.saturating_sub(15).div_euclid(16) - 1;
+    let max_x = position.x.saturating_add(15).div_euclid(16) + 1;
+    let min_z = position.z.saturating_sub(15).div_euclid(16) - 1;
+    let max_z = position.z.saturating_add(15).div_euclid(16) + 1;
+    for x in min_x..=max_x {
+        for z in min_z..=max_z {
+            required.insert(ChunkPos { x, z });
+        }
     }
 }
 
@@ -441,11 +491,18 @@ fn compute(
     })
 }
 
-fn apply(world: &mut Arc<World>, computed: Computed) -> Option<AppliedLighting> {
+fn apply(
+    world: &mut Arc<World>,
+    parked: &mut BTreeMap<ChunkPos, Arc<Chunk>>,
+    computed: Computed,
+) -> Option<AppliedLighting> {
     let mut updates = Vec::new();
     let mut originals = BTreeMap::new();
     for pos in &computed.changed {
-        let current = world.chunks.get(pos)?;
+        let current = match (world.chunks.get(pos), parked.get(pos)) {
+            (Some(chunk), None) | (None, Some(chunk)) => chunk,
+            _ => return None,
+        };
         originals.insert(*pos, Arc::clone(current));
         let calculated = computed.world.chunks.get(pos)?;
         for (&y, section) in &calculated.sections {
@@ -465,10 +522,14 @@ fn apply(world: &mut Arc<World>, computed: Computed) -> Option<AppliedLighting> 
             }
         }
     }
-    let world = Arc::make_mut(world);
     let mut changed = BTreeSet::new();
     for (pos, y, light) in updates {
-        let chunk = Arc::make_mut(world.chunks.get_mut(&pos)?);
+        let chunk = if world.chunks.contains_key(&pos) {
+            Arc::make_mut(world).chunks.get_mut(&pos)?
+        } else {
+            parked.get_mut(&pos)?
+        };
+        let chunk = Arc::make_mut(chunk);
         let section = chunk.sections.entry(y).or_insert_with(|| {
             Arc::new(Section {
                 blocks: None,
@@ -849,6 +910,8 @@ mod tests {
         assert_eq!(world.light(0, 14, 15, true), Some(14));
         assert_eq!(world.light(64, 14, 15, true), Some(15));
         assert!(!sky.settled());
+        assert!(!sky.required_chunks().contains(&first.chunk()));
+        assert!(sky.required_chunks().contains(&second.chunk()));
 
         sky.advance(&mut world, Some(bounds));
         assert!(
@@ -866,6 +929,64 @@ mod tests {
                     actual.sections[y].sky_light, section.sky_light,
                     "{pos:?}, {y}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_updates_parked_and_resident_chunks_and_retries_a_move() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let first = BlockPosition {
+            x: 15,
+            y: 15,
+            z: 15,
+        };
+        let second = BlockPosition { x: 16, ..first };
+        let neighbor = second.chunk();
+        let mut expected = fixture();
+        let mut baseline = SkyLighting::default();
+        baseline.set_enabled(true);
+        edit(&mut baseline, &mut expected, first, state("stone", &[]));
+        edit(&mut baseline, &mut expected, second, state("stone", &[]));
+        finish(&mut baseline, &mut expected, bounds);
+        assert!(baseline.settled());
+
+        for moved in [false, true] {
+            let mut world = fixture();
+            let mut sky = SkyLighting::default();
+            sky.set_enabled(true);
+            edit(&mut sky, &mut world, first, state("stone", &[]));
+            edit(&mut sky, &mut world, second, state("stone", &[]));
+            let chunk = Arc::make_mut(&mut world).chunks.remove(&neighbor).unwrap();
+            let old_parked = Arc::clone(&chunk);
+            let mut parked = BTreeMap::from([(neighbor, chunk)]);
+            sky.advance_with_parked(&mut world, &mut parked, Some(bounds));
+            sky.wait_for_worker();
+            if moved {
+                Arc::make_mut(&mut world)
+                    .chunks
+                    .insert(neighbor, parked.remove(&neighbor).unwrap());
+                sky.streaming_changed();
+            }
+            let mut changed = sky.advance_with_parked(&mut world, &mut parked, Some(bounds));
+            if moved {
+                assert!(changed.is_empty(), "a stale result must not be applied");
+                sky.wait_for_worker();
+                changed = sky.advance_with_parked(&mut world, &mut parked, Some(bounds));
+            }
+            assert!(sky.settled());
+            assert!(changed.contains(&first.chunk()));
+            assert!(changed.contains(&second.chunk()));
+            assert!(sky.required_chunks().is_empty());
+            assert_eq!(old_parked.sections[&0].sky_light.as_ref().unwrap()[0], 0xff);
+            for (pos, expected) in &expected.chunks {
+                let actual = world.chunks.get(pos).or_else(|| parked.get(pos)).unwrap();
+                for (y, section) in &expected.sections {
+                    assert_eq!(
+                        actual.sections[y].sky_light, section.sky_light,
+                        "{pos:?}, {y}"
+                    );
+                }
             }
         }
     }
@@ -1008,7 +1129,7 @@ mod tests {
             .arg(&input)
             .arg(&output));
         let expected: Vec<Vec<u8>> =
-            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(
             expected.len(),
             actions.iter().filter(|action| !action.4).count()
@@ -1074,6 +1195,54 @@ mod tests {
             }
         }
         assert!(expected.next().is_none());
+
+        let boundary_edits = [
+            serde_json::json!({"x":15,"y":24,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":16,"y":24,"z":15,"state":"stone","defer":false}),
+        ];
+        std::fs::write(&input, serde_json::to_vec(&boundary_edits).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 1);
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        for x in [15, 16] {
+            edit(
+                &mut sky,
+                &mut world,
+                BlockPosition { x, y: 24, z: 15 },
+                state("stone", &[]),
+            );
+        }
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let chunk = Arc::make_mut(&mut world).chunks.remove(&neighbor).unwrap();
+        let mut parked = BTreeMap::from([(neighbor, chunk)]);
+        sky.advance_with_parked(&mut world, &mut parked, Some(bounds));
+        sky.wait_for_worker();
+        let changed = sky.advance_with_parked(&mut world, &mut parked, Some(bounds));
+        assert!(sky.settled());
+        assert!(changed.contains(&neighbor));
+        let mut combined = world.as_ref().clone();
+        combined.chunks.extend(parked);
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(
+                        combined.light(x, y, z, true).unwrap(),
+                        expected[0][index],
+                        "after parked boundary edits, at {x},{y},{z}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

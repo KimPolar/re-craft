@@ -12609,6 +12609,7 @@ impl LoadedSession {
         let mut changed = false;
         let mut respawn_changed = false;
         let required_shapes = self.required_shape_update_chunks();
+        let required_sky = self.sky_lighting.required_chunks();
         if let Some(window) = self.pending_respawn_window.take()
             && self.respawn_window != window
         {
@@ -12690,6 +12691,7 @@ impl LoadedSession {
                         .remove(&pos)
                         .expect("resident chunk was checked");
                     if unsaved.contains(&pos)
+                        || required_sky.contains(&pos)
                         || self
                             .respawn_window
                             .is_some_and(|extra| within_window(pos, extra))
@@ -12771,6 +12773,7 @@ impl LoadedSession {
             .filter(|pos| {
                 !self.has_unsaved_chunk_changes(*pos)
                     && !required_shapes.contains(pos)
+                    && !required_sky.contains(pos)
                     && !self
                         .respawn_window
                         .is_some_and(|window| within_window(*pos, window))
@@ -22716,7 +22719,11 @@ impl LoadedSession {
         self.apply_streaming();
         let sky_bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
-        let sky_changed = self.sky_lighting.advance(&mut self.world, sky_bounds);
+        let sky_changed = self.sky_lighting.advance_with_parked(
+            &mut self.world,
+            &mut self.parked_chunks,
+            sky_bounds,
+        );
         let sky_originals = self.sky_lighting.take_applied_originals();
         for (pos, chunk) in sky_originals {
             if sky_changed.contains(&pos) {
@@ -31295,6 +31302,82 @@ pub(crate) mod tests {
         assert!(!session.sky_lighting.settled());
         assert!(session.capture_generation_terrain(&source, [pos]).is_err());
         assert!(session.verify_generation_terrain(&guard).is_err());
+    }
+
+    #[test]
+    fn sky_updates_finish_after_their_chunks_leave_the_active_window() {
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(state("minecraft:air", &[]));
+        for x in -1..=1 {
+            for z in -1..=1 {
+                let position = ChunkPos { x, z };
+                let sections = (-1..=2)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: (0..=1).contains(&y).then(|| Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                                sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+                            }),
+                        )
+                    })
+                    .collect();
+                world.chunks.insert(
+                    position,
+                    Arc::new(Chunk {
+                        position,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+            }
+        }
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: PlayerPose::Standing,
+        };
+        let bounds = BuildBounds {
+            min_y: 0,
+            max_y: 32,
+        };
+        let mut active = LoadedSession::new(world.clone(), IVec3::ZERO, bounds, player).unwrap();
+        let mut parked = LoadedSession::new(world, IVec3::ZERO, bounds, player).unwrap();
+        for session in [&mut active, &mut parked] {
+            session.set_has_skylight(true).unwrap();
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            assert!(session.set(IVec3::new(8, 15, 8), stone));
+        }
+        parked.queue_chunk_window(ChunkPos { x: 10, z: 0 }, 0);
+        active.update(TICK);
+        parked.update(TICK);
+        assert_eq!(parked.parked_chunks.len(), 9);
+        active.sky_lighting.wait_for_worker();
+        parked.sky_lighting.wait_for_worker();
+        active.update(TICK);
+        parked.update(TICK);
+        assert!(active.sky_lighting.settled());
+        assert!(parked.sky_lighting.settled());
+        for (pos, expected) in &active.world.chunks {
+            let actual = &parked.parked_chunks[pos];
+            for (&y, section) in &expected.sections {
+                assert_eq!(
+                    actual.sections[&y].sky_light, section.sky_light,
+                    "{pos:?}, {y}"
+                );
+            }
+        }
+        let clean = ChunkPos { x: -1, z: -1 };
+        assert!(!parked.dirty_chunks.contains(&clean));
+        parked.apply_streaming();
+        assert!(!parked.parked_chunks.contains_key(&clean));
+        assert!(parked.parked_chunks.contains_key(&ChunkPos { x: 0, z: 0 }));
     }
 
     #[test]

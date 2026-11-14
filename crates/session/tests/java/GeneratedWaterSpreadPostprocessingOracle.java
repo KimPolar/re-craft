@@ -137,6 +137,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("building_barriers")){
             scenarios.clear();for(var name:List.of("oak_planks","deepslate_bricks","light_blue_concrete","white_wool","blue_ice"))scenarios.add("barrier_"+name);
         }
+        if(args.length>0 && args[0].equals("lava_drain")){
+            scenarios.clear();for(int amount=1;amount<=15;amount++)scenarios.add("lava_drain_"+amount);
+        }
         if(args.length>0 && args[0].equals("down_containers")){
             scenarios.clear();
             for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
@@ -166,6 +169,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             pos=new BlockPos(scenario.startsWith("edge")?15:8,8,8);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("dry_lichen_off")&&!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off")&&!scenario.equals("ladder_off")&&!scenario.equals("ladder_down_source_off")&&!(scenario.startsWith("down_container_")&&scenario.endsWith("_false")),null);
             blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
+            if(scenario.startsWith("lava_drain_"))
+                blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,Integer.parseInt(scenario.substring("lava_drain_".length()))));
             if(scenario.startsWith("dry_lichen_")) {
                 var target=(scenario.equals("dry_lichen_down") || scenario.equals("dry_lichen_support"))?pos.below():pos.east();
                 blocks.put(target,Blocks.GLOW_LICHEN.defaultBlockState().setValue(MultifaceBlock.getFaceProperty(Direction.EAST),true));

@@ -1953,6 +1953,14 @@ impl GeneratedBlockView<'_> {
             return Ok(());
         }
         use native_world::fluid_sim::ChangedBlock;
+        if fluid.kind == FluidKind::Lava
+            && !fluid.source
+            && planned.len() == 1
+            && planned[0].position == glam::IVec3::from_array(pos)
+            && matches!(planned[0].block, ChangedBlock::Air)
+        {
+            return self.remove_exhausted_lava(pos, fluid);
+        }
         ensure!(
             fluid.kind == FluidKind::Water,
             "generated lava callbacks are unsupported"
@@ -2061,6 +2069,72 @@ impl GeneratedBlockView<'_> {
             }
         }
         Ok(())
+    }
+
+    /// A flowing lava block with no incoming fluid disappears before spreading.
+    /// Only inert neighbors can be updated here without additional callbacks.
+    fn remove_exhausted_lava(
+        &mut self,
+        pos: [i32; 3],
+        fluid: native_world::fluid::FluidState,
+    ) -> Result<()> {
+        let old = self.read(pos)?;
+        ensure!(liquid_state(&old)? == Some(fluid), "lava origin changed");
+        for delta in [
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+        ] {
+            let neighbor = [pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2]];
+            let state = self.read(neighbor)?;
+            ensure!(
+                matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain)),
+                "exhausted lava requires unsupported neighbor callbacks"
+            );
+        }
+        let chunk = ChunkPos {
+            x: pos[0].div_euclid(16),
+            z: pos[2].div_euclid(16),
+        };
+        let section_y = i8::try_from(pos[1].div_euclid(16)).context("lava section out of range")?;
+        let blocks = self
+            .world
+            .chunks
+            .get(&chunk)
+            .and_then(|chunk| chunk.sections.get(&section_y))
+            .and_then(|section| section.blocks.as_ref())
+            .context("lava section unavailable")?;
+        let mut nonempty = 0;
+        for id in blocks.iter() {
+            let state = self
+                .world
+                .state(*id)
+                .context("lava section state missing")?;
+            if !matches!(
+                state.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ) {
+                nonempty += 1;
+                if nonempty >= 2 {
+                    break;
+                }
+            }
+        }
+        ensure!(
+            nonempty >= 2,
+            "lava removal requires light section allocation update"
+        );
+        self.write_postprocessed_state(
+            pos,
+            &old,
+            &BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            },
+        )
     }
 
     fn fluid_incomplete_error(
@@ -7704,6 +7778,24 @@ mod tests {
         }
         world.set_block_id(origin_x, 8, 8, water).unwrap();
         match case {
+            case if case.starts_with("lava_drain_") => {
+                let level = if case == "lava_drain_sand" {
+                    4
+                } else {
+                    case.strip_prefix("lava_drain_")
+                        .unwrap()
+                        .parse::<u8>()
+                        .unwrap()
+                };
+                let lava = world.intern_state(BlockState {
+                    name: "minecraft:lava".into(),
+                    properties: BTreeMap::from([("level".into(), level.to_string())]),
+                });
+                world.set_block_id(origin_x, 8, 8, lava).unwrap();
+                if case == "lava_drain_sand" {
+                    world.set_block_id(origin_x, 9, 8, sand).unwrap();
+                }
+            }
             "dry_lichen_on" | "dry_lichen_off" | "dry_lichen_down" | "dry_lichen_support" => {
                 let lichen = world.intern_state(BlockState {
                     name: "minecraft:glow_lichen".into(),
@@ -8363,6 +8455,7 @@ mod tests {
         let mut registry: BTreeSet<String> = [
             "air",
             "water",
+            "lava",
             "stone",
             "sulfur",
             "cinnabar",
@@ -8555,6 +8648,15 @@ mod tests {
                 before_random.next_int()
             );
             return vec!["rolled back".into()];
+        }
+        if case == "lava_drain_sand" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            assert_eq!(stage.world.block(8, 9, 8), source.block(8, 9, 8));
+            assert!(stage.edits.is_empty());
+            return vec![format!("{error:#}")];
         }
         if case == "ladder_break_unsupported" {
             let error = stage.poll(chunk, 1).unwrap_err();
@@ -10264,6 +10366,37 @@ mod tests {
         .into_iter()
         .flat_map(|name| water_spread_trace(&format!("barrier_{name}")))
         .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exhausted_generated_lava_disappears_without_scheduling_ticks() {
+        for level in 1..=15 {
+            let trace = water_spread_trace(&format!("lava_drain_{level}"));
+            assert_eq!(trace[1], "state 8,8,8 minecraft:air -");
+            assert_eq!(trace.last().unwrap(), "counter 2");
+            assert!(
+                !trace
+                    .iter()
+                    .any(|line| line.starts_with("fluid ") || line.starts_with("block "))
+            );
+        }
+        assert!(
+            water_spread_trace("lava_drain_sand")[0].contains("unsupported neighbor callbacks")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn exhausted_generated_lava_matches_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_drain"],
+        );
+        let expected = (1..=15)
+            .flat_map(|level| water_spread_trace(&format!("lava_drain_{level}")))
+            .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
 

@@ -277,7 +277,9 @@ impl StructurePreparationPlan {
 /// Rigid pieces are summed from zero before junctions. Two initial terms
 /// commute, but junctions from different kinds cannot generally commute
 /// after a nonzero rigid sum because floating-point addition is not associative.
-fn terrain_contributions_commute(counts: impl IntoIterator<Item = (usize, usize)>) -> bool {
+pub(super) fn terrain_contributions_commute(
+    counts: impl IntoIterator<Item = (usize, usize)>,
+) -> bool {
     let mut rigid_total = 0usize;
     let mut junction_total = 0usize;
     let mut rigid_kinds = 0usize;
@@ -294,7 +296,7 @@ fn terrain_contributions_commute(counts: impl IntoIterator<Item = (usize, usize)
 
 /// Different structure kinds can be reordered when none of their possible
 /// nonzero contributions overlap. Unknown or overflowing bounds are rejected.
-fn terrain_supports_disjoint(
+pub(super) fn terrain_supports_disjoint(
     supports: &BTreeMap<ResourceId, Option<Vec<native_core::beardifier::BoundingBox>>>,
 ) -> bool {
     let mut previous: Vec<&[native_core::beardifier::BoundingBox]> = Vec::new();

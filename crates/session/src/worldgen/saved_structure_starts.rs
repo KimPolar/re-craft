@@ -139,6 +139,55 @@ pub fn saved_beardifier_for_chunk(
     )
 }
 
+/// Infer a structure-key order only when every possible order produces the
+/// same chunk-clipped terrain contributions. Per-key reference and piece
+/// order remains the captured Java order; ambiguous overlap returns `None`.
+pub fn unambiguous_beardifier_structure_order(
+    target: ChunkPos,
+    references: &OrderedStructureReferences,
+    mut pieces_for_start: impl FnMut(&ResourceId, ChunkPos) -> Result<Vec<StructurePiece>>,
+) -> Result<Option<Vec<ResourceId>>> {
+    let mut counts = BTreeMap::<ResourceId, (usize, usize)>::new();
+    let mut supports = BTreeMap::<ResourceId, Option<Vec<BoundingBox>>>::new();
+    for id in references.membership().keys() {
+        for &packed in references
+            .order(id)
+            .context("missing saved reference order")?
+        {
+            let source = ChunkPos {
+                x: packed as u32 as i32,
+                z: ((packed as u64) >> 32) as u32 as i32,
+            };
+            let pieces = pieces_for_start(id, source)?;
+            let clipped =
+                Beardifier::for_chunk([target.x, target.z], &pieces).map_err(anyhow::Error::msg)?;
+            let (rigids, junctions) = clipped.contribution_counts();
+            let entry = counts.entry(id.clone()).or_default();
+            entry.0 = entry
+                .0
+                .checked_add(rigids)
+                .context("too many rigid pieces")?;
+            entry.1 = entry
+                .1
+                .checked_add(junctions)
+                .context("too many junctions")?;
+            let entry = supports
+                .entry(id.clone())
+                .or_insert_with(|| Some(Vec::new()));
+            match (entry.as_mut(), clipped.contribution_supports()) {
+                (Some(existing), Some(regions)) => existing.extend(regions),
+                _ => *entry = None,
+            }
+        }
+    }
+    if !super::structure_batch::terrain_contributions_commute(counts.values().copied())
+        && !super::structure_batch::terrain_supports_disjoint(&supports)
+    {
+        return Ok(None);
+    }
+    Ok(Some(references.membership().keys().cloned().collect()))
+}
+
 /// Build a beardifier from either saved or newly collected references.
 /// The caller resolves each start from the same captured generation inputs.
 pub fn beardifier_for_ordered_references(
@@ -712,6 +761,82 @@ mod tests {
             visited[1..].iter().map(|(_, pos)| *pos).collect::<Vec<_>>(),
             expected_a
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inferred_beardifier_key_order_requires_order_independent_contributions() -> Result<()> {
+        use super::super::structure_references::collect_ordered_structure_references;
+
+        let target = ChunkPos { x: 0, z: 0 };
+        let a = ResourceId::parse("example:a")?;
+        let b = ResourceId::parse("example:b")?;
+        let references = collect_ordered_structure_references(target, |source| {
+            if source != target {
+                return Ok(Vec::new());
+            }
+            let bounds = BoundingBox::new([0, 0, 0], [15, 20, 15]).unwrap();
+            Ok(vec![
+                StructureStartBounds {
+                    structure: a.clone(),
+                    bounds,
+                },
+                StructureStartBounds {
+                    structure: b.clone(),
+                    bounds,
+                },
+            ])
+        })?;
+        let piece = |y| StructurePiece {
+            bounds: BoundingBox::new([2, y, 3], [5, y + 2, 7]).unwrap(),
+            adjustment: TerrainAdjustment::BeardThin,
+            ground_delta: 0,
+            projection: PieceProjection::NonPool,
+            junctions: Vec::new(),
+        };
+        let mut pieces = BTreeMap::from([(a.clone(), vec![piece(0)]), (b.clone(), vec![piece(4)])]);
+        let infer = |pieces: &BTreeMap<ResourceId, Vec<StructurePiece>>| {
+            unambiguous_beardifier_structure_order(target, &references, |id, pos| {
+                ensure!(pos == target, "unexpected reference source");
+                Ok(pieces.get(id).context("missing referenced start")?.clone())
+            })
+        };
+        let order = infer(&pieces)?.context("two rigid contributions should commute")?;
+        assert_eq!(order, vec![a.clone(), b.clone()]);
+        let compare = |pieces: &BTreeMap<ResourceId, Vec<StructurePiece>>,
+                       ys: std::ops::Range<i32>|
+         -> Result<()> {
+            let build = |order: &[ResourceId]| {
+                beardifier_for_ordered_references(target, &references, order, |id, _| {
+                    Ok(pieces.get(id).context("missing referenced start")?.clone())
+                })
+            };
+            let forward = build(&[a.clone(), b.clone()])?;
+            let reverse = build(&[b.clone(), a.clone()])?;
+            for y in ys {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        assert_eq!(
+                            forward.sample(x, y, z).to_bits(),
+                            reverse.sample(x, y, z).to_bits(),
+                            "terrain adaptation differs at {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        };
+        compare(&pieces, -8..16)?;
+
+        pieces.insert(a.clone(), vec![piece(0), piece(3)]);
+        pieces.insert(b.clone(), vec![piece(6), piece(9)]);
+        assert!(infer(&pieces)?.is_none());
+        pieces.insert(b.clone(), vec![piece(100), piece(103)]);
+        assert!(infer(&pieces)?.is_some());
+        compare(&pieces, -8..120)?;
+
+        pieces.remove(&b);
+        assert!(infer(&pieces).is_err());
         Ok(())
     }
 }

@@ -60,7 +60,7 @@ public class GeneratedInertPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         var names=new ArrayList<>(List.of("stone","sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","dripstone_block",
             "cobblestone","mossy_cobblestone","dirt","coarse_dirt","rooted_dirt","moss_block","clay","bedrock",
-            "netherrack","end_stone","blackstone","obsidian","crying_obsidian","coal_ore","iron_ore",
+            "netherrack","soul_soil","end_stone","blackstone","obsidian","crying_obsidian","coal_ore","iron_ore",
             "copper_ore","gold_ore","lapis_ore","diamond_ore","emerald_ore","deepslate_coal_ore",
             "deepslate_iron_ore","deepslate_copper_ore","deepslate_gold_ore","deepslate_lapis_ore",
             "deepslate_diamond_ore","deepslate_emerald_ore","nether_gold_ore","nether_quartz_ore","ancient_debris",

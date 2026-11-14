@@ -32,6 +32,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
     static BlockPos pos = new BlockPos(8,8,8);
     static final Map<BlockPos, BlockState> blocks = new HashMap<>();
     static final List<BlockPos> lightChecks = new ArrayList<>();
+    static final List<BlockPos> fizzEvents = new ArrayList<>();
     static LevelTicks<Block> blockAccess;
     static LevelTicks<Fluid> fluidAccess;
     static long counter;
@@ -59,6 +60,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         @Override public LevelTicks<Fluid> getFluidTicks(){return fluidAccess;}
         @Override public long getGameTime(){return 100;}
         @Override public long nextSubTickCount(){return counter++;}
+        @Override public void levelEvent(net.minecraft.world.entity.Entity source,int event,BlockPos p,int data){
+            if(event!=1501 || data!=0)throw new AssertionError("unexpected level event "+event);
+            fizzEvents.add(p.immutable());
+        }
         @Override public void neighborChanged(BlockPos p,Block block,Orientation orientation){updater.neighborChanged(p,block,orientation);}
         @Override public void neighborShapeChanged(Direction dir,BlockPos target,BlockPos source,BlockState state,int flags,int depth){updater.shapeUpdate(dir,state,target,source,flags,depth);}
         // Capture the Level.destroyBlock replacement and neighbor callbacks;
@@ -145,6 +150,12 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lava_spread")){
             scenarios.clear();scenarios.addAll(List.of("lava_down_slow","lava_down_fast","lava_sides_slow","lava_sides_fast","lava_rise_slow","lava_rise_fast","lava_convert_off","lava_convert_on"));
         }
+        if(args.length>0 && args[0].equals("lava_water_down")){
+            scenarios.clear();scenarios.addAll(List.of("lava_water_down_slow","lava_water_down_fast","lava_water_down_flow","lava_water_down_adjacent"));
+        }
+        if(args.length>0 && args[0].equals("lava_neighbors")){
+            scenarios.clear();scenarios.addAll(List.of("lava_touch_water","lava_touch_basalt","lava_touch_basalt_source_tag","lava_touch_basalt_flowing_tag","water_touch_lava_source","water_touch_lava_flow","water_touch_lava_cascade","lava_convert_on_water"));
+        }
         if(args.length>0 && args[0].equals("down_containers")){
             scenarios.clear();
             for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
@@ -165,6 +176,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     scenarios.add("snow_"+kind+"_"+name+"_"+initial+"_"+tagged);
         }
         for(String scenario:scenarios) {
+            bind.invoke(Fluids.LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_flowing_tag")?List.of():List.of(FluidTags.LAVA));
+            bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_source_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             boolean snowyWater=scenario.startsWith("snow_water_");
             boolean snowyFence=scenario.startsWith("snow_fence_");
@@ -173,14 +186,34 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             bind.invoke(Blocks.OAK_FENCE.builtInRegistryHolder(),snowyFence && tagged?List.of(BlockTags.FENCES,BlockTags.WOODEN_FENCES,BlockTags.SNOW):List.of(BlockTags.FENCES,BlockTags.WOODEN_FENCES));
             pos=new BlockPos(scenario.startsWith("edge")?15:8,8,8);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("dry_lichen_off")&&!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off")&&!scenario.equals("ladder_off")&&!scenario.equals("ladder_down_source_off")&&!(scenario.startsWith("down_container_")&&scenario.endsWith("_false")),null);
-            rules.set(GameRules.LAVA_SOURCE_CONVERSION,scenario.equals("lava_convert_on"),null);
-            blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
+            rules.set(GameRules.LAVA_SOURCE_CONVERSION,scenario.equals("lava_convert_on")||scenario.equals("lava_convert_on_water"),null);
+            blocks.clear();lightChecks.clear();fizzEvents.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
+            if(scenario.startsWith("lava_touch_")){
+                blocks.put(pos,Blocks.LAVA.defaultBlockState());blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.equals("lava_touch_water"))blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
+                else {blocks.put(pos.east().below(),Blocks.SOUL_SOIL.defaultBlockState());blocks.put(pos.east().north(),Blocks.BLUE_ICE.defaultBlockState());}
+                attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,false).build()).build();
+            }
+            if(scenario.startsWith("water_touch_lava_")){
+                blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                blocks.put(pos.below().east(),Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,scenario.endsWith("flow")?4:0));
+                if(scenario.equals("water_touch_lava_cascade"))blocks.put(pos.below().west(),Blocks.LAVA.defaultBlockState());
+                attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,false).build()).build();
+            }
+            if(scenario.startsWith("lava_water_down_")){
+                blocks.put(pos,Blocks.LAVA.defaultBlockState());
+                var water=Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,scenario.endsWith("_flow")?4:0);
+                blocks.put(pos.below(),water);
+                if(scenario.endsWith("_adjacent"))blocks.put(pos.below().east(),water);
+                attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,scenario.endsWith("_fast")).build()).build();
+            }
             if(scenario.startsWith("lava_down_") || scenario.startsWith("lava_sides_") || scenario.startsWith("lava_rise_") || scenario.startsWith("lava_convert_")){
                 blocks.put(pos,Blocks.LAVA.defaultBlockState());
                 if(scenario.startsWith("lava_down_"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
                 else if(scenario.startsWith("lava_sides_"))for(var p:List.of(pos.north(),pos.south(),pos.west(),pos.east()))blocks.put(p,Blocks.AIR.defaultBlockState());
                 else {blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,4));blocks.put(pos.west(),Blocks.LAVA.defaultBlockState());}
                 if(scenario.startsWith("lava_convert_"))blocks.put(pos.north(),Blocks.LAVA.defaultBlockState());
+                if(scenario.equals("lava_convert_on_water"))blocks.put(pos.east(),Blocks.WATER.defaultBlockState());
                 attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,scenario.endsWith("_fast")).build()).build();
             }
             if(scenario.startsWith("lava_drain_"))
@@ -363,7 +396,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(scenario.startsWith("ladder_break_")){var s=get(pos.east(2));out.printf("destroyed %s %s%n",BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.getBlock()==Blocks.WATER?s.getValue(LiquidBlock.LEVEL).toString():"-");}
             if(snowyWater || snowyFence){var p=snowyWater?pos.below(2):pos.below();var s=get(p);out.printf("snow %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.getValue(BlockStateProperties.SNOWY));}
             if(scenario.equals("fence_on_neighbor")){var s=get(pos.east(2));out.printf("neighbor %s %s %s %s %s%n",s.getValue(FenceBlock.NORTH),s.getValue(FenceBlock.EAST),s.getValue(FenceBlock.SOUTH),s.getValue(FenceBlock.WEST),s.getValue(BlockStateProperties.WATERLOGGED));}
-            if(scenario.startsWith("marked_stair_corner_")||scenario.equals("fence_on_neighbor")||scenario.startsWith("marked_lichen_destroy_")||scenario.startsWith("lava_"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
+            if(scenario.startsWith("marked_stair_corner_")||scenario.equals("fence_on_neighbor")||scenario.startsWith("marked_lichen_destroy_")||scenario.startsWith("lava_")||scenario.startsWith("water_touch_lava_"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
+            for(var p:fizzEvents)out.printf("fizz %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
+            if(scenario.startsWith("water_touch_lava_"))out.printf("reaction 9,7,8 %s%n",BuiltInRegistries.BLOCK.getKey(get(pos.below().east()).getBlock()));
+            if(scenario.equals("water_touch_lava_cascade"))out.printf("reaction 7,7,8 %s%n",BuiltInRegistries.BLOCK.getKey(get(pos.below().west()).getBlock()));
             for(var tick:bt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:eastBt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:ft.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}

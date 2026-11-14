@@ -8,12 +8,14 @@ use native_world::{loaded::BlockState, movement::BoundingBox};
 pub(crate) enum InsideBlock {
     Fire(u8),
     Campfire(u8),
+    Cactus,
     Honey,
     Bubble(bool),
 }
 
 pub(crate) fn effect(state: &BlockState) -> Option<InsideBlock> {
     match state.name.as_str() {
+        "minecraft:cactus" => Some(InsideBlock::Cactus),
         "minecraft:fire" => Some(InsideBlock::Fire(1)),
         "minecraft:soul_fire" => Some(InsideBlock::Fire(2)),
         "minecraft:honey_block" if state.properties.is_empty() => Some(InsideBlock::Honey),

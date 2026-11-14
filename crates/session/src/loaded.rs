@@ -22802,6 +22802,8 @@ impl LoadedSession {
                             state.name.as_str(),
                             "minecraft:campfire" | "minecraft:soul_campfire"
                         ) && native_world::collision::block_shape(state).is_none()
+                            || (state.name == "minecraft:cactus"
+                                && native_world::collision::block_shape(state).is_none())
                             || (state.name == "minecraft:bubble_column"
                                 && bubble_column_drag(state).is_none())
                         {
@@ -23061,6 +23063,11 @@ impl LoadedSession {
         if let Some(contacts) = player_fire_contacts {
             for contact in contacts {
                 match contact.kind {
+                    crate::fire_contact::InsideBlock::Cactus => {
+                        if self.death.is_none() {
+                            self.player_damage(1.0, "minecraft:cactus", DeathCause::Cactus);
+                        }
+                    }
                     crate::fire_contact::InsideBlock::Campfire(amount) => {
                         self.unresolved_player_fire_contact = true;
                         if self.death.is_none() {
@@ -61865,6 +61872,120 @@ pub(crate) mod tests {
         assert!(session.take_consume_sounds().is_empty());
         assert_eq!(session.vitals.exhaustion, 0.0);
         assert_eq!(session.player_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn cactus_contact_damages_players_and_respects_cooldown_and_game_mode() {
+        for (mode, expected) in [
+            (GameMode::Survival, 19.0),
+            (GameMode::Creative, 20.0),
+            (GameMode::Spectator, 20.0),
+        ] {
+            let mut test = session();
+            let cactus = test.intern_block(state("minecraft:cactus", &[("age", "0")]));
+            assert!(test.set(IVec3::new(9, 1, 8), cactus));
+            test.motion.position.x = 8.7625;
+            test.set_game_mode(mode);
+            test.survival_rules.natural_health_regeneration = false;
+            test.update(TICK);
+            assert_eq!(test.vitals.health, expected, "{mode:?}");
+            if mode == GameMode::Survival {
+                assert_eq!(test.vitals.exhaustion, 0.1);
+                assert_eq!(
+                    test.take_consume_sounds()[0].info.event,
+                    "entity.player.hurt"
+                );
+                assert!(!test.unresolved_player_damage);
+                for _ in 0..9 {
+                    test.update(TICK);
+                }
+                assert_eq!(test.vitals.health, 19.0);
+                test.update(TICK);
+                assert_eq!(test.vitals.health, 18.0);
+            }
+        }
+
+        let mut outside = session();
+        let cactus = outside.intern_block(state("minecraft:cactus", &[("age", "15")]));
+        assert!(outside.set(IVec3::new(9, 1, 8), cactus));
+        outside.motion.position.x = 8.69;
+        outside.update(TICK);
+        assert_eq!(outside.vitals.health, 20.0);
+
+        let mut fatal = session();
+        let cactus = fatal.intern_block(state("minecraft:cactus", &[("age", "0")]));
+        assert!(fatal.set(IVec3::new(8, 1, 8), cactus));
+        fatal.vitals.health = 1.0;
+        fatal.update(TICK);
+        assert_eq!(fatal.snapshot().death.unwrap().cause, DeathCause::Cactus);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn cactus_contact_matches_java_block() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let source = temp.path().join("CactusContactOracle.java");
+        let output = temp.path().join("result.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CactusContactOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("CactusContactOracle")
+            .arg(&output));
+        let rows: Vec<(u8, bool, u32, f32, bool)> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 32);
+        for (age, _end, hits, amount, source_is_cactus) in rows {
+            assert_eq!(hits, 1);
+            assert!(source_is_cactus);
+            let mut test = session();
+            let cactus = test.intern_block(state("minecraft:cactus", &[("age", &age.to_string())]));
+            assert!(test.set(IVec3::new(8, 1, 8), cactus));
+            test.update(TICK);
+            assert_eq!(20.0 - test.vitals.health, amount, "age={age}");
+        }
     }
 
     #[test]

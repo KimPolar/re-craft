@@ -506,6 +506,7 @@ pub enum DeathCause {
     InFire,
     Campfire,
     HotFloor,
+    Cactus,
     Magic,
     Starve,
 }

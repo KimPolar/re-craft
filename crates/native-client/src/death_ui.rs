@@ -267,6 +267,9 @@ impl DeathScreen {
                         "death.attack.hotFloor",
                         "%1$s discovered the floor was lava",
                     )),
+                    DeathCause::Cactus => {
+                        Some(("death.attack.cactus", "%1$s was pricked to death"))
+                    }
                     DeathCause::Magic => Some(("death.attack.magic", "%1$s was killed by magic")),
                     DeathCause::Starve => Some(("death.attack.starve", "%1$s starved to death")),
                 };

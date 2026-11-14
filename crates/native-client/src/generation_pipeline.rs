@@ -345,10 +345,10 @@ mod tests {
         )?;
         match wait(&mut pipeline) {
             InitialWorldResult::Ready { generation, world } => {
-                let (path, uuid) = match &world {
-                    StagedWorld::Regular(world) => (world.path(), world.initial.uuid),
-                    StagedWorld::Structured(world) => (world.path(), world.initial.uuid),
+                let StagedWorld::Structured(world) = &world else {
+                    anyhow::bail!("structured generation returned an unstructured stage");
                 };
+                let (path, uuid) = (world.path(), world.initial.uuid);
                 let mut reader = native_persistence::world::WorldReader::open(
                     path,
                     native_persistence::world::DimensionId::parse("overworld")?,
@@ -368,6 +368,8 @@ mod tests {
                     .as_ref()
                     .context("postprocessed generation missing")?;
                 assert!(!processed.chunks.is_empty());
+                let mut structure_starts = 0_usize;
+                let mut structure_references = 0_usize;
                 for (position, expected) in &processed.chunks {
                     let saved = reader
                         .read_chunk(position.x, position.z)?
@@ -380,6 +382,7 @@ mod tests {
                         "block_ticks",
                         "fluid_ticks",
                         "PostProcessing",
+                        "structures",
                     ] {
                         assert_eq!(
                             saved.document.value.get(field),
@@ -387,6 +390,23 @@ mod tests {
                             "chunk {position:?}: {field}"
                         );
                     }
+                    let structures = saved
+                        .document
+                        .value
+                        .get("structures")
+                        .context("staged structure data missing")?;
+                    let Some(native_persistence::nbt::Tag::Compound(starts)) =
+                        structures.get("starts")
+                    else {
+                        anyhow::bail!("staged structure starts are invalid at {position:?}");
+                    };
+                    let Some(native_persistence::nbt::Tag::Compound(references)) =
+                        structures.get("References")
+                    else {
+                        anyhow::bail!("staged structure references are invalid at {position:?}");
+                    };
+                    structure_starts += starts.len();
+                    structure_references += references.len();
                     let records = expected
                         .entity_records
                         .as_ref()
@@ -411,6 +431,10 @@ mod tests {
                         );
                     }
                 }
+                eprintln!(
+                    "seed {seed}: checked {} staged chunks, {structure_starts} structure starts and {structure_references} reference entries",
+                    processed.chunks.len()
+                );
             }
             InitialWorldResult::Failed { error, .. } => return Err(error),
             InitialWorldResult::Cancelled { .. } => {

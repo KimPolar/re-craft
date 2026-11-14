@@ -215,7 +215,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.getFluidState().isEmpty() || !LightEngine.hasDifferentLightProperties(source,target.defaultBlockState()))
                     throw new AssertionError("unsupported patch vine source "+source+" -> "+target);
         boolean magmaActive=vineActive && args[1].endsWith("_magma_block");
-        if(magmaActive) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore","sulfur","cinnabar","deepslate","granite","diorite","andesite","tuff","calcite")) {
+        if(magmaActive) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","raw_iron_block","raw_copper_block","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore","sulfur","cinnabar","deepslate","granite","diorite","andesite","tuff","calcite")) {
             var block=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
             for(var state:block.getStateDefinition().getPossibleStates())
                 if(!state.isSolid() || !state.canOcclude() || state.hasBlockEntity() || !state.getFluidState().isEmpty() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state) || state.getPostProcessPos(null,BlockPos.ZERO)!=null || !LightEngine.hasDifferentLightProperties(state,Blocks.MAGMA_BLOCK.defaultBlockState()))
@@ -227,7 +227,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean lakeMixed=lakeActive && args[1].endsWith("_mixed");
         boolean lakeOre=lakeActive && args[1].contains("_iron_ore_");
         boolean lakeGenerated=lakeActive && args[1].contains("_lake_genore_");
-        if(lakeGenerated) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore")) {
+        if(lakeGenerated) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","raw_iron_block","raw_copper_block","gold_ore","deepslate_gold_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore")) {
             var source=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name)).defaultBlockState();
             if(!source.isSolid() || !source.canOcclude() || source.hasBlockEntity() || !source.getFluidState().isEmpty() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || LightEngine.hasDifferentLightProperties(source,Blocks.STONE.defaultBlockState()))
                 throw new AssertionError("unsupported lake ore source "+source);
@@ -399,7 +399,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
             if(x==1 && z==0 && magmaActive) {
                 fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
-                if(args[1].contains("_coal_ore_")) {
+                if(args[1].contains("_raw_iron_block_") || args[1].contains("_raw_copper_block_")) {
+                    var source=(args[1].contains("_raw_iron_block_") ? Blocks.RAW_IRON_BLOCK : Blocks.RAW_COPPER_BLOCK).defaultBlockState();
+                    fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
+                } else if(args[1].contains("_coal_ore_")) {
                     var source=args[1].contains("_deepslate_coal_ore_") ? Blocks.DEEPSLATE_COAL_ORE.defaultBlockState() : Blocks.COAL_ORE.defaultBlockState();
                     if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.isSolid())throw new AssertionError("unsupported magma source effects");
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);

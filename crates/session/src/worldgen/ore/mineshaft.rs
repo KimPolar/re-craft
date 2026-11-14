@@ -29,6 +29,8 @@ pub(super) fn mineshaft_center_support(state: &BlockState) -> Option<bool> {
             | "minecraft:smooth_basalt"
             | "minecraft:amethyst_block"
             | "minecraft:budding_amethyst"
+            | "minecraft:raw_iron_block"
+            | "minecraft:raw_copper_block"
     ) && state.properties.is_empty()
     {
         return Some(true);

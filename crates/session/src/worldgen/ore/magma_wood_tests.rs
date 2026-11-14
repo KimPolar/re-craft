@@ -91,6 +91,7 @@ fn wood_magma_faces_match_installed_java() -> Result<()> {
         .into_iter()
         .map(Planks::id)
         .chain(Wood::all().map(Wood::id))
+        .chain(["minecraft:raw_iron_block", "minecraft:raw_copper_block"])
         .collect();
     std::fs::write(&input, ids.join("\n"))?;
     let compiled = Command::new(java.join("javac.exe"))
@@ -155,7 +156,7 @@ fn wood_magma_faces_match_installed_java() -> Result<()> {
     }
     assert_eq!(
         rows.len(),
-        (Planks::ALL.len() + Wood::all().count() * 3) * 6
+        (Planks::ALL.len() + Wood::all().count() * 3 + 2) * 6
     );
     Ok(())
 }

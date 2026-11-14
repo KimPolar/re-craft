@@ -4635,7 +4635,21 @@ fn generation_non_sturdy_structure(state: &BlockState) -> bool {
         ) && native_world::block_light::same_light_behavior(state, state).is_some())
 }
 
+fn generated_raw_ore_block(state: &BlockState) -> Result<bool> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:raw_iron_block" | "minecraft:raw_copper_block"
+    ) {
+        return Ok(false);
+    }
+    ensure!(state.properties.is_empty(), "invalid raw ore block state");
+    Ok(true)
+}
+
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
+    if generated_raw_ore_block(state)? {
+        return Ok(true);
+    }
     if generation_non_sturdy_structure(state) {
         return Ok(false);
     }
@@ -4673,6 +4687,9 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
+    if generated_raw_ore_block(state)? {
+        return Ok(true);
+    }
     if generation_non_sturdy_structure(state) {
         return Ok(false);
     }
@@ -5315,6 +5332,9 @@ impl FallenFeatureWorld for DecorationRegion<'_> {
 // Only state families independently checked against 26.3 are accepted here.
 pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     let name = state.name.as_str();
+    if generated_raw_ore_block(state)? {
+        return Ok((true, true));
+    }
     if is_air(state) {
         return Ok((false, false));
     }
@@ -6189,6 +6209,9 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
 // Ore states are used here only for solid and fluid predicates, not as proof
 // that replacing them preserves all other world-generation side effects.
 fn generated_ore_state(state: &BlockState) -> Result<bool> {
+    if generated_raw_ore_block(state)? {
+        return Ok(true);
+    }
     let name = state.name.as_str();
     let redstone = matches!(
         name,
@@ -7426,9 +7449,10 @@ impl DecorationRegion<'_> {
         if self.tags.contains(unstable, &support.name)? {
             return Ok(false);
         }
-        let center = vanilla_full_occlusion(&support.name).with_context(|| {
-            format!("unsupported spore blossom center support {}", support.name)
-        })?;
+        let center = generated_raw_ore_block(&support)?
+            || vanilla_full_occlusion(&support.name).with_context(|| {
+                format!("unsupported spore blossom center support {}", support.name)
+            })?;
         if !center {
             return Ok(false);
         }
@@ -7802,6 +7826,9 @@ impl MagmaWorld for DecorationRegion<'_> {
             "minecraft:cave_vines" | "minecraft:cave_vines_plant"
         ) {
             ensure!(tree_cave_vines(state)?, "invalid magma neighbor cave vines");
+        }
+        if generated_raw_ore_block(state)? {
+            return Ok(true);
         }
         if let Some(full) = vanilla_full_occlusion(&state.name) {
             return Ok(full);
@@ -12968,6 +12995,21 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_raw_ore_blocks_match_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_room_raw_iron_block_air",
+            "vine_active_self_room_raw_copper_block_air",
+            "vine_active_lake_genore_raw_iron_block_water",
+            "vine_active_self_lake_genore_raw_copper_block_lava",
+            "vine_active_geode_raw_iron_block_to_air",
+            "vine_active_self_geode_raw_copper_block_to_air",
+            "vine_active_raw_iron_block_magma_block",
+            "vine_active_self_raw_copper_block_magma_block",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_geode_carving_matches_java_light() {
         check_staged_light_modes(&[
             "vine_active_geode_sulfur_to_air",
@@ -13504,7 +13546,15 @@ mod tests {
                 water.properties.insert("level".into(), "0".into());
                 let id = world.intern_state(water);
                 world.set_block_id(16, 8, 8, id).unwrap();
-                if mode.contains("_coal_ore_") {
+                if mode.contains("_raw_iron_block_") || mode.contains("_raw_copper_block_") {
+                    let source = state(if mode.contains("_raw_iron_block_") {
+                        "raw_iron_block"
+                    } else {
+                        "raw_copper_block"
+                    });
+                    let id = world.intern_state(source);
+                    world.set_block_id(16, 7, 8, id).unwrap();
+                } else if mode.contains("_coal_ore_") {
                     let source = state(if mode.contains("_deepslate_coal_ore_") {
                         "deepslate_coal_ore"
                     } else {
@@ -17056,6 +17106,8 @@ mod tests {
         for (name, states) in [
             ("coal_ore", 1),
             ("deepslate_coal_ore", 1),
+            ("raw_iron_block", 1),
+            ("raw_copper_block", 1),
             ("redstone_ore", 2),
             ("deepslate_redstone_ore", 2),
             ("cave_vines", 52),
@@ -19598,6 +19650,8 @@ mod tests {
                 "minecraft:dirt",
                 "minecraft:water",
                 "minecraft:lava",
+                "minecraft:raw_iron_block",
+                "minecraft:raw_copper_block",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -19635,7 +19689,16 @@ mod tests {
                 assert_eq!(p.len(), 9, "{line}");
                 let support: usize = p[2].parse().unwrap();
                 let current: usize = p[3].parse().unwrap();
-                let mut above = state(["air", "stone", "dirt", "water"][support]);
+                let mut above = state(
+                    [
+                        "air",
+                        "stone",
+                        "dirt",
+                        "water",
+                        "raw_iron_block",
+                        "raw_copper_block",
+                    ][support],
+                );
                 let mut here = state(["air", "water", "lava"][current]);
                 for block in [&mut above, &mut here] {
                     if matches!(block.name.as_str(), "minecraft:water" | "minecraft:lava") {
@@ -19665,7 +19728,7 @@ mod tests {
                 cases += 1;
             }
         }
-        assert_eq!(cases, 48);
+        assert_eq!(cases, 72);
         let placed = PlacedDecorationFeature::from_placement(&mut SporeData(false), PlacedFeature::decode(&json!({"feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:spore_blossom"}}, "placement":[]})).unwrap(), &mut resolve_tree_test).unwrap();
         assert!(placed.needs_water_fluids());
         assert!(
@@ -20757,6 +20820,26 @@ mod tests {
         let mut invalid = state("oak_planks");
         invalid.properties.insert("extra".into(), "true".into());
         assert!(monster_block_flags(&invalid).is_err());
+    }
+
+    #[test]
+    fn raw_ore_blocks_reject_invalid_properties() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        for name in ["raw_iron_block", "raw_copper_block"] {
+            let mut block = state(name);
+            assert_eq!(monster_block_flags(&block).unwrap(), (true, true));
+            assert!(generated_ore_state(&block).unwrap());
+            block.properties.insert("extra".into(), "true".into());
+            assert!(monster_block_flags(&block).is_err());
+            assert!(generated_ore_state(&block).is_err());
+            assert!(tree_solid_render(&block).is_err());
+            assert!(tree_sturdy_up(&block).is_err());
+            assert!(directional_multiface_support(&block, [0, 1, 0]).is_err());
+            assert!(MagmaWorld::face_is_full(&mut region, &block, [0, 1, 0]).is_err());
+            assert_eq!(mineshaft::mineshaft_center_support(&block), None);
+        }
     }
 
     #[test]

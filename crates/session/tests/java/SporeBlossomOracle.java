@@ -21,7 +21,7 @@ public class SporeBlossomOracle {
     var target=Blocks.SPORE_BLOSSOM.defaultBlockState();
     if(target.hasBlockEntity() || PoiTypes.hasPoi(target) || target.getPostProcessPos(null,BlockPos.ZERO)!=null) throw new AssertionError("unsafe spore blossom");
     if(target.isSolid()) throw new AssertionError("spore blossom unexpectedly solid");
-    var supports=new Block[]{Blocks.AIR,Blocks.STONE,Blocks.DIRT,Blocks.WATER};
+    var supports=new Block[]{Blocks.AIR,Blocks.STONE,Blocks.DIRT,Blocks.WATER,Blocks.RAW_IRON_BLOCK,Blocks.RAW_COPPER_BLOCK};
     var current=new BlockState[]{Blocks.AIR.defaultBlockState(),Blocks.WATER.defaultBlockState(),Blocks.LAVA.defaultBlockState()};
     var origin=new BlockPos(8,8,8);
     for(int mode=0;mode<4;mode++) {

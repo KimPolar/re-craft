@@ -41,11 +41,24 @@ public class ResumedLightOracle {
             original = NbtIo.read((DataInput) input);
         }
         boolean spawnStatus = args.length > 3 && args[3].equals("status:spawn");
-        if (!spawnStatus) original.putString("Status", "minecraft:light");
+        boolean fullStatus = args.length > 3 && args[3].equals("status:full");
+        if (!spawnStatus && !fullStatus) original.putString("Status", "minecraft:light");
         var height = LevelHeightAccessor.create(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
         var parsed = SerializableChunkData.parse(height, factory, original);
-        if (parsed == null || parsed.chunkStatus() != (spawnStatus ? ChunkStatus.SPAWN : ChunkStatus.LIGHT)) throw new AssertionError("status");
+        if (parsed == null || parsed.chunkStatus() != (fullStatus ? ChunkStatus.FULL : spawnStatus ? ChunkStatus.SPAWN : ChunkStatus.LIGHT)) throw new AssertionError("status");
         var rewritten = parsed.write();
+        if (fullStatus && args.length > 4) {
+            CompoundTag entityChunk;
+            try (var input = new java.io.DataInputStream(Files.newInputStream(Path.of(args[4])))) {
+                entityChunk = NbtIo.read((DataInput) input);
+            }
+            int[] position = entityChunk.getIntArray("Position").orElseThrow();
+            if (position.length != 2 || position[0] != original.getIntOr("xPos", Integer.MAX_VALUE)
+                    || position[1] != original.getIntOr("zPos", Integer.MAX_VALUE)) throw new AssertionError("entity position");
+            if (entityChunk.getIntOr("DataVersion", 0) != 5023) throw new AssertionError("entity data version");
+            var entities = entityChunk.getListOrEmpty("Entities");
+            if (entities.isEmpty() || !entities.getCompoundOrEmpty(0).getStringOr("id", "").equals("minecraft:pig")) throw new AssertionError("pig entity missing");
+        }
         if (args.length > 3 && args[3].startsWith("entities:")) {
             String expectedEntity = "minecraft:" + args[3].substring("entities:".length());
             if (!Objects.equals(original.get("entities"), rewritten.get("entities"))) throw new AssertionError("spawned entities changed");

@@ -1013,6 +1013,53 @@ impl CapturedMixedPostprocessedComponents {
     }
 }
 
+/// In-memory FULL and entity-region drafts from one captured pass. They do not
+/// authorize overwriting captured files or replacing a live session.
+pub(crate) struct CapturedMixedFullDrafts {
+    result_identity: Arc<()>,
+    chunks: BTreeMap<native_world::loaded::ChunkPos, CapturedMixedFullDraft>,
+}
+
+pub(crate) struct CapturedMixedFullDraft {
+    source_nbt: Option<Vec<u8>>,
+    chunk: NamedTag,
+    entity_chunk: NamedTag,
+}
+
+impl CapturedMixedFullDraft {
+    pub fn chunk(&self) -> &NamedTag {
+        &self.chunk
+    }
+    pub fn entity_chunk(&self) -> &NamedTag {
+        &self.entity_chunk
+    }
+    pub fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        match (&self.source_nbt, source) {
+            (None, None) => Ok(true),
+            (Some(expected), Some(actual)) => {
+                Ok(*expected == native_persistence::nbt::write(actual)?)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+impl CapturedMixedFullDrafts {
+    pub fn chunks(&self) -> &BTreeMap<native_world::loaded::ChunkPos, CapturedMixedFullDraft> {
+        &self.chunks
+    }
+    pub fn matches_state(
+        &self,
+        completed: &CapturedMixedPostprocessedRegion,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        Arc::ptr_eq(&self.result_identity, &completed.identity)
+            && completed.matches_state(batch, light, inputs)
+    }
+}
+
 /// A single captured chunk's converted pending ticks and ordered callbacks.
 /// The proof must be rechecked against the same generation revision before
 /// using the parts in an isolated postprocessing pass.
@@ -3285,6 +3332,81 @@ impl PreparedExistingGenerator {
             structures,
             external_structure_sources,
             missing_poi,
+        })
+    }
+
+    /// Prepare FULL chunk and entity-region documents without writing them.
+    /// Missing entity coverage stops the whole operation. The caller must
+    /// separately recheck sidecars, live state and all save dependencies.
+    pub fn draft_captured_mixed_full_chunks(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedMixedPostprocessedRegion,
+        components: &CapturedMixedPostprocessedComponents,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedFullDrafts> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && components.matches_state(completed, batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            !components.chunks.is_empty(),
+            "no postprocessed chunks selected"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let mut chunks = BTreeMap::new();
+        for (&position, parts) in &components.chunks {
+            let source = batch
+                .sources
+                .get(&native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                })
+                .context("terrain source was not captured")?;
+            let proof = completed
+                .proofs
+                .get(&position)
+                .context("postprocessing proof is missing")?;
+            ensure!(
+                proof.matches_source(source.as_deref())?,
+                "postprocessing source differs"
+            );
+            if let Some(source) = source {
+                parse_captured_upgrade_data(source, self.lighting.height, &assets.block_ids)?;
+            }
+            let structures = components
+                .structures
+                .get(&position)
+                .context("structure data missing")?;
+            let (chunk, entity_chunk) = assemble_captured_mixed_full_chunk(
+                position,
+                self.lighting.min_y,
+                self.lighting.height,
+                inputs.game_time,
+                source.as_deref(),
+                structures.as_ref(),
+                parts,
+            )?;
+            chunks.insert(
+                position,
+                CapturedMixedFullDraft {
+                    source_nbt: source
+                        .as_deref()
+                        .map(native_persistence::nbt::write)
+                        .transpose()?,
+                    chunk,
+                    entity_chunk,
+                },
+            );
+        }
+        Ok(CapturedMixedFullDrafts {
+            result_identity: Arc::clone(&completed.identity),
+            chunks,
         })
     }
 
@@ -8133,6 +8255,99 @@ fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) ->
     Ok(())
 }
 
+fn assemble_captured_mixed_full_chunk(
+    position: native_world::loaded::ChunkPos,
+    min_y: i32,
+    height: i32,
+    game_time: i64,
+    source: Option<&NamedTag>,
+    structures: Option<&Tag>,
+    parts: &native_session::worldgen::PostprocessedChunkComponents,
+) -> Result<(NamedTag, NamedTag)> {
+    let entities = parts
+        .entity_records
+        .as_ref()
+        .context("captured entity records are incomplete")?;
+    let entity_chunk =
+        native_persistence::generated_chunk::assemble_entity_chunk(position, entities)?;
+    let Tag::Compound(heightmaps) = &parts.heightmaps else {
+        bail!("postprocessed heightmaps are not a compound")
+    };
+    let full_maps = Tag::Compound(
+        heightmaps
+            .iter()
+            .filter(|(name, _)| {
+                [
+                    "WORLD_SURFACE",
+                    "OCEAN_FLOOR",
+                    "MOTION_BLOCKING",
+                    "MOTION_BLOCKING_NO_LEAVES",
+                ]
+                .iter()
+                .any(|expected| name.matches(expected))
+            })
+            .cloned()
+            .collect(),
+    );
+    let mut canonical = native_persistence::generated_chunk::assemble_full_chunk(
+        native_persistence::generated_chunk::FullChunkComponents {
+            position,
+            min_y,
+            height,
+            last_update: game_time,
+            sections: parts.sections.clone(),
+            heightmaps: full_maps,
+            block_ticks: parts.block_ticks.clone(),
+            fluid_ticks: parts.fluid_ticks.clone(),
+            block_entities: parts.block_entities.clone(),
+        },
+    )?;
+    replace_unique_root_field(&mut canonical, "Heightmaps", parts.heightmaps.clone())?;
+    if let Some(structures) = structures {
+        ensure!(
+            matches!(structures, Tag::Compound(_)),
+            "invalid captured structures"
+        );
+        replace_unique_root_field(&mut canonical, "structures", structures.clone())?;
+    }
+    let Some(source) = source else {
+        native_persistence::nbt::write(&canonical)?;
+        return Ok((canonical, entity_chunk));
+    };
+    ensure!(
+        unique_root_field(source, "xPos")? == Some(&Tag::Int(position.x))
+            && unique_root_field(source, "zPos")? == Some(&Tag::Int(position.z)),
+        "captured source position differs"
+    );
+    if let Some(inhabited) = unique_root_field(source, "InhabitedTime")? {
+        ensure!(
+            matches!(inhabited, Tag::Long(_)),
+            "invalid captured inhabited time"
+        );
+    }
+    unique_root_field(source, "entities")?;
+    unique_root_field(source, "UpgradeData")?;
+    let mut document = source.clone();
+    let Tag::Compound(fields) = &mut document.value else {
+        unreachable!()
+    };
+    // Proto entities moved to the separate entity chunk. Validated upgrade
+    // callbacks have completed, so retaining their pending ticks would replay them.
+    fields.retain(|(name, _)| !name.matches("entities") && !name.matches("UpgradeData"));
+    let Tag::Compound(fields) = canonical.value else {
+        unreachable!()
+    };
+    for (name, value) in fields {
+        let name = String::from_utf16(&name.0).context("invalid generated field name")?;
+        if name == "InhabitedTime" && unique_root_field(&document, &name)?.is_some() {
+            continue;
+        }
+        replace_unique_root_field(&mut document, &name, value)?;
+    }
+    native_persistence::nbt::write(&document)?;
+    Ok((document, entity_chunk))
+}
+
 fn original_structure_references(document: &NamedTag) -> Result<Option<&Tag>> {
     let Some(structures) = unique_root_field(document, "structures")? else {
         return Ok(None);
@@ -11248,24 +11463,26 @@ mod tests {
             &batch,
             &staged,
             complete_region,
-            [target],
+            [target, second],
             inputs,
         )?;
-        let mut done = false;
-        for _ in 0..1024 {
-            match complete_stage.try_poll(&batch, &staged, inputs, target, 64)? {
-                native_session::worldgen::PostprocessingAttempt::Progress { complete } => {
-                    if complete {
-                        done = true;
-                        break;
+        for position in [target, second] {
+            let mut done = false;
+            for _ in 0..1024 {
+                match complete_stage.try_poll(&batch, &staged, inputs, position, 64)? {
+                    native_session::worldgen::PostprocessingAttempt::Progress { complete } => {
+                        if complete {
+                            done = true;
+                            break;
+                        }
+                    }
+                    native_session::worldgen::PostprocessingAttempt::NeedsChunk(missing) => {
+                        bail!("postprocessed chunk needs unprepared neighbor {missing:?}")
                     }
                 }
-                native_session::worldgen::PostprocessingAttempt::NeedsChunk(missing) => {
-                    bail!("creature chunk needs unprepared neighbor {missing:?}")
-                }
             }
+            assert!(done, "chunk postprocessing did not finish for {position:?}");
         }
-        assert!(done, "creature chunk postprocessing did not finish");
         actual.drain_captured_mixed_postprocessing_light(
             &batch,
             &staged,
@@ -11304,20 +11521,14 @@ mod tests {
             &batch,
             &staged,
             &completed,
-            [target],
+            [target, second],
             inputs,
         )?;
         assert!(sections.matches_state(&completed, &batch, &staged, inputs));
         assert!(sections.sections().contains_key(&target));
         assert!(
             actual
-                .captured_mixed_postprocessed_sections(
-                    &batch,
-                    &staged,
-                    &completed,
-                    [second],
-                    inputs
-                )
+                .captured_mixed_postprocessed_sections(&batch, &staged, &completed, [third], inputs)
                 .is_err()
         );
         let components = actual.captured_mixed_postprocessed_components(
@@ -11333,6 +11544,84 @@ mod tests {
                 .is_some_and(|records| records
                     .iter()
                     .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into()))))
+        );
+        assert!(
+            chunks[&second]
+                .entity_records
+                .as_ref()
+                .is_some_and(|records| records.is_empty())
+        );
+        let original_parts = &chunks[&target];
+        let unknown_entities = native_session::worldgen::PostprocessedChunkComponents {
+            sections: original_parts.sections.clone(),
+            heightmaps: original_parts.heightmaps.clone(),
+            block_ticks: original_parts.block_ticks.clone(),
+            fluid_ticks: original_parts.fluid_ticks.clone(),
+            block_entities: original_parts.block_entities.clone(),
+            entity_records: None,
+        };
+        assert!(
+            assemble_captured_mixed_full_chunk(
+                target,
+                lighting.min_y,
+                lighting.height,
+                42,
+                None,
+                None,
+                &unknown_entities,
+            )
+            .is_err()
+        );
+        assert!(
+            actual
+                .draft_captured_mixed_full_chunks(
+                    &batch,
+                    &staged,
+                    &completed,
+                    &components,
+                    wrong_inputs
+                )
+                .is_err()
+        );
+        let full_drafts = actual.draft_captured_mixed_full_chunks(
+            &batch,
+            &staged,
+            &completed,
+            &components,
+            inputs,
+        )?;
+        assert!(full_drafts.matches_state(&completed, &batch, &staged, inputs));
+        assert!(!full_drafts.matches_state(&completed, &batch, &staged, wrong_inputs));
+        let full_new = &full_drafts.chunks()[&target];
+        let full_saved = &full_drafts.chunks()[&second];
+        assert!(full_new.matches_source(None)?);
+        assert!(full_saved.matches_source(Some(&saved))?);
+        assert!(!full_saved.matches_source(None)?);
+        assert_eq!(
+            full_new.chunk().value.get("Status"),
+            Some(&Tag::String("minecraft:full".into()))
+        );
+        assert_eq!(
+            full_saved.chunk().value.get("example:root"),
+            Some(&Tag::Int(73))
+        );
+        assert_eq!(
+            full_saved
+                .chunk()
+                .value
+                .get("Heightmaps")
+                .and_then(|maps| maps.get("example:map")),
+            Some(&Tag::Int(37))
+        );
+        assert!(full_saved.chunk().value.get("UpgradeData").is_none());
+        assert!(full_new.chunk().value.get("entities").is_none());
+        let Some(Tag::List { values, .. }) = full_new.entity_chunk().value.get("Entities") else {
+            bail!("entity region records missing")
+        };
+        assert!(
+            values
+                .iter()
+                .any(|entity| entity.get("id") == Some(&Tag::String("minecraft:pig".into())))
         );
         if matches!(
             retry,
@@ -12276,6 +12565,34 @@ mod tests {
             String::from_utf8_lossy(&checked.stdout),
             String::from_utf8_lossy(&checked.stderr)
         );
+        let entity_input = oracle.path().join("captured-full-entities.nbt");
+        std::fs::write(
+            &entity_input,
+            native_persistence::nbt::write(full_new.entity_chunk())?,
+        )?;
+        for (name, draft) in [("new", full_new), ("saved", full_saved)] {
+            let chunk_input = oracle.path().join(format!("captured-{name}-full.nbt"));
+            std::fs::write(&chunk_input, native_persistence::nbt::write(draft.chunk())?)?;
+            let mut command = std::process::Command::new(java.join("java.exe"));
+            command
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("ResumedLightOracle")
+                .arg(&chunk_input)
+                .arg(lighting.min_y.to_string())
+                .arg(lighting.height.to_string())
+                .arg("status:full");
+            if name == "new" {
+                command.arg(&entity_input);
+            }
+            let checked = command.output()?;
+            ensure!(
+                checked.status.success(),
+                "Java {name} FULL chunk validation failed: {}\n{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            );
+        }
         assert!(
             actual
                 .propagate_captured_light(&mut batch, &mut staged, target)

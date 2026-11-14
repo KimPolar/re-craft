@@ -6365,6 +6365,7 @@ pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
     if native_world::collision::fence_waterlogged(state).is_some()
         || generation_rail_state(state)
         || jigsaw::jigsaw_torch(state)
+        || jigsaw::jigsaw_speleothem(state)
     {
         return Ok(false);
     }
@@ -16638,6 +16639,8 @@ mod tests {
             ("big_dripleaf_stem", 8),
             ("small_dripleaf", 16),
             ("glow_lichen", 128),
+            ("sulfur_spike", 20),
+            ("pointed_dripstone", 20),
             ("oak_slab", 6),
             ("stone_slab", 6),
             ("oak_stairs", 80),

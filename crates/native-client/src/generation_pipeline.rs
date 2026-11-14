@@ -36,6 +36,9 @@ pub enum InitialWorldResult {
     Ready {
         generation: GenerationReady,
         world: StagedWorld,
+        /// Coverage of the player's initial 3×3 load area. This report does
+        /// not establish full world completeness or authorize publication.
+        player_area: Result<InitialPlayerArea>,
     },
     Cancelled {
         /// Available when generation completed before cancellation.
@@ -46,6 +49,100 @@ pub enum InitialWorldResult {
         /// Staging failures retain their input so a caller can retry.
         generation: Option<GenerationReady>,
     },
+}
+
+/// Chunks needed for the initial player load that are absent or still have
+/// deferred postprocessing. Coordinates are in the generated dimension.
+#[derive(Debug, Eq, PartialEq)]
+pub struct InitialPlayerArea {
+    pub center: native_world::loaded::ChunkPos,
+    pub missing: Vec<native_world::loaded::ChunkPos>,
+    pub deferred: Vec<native_world::loaded::ChunkPos>,
+}
+
+fn initial_player_area(generation: &GenerationReady) -> Result<InitialPlayerArea> {
+    use anyhow::Context;
+    let spawn = generation
+        .player_spawn
+        .context("initial player spawn missing")?;
+    let processed = generation
+        .postprocessed
+        .as_ref()
+        .context("initial postprocessing missing")?;
+    classify_initial_player_area(
+        spawn,
+        processed
+            .region
+            .ticks()
+            .registration_order()
+            .iter()
+            .copied(),
+        &processed.region.chunks,
+        processed.region.deferred_chunks(),
+    )
+}
+
+fn classify_initial_player_area(
+    spawn: glam::IVec3,
+    registered_positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+    completed: &std::collections::BTreeSet<native_world::loaded::ChunkPos>,
+    deferred_positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+) -> Result<InitialPlayerArea> {
+    use anyhow::{Context, ensure};
+    use native_world::loaded::ChunkPos;
+    let center = ChunkPos {
+        x: spawn.x.div_euclid(16),
+        z: spawn.z.div_euclid(16),
+    };
+    let min_x = center.x.checked_sub(1).context("initial area X overflow")?;
+    let max_x = center.x.checked_add(1).context("initial area X overflow")?;
+    let min_z = center.z.checked_sub(1).context("initial area Z overflow")?;
+    let max_z = center.z.checked_add(1).context("initial area Z overflow")?;
+    let mut registered = std::collections::BTreeSet::new();
+    for position in registered_positions {
+        if (min_x..=max_x).contains(&position.x) && (min_z..=max_z).contains(&position.z) {
+            ensure!(
+                registered.insert(position),
+                "duplicate registered initial chunk"
+            );
+        }
+    }
+    let deferred_chunks: std::collections::BTreeSet<_> = deferred_positions
+        .into_iter()
+        .filter(|position| {
+            (min_x..=max_x).contains(&position.x) && (min_z..=max_z).contains(&position.z)
+        })
+        .collect();
+    let mut missing = Vec::new();
+    let mut deferred = Vec::new();
+    for z in min_z..=max_z {
+        for x in min_x..=max_x {
+            let position = ChunkPos { x, z };
+            if !registered.contains(&position) {
+                ensure!(
+                    !completed.contains(&position) && !deferred_chunks.contains(&position),
+                    "unregistered initial chunk has postprocessing state"
+                );
+                missing.push(position);
+            } else if !completed.contains(&position) {
+                ensure!(
+                    deferred_chunks.contains(&position),
+                    "registered initial chunk has no postprocessing state"
+                );
+                deferred.push(position);
+            } else {
+                ensure!(
+                    !deferred_chunks.contains(&position),
+                    "completed initial chunk is also deferred"
+                );
+            }
+        }
+    }
+    Ok(InitialPlayerArea {
+        center,
+        missing,
+        deferred,
+    })
 }
 
 enum State {
@@ -173,7 +270,12 @@ impl InitialWorldPipeline {
                 Ok(None) => None,
                 Ok(Some(StagingResult::Ready { generation, world })) if !self.cancelled => {
                     self.state = State::Finished;
-                    Some(InitialWorldResult::Ready { generation, world })
+                    let player_area = initial_player_area(&generation);
+                    Some(InitialWorldResult::Ready {
+                        generation,
+                        world,
+                        player_area,
+                    })
                 }
                 Ok(Some(
                     StagingResult::Ready { generation, .. } | StagingResult::Cancelled(generation),
@@ -244,6 +346,23 @@ mod tests {
         }
     }
 
+    fn copy_staged_tree(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let metadata = entry.file_type()?;
+            let target = destination.join(entry.file_name());
+            if metadata.is_dir() {
+                copy_staged_tree(&entry.path(), &target)?;
+            } else if metadata.is_file() {
+                std::fs::copy(entry.path(), target)?;
+            } else {
+                anyhow::bail!("unexpected staged world entry");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn rejects_inconsistent_settings_before_starting_generation() -> Result<()> {
         let parent = tempfile::tempdir()?;
@@ -255,6 +374,54 @@ mod tests {
             .context("inconsistent settings were accepted")?;
         assert!(format!("{error:#}").contains("session seed differs"));
         assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn player_area_reports_missing_and_deferred_chunks() -> Result<()> {
+        use native_world::loaded::ChunkPos;
+        use std::collections::BTreeSet;
+        let center = ChunkPos { x: -1, z: -2 };
+        let neighbor = ChunkPos { x: -2, z: -2 };
+        let complete = BTreeSet::from([center]);
+        let area = classify_initial_player_area(
+            glam::IVec3::new(-1, 64, -17),
+            [center, neighbor],
+            &complete,
+            [neighbor],
+        )?;
+        assert_eq!(area.center, center);
+        assert_eq!(area.deferred, vec![neighbor]);
+        assert_eq!(area.missing.len(), 7);
+        assert!(!area.missing.contains(&center));
+        assert!(!area.missing.contains(&neighbor));
+        assert!(
+            classify_initial_player_area(
+                glam::IVec3::ZERO,
+                [ChunkPos { x: 0, z: 0 }; 2],
+                &BTreeSet::new(),
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            classify_initial_player_area(
+                glam::IVec3::ZERO,
+                [ChunkPos { x: 0, z: 0 }],
+                &BTreeSet::new(),
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            classify_initial_player_area(
+                glam::IVec3::ZERO,
+                [],
+                &BTreeSet::from([ChunkPos { x: 0, z: 0 }]),
+                [],
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -340,11 +507,16 @@ mod tests {
         settings.seed = crate::chat_input::ChatInput::field(&seed.to_string());
         settings.generate_structures = true;
         let mut pipeline = InitialWorldPipeline::start(
-            settings.freeze(game, None),
+            settings.freeze(game.clone(), None),
             options(parent.path().to_path_buf()),
         )?;
         match wait(&mut pipeline) {
-            InitialWorldResult::Ready { generation, world } => {
+            InitialWorldResult::Ready {
+                generation,
+                world,
+                player_area,
+            } => {
+                let player_area = player_area?;
                 let StagedWorld::Structured(world) = &world else {
                     anyhow::bail!("structured generation returned an unstructured stage");
                 };
@@ -435,6 +607,50 @@ mod tests {
                     "seed {seed}: checked {} staged chunks, {structure_starts} structure starts and {structure_references} reference entries",
                     processed.chunks.len()
                 );
+                drop(reader);
+                // The normal session loader creates a lock file; inspect a copy
+                // so that this test does not change the sealed private stage.
+                let reopened_path = parent.path().join("reopened-world");
+                copy_staged_tree(path, &reopened_path)?;
+                let prepared = crate::prepare_existing_world(
+                    &reopened_path,
+                    &game,
+                    &[],
+                    crate::ViewOptions {
+                        dimension: None,
+                        chunk: None,
+                        radius: 1,
+                        smoke_test: false,
+                        block_report: None,
+                        play: true,
+                        video: crate::menu_settings::VideoSettings::default(),
+                    },
+                    None,
+                )?;
+                let crate::PreparedWorld::Play(reopened) = prepared else {
+                    anyhow::bail!("staged world did not reopen as a play session");
+                };
+                use native_session::GameSession;
+                let before = world.initial.session.snapshot();
+                let after = reopened.session.snapshot();
+                let before_position = before.origin.as_vec3() + before.player.position;
+                let after_position = after.origin.as_vec3() + after.player.position;
+                assert!((before_position - after_position).length() < 0.0001);
+                assert_eq!(before.game_time, after.game_time);
+                assert_eq!(before.game_mode, after.game_mode);
+                let reopened_world = after
+                    .world
+                    .loaded()
+                    .context("reopened terrain is missing")?;
+                assert!(!reopened_world.chunks.is_empty());
+                assert_eq!(
+                    player_area
+                        .missing
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    reopened_world.missing_chunks,
+                );
             }
             InitialWorldResult::Failed { error, .. } => return Err(error),
             InitialWorldResult::Cancelled { .. } => {
@@ -485,7 +701,9 @@ mod tests {
             .retry_staging(generation, parent.path().to_path_buf())
             .map_err(|failure| failure.error)?;
         let (generation, world) = match wait(&mut pipeline) {
-            InitialWorldResult::Ready { generation, world } => (generation, world),
+            InitialWorldResult::Ready {
+                generation, world, ..
+            } => (generation, world),
             InitialWorldResult::Failed { error, .. } => return Err(error),
             _ => anyhow::bail!("staging retry was cancelled"),
         };

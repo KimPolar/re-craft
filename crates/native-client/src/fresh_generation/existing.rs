@@ -692,6 +692,225 @@ impl CapturedPlannedConvertedPostprocessing {
     }
 }
 
+/// Current live inputs checked before each isolated callback operation.
+#[derive(Clone, Copy)]
+pub(crate) struct CapturedPostprocessingInputs<'a> {
+    pub spawn_mobs: bool,
+    pub clocks: &'a BTreeMap<ResourceId, i64>,
+    pub border: Option<native_session::respawn::RespawnBorder>,
+    pub game_time: i64,
+    pub next_sub_tick: i64,
+    pub water_source_conversion: bool,
+}
+
+pub(crate) enum CapturedPostprocessingSpawn<'a> {
+    Empty(&'a CapturedEmptySpawnDraft),
+    Planned(&'a CapturedPlannedSpawn),
+}
+
+impl CapturedPostprocessingSpawn<'_> {
+    fn position(&self) -> native_world::loaded::ChunkPos {
+        match self {
+            Self::Empty(spawn) => spawn.position,
+            Self::Planned(spawn) => spawn.position,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CapturedPostprocessingProof {
+    Empty(CapturedConvertedHeightmaps),
+    Planned(CapturedPlannedConvertedHeightmaps),
+}
+
+impl CapturedPostprocessingProof {
+    fn heightmaps(&self) -> &native_persistence::heightmap::FullHeightmaps {
+        match self {
+            Self::Empty(proof) => proof.heightmaps(),
+            Self::Planned(proof) => proof.heightmaps(),
+        }
+    }
+
+    fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        match self {
+            Self::Empty(proof) => proof.matches_state(batch, light, inputs.spawn_mobs),
+            Self::Planned(proof) => proof.matches_state(
+                batch,
+                light,
+                inputs.spawn_mobs,
+                inputs.clocks,
+                proof.border.and(inputs.border),
+            ),
+        }
+    }
+}
+
+/// Ordered converted chunks retaining either kind of spawn proof.
+pub(crate) struct CapturedMixedConvertedRegion {
+    proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedPostprocessingProof>,
+    region: native_session::worldgen::postprocessing::ConvertedPostprocessingRegion,
+}
+
+impl CapturedMixedConvertedRegion {
+    fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        !self.proofs.is_empty()
+            && self.region.ticks.game_time() == inputs.game_time
+            && self.region.ticks.next_sub_tick() == inputs.next_sub_tick
+            && self
+                .proofs
+                .values()
+                .all(|proof| proof.matches_state(batch, light, inputs))
+    }
+}
+
+/// Private callback execution over converted chunks and their spawn proofs.
+pub(crate) struct CapturedMixedPostprocessingStage {
+    proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedPostprocessingProof>,
+    stage: native_session::worldgen::GeneratedPostprocessing,
+    game_time: i64,
+    next_sub_tick: i64,
+    water_source_conversion: bool,
+    waiting_neighbor: Option<native_world::loaded::ChunkPos>,
+    retry_target: Option<native_world::loaded::ChunkPos>,
+}
+
+impl CapturedMixedPostprocessingStage {
+    pub fn waiting_neighbor(&self) -> Option<native_world::loaded::ChunkPos> {
+        self.waiting_neighbor
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        self.game_time == inputs.game_time
+            && self.next_sub_tick == inputs.next_sub_tick
+            && self.water_source_conversion == inputs.water_source_conversion
+            && !self.proofs.is_empty()
+            && self
+                .proofs
+                .values()
+                .all(|proof| proof.matches_state(batch, light, inputs))
+    }
+
+    pub fn request_converted_chunk(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        ensure!(
+            self.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            self.waiting_neighbor.is_none() && self.retry_target.is_none(),
+            "finish the interrupted callback before requesting another chunk"
+        );
+        ensure!(
+            self.proofs.contains_key(&position),
+            "postprocessing chunk was not captured"
+        );
+        self.stage.request_converted_chunk(position)
+    }
+
+    pub fn try_poll(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+        position: native_world::loaded::ChunkPos,
+        budget: usize,
+    ) -> Result<native_session::worldgen::PostprocessingAttempt> {
+        ensure!(
+            self.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            self.waiting_neighbor.is_none(),
+            "register the requested neighbor before retrying"
+        );
+        ensure!(
+            self.retry_target.is_none_or(|target| target == position),
+            "retry the interrupted chunk before another chunk"
+        );
+        ensure!(budget > 0, "postprocessing budget must be positive");
+        let attempt = self.stage.try_poll(position, budget)?;
+        self.waiting_neighbor = match attempt {
+            native_session::worldgen::PostprocessingAttempt::NeedsChunk(position) => Some(position),
+            native_session::worldgen::PostprocessingAttempt::Progress { .. } => None,
+        };
+        self.retry_target = self.waiting_neighbor.map(|_| position);
+        Ok(attempt)
+    }
+
+    pub fn finish(
+        self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedPostprocessedRegion> {
+        ensure!(
+            self.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            self.waiting_neighbor.is_none() && self.retry_target.is_none(),
+            "postprocessing still needs a retry"
+        );
+        Ok(CapturedMixedPostprocessedRegion {
+            proofs: self.proofs,
+            region: self.stage.finish()?,
+            game_time: self.game_time,
+            next_sub_tick: self.next_sub_tick,
+            water_source_conversion: self.water_source_conversion,
+        })
+    }
+}
+
+pub(crate) struct CapturedMixedPostprocessedRegion {
+    proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedPostprocessingProof>,
+    region: native_session::worldgen::PostprocessedGeneratedRegion,
+    game_time: i64,
+    next_sub_tick: i64,
+    water_source_conversion: bool,
+}
+
+impl CapturedMixedPostprocessedRegion {
+    pub fn region(&self) -> &native_session::worldgen::PostprocessedGeneratedRegion {
+        &self.region
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        self.game_time == inputs.game_time
+            && self.next_sub_tick == inputs.next_sub_tick
+            && self.water_source_conversion == inputs.water_source_conversion
+            && !self.proofs.is_empty()
+            && self
+                .proofs
+                .values()
+                .all(|proof| proof.matches_state(batch, light, inputs))
+    }
+}
+
 /// A single captured chunk's converted pending ticks and ordered callbacks.
 /// The proof must be rechecked against the same generation revision before
 /// using the parts in an isolated postprocessing pass.
@@ -2467,6 +2686,220 @@ impl PreparedExistingGenerator {
                 fluids: ChunkTicks::from_saved(position, fluids)?,
             },
         })
+    }
+
+    fn convert_postprocessing_spawn(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn: CapturedPostprocessingSpawn<'_>,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<(
+        CapturedPostprocessingProof,
+        native_session::worldgen::postprocessing::ConvertedChunkPostprocessing,
+    )> {
+        match spawn {
+            CapturedPostprocessingSpawn::Empty(spawn) => {
+                ensure!(spawn.spawn_mobs == inputs.spawn_mobs, "spawn rule differs");
+                let proof = self.convert_captured_heightmaps(batch, light, spawn)?;
+                let (proof, converted) = self
+                    .begin_captured_postprocessing(batch, light, spawn, proof)?
+                    .into_parts();
+                Ok((CapturedPostprocessingProof::Empty(proof), converted))
+            }
+            CapturedPostprocessingSpawn::Planned(spawn) => {
+                ensure!(inputs.spawn_mobs, "spawn rule differs");
+                let border = spawn.border.and(inputs.border);
+                let proof = self.convert_captured_planned_heightmaps(
+                    batch,
+                    light,
+                    spawn,
+                    inputs.clocks,
+                    border,
+                )?;
+                let (proof, converted) = self
+                    .begin_captured_planned_postprocessing(
+                        batch,
+                        light,
+                        spawn,
+                        proof,
+                        inputs.clocks,
+                        border,
+                    )?
+                    .into_parts();
+                Ok((CapturedPostprocessingProof::Planned(proof), converted))
+            }
+        }
+    }
+
+    /// Convert empty and creature-bearing chunks in the supplied tick order.
+    pub fn begin_captured_mixed_postprocessing_region<'a>(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawns: impl IntoIterator<Item = CapturedPostprocessingSpawn<'a>>,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedConvertedRegion> {
+        let mut proofs = BTreeMap::new();
+        let mut tasks = BTreeMap::new();
+        let mut ticks = BTreeMap::new();
+        let mut registration = Vec::new();
+        for spawn in spawns {
+            let position = spawn.position();
+            ensure!(!proofs.contains_key(&position), "duplicate converted chunk");
+            let (proof, converted) =
+                self.convert_postprocessing_spawn(batch, light, spawn, inputs)?;
+            ensure!(
+                proof.matches_state(batch, light, inputs),
+                "spawn inputs differ"
+            );
+            proofs.insert(position, proof);
+            tasks.insert(position, converted.task);
+            ticks.insert(position, converted.ticks);
+            registration.push(position);
+        }
+        ensure!(!proofs.is_empty(), "no converted chunks");
+        Ok(CapturedMixedConvertedRegion {
+            proofs,
+            region: native_session::worldgen::postprocessing::ConvertedPostprocessingRegion {
+                tasks,
+                ticks: native_session::worldgen::chunk_ticks::RegionTicks::new_ordered(
+                    ticks,
+                    inputs.game_time,
+                    inputs.next_sub_tick,
+                    &registration,
+                )?,
+            },
+        })
+    }
+
+    /// Run callbacks on private terrain; no changes are saved or published.
+    pub fn run_captured_mixed_postprocessing(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        region: CapturedMixedConvertedRegion,
+        targets: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedPostprocessingStage> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && region.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        let mut selected = BTreeSet::new();
+        for position in targets {
+            ensure!(selected.insert(position), "duplicate postprocessing target");
+            ensure!(
+                region.proofs.contains_key(&position),
+                "postprocessing target is not converted"
+            );
+        }
+        ensure!(!selected.is_empty(), "no postprocessing targets");
+        let positions = region.proofs.keys().copied().collect::<Vec<_>>();
+        let heightmaps = region
+            .proofs
+            .iter()
+            .map(|(&pos, proof)| (pos, proof.heightmaps().clone()))
+            .collect();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let visible = light
+            .engine
+            .snapshot(&batch.terrain, positions, &assets.blocks)?;
+        let mut stage = batch.terrain.begin_captured_postprocessing(
+            &mut self.resources,
+            &assets.block_ids,
+            &assets.blocks,
+            region.region,
+            heightmaps,
+            Some(visible),
+        )?;
+        stage.set_water_source_conversion(inputs.water_source_conversion)?;
+        stage.select_initial_targets(selected)?;
+        Ok(CapturedMixedPostprocessingStage {
+            proofs: region.proofs,
+            stage,
+            game_time: inputs.game_time,
+            next_sub_tick: inputs.next_sub_tick,
+            water_source_conversion: inputs.water_source_conversion,
+            waiting_neighbor: None,
+            retry_target: None,
+        })
+    }
+
+    /// Supply the precise missing neighbor without advancing the interrupted callback.
+    pub fn add_captured_mixed_postprocessing_neighbor(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        stage: &mut CapturedMixedPostprocessingStage,
+        spawn: CapturedPostprocessingSpawn<'_>,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && stage.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        let position = spawn.position();
+        ensure!(
+            stage.waiting_neighbor == Some(position),
+            "chunk was not the requested neighbor"
+        );
+        ensure!(
+            !stage.proofs.contains_key(&position),
+            "postprocessing chunk is already registered"
+        );
+        let (proof, converted) = self.convert_postprocessing_spawn(batch, light, spawn, inputs)?;
+        ensure!(
+            proof.matches_state(batch, light, inputs),
+            "neighbor spawn inputs differ"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        batch.terrain.register_captured_postprocessing_neighbor(
+            &mut stage.stage,
+            &light.engine,
+            &assets.blocks,
+            position,
+            converted,
+            proof.heightmaps().clone(),
+        )?;
+        stage.proofs.insert(position, proof);
+        stage.waiting_neighbor = None;
+        Ok(())
+    }
+
+    pub fn drain_captured_mixed_postprocessing_light(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        stage: &mut CapturedMixedPostprocessingStage,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<bool> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && stage.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            stage.waiting_neighbor.is_none() && stage.retry_target.is_none(),
+            "finish the interrupted callback before draining light"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        batch.terrain.drain_captured_postprocessing_light(
+            &mut stage.stage,
+            &light.engine,
+            &assets.blocks,
+        )
     }
 
     /// Prepare an isolated converted region in the caller's registration
@@ -10177,11 +10610,6 @@ mod tests {
                 )
                 .is_err()
         );
-        batch.schedule = saved_schedule;
-        staged.completed_creature_spawns.remove(&target);
-        assert!(!spawn.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
-        assert!(!proof.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
-
         let mut saved_animal =
             actual.plan_captured_creatures(&batch, &staged, second, true, &clocks)?;
         saved_animal.inner.planner =
@@ -10197,7 +10625,6 @@ mod tests {
             saved_animal.advance(&batch, &staged, true, &clocks)?,
             native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished,
         );
-        let saved_schedule = batch.schedule.clone();
         let saved_spawn = actual.finish_captured_creatures(
             &mut batch,
             &mut staged,
@@ -10238,8 +10665,180 @@ mod tests {
             saved_spawn.document().value.get("example:root"),
             Some(&Tag::Int(73))
         );
+        let mut additional_spawns = Vec::new();
+        for position in [third, neighbor] {
+            let mut plan =
+                actual.plan_captured_creatures(&batch, &staged, position, true, &clocks)?;
+            plan.inner.planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+                42,
+                position.x,
+                position.z,
+                true,
+                0.0,
+                Default::default(),
+            )?;
+            assert_eq!(
+                plan.advance(&batch, &staged, true, &clocks)?,
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished
+            );
+            additional_spawns.push(actual.finish_captured_creatures(
+                &mut batch,
+                &mut staged,
+                &plan,
+                true,
+                &clocks,
+                None,
+                42,
+            )?);
+        }
+        let inputs = CapturedPostprocessingInputs {
+            spawn_mobs: true,
+            clocks: &clocks,
+            border: Some(changed_border),
+            game_time: 42,
+            next_sub_tick: 9,
+            water_source_conversion: true,
+        };
+        let wrong_inputs = CapturedPostprocessingInputs {
+            clocks: &wrong_clocks,
+            ..inputs
+        };
+        assert!(
+            actual
+                .begin_captured_mixed_postprocessing_region(
+                    &batch,
+                    &staged,
+                    [CapturedPostprocessingSpawn::Planned(&spawn)],
+                    wrong_inputs,
+                )
+                .is_err()
+        );
+        assert!(
+            actual
+                .begin_captured_mixed_postprocessing_region(
+                    &batch,
+                    &staged,
+                    [
+                        CapturedPostprocessingSpawn::Planned(&spawn),
+                        CapturedPostprocessingSpawn::Planned(&spawn)
+                    ],
+                    inputs,
+                )
+                .is_err()
+        );
+        let region = actual.begin_captured_mixed_postprocessing_region(
+            &batch,
+            &staged,
+            [
+                CapturedPostprocessingSpawn::Planned(&spawn),
+                CapturedPostprocessingSpawn::Planned(&saved_spawn),
+                CapturedPostprocessingSpawn::Planned(&additional_spawns[0]),
+            ],
+            inputs,
+        )?;
+        let before_pass = batch.terrain.snapshot();
+        let mut pass =
+            actual.run_captured_mixed_postprocessing(&batch, &staged, region, [target], inputs)?;
+        assert!(pass.matches_state(&batch, &staged, inputs));
+        assert!(!pass.matches_state(&batch, &staged, wrong_inputs));
+        assert!(
+            pass.try_poll(&batch, &staged, wrong_inputs, target, 1)
+                .is_err()
+        );
+        pass.request_converted_chunk(&batch, &staged, inputs, second)?;
+        pass.request_converted_chunk(&batch, &staged, inputs, third)?;
+        assert_eq!(
+            pass.try_poll(&batch, &staged, inputs, target, 1)?,
+            native_session::worldgen::PostprocessingAttempt::NeedsChunk(neighbor)
+        );
+        assert_eq!(pass.waiting_neighbor(), Some(neighbor));
+        assert!(
+            actual
+                .add_captured_mixed_postprocessing_neighbor(
+                    &batch,
+                    &staged,
+                    &mut pass,
+                    CapturedPostprocessingSpawn::Planned(&additional_spawns[1]),
+                    wrong_inputs,
+                )
+                .is_err()
+        );
+        actual.add_captured_mixed_postprocessing_neighbor(
+            &batch,
+            &staged,
+            &mut pass,
+            CapturedPostprocessingSpawn::Planned(&additional_spawns[1]),
+            inputs,
+        )?;
+        assert_eq!(pass.waiting_neighbor(), None);
+        assert!(pass.try_poll(&batch, &staged, inputs, second, 1).is_err());
+        let retry = pass.try_poll(&batch, &staged, inputs, target, 1)?;
+        assert_ne!(
+            retry,
+            native_session::worldgen::PostprocessingAttempt::NeedsChunk(neighbor)
+        );
+        let baseline_region = actual.begin_captured_mixed_postprocessing_region(
+            &batch,
+            &staged,
+            [
+                CapturedPostprocessingSpawn::Planned(&spawn),
+                CapturedPostprocessingSpawn::Planned(&saved_spawn),
+                CapturedPostprocessingSpawn::Planned(&additional_spawns[0]),
+                CapturedPostprocessingSpawn::Planned(&additional_spawns[1]),
+            ],
+            inputs,
+        )?;
+        let mut baseline = actual.run_captured_mixed_postprocessing(
+            &batch,
+            &staged,
+            baseline_region,
+            [target, second, third, neighbor],
+            inputs,
+        )?;
+        assert_eq!(
+            retry,
+            baseline.try_poll(&batch, &staged, inputs, target, 1)?
+        );
+        if matches!(
+            retry,
+            native_session::worldgen::PostprocessingAttempt::Progress { .. }
+        ) {
+            actual.drain_captured_mixed_postprocessing_light(&batch, &staged, &mut pass, inputs)?;
+        }
+        assert!(Arc::ptr_eq(&before_pass, &batch.terrain.snapshot()));
+        let mut waiting = None;
+        'chunks: for position in [target, second, third] {
+            let mut complete = position == target
+                && matches!(
+                    retry,
+                    native_session::worldgen::PostprocessingAttempt::Progress { complete: true }
+                );
+            for _ in 0..1024 {
+                if complete {
+                    break;
+                }
+                match pass.try_poll(&batch, &staged, inputs, position, 64)? {
+                    native_session::worldgen::PostprocessingAttempt::Progress {
+                        complete: done,
+                    } => complete = done,
+                    native_session::worldgen::PostprocessingAttempt::NeedsChunk(missing) => {
+                        waiting = Some(missing);
+                        break 'chunks;
+                    }
+                }
+            }
+            assert!(complete, "postprocessing did not finish for {position:?}");
+        }
+        let missing = waiting.context("test expected another unprepared neighbor")?;
+        assert_eq!(pass.waiting_neighbor(), Some(missing));
+        assert!(pass.finish(&batch, &staged, inputs).is_err());
         batch.schedule = saved_schedule;
         staged.completed_creature_spawns.remove(&second);
+        staged.completed_creature_spawns.remove(&target);
+        staged.completed_creature_spawns.remove(&third);
+        staged.completed_creature_spawns.remove(&neighbor);
+        assert!(!spawn.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
+        assert!(!proof.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
         assert!(!saved_spawn.matches_state(&batch, &staged, true, &clocks, None));
         assert!(!saved_proof.matches_state(&batch, &staged, true, &clocks, None));
         let light_revision = Arc::clone(&staged.light_revision);
@@ -10309,6 +10908,40 @@ mod tests {
             actual.draft_captured_empty_spawn(&batch, &staged, saved_third, false, 42)?;
         let neighbor_spawn =
             actual.draft_captured_empty_spawn(&batch, &staged, saved_neighbor, false, 42)?;
+        let empty_inputs = CapturedPostprocessingInputs {
+            spawn_mobs: false,
+            clocks: &clocks,
+            border: None,
+            game_time: 42,
+            next_sub_tick: 9,
+            water_source_conversion: true,
+        };
+        let empty_region = actual.begin_captured_mixed_postprocessing_region(
+            &batch,
+            &staged,
+            [
+                CapturedPostprocessingSpawn::Empty(&new_spawn),
+                CapturedPostprocessingSpawn::Empty(&saved_spawn),
+            ],
+            empty_inputs,
+        )?;
+        assert!(empty_region.matches_state(&batch, &staged, empty_inputs));
+        assert!(!empty_region.matches_state(
+            &batch,
+            &staged,
+            CapturedPostprocessingInputs {
+                spawn_mobs: true,
+                ..empty_inputs
+            }
+        ));
+        let empty_stage = actual.run_captured_mixed_postprocessing(
+            &batch,
+            &staged,
+            empty_region,
+            [target],
+            empty_inputs,
+        )?;
+        assert!(empty_stage.finish(&batch, &staged, empty_inputs).is_err());
         assert!(new_spawn.matches_state(&batch, &staged, false));
         assert!(saved_spawn.matches_state(&batch, &staged, false));
         assert!(!new_spawn.matches_state(&batch, &staged, true));

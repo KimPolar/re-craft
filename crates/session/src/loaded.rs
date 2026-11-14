@@ -952,6 +952,7 @@ pub struct LoadedSession {
     air_pending: BTreeSet<AirTickKey>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    speleothem_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_ticks: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
     leaf_deferred: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
     leaf_deferred_revision: Option<u64>,
@@ -961,6 +962,7 @@ pub struct LoadedSession {
     unresolved_leaf_decay: bool,
     unresolved_crop_tick: bool,
     unresolved_crop_shape: bool,
+    unresolved_speleothem_shape: bool,
     unresolved_lichen_shape: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
@@ -4276,6 +4278,7 @@ impl LoadedSession {
             "a crop neighbor update could not be resolved for saving"
         );
         self.validate_stair_updates()?;
+        self.validate_speleothem_updates()?;
         self.validate_lichen_updates()?;
         anyhow::ensure!(
             !self.unresolved_player_damage,
@@ -4520,6 +4523,7 @@ impl LoadedSession {
             self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
         self.validate_stair_updates()?;
+        self.validate_speleothem_updates()?;
         self.validate_lichen_updates()?;
         anyhow::ensure!(
             self.commands.is_empty(),
@@ -5674,6 +5678,7 @@ impl LoadedSession {
                 && !self.unresolved_leaf_shape
                 && !self.unresolved_leaf_decay
                 && !self.unresolved_crop_shape
+                && !self.unresolved_speleothem_shape
                 && !self.unresolved_crop_tick
                 && !self.unresolved_ice_tick
                 && !self.unresolved_bubble_tick,
@@ -6305,6 +6310,10 @@ impl LoadedSession {
     ) {
         self.fence_tags = Some(tags);
         self.retry_fence_updates();
+    }
+
+    pub fn set_speleothem_tags(&mut self, tags: Arc<native_resources::ore_feature::OreBlockTags>) {
+        self.speleothem_tags = Some(tags);
     }
 
     pub fn set_bubble_column_tags(
@@ -7526,6 +7535,7 @@ impl LoadedSession {
             air_pending: BTreeSet::new(),
             leaf_tags: None,
             fence_tags: None,
+            speleothem_tags: None,
             leaf_ticks: BTreeMap::new(),
             leaf_deferred: BTreeMap::new(),
             leaf_deferred_revision: None,
@@ -7535,6 +7545,7 @@ impl LoadedSession {
             unresolved_leaf_decay: false,
             unresolved_crop_tick: false,
             unresolved_crop_shape: false,
+            unresolved_speleothem_shape: false,
             unresolved_lichen_shape: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
@@ -10562,6 +10573,7 @@ impl LoadedSession {
             self.pending_fence_updates.keys().collect::<Vec<_>>()
         );
         self.validate_stair_updates()?;
+        self.validate_speleothem_updates()?;
         self.validate_lichen_updates()?;
         ensure!(
             !self.unresolved_leaf_decay,
@@ -10819,6 +10831,7 @@ impl LoadedSession {
     pub fn draft_fluid_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedFluidTick>> {
         use anyhow::{Context, ensure};
         self.validate_stair_updates()?;
+        self.validate_speleothem_updates()?;
         self.validate_lichen_updates()?;
         ensure!(
             self.commands.is_empty(),
@@ -19896,6 +19909,14 @@ impl LoadedSession {
         Ok(())
     }
 
+    fn validate_speleothem_updates(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.unresolved_speleothem_shape,
+            "a speleothem neighbor update could not be resolved for saving"
+        );
+        Ok(())
+    }
+
     fn validate_lichen_updates(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.unresolved_lichen_shape && self.pending_lichen_updates.is_empty(),
@@ -20083,6 +20104,144 @@ impl LoadedSession {
         true
     }
 
+    /// Apply a dry, supported speleothem's vertical neighbor shape update.
+    /// Pending falls and waterlogged blocks require additional tick handling.
+    fn update_speleothem_neighbor(
+        &mut self,
+        position: IVec3,
+        id: BlockStateId,
+        direction: IVec3,
+        neighbor: BlockStateId,
+    ) -> bool {
+        let Some(state) = self
+            .world
+            .state(id)
+            .filter(|state| {
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"
+                )
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        let result = (|| -> anyhow::Result<()> {
+            use anyhow::Context;
+            anyhow::ensure!(
+                native_world::collision::positioned_speleothem_shape(&state, IVec3::ZERO).is_some(),
+                "invalid speleothem state"
+            );
+            anyhow::ensure!(
+                state.properties["waterlogged"] == "false",
+                "waterlogged speleothem tick is not simulated"
+            );
+            if direction.y == 0 {
+                return Ok(());
+            }
+            let facing = state.properties["vertical_direction"].as_str();
+            let offset = if facing == "down" { -1 } else { 1 };
+            let absolute = add(self.origin, position).context("speleothem position overflow")?;
+            let chunk = ChunkPos {
+                x: absolute.x.div_euclid(16),
+                z: absolute.z.div_euclid(16),
+            };
+            if facing == "down"
+                && self
+                    .world
+                    .saved_block_ticks
+                    .get(&chunk)
+                    .is_some_and(|ticks| {
+                        ticks.iter().any(|tick| {
+                            tick.block == state.name && tick.position == absolute.to_array()
+                        })
+                    })
+            {
+                anyhow::bail!("pending speleothem fall is not simulated");
+            }
+            let tags = self
+                .speleothem_tags
+                .as_ref()
+                .context("speleothem tags unavailable")?;
+            static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
+                std::sync::OnceLock::new();
+            let tag = TAG.get_or_init(|| {
+                native_resources::packs::ResourceId::parse("minecraft:speleothems")
+                    .expect("static tag")
+            });
+            let in_direction = |other: &BlockState, expected: &str| -> anyhow::Result<bool> {
+                if !tags.contains(tag, &other.name)? {
+                    return Ok(false);
+                }
+                let direction = other
+                    .properties
+                    .get("vertical_direction")
+                    .context("tagged speleothem has no direction")?;
+                anyhow::ensure!(
+                    matches!(direction.as_str(), "up" | "down"),
+                    "invalid tagged speleothem direction"
+                );
+                Ok(direction == expected)
+            };
+            if direction == IVec3::new(0, -offset, 0) {
+                let support = self
+                    .world
+                    .state(neighbor)
+                    .context("missing support state")?;
+                let same = in_direction(support, facing)? && support.name == state.name;
+                let sturdy = same
+                    || native_world::collision::button_support_face(
+                        support,
+                        IVec3::new(0, offset, 0),
+                    )
+                    .context("unknown support face")?;
+                anyhow::ensure!(sturdy, "unsupported speleothem tick is not simulated");
+            }
+            let read = |at: IVec3| -> anyhow::Result<BlockState> {
+                let Cell::State(id) =
+                    cell(&self.world, self.origin, self.bounds, at, self.states[0])
+                else {
+                    anyhow::bail!("speleothem neighbor is unavailable");
+                };
+                self.world
+                    .state(id)
+                    .cloned()
+                    .context("speleothem neighbor state unavailable")
+            };
+            let tip =
+                read(add(position, IVec3::new(0, offset, 0)).context("speleothem tip overflow")?)?;
+            let thickness = crate::worldgen::speleothem_thickness(
+                &state,
+                &tip,
+                || {
+                    read(
+                        add(position, IVec3::new(0, -offset, 0))
+                            .context("speleothem base overflow")?,
+                    )
+                },
+                in_direction,
+            )?;
+            if state.properties["thickness"] != thickness {
+                let mut next = state.clone();
+                next.properties.insert("thickness".into(), thickness.into());
+                let next = self.intern_block(next);
+                anyhow::ensure!(
+                    self.set(position, next),
+                    "speleothem shape could not be updated"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if !self.unresolved_speleothem_shape {
+                self.stream_errors
+                    .push(format!("speleothem update at {position:?}: {error:#}"));
+            }
+            self.unresolved_speleothem_shape = true;
+        }
+        true
+    }
+
     /// Apply VegetationBlock's shape update for a crop. Unknown light, support,
     /// or loot cannot be guessed without risking an incorrect world save.
     fn update_crop_neighbor(&mut self, position: IVec3, id: BlockStateId) -> bool {
@@ -20260,6 +20419,9 @@ impl LoadedSession {
                     continue;
                 }
                 if self.update_lichen_neighbor(neighbor, id, -direction, current) {
+                    continue;
+                }
+                if self.update_speleothem_neighbor(neighbor, id, -direction, current) {
                     continue;
                 }
             }
@@ -78961,6 +79123,102 @@ pub(crate) mod tests {
             2.0
         ));
         assert!((position.x - (8.0 + 6.0 / 16.0 - PLAYER_HALF_WIDTH)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn speleothem_neighbors_update_thickness_and_respect_tags() {
+        struct Tags(bool);
+        impl native_resources::packs::ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![if self.0 {
+                    br#"{"values":["minecraft:pointed_dripstone","minecraft:sulfur_spike"]}"#
+                        .to_vec()
+                } else {
+                    br#"{"values":[]}"#.to_vec()
+                }])
+            }
+        }
+        for tagged in [false, true] {
+            let mut session = session();
+            let registry = BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:stone".into(),
+                "minecraft:pointed_dripstone".into(),
+                "minecraft:sulfur_spike".into(),
+            ]);
+            let tag = native_resources::packs::ResourceId::parse("minecraft:speleothems").unwrap();
+            let tags = native_resources::ore_feature::OreBlockTags::load(
+                &mut Tags(tagged),
+                &registry,
+                &BTreeSet::from([tag]),
+            )
+            .unwrap();
+            session.set_speleothem_tags(Arc::new(tags));
+            let low = IVec3::new(10, 1, 8);
+            let spike = session.intern_block(state(
+                "minecraft:pointed_dripstone",
+                &[
+                    ("vertical_direction", "up"),
+                    ("thickness", "tip"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            assert!(session.set(low, spike));
+            assert!(session.set(low + IVec3::Y, spike));
+            let block = session
+                .world
+                .block(
+                    (session.origin + low).x,
+                    (session.origin + low).y,
+                    (session.origin + low).z,
+                )
+                .unwrap();
+            assert_eq!(
+                block.properties["thickness"],
+                if tagged { "frustum" } else { "tip" }
+            );
+            assert!(!session.unresolved_speleothem_shape);
+            assert!(session.set(low + IVec3::Y, session.states[0]));
+            let block = session
+                .world
+                .block(
+                    (session.origin + low).x,
+                    (session.origin + low).y,
+                    (session.origin + low).z,
+                )
+                .unwrap();
+            assert_eq!(block.properties["thickness"], "tip");
+            assert!(!session.unresolved_speleothem_shape);
+        }
+    }
+
+    #[test]
+    fn unresolved_speleothem_updates_block_saving() {
+        for waterlogged in [false, true] {
+            let mut session = session();
+            let position = IVec3::new(10, 1, 8);
+            let spike = session.intern_block(state(
+                "minecraft:pointed_dripstone",
+                &[
+                    ("vertical_direction", "up"),
+                    ("thickness", "tip"),
+                    ("waterlogged", if waterlogged { "true" } else { "false" }),
+                ],
+            ));
+            assert!(session.set(position, spike));
+            if waterlogged {
+                let stone = session.states[3];
+                assert!(session.set(position + IVec3::X, stone));
+            } else {
+                assert!(session.set(position + IVec3::NEG_Y, session.states[0]));
+            }
+            assert!(session.unresolved_speleothem_shape);
+            assert!(session.validate_speleothem_updates().is_err());
+            assert!(session.validate_generation_terrain_readiness().is_err());
+        }
     }
 
     #[test]

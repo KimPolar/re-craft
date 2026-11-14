@@ -1565,6 +1565,16 @@ fn prepare_existing_world(
                     Ok(tags) => session.set_fence_connection_tags(Arc::new(tags)),
                     Err(error) => eprintln!("Fence connection tags are unavailable: {error:#}"),
                 }
+                let speleothem_tag =
+                    native_resources::packs::ResourceId::parse("minecraft:speleothems")?;
+                match native_resources::ore_feature::OreBlockTags::load(
+                    &mut resources,
+                    &registry,
+                    &std::collections::BTreeSet::from([speleothem_tag]),
+                ) {
+                    Ok(tags) => session.set_speleothem_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Speleothem block tag is unavailable: {error:#}"),
+                }
                 match native_resources::respawn_tags::load_bounce_suppression_tag(
                     &mut resources,
                     &registry,

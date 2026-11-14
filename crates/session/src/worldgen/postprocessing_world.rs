@@ -1786,6 +1786,50 @@ fn supported_speleothem(state: &BlockState) -> bool {
     ) && native_world::block_light::same_light_behavior(state, state).is_some()
 }
 
+/// Calculate the thickness used by SpeleothemBlock's vertical shape update.
+/// The block behind the tip is queried only when Java needs it.
+pub(crate) fn speleothem_thickness(
+    state: &BlockState,
+    tip: &BlockState,
+    base: impl FnOnce() -> Result<BlockState>,
+    in_direction: impl Fn(&BlockState, &str) -> Result<bool>,
+) -> Result<&'static str> {
+    let facing = state
+        .properties
+        .get("vertical_direction")
+        .context("missing speleothem direction")?;
+    let opposite = match facing.as_str() {
+        "down" => "up",
+        "up" => "down",
+        _ => anyhow::bail!("invalid speleothem direction"),
+    };
+    if in_direction(tip, opposite)? && tip.name == state.name {
+        return Ok(
+            if state.properties.get("thickness").map(String::as_str) == Some("tip_merge")
+                || tip.properties.get("thickness").map(String::as_str) == Some("tip_merge")
+            {
+                "tip_merge"
+            } else {
+                "tip"
+            },
+        );
+    }
+    if !in_direction(tip, facing)? {
+        return Ok("tip");
+    }
+    if matches!(
+        tip.properties.get("thickness").map(String::as_str),
+        Some("tip" | "tip_merge")
+    ) {
+        return Ok("frustum");
+    }
+    Ok(if in_direction(&base()?, facing)? {
+        "middle"
+    } else {
+        "base"
+    })
+}
+
 fn bonus_water_shape_schedules(state: &BlockState) -> Result<bool> {
     Ok(liquid_state(state)?
         .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water && fluid.source))
@@ -4344,37 +4388,20 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                     .context("speleothem Y overflow")?,
                 pos[2],
             ])?;
-            let opposite = if down { "up" } else { "down" };
-            let thickness =
-                if self.speleothem_in_direction(&tip, opposite)? && tip.name == state.name {
-                    if state.properties["thickness"] == "tip_merge"
-                        || tip.properties.get("thickness").map(String::as_str) == Some("tip_merge")
-                    {
-                        "tip_merge"
-                    } else {
-                        "tip"
-                    }
-                } else if !self.speleothem_in_direction(&tip, facing)? {
-                    "tip"
-                } else if matches!(
-                    tip.properties.get("thickness").map(String::as_str),
-                    Some("tip" | "tip_merge")
-                ) {
-                    "frustum"
-                } else {
-                    let base = self.read([
+            let thickness = speleothem_thickness(
+                state,
+                &tip,
+                || {
+                    self.read([
                         pos[0],
                         pos[1]
                             .checked_sub(offset)
                             .context("speleothem Y overflow")?,
                         pos[2],
-                    ])?;
-                    if self.speleothem_in_direction(&base, facing)? {
-                        "middle"
-                    } else {
-                        "base"
-                    }
-                };
+                    ])
+                },
+                |neighbor, facing| self.speleothem_in_direction(neighbor, facing),
+            )?;
             let mut next = state.clone();
             next.properties.insert("thickness".into(), thickness.into());
             return Ok(next);

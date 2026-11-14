@@ -99,6 +99,8 @@ pub enum FallingKind {
     Sand,
     RedSand,
     Gravel,
+    PointedDripstone,
+    SulfurSpike,
 }
 
 /// FallingBlockEntity's saved damage parameters. The caller must separately
@@ -189,6 +191,8 @@ impl FallingKind {
             Self::Sand => "minecraft:sand",
             Self::RedSand => "minecraft:red_sand",
             Self::Gravel => "minecraft:gravel",
+            Self::PointedDripstone => "minecraft:pointed_dripstone",
+            Self::SulfurSpike => "minecraft:sulfur_spike",
         }
     }
 

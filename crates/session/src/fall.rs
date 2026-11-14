@@ -711,7 +711,7 @@ impl FallTracker {
             | "minecraft:in_fire"
             | "minecraft:campfire"
             | "minecraft:hot_floor" => (0.1, DamageEffects::Burning),
-            "minecraft:cactus" => (0.1, DamageEffects::Hurt),
+            "minecraft:cactus" | "minecraft:falling_stalactite" => (0.1, DamageEffects::Hurt),
             "minecraft:on_fire" => (0.0, DamageEffects::Burning),
             "minecraft:fall" | "minecraft:stalagmite" | "minecraft:starve" | "minecraft:magic" => {
                 (0.0, DamageEffects::Hurt)

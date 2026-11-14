@@ -967,6 +967,7 @@ pub struct LoadedSession {
     unresolved_crop_tick: bool,
     unresolved_crop_shape: bool,
     unresolved_speleothem_shape: bool,
+    unresolved_stalactite_lifecycle: bool,
     unresolved_lichen_shape: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
@@ -1545,6 +1546,7 @@ struct FallingSand {
     previous: DVec3,
     fall_distance: f64,
     fall_distance_verified: bool,
+    stalactite: Option<crate::falling_block::FallingStalactite>,
     kind: FallingKind,
     drop_item: bool,
     cancel_drop: bool,
@@ -5723,6 +5725,7 @@ impl LoadedSession {
                 && !self.unresolved_leaf_decay
                 && !self.unresolved_crop_shape
                 && !self.unresolved_speleothem_shape
+                && !self.unresolved_stalactite_lifecycle
                 && !self.unresolved_crop_tick
                 && !self.unresolved_ice_tick
                 && !self.unresolved_bubble_tick,
@@ -7602,6 +7605,7 @@ impl LoadedSession {
             unresolved_crop_tick: false,
             unresolved_crop_shape: false,
             unresolved_speleothem_shape: false,
+            unresolved_stalactite_lifecycle: false,
             unresolved_lichen_shape: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
@@ -12681,6 +12685,7 @@ impl LoadedSession {
                     previous: saved.position,
                     fall_distance: saved.fall_distance,
                     fall_distance_verified: true,
+                    stalactite: None,
                     kind,
                     drop_item: saved.drop_item,
                     cancel_drop: saved.cancel_drop,
@@ -18677,6 +18682,7 @@ impl LoadedSession {
                         previous: motion.position,
                         fall_distance: 0.0,
                         fall_distance_verified: true,
+                        stalactite: None,
                         motion,
                         kind: key.kind,
                         drop_item: true,
@@ -19458,6 +19464,7 @@ impl LoadedSession {
         // only until the next block change, and always recheck start overlap.
         let mut path_cache = ItemPathRegionCache::default();
         for mut entity in std::mem::take(&mut self.falling_sand) {
+            let mut impact_distance = None;
             entity.previous = entity.motion.position;
             let relative = entity.motion.position - self.origin.as_dvec3();
             let mut probe = entity.motion;
@@ -19592,6 +19599,9 @@ impl LoadedSession {
                         collision.actual.y,
                         false,
                     );
+                    if collision.on_ground {
+                        impact_distance = Some(landing_distance);
+                    }
                     if !self.sculk_listeners.is_empty()
                         && crate::fall::emits_landing(landing_distance, collision.on_ground)
                     {
@@ -19662,6 +19672,22 @@ impl LoadedSession {
                 }
             }
             if collision.on_ground {
+                if let (Some(body), Some(distance)) = (&entity.stalactite, impact_distance)
+                    && let Some(amount) = body.damage().and_then(|damage| damage.amount(distance))
+                {
+                    let falling = entity.motion.bounds();
+                    let player = crate::movement::player_bounds(
+                        self.origin.as_dvec3() + self.motion.position,
+                        self.player.height(),
+                    );
+                    if falling.min.cmplt(player.max).all() && falling.max.cmpgt(player.min).all() {
+                        self.player_damage(
+                            amount as f32,
+                            "minecraft:falling_stalactite",
+                            DeathCause::FallingStalactite,
+                        );
+                    }
+                }
                 if entity.cancel_drop {
                     self.track_removed_falling_sand(entity);
                     continue;
@@ -19709,8 +19735,29 @@ impl LoadedSession {
                         }
                         Some(false) => {}
                     }
-                    let name = entity.kind.id();
-                    let id = self.intern_block(state(name, &[]));
+                    let id = if let Some(body) = &entity.stalactite {
+                        let Some(survives) =
+                            self.stalactite_can_survive(target_relative, body.block())
+                        else {
+                            remaining.push(entity);
+                            continue;
+                        };
+                        if !survives {
+                            self.drop_falling_sand(&entity);
+                            self.track_removed_falling_sand(entity);
+                            continue;
+                        }
+                        let mut block = body.block().clone();
+                        if self
+                            .simulated_fluid(current)
+                            .is_some_and(|fluid| fluid.kind == FluidKind::Water && fluid.source)
+                        {
+                            block.properties.insert("waterlogged".into(), "true".into());
+                        }
+                        self.intern_block(block)
+                    } else {
+                        self.intern_block(state(entity.kind.id(), &[]))
+                    };
                     let placed = self.set(target_relative, id);
                     path_cache.clear();
                     if placed {
@@ -19741,6 +19788,34 @@ impl LoadedSession {
             self.uncoordinated_falling_lifecycle = true;
         }
         self.falling_sand = remaining;
+    }
+
+    fn stalactite_can_survive(&self, position: IVec3, block: &BlockState) -> Option<bool> {
+        let above = add(position, IVec3::Y)?;
+        let Cell::State(id) = cell(&self.world, self.origin, self.bounds, above, self.states[0])
+        else {
+            return None;
+        };
+        let support = self.world.state(id)?;
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:speleothems").expect("static tag")
+        });
+        let tagged = self
+            .speleothem_tags
+            .as_ref()?
+            .contains(tag, &support.name)
+            .ok()?;
+        if tagged
+            && support.name == block.name
+            && support
+                .properties
+                .get("vertical_direction")
+                .is_some_and(|direction| direction == "down")
+        {
+            return Some(true);
+        }
+        native_world::collision::button_support_face(support, IVec3::NEG_Y)
     }
 
     fn track_removed_falling_sand(&mut self, entity: FallingSand) {
@@ -20106,6 +20181,10 @@ impl LoadedSession {
             "a speleothem neighbor update could not be resolved for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_stalactite_lifecycle,
+            "falling stalactite effects cannot yet be saved safely"
+        );
+        anyhow::ensure!(
             self.speleothem_deferred.is_empty(),
             "a speleothem tick could not be simulated for saving"
         );
@@ -20155,9 +20234,7 @@ impl LoadedSession {
             return true;
         }
         if block.properties["vertical_direction"] == "down" {
-            // A stalactite creates falling entities, including tip-specific
-            // damage. Do not consume its tick until those effects are modeled.
-            return false;
+            return self.spawn_stalactite(relative, absolute.y);
         }
         let Some(support_pos) = add(relative, IVec3::NEG_Y) else {
             return false;
@@ -20223,6 +20300,150 @@ impl LoadedSession {
             Some(&block.name),
         );
         self.mark_tick_chunk_dirty(key.x, key.z);
+        true
+    }
+
+    /// Spawn from top to bottom, reading each next state after the preceding
+    /// replacement has notified its neighbors, as FallingBlockEntity.fall does.
+    fn spawn_stalactite(&mut self, first: IVec3, top_y: i32) -> bool {
+        let Some(tags) = self.speleothem_tags.clone() else {
+            return false;
+        };
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:speleothems").expect("static tag")
+        });
+        let water = self.intern_block(state("minecraft:water", &[("level", "0")]));
+        let mut positions = Vec::new();
+        let mut position = first;
+        loop {
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                position,
+                self.states[0],
+            ) else {
+                return false;
+            };
+            let Some(block) = self.world.state(id) else {
+                return false;
+            };
+            let Ok(tagged) = tags.contains(tag, &block.name) else {
+                return false;
+            };
+            if !tagged {
+                break;
+            }
+            let Some(direction) = block.properties.get("vertical_direction") else {
+                return false;
+            };
+            if direction != "down" {
+                break;
+            }
+            let Some(absolute) = add(self.origin, position) else {
+                return false;
+            };
+            let Some(body) =
+                crate::falling_block::FallingStalactite::from_source(block, top_y, absolute.y)
+            else {
+                return false;
+            };
+            let replacement = if body.source_waterlogged() {
+                water
+            } else {
+                self.states[0]
+            };
+            if !self.banner_support_neighbors_available(position)
+                || self
+                    .check_block_set(position, replacement, true, false)
+                    .is_none()
+            {
+                return false;
+            }
+            let tip = body.damage().is_some();
+            positions.push(position);
+            if tip {
+                break;
+            }
+            let Some(next) = add(position, IVec3::NEG_Y) else {
+                return false;
+            };
+            position = next;
+        }
+        if positions.is_empty() {
+            return false;
+        }
+        let mut spawned = 0usize;
+        for position in positions {
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                position,
+                self.states[0],
+            ) else {
+                break;
+            };
+            let Some(block) = self.world.state(id).cloned() else {
+                break;
+            };
+            if !tags.contains(tag, &block.name).unwrap_or(false)
+                || block
+                    .properties
+                    .get("vertical_direction")
+                    .is_none_or(|direction| direction != "down")
+            {
+                break;
+            }
+            let Some(absolute) = add(self.origin, position) else {
+                break;
+            };
+            let Some(body) =
+                crate::falling_block::FallingStalactite::from_source(&block, top_y, absolute.y)
+            else {
+                break;
+            };
+            let replacement = if body.source_waterlogged() {
+                water
+            } else {
+                self.states[0]
+            };
+            if !self.set(position, replacement) {
+                break;
+            }
+            // Saving stays disabled until entity damage, rendering and lifecycle
+            // effects can all be committed with the edited terrain.
+            self.unresolved_stalactite_lifecycle = true;
+            let tip = body.damage().is_some();
+            let kind = if block.name == "minecraft:pointed_dripstone" {
+                FallingKind::PointedDripstone
+            } else {
+                FallingKind::SulfurSpike
+            };
+            let motion = crate::falling_block::AirborneMotion::from_block(absolute);
+            self.falling_sand.push(FallingSand {
+                previous: motion.position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
+                stalactite: Some(body),
+                motion,
+                kind,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: None,
+                created: None,
+            });
+            spawned += 1;
+            if tip {
+                break;
+            }
+        }
+        if spawned == 0 {
+            return false;
+        }
+        self.mark_tick_chunk_dirty((self.origin + first).x, (self.origin + first).z);
         true
     }
 
@@ -34054,6 +34275,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
                 cancel_drop: false,
@@ -34092,6 +34314,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
                 cancel_drop: false,
@@ -34173,6 +34396,7 @@ pub(crate) mod tests {
                 previous: entity_pos,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
                 cancel_drop: false,
@@ -44161,6 +44385,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 4.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
                 cancel_drop: false,
@@ -45247,6 +45472,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: distance,
                 fall_distance_verified: true,
+                stalactite: None,
                 motion: crate::falling_block::AirborneMotion {
                     position,
                     velocity: DVec3::new(0.0, -0.2, 0.0),
@@ -69796,6 +70022,7 @@ pub(crate) mod tests {
                 previous: motion.position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 motion,
                 kind: FallingKind::Sand,
                 drop_item: true,
@@ -76141,6 +76368,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 motion: crate::falling_block::AirborneMotion {
                     position,
                     velocity: DVec3::ZERO,
@@ -76304,6 +76532,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 motion: crate::falling_block::AirborneMotion::from_block(
                     session.origin + IVec3::new(10, 4, 8),
                 ),
@@ -76341,6 +76570,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                stalactite: None,
                 motion: crate::falling_block::AirborneMotion {
                     position,
                     velocity: DVec3::ZERO,
@@ -79601,6 +79831,114 @@ pub(crate) mod tests {
         Arc::new(BlockLootTables::load(&mut Loot).unwrap())
     }
 
+    fn stalactite_chain_trace(name: &str, length: i32, wet: bool) -> String {
+        let mut session = session();
+        session.set_speleothem_tags(test_speleothem_tags());
+        let top = IVec3::new(8, 14, 8);
+        for i in 0..length {
+            let thickness = match length - i {
+                1 => "tip",
+                2 => "frustum",
+                3 => "middle",
+                _ => "base",
+            };
+            let id = session.intern_block(state(
+                name,
+                &[
+                    ("vertical_direction", "down"),
+                    ("thickness", thickness),
+                    ("waterlogged", if wet { "true" } else { "false" }),
+                ],
+            ));
+            assert!(session.set_with_notify(top - IVec3::Y * i, id, false));
+        }
+        let absolute = session.origin + top;
+        session.schedule_speleothem(absolute, SpeleothemKind::from_id(name).unwrap(), 1);
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert!(session.validate_speleothem_updates().is_err());
+        let mut result = format!("{name} {length} {wet} {}", session.falling_sand.len());
+        for (i, entity) in session.falling_sand.iter().enumerate() {
+            let body = entity.stalactite.as_ref().unwrap();
+            let block = body.block();
+            let damage = body.damage();
+            let source = absolute - IVec3::Y * i as i32;
+            let source = session.world.block(source.x, source.y, source.z).unwrap();
+            result.push_str(&format!(
+                " {}:{}:{}:{}:{:.1}:{}",
+                entity.motion.position.y as i32,
+                block.properties["thickness"],
+                block.properties["waterlogged"],
+                damage.is_some(),
+                damage.map_or(0.0, |damage| damage.per_distance),
+                source.name
+            ));
+        }
+        result
+    }
+
+    #[test]
+    fn stalactite_chains_spawn_in_order_and_leave_source_fluids() {
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for length in [1, 2, 4, 7] {
+                for wet in [false, true] {
+                    let row = stalactite_chain_trace(name, length, wet);
+                    let fields: Vec<_> = row.split_whitespace().collect();
+                    assert_eq!(fields[3].parse::<i32>().unwrap(), length, "{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn falling_stalactite_hurts_overlapping_survival_player_on_landing() {
+        for (mode, overlap, expected) in [
+            (GameMode::Survival, true, 6.0),
+            (GameMode::Creative, true, 20.0),
+            (GameMode::Survival, false, 20.0),
+        ] {
+            let mut session = session();
+            session.set_game_mode(mode);
+            session.set_speleothem_tags(test_speleothem_tags());
+            session.motion.position = DVec3::new(if overlap { 8.5 } else { 10.5 }, 1.0, 8.5);
+            let block = state(
+                "minecraft:pointed_dripstone",
+                &[
+                    ("vertical_direction", "down"),
+                    ("thickness", "tip"),
+                    ("waterlogged", "false"),
+                ],
+            );
+            let body =
+                crate::falling_block::FallingStalactite::from_source(&block, 20, 14).unwrap();
+            let position = session.origin.as_dvec3() + DVec3::new(8.5, 1.1, 8.5);
+            session.falling_sand.push(FallingSand {
+                previous: position,
+                fall_distance: 2.0,
+                fall_distance_verified: true,
+                stalactite: Some(body),
+                motion: crate::falling_block::AirborneMotion {
+                    position,
+                    velocity: DVec3::new(0.0, -0.2, 0.0),
+                    age: 0,
+                    no_gravity: true,
+                },
+                kind: FallingKind::PointedDripstone,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: None,
+                created: None,
+            });
+            session.advance_falling_sand();
+            assert_eq!(
+                session.vitals.health, expected,
+                "{mode:?} overlap={overlap}"
+            );
+            assert!(session.falling_sand.is_empty());
+        }
+    }
+
     #[test]
     fn untagged_speleothem_ticks_are_consumed_without_changes() {
         for kind in [SpeleothemKind::Dripstone, SpeleothemKind::Sulfur] {
@@ -79653,6 +79991,7 @@ pub(crate) mod tests {
         ));
         assert!(session.set_with_notify(relative, spike, false));
         session.schedule_speleothem(absolute, SpeleothemKind::Dripstone, 1);
+        session.speleothem_tags = None;
         session.tick = 1;
         session.advance_block_ticks();
         assert_eq!(session.speleothem_deferred.len(), 1);
@@ -79670,7 +80009,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn speleothem_support_ticks_recheck_upward_and_retain_unimplemented_falls() {
+    fn speleothem_support_ticks_recheck_upward_and_spawn_falls() {
         for kind in [SpeleothemKind::Dripstone, SpeleothemKind::Sulfur] {
             for direction in ["up", "down"] {
                 for wet in [false, true] {
@@ -79719,9 +80058,21 @@ pub(crate) mod tests {
                             .block(absolute.x, absolute.y, absolute.z)
                             .unwrap();
                         if direction == "down" {
-                            assert_eq!(actual.name, kind.id());
-                            assert!(session.speleothem_pending.contains(&key));
-                            assert_eq!(session.speleothem_deferred.len(), 1);
+                            assert_eq!(
+                                actual.name,
+                                if wet {
+                                    "minecraft:water"
+                                } else {
+                                    "minecraft:air"
+                                }
+                            );
+                            assert!(!session.speleothem_pending.contains(&key));
+                            assert!(session.speleothem_deferred.is_empty());
+                            assert_eq!(session.falling_sand.len(), 1);
+                            let body = session.falling_sand[0].stalactite.as_ref().unwrap();
+                            assert_eq!(body.block().name, kind.id());
+                            assert_eq!(body.block().properties["waterlogged"], "false");
+                            assert_eq!(body.damage().unwrap().per_distance, 6.0);
                             assert!(session.validate_speleothem_updates().is_err());
                         } else {
                             assert!(
@@ -79953,7 +80304,7 @@ pub(crate) mod tests {
         );
         let result = Command::new(java.join("java.exe"))
             .arg("-cp")
-            .arg(classpath)
+            .arg(&classpath)
             .args([
                 "GeneratedWaterSpreadPostprocessingOracle",
                 if tagged {
@@ -80027,6 +80378,11 @@ pub(crate) mod tests {
                 parts[5],
                 "{row}"
             );
+            assert_eq!(
+                session.falling_sand.len(),
+                parts[6].parse::<usize>().unwrap(),
+                "{row}"
+            );
             if !tagged {
                 assert!(session.speleothem_pending.is_empty(), "{row}");
                 assert!(session.speleothem_deferred.is_empty(), "{row}");
@@ -80035,6 +80391,41 @@ pub(crate) mod tests {
                 let drops = session.dropped_items.snapshot();
                 assert_eq!(drops.len(), 1, "{row}");
                 assert_eq!(drops[0].stack.id(), kind.id(), "{row}");
+            }
+        }
+        if tagged {
+            let result = Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .args([
+                    "GeneratedWaterSpreadPostprocessingOracle",
+                    "stalactite_chain",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let output = String::from_utf8(result.stdout).unwrap();
+            let rows: Vec<_> = output
+                .lines()
+                .skip_while(|line| *line != "BEGIN_RESULT")
+                .skip(1)
+                .take_while(|line| *line != "END_RESULT")
+                .collect();
+            assert_eq!(rows.len(), 16, "{output}");
+            for row in rows {
+                let fields: Vec<_> = row.split_whitespace().collect();
+                assert_eq!(
+                    stalactite_chain_trace(
+                        fields[0],
+                        fields[1].parse().unwrap(),
+                        fields[2] == "true"
+                    ),
+                    row
+                );
             }
         }
     }

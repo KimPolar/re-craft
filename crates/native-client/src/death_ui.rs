@@ -258,6 +258,10 @@ impl DeathScreen {
                         "death.attack.stalagmite",
                         "%1$s was impaled on a stalagmite",
                     )),
+                    DeathCause::FallingStalactite => Some((
+                        "death.attack.fallingStalactite",
+                        "%1$s was skewered by a falling stalactite",
+                    )),
                     DeathCause::Drown => Some(("death.attack.drown", "%1$s drowned")),
                     DeathCause::Lava => Some(("death.attack.lava", "%1$s tried to swim in lava")),
                     DeathCause::OnFire => Some(("death.attack.onFire", "%1$s burned to death")),

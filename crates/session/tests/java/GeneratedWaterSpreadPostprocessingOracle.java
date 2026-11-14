@@ -8,6 +8,8 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.tags.*;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.attribute.EnvironmentAttributeSystem;
@@ -33,6 +35,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
     static final Map<BlockPos, BlockState> blocks = new HashMap<>();
     static final List<BlockPos> lightChecks = new ArrayList<>();
     static final List<BlockPos> fizzEvents = new ArrayList<>();
+    static final List<FallingBlockEntity> fallingEntities = new ArrayList<>();
     static LevelTicks<Block> blockAccess;
     static LevelTicks<Fluid> fluidAccess;
     static long counter;
@@ -53,6 +56,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         @Override public BlockState getBlockState(BlockPos p){return get(p);}
         @Override public FluidState getFluidState(BlockPos p){return get(p).getFluidState();}
         @Override public RandomSource getRandom(){return random;}
+        @Override public int getNextEntityId(){return 1;}
+        @Override public boolean addFreshEntity(Entity entity){fallingEntities.add((FallingBlockEntity)entity);return true;}
         @Override public GameRules getGameRules(){return rules;}
         @Override public FeatureFlagSet enabledFeatures(){return FeatureFlags.DEFAULT_FLAGS;}
         @Override public EnvironmentAttributeSystem environmentAttributes(){return attributes;}
@@ -120,6 +125,38 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
+        if(args.length>0 && args[0].equals("stalactite_chain")) {
+            var tickMethod=SpeleothemBlock.class.getDeclaredMethod("tick",BlockState.class,ServerLevel.class,BlockPos.class,RandomSource.class);tickMethod.setAccessible(true);
+            var hurts=FallingBlockEntity.class.getDeclaredField("hurtEntities");hurts.setAccessible(true);
+            var amount=FallingBlockEntity.class.getDeclaredField("fallDamagePerDistance");amount.setAccessible(true);
+            var top=new BlockPos(8,14,8);
+            for(var block:List.of(Blocks.POINTED_DRIPSTONE,Blocks.SULFUR_SPIKE)) for(int length:new int[]{1,2,4,7}) for(boolean wet:new boolean[]{false,true}) {
+                blocks.clear();lightChecks.clear();fizzEvents.clear();fallingEntities.clear();
+                var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
+                blockAccess=new LevelTicks<Block>(p->true);fluidAccess=new LevelTicks<Fluid>(p->true);
+                blockAccess.addContainer(new ChunkPos(0,0),bt);fluidAccess.addContainer(new ChunkPos(0,0),ft);
+                counter=0;random=RandomSource.create(42);set(level,"random",random);updater=new CollectingNeighborUpdater(level,100000);
+                for(int i=0;i<length;i++) {
+                    int remaining=length-i;
+                    var thickness=remaining==1?net.minecraft.world.level.block.state.properties.SpeleothemThickness.TIP:
+                        remaining==2?net.minecraft.world.level.block.state.properties.SpeleothemThickness.FRUSTUM:
+                        remaining==3?net.minecraft.world.level.block.state.properties.SpeleothemThickness.MIDDLE:
+                        net.minecraft.world.level.block.state.properties.SpeleothemThickness.BASE;
+                    blocks.put(top.below(i),block.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION,Direction.DOWN)
+                        .setValue(SpeleothemBlock.THICKNESS,thickness).setValue(SpeleothemBlock.WATERLOGGED,wet));
+                }
+                tickMethod.invoke(block,get(top),level,top,random);
+                out.printf("%s %d %s %d",BuiltInRegistries.BLOCK.getKey(block),length,wet,fallingEntities.size());
+                for(int i=0;i<fallingEntities.size();i++) {
+                    var entity=fallingEntities.get(i);var state=entity.getBlockState();
+                    out.printf(" %d:%s:%s:%s:%s:%s",(int)entity.getY(),state.getValue(SpeleothemBlock.THICKNESS),
+                        state.getValue(SpeleothemBlock.WATERLOGGED),hurts.getBoolean(entity),amount.getFloat(entity),
+                        BuiltInRegistries.BLOCK.getKey(get(top.below(i)).getBlock()));
+                }
+                out.println();
+            }
+            out.println("END_RESULT");return;
+        }
         if(args.length>0 && (args[0].equals("speleothem_tick") || args[0].equals("speleothem_tick_untagged"))) {
             boolean untagged=args[0].equals("speleothem_tick_untagged");
             var tickMethod=SpeleothemBlock.class.getDeclaredMethod("tick",BlockState.class,ServerLevel.class,BlockPos.class,RandomSource.class);
@@ -128,7 +165,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 for(var direction:List.of(Direction.UP,Direction.DOWN))
                     for(var wet:List.of(false,true)) for(var restored:List.of(false,true)) {
                         bind.invoke(block.builtInRegistryHolder(),List.of(BlockTags.SPELEOTHEMS));
-                        blocks.clear();lightChecks.clear();fizzEvents.clear();
+                        blocks.clear();lightChecks.clear();fizzEvents.clear();fallingEntities.clear();
                         var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
                         blockAccess=new LevelTicks<Block>(p->true);fluidAccess=new LevelTicks<Fluid>(p->true);
                         blockAccess.addContainer(new ChunkPos(0,0),bt);fluidAccess.addContainer(new ChunkPos(0,0),ft);
@@ -141,9 +178,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                         int delay=scheduled.getFirst().delay();
                         if(restored)level.setBlock(support,Blocks.STONE.defaultBlockState(),3,512);
                         if(untagged)bind.invoke(block.builtInRegistryHolder(),List.of());
-                        if(direction==Direction.UP || untagged)tickMethod.invoke(block,get(pos),level,pos,random);
+                        tickMethod.invoke(block,get(pos),level,pos,random);
                         var result=get(pos);
-                        out.printf("%s %s %s %s %d %s%n",BuiltInRegistries.BLOCK.getKey(block),direction,wet,restored,delay,BuiltInRegistries.BLOCK.getKey(result.getBlock()));
+                        out.printf("%s %s %s %s %d %s %d%n",BuiltInRegistries.BLOCK.getKey(block),direction,wet,restored,delay,BuiltInRegistries.BLOCK.getKey(result.getBlock()),fallingEntities.size());
                     }
             out.println("END_RESULT");
             return;

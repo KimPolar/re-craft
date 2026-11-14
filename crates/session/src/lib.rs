@@ -502,6 +502,7 @@ pub enum DeathCause {
     Fall,
     FallHigh,
     Stalagmite,
+    FallingStalactite,
     Drown,
     Lava,
     OnFire,

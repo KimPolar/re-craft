@@ -101,7 +101,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             BlockTags.WASHED_AWAY_BY_FLUIDS,List.of(Blocks.AIR.builtInRegistryHolder(),Blocks.WATER.builtInRegistryHolder()),
             BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN,List.of(),BlockTags.ENABLES_BUBBLE_COLUMN_PUSH_UP,List.of(),
             BlockTags.FENCES,List.of(Blocks.OAK_FENCE.builtInRegistryHolder()),
-            BlockTags.WOODEN_FENCES,List.of(Blocks.OAK_FENCE.builtInRegistryHolder()),BlockTags.SHULKER_BOXES,List.of()))).apply();
+            BlockTags.WOODEN_FENCES,List.of(Blocks.OAK_FENCE.builtInRegistryHolder()),BlockTags.SHULKER_BOXES,List.of(),
+            BlockTags.SPELEOTHEMS,List.of(Blocks.SULFUR_SPIKE.builtInRegistryHolder(),Blocks.POINTED_DRIPSTONE.builtInRegistryHolder())))).apply();
         BuiltInRegistries.FLUID.prepareTagReload(new TagLoader.LoadResult<>(Registries.FLUID, Map.of(
             FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
             FluidTags.LAVA,List.of(Fluids.LAVA.builtInRegistryHolder(),Fluids.FLOWING_LAVA.builtInRegistryHolder()),
@@ -138,6 +139,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lichen_destroy")){scenarios.clear();scenarios.addAll(List.of("marked_lichen_destroy_on","marked_lichen_destroy_off"));}
         if(args.length>0 && args[0].equals("dry_lichen")){scenarios.clear();scenarios.addAll(List.of("dry_lichen_on","dry_lichen_off","dry_lichen_down","dry_lichen_support"));}
         if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone"));}
+        if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack"));}
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
             if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
@@ -279,6 +281,11 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 var block=scenario.endsWith("sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
                 blocks.put(pos.north(),block.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,Direction.UP).setValue(BlockStateProperties.WATERLOGGED,true));
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+            }
+            if(scenario.startsWith("marked_speleothem_")) {
+                var block=scenario.contains("_sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
+                blocks.put(pos,block.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,Direction.UP).setValue(BlockStateProperties.WATERLOGGED,true));
+                blocks.put(pos.above(),scenario.endsWith("_stack")?get(pos):Blocks.AIR.defaultBlockState());
             }
             if(snowyWater || snowyFence) {
                 var parts=scenario.split("_");
@@ -444,6 +451,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
                     BuiltInRegistries.BLOCK.getKey(state.getBlock()),(state.getBlock()==Blocks.WATER || state.getBlock()==Blocks.LAVA)?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock || state.getBlock() instanceof LeavesBlock || state.getBlock() instanceof FenceBlock || state.getBlock() instanceof LadderBlock || state.getBlock() instanceof MultifaceBlock || state.getBlock()==Blocks.SULFUR_SPIKE || state.getBlock()==Blocks.POINTED_DRIPSTONE)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
                 if(state.getBlock() instanceof LadderBlock)out.printf("ladder %d,%d,%d %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(LadderBlock.FACING));
+                if(state.getBlock() instanceof SpeleothemBlock)out.printf("speleothem %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(SpeleothemBlock.TIP_DIRECTION),state.getValue(SpeleothemBlock.THICKNESS));
                 if(state.getBlock() instanceof MultifaceBlock)out.printf("lichen %d,%d,%d %s %s %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(MultifaceBlock.getFaceProperty(Direction.DOWN)),state.getValue(MultifaceBlock.getFaceProperty(Direction.UP)),state.getValue(MultifaceBlock.getFaceProperty(Direction.NORTH)),state.getValue(MultifaceBlock.getFaceProperty(Direction.SOUTH)),state.getValue(MultifaceBlock.getFaceProperty(Direction.WEST)),state.getValue(MultifaceBlock.getFaceProperty(Direction.EAST)));
                 if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
                 if(state.getBlock() instanceof FenceBlock)out.printf("fence %d,%d,%d %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(FenceBlock.NORTH),state.getValue(FenceBlock.EAST),state.getValue(FenceBlock.SOUTH),state.getValue(FenceBlock.WEST));

@@ -479,6 +479,7 @@ struct DecorationConfig {
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    speleothem_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
@@ -2244,6 +2245,13 @@ impl FreshTerrainBatch {
         )
         .ok()
         .map(Arc::new);
+        let speleothem_tags = native_resources::ore_feature::OreBlockTags::load(
+            provider,
+            &block_registry,
+            &BTreeSet::from([ResourceId::parse("minecraft:speleothems")?]),
+        )
+        .ok()
+        .map(Arc::new);
         let bubble_tags =
             native_resources::fluid_tags::BubbleColumnTags::load(provider, &block_registry)
                 .ok()
@@ -2270,6 +2278,7 @@ impl FreshTerrainBatch {
             leaf_tags,
             snow_tags,
             fence_tags,
+            speleothem_tags,
             bubble_tags,
             washed_blocks,
             lava_fluids,
@@ -3151,6 +3160,11 @@ impl FreshTerrainBatch {
                 .as_ref()
                 .and_then(|config| config.fence_tags.clone()),
         );
+        stage.set_speleothem_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.speleothem_tags.clone()),
+        );
         stage.set_bubble_tags(
             self.decoration
                 .as_ref()
@@ -3318,6 +3332,7 @@ impl FreshTerrainBatch {
         stage.set_leaf_tags(config.leaf_tags.clone());
         stage.set_snow_tags(config.snow_tags.clone());
         stage.set_fence_tags(config.fence_tags.clone());
+        stage.set_speleothem_tags(config.speleothem_tags.clone());
         stage.set_bubble_tags(config.bubble_tags.clone());
         stage.set_fluid_tags(config.washed_blocks.clone(), config.lava_fluids.clone());
         stage.set_water_fluid_tags(config.water_fluids.clone());

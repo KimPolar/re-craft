@@ -160,6 +160,7 @@ pub struct GeneratedPostprocessing {
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    speleothem_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
@@ -252,6 +253,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    pub(super) speleothem_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     pub(super) washed_blocks: Option<Arc<BTreeSet<String>>>,
     pub(super) lava_fluids: Option<Arc<BTreeSet<String>>>,
@@ -643,6 +645,7 @@ impl GeneratedPostprocessing {
             leaf_tags: None,
             snow_tags: None,
             fence_tags: None,
+            speleothem_tags: None,
             bubble_tags: None,
             washed_blocks: None,
             lava_fluids: None,
@@ -762,6 +765,7 @@ impl GeneratedPostprocessing {
         stage.leaf_tags = completed.leaf_tags.clone();
         stage.snow_tags = completed.snow_tags.clone();
         stage.fence_tags = completed.fence_tags.clone();
+        stage.speleothem_tags = completed.speleothem_tags.clone();
         stage.bubble_tags = completed.bubble_tags.clone();
         stage.washed_blocks = completed.washed_blocks.clone();
         stage.lava_fluids = completed.lava_fluids.clone();
@@ -929,6 +933,13 @@ impl GeneratedPostprocessing {
         tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     ) {
         self.fence_tags = tags;
+    }
+
+    pub(super) fn set_speleothem_tags(
+        &mut self,
+        tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    ) {
+        self.speleothem_tags = tags;
     }
 
     pub(super) fn set_bubble_tags(
@@ -1136,6 +1147,7 @@ impl GeneratedPostprocessing {
             leaf_tags: self.leaf_tags.as_deref(),
             snow_tags: self.snow_tags.as_deref(),
             fence_tags: self.fence_tags.as_deref(),
+            speleothem_tags: self.speleothem_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
@@ -1230,6 +1242,7 @@ impl GeneratedPostprocessing {
             leaf_tags: self.leaf_tags.as_deref(),
             snow_tags: self.snow_tags.as_deref(),
             fence_tags: self.fence_tags.as_deref(),
+            speleothem_tags: self.speleothem_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
@@ -1294,6 +1307,7 @@ impl GeneratedPostprocessing {
             leaf_tags: self.leaf_tags,
             snow_tags: self.snow_tags,
             fence_tags: self.fence_tags,
+            speleothem_tags: self.speleothem_tags,
             bubble_tags: self.bubble_tags,
             washed_blocks: self.washed_blocks,
             lava_fluids: self.lava_fluids,
@@ -1329,6 +1343,7 @@ struct GeneratedBlockView<'a> {
     leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     snow_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     fence_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    speleothem_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     washed_blocks: Option<&'a BTreeSet<String>>,
     lava_fluids: Option<&'a BTreeSet<String>>,
@@ -1739,9 +1754,26 @@ fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
         state.name.as_str(),
         "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"
     ) && state.properties.len() == 3
-        && state.properties.get("vertical_direction").map(String::as_str) == Some("up")
+        && state
+            .properties
+            .get("vertical_direction")
+            .map(String::as_str)
+            == Some("up")
         && state.properties.get("thickness").map(String::as_str) == Some("tip")
         && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+}
+
+fn wet_upward_speleothem(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"
+    ) && state
+        .properties
+        .get("vertical_direction")
+        .map(String::as_str)
+        == Some("up")
+        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+        && native_world::block_light::same_light_behavior(state, state).is_some()
 }
 
 fn bonus_water_shape_schedules(state: &BlockState) -> Result<bool> {
@@ -1838,6 +1870,31 @@ pub(crate) fn fence_connection(
 }
 
 impl GeneratedBlockView<'_> {
+    fn speleothem_in_direction(&self, state: &BlockState, direction: &str) -> Result<bool> {
+        static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
+            std::sync::OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:speleothems")
+                .expect("static tag identifier")
+        });
+        if !self
+            .speleothem_tags
+            .context("speleothem block tags unavailable")?
+            .contains(tag, &state.name)?
+        {
+            return Ok(false);
+        }
+        let actual = state
+            .properties
+            .get("vertical_direction")
+            .context("tagged speleothem has no vertical direction")?;
+        ensure!(
+            matches!(actual.as_str(), "up" | "down"),
+            "invalid speleothem direction"
+        );
+        Ok(actual == direction)
+    }
+
     fn slab(&self, state: &BlockState) -> Option<(bool, bool)> {
         if !state.name.starts_with("minecraft:")
             || !state.name.ends_with("_slab")
@@ -3775,6 +3832,17 @@ impl GeneratedBlockView<'_> {
             // postprocessing at an explicitly chosen light-engine boundary.
             return self.write_postprocessed_state(pos, &old, next);
         }
+        if wet_upward_speleothem(&old) && wet_upward_speleothem(next) {
+            let mut expected = old.clone();
+            expected
+                .properties
+                .insert("thickness".into(), next.properties["thickness"].clone());
+            ensure!(
+                flags == 276 && *next == expected,
+                "unsupported generated speleothem write"
+            );
+            return self.write_postprocessed_state(pos, &old, next);
+        }
         ensure!(
             flags == 276 && next.name == "minecraft:air" && next.properties.is_empty(),
             "unsupported generated postprocessing write"
@@ -4115,6 +4183,79 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if wet_upward_speleothem(state) {
+            self.schedule_contained_water(pos)?;
+            if direction[1] == 0 {
+                ensure!(
+                    matches!(direction, [-1, 0, 0] | [1, 0, 0] | [0, 0, -1] | [0, 0, 1]),
+                    "invalid speleothem update direction"
+                );
+                return Ok(state.clone());
+            }
+            ensure!(
+                matches!(direction, [0, -1, 0] | [0, 1, 0]),
+                "invalid speleothem update direction"
+            );
+            if direction == [0, -1, 0] {
+                let same_support =
+                    self.speleothem_in_direction(neighbor, "up")? && neighbor.name == state.name;
+                let sturdy = if same_support {
+                    true
+                } else if neighbor.properties.is_empty()
+                    && inert_generated_full_cube(&neighbor.name)
+                {
+                    true
+                } else {
+                    native_world::collision::button_support_face(neighbor, glam::IVec3::Y)
+                        .context("speleothem support face unavailable")?
+                };
+                if !sturdy {
+                    ensure!(
+                        self.ticks
+                            .schedule(TickRegistry::Block, &state.name, pos, 1, 0)?
+                            != ScheduleOutcome::MissingChunk,
+                        "speleothem tick container is missing"
+                    );
+                    return Ok(state.clone());
+                }
+            }
+            let tip = self.read([
+                pos[0],
+                pos[1].checked_add(1).context("speleothem Y overflow")?,
+                pos[2],
+            ])?;
+            let thickness = if self.speleothem_in_direction(&tip, "down")? && tip.name == state.name
+            {
+                if state.properties["thickness"] == "tip_merge"
+                    || tip.properties.get("thickness").map(String::as_str) == Some("tip_merge")
+                {
+                    "tip_merge"
+                } else {
+                    "tip"
+                }
+            } else if !self.speleothem_in_direction(&tip, "up")? {
+                "tip"
+            } else if matches!(
+                tip.properties.get("thickness").map(String::as_str),
+                Some("tip" | "tip_merge")
+            ) {
+                "frustum"
+            } else {
+                let base = self.read([
+                    pos[0],
+                    pos[1].checked_sub(1).context("speleothem Y overflow")?,
+                    pos[2],
+                ])?;
+                if self.speleothem_in_direction(&base, "up")? {
+                    "middle"
+                } else {
+                    "base"
+                }
+            };
+            let mut next = state.clone();
+            next.properties.insert("thickness".into(), thickness.into());
+            return Ok(next);
+        }
         if let Some((facing, wet)) = ladder_state(state) {
             let changed = glam::IVec3::from_array(direction);
             if changed == -facing {
@@ -4303,6 +4444,9 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         self.read(pos)
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
+        if wet_upward_speleothem_tip(state) {
+            return Ok(self.fluid_cell_from_state(state).contained_fluid());
+        }
         if let Some((facing, waterlogged)) = ladder_state(state) {
             return Ok(native_world::fluid_sim::Cell::Ladder {
                 facing,
@@ -8659,6 +8803,12 @@ mod tests {
                 if path == "data/minecraft/tags/block/shulker_boxes.json" {
                     return Ok(Some(br#"{"values":[]}"#.to_vec()));
                 }
+                if path == "data/minecraft/tags/block/speleothems.json" {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:sulfur_spike","minecraft:pointed_dripstone"]}"#
+                            .to_vec(),
+                    ));
+                }
                 Ok(None)
             }
         }
@@ -9065,6 +9215,27 @@ mod tests {
                 });
                 world.set_block_id(8, 8, 7, spike).unwrap();
                 world.set_block_id(9, 8, 8, air).unwrap();
+            }
+            "marked_speleothem_sulfur"
+            | "marked_speleothem_dripstone"
+            | "marked_speleothem_sulfur_stack" => {
+                let spike = world.intern_state(BlockState {
+                    name: if case.contains("_sulfur") {
+                        "minecraft:sulfur_spike"
+                    } else {
+                        "minecraft:pointed_dripstone"
+                    }
+                    .into(),
+                    properties: BTreeMap::from([
+                        ("thickness".into(), "tip".into()),
+                        ("vertical_direction".into(), "up".into()),
+                        ("waterlogged".into(), "true".into()),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, spike).unwrap();
+                world
+                    .set_block_id(8, 9, 8, if case.ends_with("_stack") { spike } else { air })
+                    .unwrap();
             }
             "barrier_sulfur"
             | "barrier_cinnabar"
@@ -9686,6 +9857,17 @@ mod tests {
             native_resources::ore_feature::OreBlockTags::load(&mut Tags, &registry, &fence_tags)
                 .unwrap(),
         )));
+        if case.starts_with("marked_speleothem_") {
+            let tag = native_resources::packs::ResourceId::parse("minecraft:speleothems").unwrap();
+            stage.set_speleothem_tags(Some(Arc::new(
+                native_resources::ore_feature::OreBlockTags::load(
+                    &mut Tags,
+                    &registry,
+                    &BTreeSet::from([tag]),
+                )
+                .unwrap(),
+            )));
+        }
         stage.heightmaps.insert(chunk, fixture_maps(16));
         if case.starts_with("edge") {
             stage.heightmaps.insert(east_chunk, fixture_maps(16));
@@ -9785,6 +9967,7 @@ mod tests {
         }
         if case.starts_with("down_container_")
             || case.starts_with("wet_tip_neighbor_")
+            || case.starts_with("marked_speleothem_")
             || matches!(
                 case,
                 "dry_lichen_on"
@@ -10159,6 +10342,7 @@ mod tests {
             match case {
                 case if case.starts_with("down_container_") => Some(case.ends_with("_true")),
                 case if case.starts_with("wet_tip_neighbor_") => Some(true),
+                case if case.starts_with("marked_speleothem_") => Some(true),
                 "dry_lichen_off"
                 | "convert_off"
                 | "origin_source_off"
@@ -10223,6 +10407,15 @@ mod tests {
             }
             if state.name == "minecraft:ladder" {
                 trace.push(format!("ladder {x},{y},{z} {}", state.properties["facing"]));
+            }
+            if matches!(
+                state.name.as_str(),
+                "minecraft:sulfur_spike" | "minecraft:pointed_dripstone"
+            ) {
+                trace.push(format!(
+                    "speleothem {x},{y},{z} {} {}",
+                    state.properties["vertical_direction"], state.properties["thickness"]
+                ));
             }
             if state.name == "minecraft:glow_lichen" {
                 trace.push(format!(
@@ -11643,7 +11836,10 @@ mod tests {
                 ("vertical_direction", "down"),
                 ("waterlogged", "false"),
             ] {
-                let old = state.properties.insert(property.into(), value.into()).unwrap();
+                let old = state
+                    .properties
+                    .insert(property.into(), value.into())
+                    .unwrap();
                 assert!(!wet_upward_speleothem_tip(&state));
                 state.properties.insert(property.into(), old);
             }
@@ -11675,6 +11871,25 @@ mod tests {
             .into_iter()
             .flat_map(water_spread_trace)
             .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn marked_speleothem_tips_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["marked_speleothem"],
+        );
+        let expected: Vec<_> = [
+            "marked_speleothem_sulfur",
+            "marked_speleothem_dripstone",
+            "marked_speleothem_sulfur_stack",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
         assert_eq!(actual, expected);
     }
 

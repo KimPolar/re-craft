@@ -10540,20 +10540,22 @@ impl LoadedSession {
                     .map(|created| (entity, created))
             })
             .map(|(entity, created)| {
-                crate::saved_falling_block::draft_created(
-                    created.uuid.expect("validated UUID"),
-                    entity.kind.id(),
-                    crate::saved_falling_block::FallingSaveState {
-                        position: entity.motion.position,
-                        velocity: entity.motion.velocity,
-                        fall_distance: entity.fall_distance,
-                        on_ground: entity.on_ground,
-                        no_gravity: entity.motion.no_gravity,
-                        time: entity.motion.age,
-                        drop_item: entity.drop_item,
-                        cancel_drop: entity.cancel_drop,
-                    },
-                )
+                let uuid = created.uuid.expect("validated UUID");
+                let state = crate::saved_falling_block::FallingSaveState {
+                    position: entity.motion.position,
+                    velocity: entity.motion.velocity,
+                    fall_distance: entity.fall_distance,
+                    on_ground: entity.on_ground,
+                    no_gravity: entity.motion.no_gravity,
+                    time: entity.motion.age,
+                    drop_item: entity.drop_item,
+                    cancel_drop: entity.cancel_drop,
+                };
+                if let Some(body) = &entity.stalactite {
+                    crate::saved_falling_block::draft_created_stalactite(uuid, body, state)
+                } else {
+                    crate::saved_falling_block::draft_created(uuid, entity.kind.id(), state)
+                }
             })
             .collect::<anyhow::Result<_>>()?;
         let created_removals = self.dropped_items.created_removal_effects(positions);
@@ -20448,7 +20450,7 @@ impl LoadedSession {
                 cancel_drop: false,
                 on_ground: false,
                 source: None,
-                created: None,
+                created: Some(CreatedFallingSand::new(absolute, motion.position)),
             });
             spawned += 1;
             if tip {
@@ -79919,6 +79921,178 @@ pub(crate) mod tests {
                     assert_eq!(fields[3].parse::<i32>().unwrap(), length, "{row}");
                 }
             }
+        }
+    }
+
+    fn spawned_stalactite_draft_session(name: &str, wet: bool) -> LoadedSession {
+        let mut session = session();
+        session.set_speleothem_tags(test_speleothem_tags());
+        session.set_entity_drops(false);
+        session.motion.position = DVec3::new(12.5, 1.0, 12.5);
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let top = IVec3::new(8, 10, 8);
+        for (i, thickness) in ["middle", "frustum", "tip"].into_iter().enumerate() {
+            let id = session.intern_block(state(
+                name,
+                &[
+                    ("vertical_direction", "down"),
+                    ("thickness", thickness),
+                    ("waterlogged", if wet { "true" } else { "false" }),
+                ],
+            ));
+            assert!(session.set_with_notify(top - IVec3::Y * i as i32, id, false));
+        }
+        let absolute = session.origin + top;
+        session.schedule_speleothem(absolute, SpeleothemKind::from_id(name).unwrap(), 1);
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(session.falling_sand.len(), 3);
+        session
+    }
+
+    #[test]
+    fn spawned_stalactite_chains_prepare_tracked_entity_drafts() {
+        use native_persistence::nbt::Tag;
+
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for wet in [false, true] {
+                let mut session = spawned_stalactite_draft_session(name, wet);
+                let home = session.player_chunk().unwrap();
+                assert!(session.draft_tracked_entity_chunks().is_err());
+                session.advance_falling_sand();
+                if wet {
+                    assert!(session.draft_tracked_entity_chunks().is_err());
+                    assert!(session.falling_sand.iter().all(|entity| {
+                        entity
+                            .created
+                            .as_ref()
+                            .is_some_and(|created| !created.valid)
+                    }));
+                    continue;
+                }
+                let drafts = session.draft_tracked_entity_chunks().unwrap();
+                let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities")
+                else {
+                    panic!("missing entity list")
+                };
+                assert_eq!(values.len(), 3);
+                for (index, (saved, entity)) in values.iter().zip(&session.falling_sand).enumerate()
+                {
+                    let saved = crate::saved_falling_block::read(saved).unwrap().unwrap();
+                    let body = entity.stalactite.as_ref().unwrap();
+                    assert_eq!(saved.uuid, entity.created.as_ref().unwrap().uuid);
+                    assert_eq!(saved.block, *body.block());
+                    assert_eq!(saved.block.properties["waterlogged"], "false");
+                    assert_eq!(saved.position, entity.motion.position);
+                    assert_eq!(saved.velocity, entity.motion.velocity);
+                    assert_eq!(saved.time, 1);
+                    assert_eq!(saved.hurt_entities, Some(index == 2));
+                    assert_eq!(
+                        saved.fall_damage.per_distance,
+                        if index == 2 { 6.0 } else { 0.0 }
+                    );
+                    assert_eq!(saved.fall_damage.maximum, 40);
+                }
+                assert!(session.validate_speleothem_updates().is_err());
+                for _ in 0..80 {
+                    session.advance_falling_sand();
+                    if session.falling_sand.is_empty() {
+                        break;
+                    }
+                }
+                assert!(session.falling_sand.is_empty());
+                assert_eq!(session.removed_falling_sand.len(), 3);
+                assert!(!session.uncoordinated_falling_lifecycle);
+                let drafts = session.draft_tracked_entity_chunks().unwrap();
+                let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities")
+                else {
+                    panic!("missing entity list")
+                };
+                assert!(values.is_empty());
+                assert!(session.validate_speleothem_updates().is_err());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn spawned_stalactite_entity_drafts_are_decoded_by_java() {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let source = temp.path().join("StalactiteSessionDraftOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/StalactiteSessionDraftOracle.java"),
+        )
+        .unwrap();
+        let check = |output: std::process::Output| {
+            assert!(
+                output.status.success(),
+                "Java stalactite draft oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        check(
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source)
+                .output()
+                .unwrap(),
+        );
+        for name in ["pointed_dripstone", "sulfur_spike"] {
+            let mut session = spawned_stalactite_draft_session(&format!("minecraft:{name}"), false);
+            session.advance_falling_sand();
+            let home = session.player_chunk().unwrap();
+            let drafts = session.draft_tracked_entity_chunks().unwrap();
+            let entity_path = temp.path().join(format!("{name}.nbt"));
+            std::fs::write(
+                &entity_path,
+                native_persistence::nbt::write(drafts[&home].document()).unwrap(),
+            )
+            .unwrap();
+            check(
+                Command::new(java.join("java.exe"))
+                    .arg("-cp")
+                    .arg(&classpath)
+                    .arg("StalactiteSessionDraftOracle")
+                    .arg(entity_path)
+                    .arg(name)
+                    .output()
+                    .unwrap(),
+            );
         }
     }
 

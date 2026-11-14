@@ -389,6 +389,21 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut soil_cover_checked = 0usize;
     let mut partial_support_checked = 0usize;
     let mut snow_checked = 0usize;
+    let expected_generated_shapes = BTreeMap::from([
+        ("minecraft:cinnabar", 1),
+        ("minecraft:sulfur", 1),
+        ("minecraft:spawner", 1),
+        ("minecraft:potent_sulfur", 5),
+        ("minecraft:cobweb", 1),
+        ("minecraft:bush", 1),
+        ("minecraft:bubble_column", 2),
+        ("minecraft:leaf_litter", 16),
+        ("minecraft:rail", 20),
+        ("minecraft:powered_rail", 24),
+        ("minecraft:detector_rail", 24),
+        ("minecraft:activator_rail", 24),
+    ]);
+    let mut generated_shapes = BTreeMap::new();
     let mut failures = Vec::new();
     for entry in records.as_array().unwrap() {
         let id = entry["id"].as_str().unwrap();
@@ -436,6 +451,18 @@ fn implemented_collision_shapes_match_vanilla_states() {
             name: id.to_owned(),
             properties,
         };
+        if expected_generated_shapes.contains_key(id) {
+            assert!(
+                block_shape(&state).is_some(),
+                "missing generated collision: {state:?}"
+            );
+            assert!(
+                block_outline(&state).is_some(),
+                "missing generated outline: {state:?}"
+            );
+            assert_eq!(entry["dynamic"].as_bool(), Some(false), "{state:?}");
+            *generated_shapes.entry(id).or_insert(0) += 1;
+        }
         if id == "minecraft:glow_lichen" {
             assert_eq!(block_shape(&state), Some(Vec::new()), "{state:?}");
             assert!(block_outline(&state).is_some(), "{state:?}");
@@ -713,6 +740,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
         }
     }
     assert!(checked > 1000, "only {checked} states were checked");
+    assert_eq!(generated_shapes, expected_generated_shapes);
     assert_eq!(glow_lichen_checked, 128, "glow lichen states missing");
     assert!(
         multiface_checked > 1_000,

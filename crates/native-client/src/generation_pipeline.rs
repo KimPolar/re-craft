@@ -653,6 +653,15 @@ mod tests {
                     .loaded()
                     .context("reopened terrain is missing")?;
                 assert!(!reopened_world.chunks.is_empty());
+                for (_, state) in reopened_world.states() {
+                    let collision = native_world::collision::block_shape(state).is_none();
+                    let outline = native_world::collision::block_outline(state).is_none();
+                    if collision || outline {
+                        eprintln!(
+                            "unsupported shape: collision={collision} outline={outline} {state:?}"
+                        );
+                    }
+                }
                 assert_eq!(
                     player_area
                         .missing

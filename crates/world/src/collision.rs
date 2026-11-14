@@ -731,6 +731,42 @@ fn pressure_plate_validates_state_and_pressed_outline() {
     assert_eq!(pressure_plate_pressed(&plate), None);
 }
 
+#[cfg(test)]
+#[test]
+fn generated_rails_and_leaf_litter_use_distinct_targeting_shapes() {
+    use std::collections::BTreeMap;
+    let mut rail = BlockState {
+        name: "minecraft:rail".into(),
+        properties: BTreeMap::from([
+            ("shape".into(), "ascending_east".into()),
+            ("waterlogged".into(), "false".into()),
+        ]),
+    };
+    assert!(block_shape(&rail).unwrap().is_empty());
+    assert_eq!(block_outline(&rail).unwrap()[0].max.y, 0.5);
+    rail.properties.insert("shape".into(), "south_east".into());
+    assert_eq!(block_outline(&rail).unwrap()[0].max.y, 0.125);
+    rail.name = "minecraft:powered_rail".into();
+    rail.properties.insert("powered".into(), "true".into());
+    assert!(block_shape(&rail).is_none());
+    assert!(block_outline(&rail).is_none());
+
+    let mut leaf = BlockState {
+        name: "minecraft:leaf_litter".into(),
+        properties: BTreeMap::from([
+            ("facing".into(), "south".into()),
+            ("segment_amount".into(), "1".into()),
+        ]),
+    };
+    assert!(block_shape(&leaf).unwrap().is_empty());
+    assert_eq!(
+        block_outline(&leaf),
+        Some(vec![pixel_box(8.0, 0.0, 8.0, 16.0, 1.0, 16.0)])
+    );
+    leaf.properties.insert("segment_amount".into(), "0".into());
+    assert!(block_outline(&leaf).is_none());
+}
+
 /// Full-face support for the currently verified block families. Some blocks
 /// override the support shape, so unknown families must not be inferred from
 /// collision geometry alone.
@@ -1292,6 +1328,54 @@ pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
         )
 }
 
+fn rail_ascending(state: &BlockState) -> Option<bool> {
+    let powered = match state.name.as_str() {
+        "minecraft:rail" => false,
+        "minecraft:powered_rail" | "minecraft:detector_rail" | "minecraft:activator_rail" => true,
+        _ => return None,
+    };
+    if state.properties.len() != if powered { 3 } else { 2 }
+        || !matches!(
+            state.properties.get("waterlogged").map(String::as_str),
+            Some("true" | "false")
+        )
+        || (powered
+            && !matches!(
+                state.properties.get("powered").map(String::as_str),
+                Some("true" | "false")
+            ))
+    {
+        return None;
+    }
+    match state.properties.get("shape")?.as_str() {
+        "north_south" | "east_west" => Some(false),
+        "ascending_east" | "ascending_west" | "ascending_north" | "ascending_south" => Some(true),
+        "south_east" | "south_west" | "north_west" | "north_east" if !powered => Some(false),
+        _ => None,
+    }
+}
+
+fn bubble_column_state(state: &BlockState) -> bool {
+    state.name == "minecraft:bubble_column"
+        && state.properties.len() == 1
+        && matches!(
+            state.properties.get("drag").map(String::as_str),
+            Some("true" | "false")
+        )
+}
+
+fn potent_sulfur_state(state: &BlockState) -> bool {
+    state.name == "minecraft:potent_sulfur"
+        && state.properties.len() == 1
+        && matches!(
+            state
+                .properties
+                .get("potent_sulfur_state")
+                .map(String::as_str),
+            Some("dry" | "wet" | "dormant" | "erupting" | "continuous")
+        )
+}
+
 fn crop_outline_height(state: &BlockState) -> Option<f32> {
     let (max, step) = match state.name.as_str() {
         "minecraft:wheat" => (7, 2),
@@ -1492,6 +1576,12 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if rail_ascending(state).is_some() || bubble_column_state(state) {
+        return Some(EMPTY.to_vec());
+    }
+    if potent_sulfur_state(state) {
+        return Some(FULL.to_vec());
+    }
     if tripwire_attached(state).is_some() || tripwire_hook_facing(state).is_some() {
         return Some(EMPTY.to_vec());
     }
@@ -1805,8 +1895,14 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
             .is_empty()
             .then(|| vec![cuboid(0.0, 0.0, 0.0, 1.0, 14.0 / 16.0, 1.0)]);
     }
-    if matches!(id, "lodestone" | "magma_block") {
+    if matches!(
+        id,
+        "lodestone" | "magma_block" | "cinnabar" | "sulfur" | "spawner"
+    ) {
         return state.properties.is_empty().then(|| FULL.to_vec());
+    }
+    if matches!(id, "cobweb" | "bush") {
+        return state.properties.is_empty().then(|| EMPTY.to_vec());
     }
     if id == "straw_bed" {
         return straw_bed(state);
@@ -1824,7 +1920,6 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
             | "void_air"
             | "water"
             | "lava"
-            | "bubble_column"
             | "fire"
             | "soul_fire"
             | "kelp"
@@ -2025,6 +2120,38 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    if let Some(ascending) = rail_ascending(state) {
+        return Some(vec![pixel_box(
+            0.0,
+            0.0,
+            0.0,
+            16.0,
+            if ascending { 8.0 } else { 2.0 },
+            16.0,
+        )]);
+    }
+    if bubble_column_state(state) {
+        return Some(EMPTY.to_vec());
+    }
+    if valid_leaf_litter(state) {
+        let amount = state.properties["segment_amount"].as_str();
+        let facing = state.properties["facing"].as_str();
+        let bounds = match (facing, amount) {
+            (_, "3" | "4") => (0.0, 0.0, 16.0, 16.0),
+            ("north", "1") => (0.0, 0.0, 8.0, 8.0),
+            ("north", "2") => (0.0, 0.0, 8.0, 16.0),
+            ("south", "1") => (8.0, 8.0, 16.0, 16.0),
+            ("south", "2") => (8.0, 0.0, 16.0, 16.0),
+            ("west", "1") => (0.0, 8.0, 8.0, 16.0),
+            ("west", "2") => (0.0, 8.0, 16.0, 16.0),
+            ("east", "1") => (8.0, 0.0, 16.0, 8.0),
+            ("east", "2") => (0.0, 0.0, 16.0, 8.0),
+            _ => unreachable!("validated leaf litter state"),
+        };
+        return Some(vec![pixel_box(
+            bounds.0, 0.0, bounds.1, bounds.2, 1.0, bounds.3,
+        )]);
+    }
     if let Some(attached) = tripwire_attached(state) {
         return Some(vec![if attached {
             pixel_box(0.0, 1.0, 0.0, 16.0, 2.5, 16.0)
@@ -2058,6 +2185,15 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
         return Some(vec![cuboid(0.0, 0.0, 0.0, 1.0, height, 1.0)]);
     }
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "cobweb" {
+        return state.properties.is_empty().then(|| FULL.to_vec());
+    }
+    if id == "bush" {
+        return state
+            .properties
+            .is_empty()
+            .then(|| vec![pixel_box(0.0, 0.0, 0.0, 16.0, 13.0, 16.0)]);
+    }
     if id == "cactus" {
         return age_0_to_15(state).then(|| vec![pixel_box(1.0, 0.0, 1.0, 15.0, 16.0, 15.0)]);
     }

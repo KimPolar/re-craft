@@ -563,6 +563,95 @@ type ItemDamageRules = (
     Arc<native_resources::enchantments::OxygenEnchantments>,
 );
 
+/// BundleItem.onDestroyed drops each contained stack as a separate item.
+/// Keep the serialized order and reject ambiguous component patches.
+fn destroyed_bundle_contents(stack: &ItemStack) -> anyhow::Result<Vec<ItemStack>> {
+    use anyhow::{Context, bail, ensure};
+    use native_persistence::nbt::TagType;
+    let Some(path) = stack.id().strip_prefix("minecraft:") else {
+        return Ok(Vec::new());
+    };
+    let is_bundle = path == "bundle"
+        || path.strip_suffix("_bundle").is_some_and(|color| {
+            matches!(
+                color,
+                "white"
+                    | "orange"
+                    | "magenta"
+                    | "light_blue"
+                    | "yellow"
+                    | "lime"
+                    | "pink"
+                    | "gray"
+                    | "light_gray"
+                    | "cyan"
+                    | "purple"
+                    | "blue"
+                    | "brown"
+                    | "green"
+                    | "red"
+                    | "black"
+            )
+        });
+    if !is_bundle {
+        return Ok(Vec::new());
+    }
+    let Tag::Compound(fields) = stack.components() else {
+        bail!("bundle components are not a compound");
+    };
+    let mut contents = None;
+    let mut removed = false;
+    for (name, value) in fields {
+        if name.matches("minecraft:bundle_contents") {
+            ensure!(
+                contents.replace(value).is_none(),
+                "duplicate bundle contents"
+            );
+        } else if name.matches("!minecraft:bundle_contents") {
+            ensure!(!removed, "duplicate removed bundle contents");
+            removed = true;
+        }
+    }
+    ensure!(
+        !(removed && contents.is_some()),
+        "conflicting bundle contents patch"
+    );
+    let Some(contents) = contents else {
+        return Ok(Vec::new());
+    };
+    let Tag::List {
+        element_type,
+        values,
+    } = contents
+    else {
+        bail!("bundle contents are not a list");
+    };
+    ensure!(
+        *element_type == TagType::Compound || values.is_empty(),
+        "bundle items are not compounds"
+    );
+    values
+        .iter()
+        .map(|entry| {
+            let Tag::Compound(fields) = entry else {
+                bail!("bundle item is not a compound")
+            };
+            let mut names = std::collections::BTreeSet::new();
+            ensure!(
+                fields.iter().all(|(name, _)| names.insert(name.0.clone())),
+                "duplicate bundle item field"
+            );
+            ensure!(
+                fields.iter().all(|(name, _)| ["id", "count", "components"]
+                    .iter()
+                    .any(|key| name.matches(key))),
+                "unknown bundle item field"
+            );
+            crate::player_data::read_stack(entry).context("invalid bundle item")
+        })
+        .collect()
+}
+
 fn apply_cactus_contact(
     entity: &mut ItemEntity,
     rules: &ItemDamageRules,
@@ -698,6 +787,7 @@ pub(crate) struct ItemEntities {
     // until the session is restarted instead of accepting partial save drafts.
     unresolved_rain_effect: bool,
     unresolved_cactus_effect: bool,
+    unresolved_destroyed_bundle: bool,
     random: LegacyRandom,
     entity_seeder: Option<native_core::random::XoroshiroRandom>,
     entity_seed_checked: bool,
@@ -726,6 +816,7 @@ impl Default for ItemEntities {
             uncoordinated_saved_merge: false,
             unresolved_rain_effect: false,
             unresolved_cactus_effect: false,
+            unresolved_destroyed_bundle: false,
             random: LegacyRandom::new(0),
             entity_seeder: None,
             entity_seed_checked: false,
@@ -858,6 +949,10 @@ impl ItemEntities {
         anyhow::ensure!(
             !self.unresolved_cactus_effect,
             "item cactus damage events or destruction effects cannot yet be saved"
+        );
+        anyhow::ensure!(
+            !self.unresolved_destroyed_bundle,
+            "destroyed bundle contents cannot yet be safely saved"
         );
         Ok(())
     }
@@ -1675,6 +1770,12 @@ impl ItemEntities {
     /// ItemEntity created by Entity.spawnAtLocation. The random stream is
     /// still session-local; the saved Java entity RNG is not yet reproduced.
     pub(crate) fn spawn_from_entity(&mut self, position: DVec3, stack: ItemStack) {
+        self.spawn_with_pickup_delay(position, stack, 10);
+    }
+
+    /// ItemUtils.onContainerDestroyed constructs ItemEntity directly, without
+    /// the pickup delay added by Entity.spawnAtLocation.
+    fn spawn_with_pickup_delay(&mut self, position: DVec3, stack: ItemStack, pickup_delay: i32) {
         let (uuid, bob_offset, yaw, mut entity_random) = self.item_visuals();
         let velocity = DVec3::new(
             entity_random.next_double() * 0.2 - 0.1,
@@ -1694,7 +1795,7 @@ impl ItemEntities {
             velocity,
             on_ground: false,
             ground_without_support: false,
-            pickup_delay: 10,
+            pickup_delay,
             lifetime: 0,
             no_gravity: false,
             owner: None,
@@ -2552,6 +2653,7 @@ impl ItemEntities {
         let damage_rules = &self.damage_rules;
         let mut removed = vec![false; self.entities.len()];
         let mut created_removal_causes = vec![None; self.entities.len()];
+        let mut destroyed_bundle_items = Vec::new();
         // For large populations, index the horizontal block cell. A one-cell
         // halo contains every possible merge candidate; section traversal
         // order is applied after the spatial search.
@@ -2634,8 +2736,18 @@ impl ItemEntities {
             if let Some(rules) = damage_rules
                 && apply_fire_tick(entity, rules, contacts.lava.depth > 0.0).unwrap_or(false)
             {
-                removed[index] = true;
-                continue;
+                match destroyed_bundle_contents(&entity.item.stack) {
+                    Ok(items) => {
+                        self.unresolved_destroyed_bundle |= !items.is_empty();
+                        destroyed_bundle_items.push((entity.item.position, items));
+                        removed[index] = true;
+                        continue;
+                    }
+                    Err(_) => {
+                        self.unresolved_destroyed_bundle = true;
+                        entity._damage_state.health = 1;
+                    }
+                }
             }
             entity.velocity = contacts.water.push_entity(entity.velocity, 0.014);
             entity.velocity = contacts.lava.push_entity(
@@ -2808,7 +2920,19 @@ impl ItemEntities {
                                             ));
                                         }
                                         if destroyed {
-                                            removed[index] = true;
+                                            match destroyed_bundle_contents(&entity.item.stack) {
+                                                Ok(items) => {
+                                                    self.unresolved_destroyed_bundle |=
+                                                        !items.is_empty();
+                                                    destroyed_bundle_items
+                                                        .push((entity.item.position, items));
+                                                    removed[index] = true;
+                                                }
+                                                Err(_) => {
+                                                    self.unresolved_destroyed_bundle = true;
+                                                    entity._damage_state.health = 1;
+                                                }
+                                            }
                                             break;
                                         }
                                     }
@@ -2885,7 +3009,17 @@ impl ItemEntities {
                         if let Some(rules) = damage_rules
                             && apply_lava_contact(entity, rules).unwrap_or(false)
                         {
-                            removed[index] = true;
+                            match destroyed_bundle_contents(&entity.item.stack) {
+                                Ok(items) => {
+                                    self.unresolved_destroyed_bundle |= !items.is_empty();
+                                    destroyed_bundle_items.push((entity.item.position, items));
+                                    removed[index] = true;
+                                }
+                                Err(_) => {
+                                    self.unresolved_destroyed_bundle = true;
+                                    entity._damage_state.health = 1;
+                                }
+                            }
                             break;
                         }
                     }
@@ -3110,6 +3244,11 @@ impl ItemEntities {
             index += 1;
             keep
         });
+        for (position, items) in destroyed_bundle_items {
+            for item in items {
+                self.spawn_with_pickup_delay(position, item, 0);
+            }
+        }
     }
 
     fn merge_neighbours(
@@ -4594,6 +4733,48 @@ mod tests {
     }
 
     #[test]
+    fn destroyed_bundles_decode_contents_in_order() {
+        let item = |id: &str, count: i32| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("count".into(), Tag::Int(count)),
+            ])
+        };
+        let components = Tag::Compound(vec![(
+            "minecraft:bundle_contents".into(),
+            Tag::List {
+                element_type: native_persistence::nbt::TagType::Compound,
+                values: vec![item("minecraft:stone", 3), item("minecraft:dirt", 2)],
+            },
+        )]);
+        for id in [
+            "minecraft:bundle",
+            "minecraft:red_bundle",
+            "minecraft:light_blue_bundle",
+        ] {
+            let bundle = ItemStack::new(id.into(), 1, 1, components.clone()).unwrap();
+            let contents = destroyed_bundle_contents(&bundle).unwrap();
+            assert_eq!(
+                contents
+                    .iter()
+                    .map(|item| (item.id(), item.count()))
+                    .collect::<Vec<_>>(),
+                vec![("minecraft:stone", 3), ("minecraft:dirt", 2)]
+            );
+        }
+        let other = ItemStack::new("minecraft:stone".into(), 1, 64, components.clone()).unwrap();
+        assert!(destroyed_bundle_contents(&other).unwrap().is_empty());
+        let malformed = ItemStack::new(
+            "minecraft:bundle".into(),
+            1,
+            1,
+            Tag::Compound(vec![("minecraft:bundle_contents".into(), Tag::Int(1))]),
+        )
+        .unwrap();
+        assert!(destroyed_bundle_contents(&malformed).is_err());
+    }
+
+    #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]
     fn lava_contact_uses_vanilla_resistance_and_saved_health() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -4799,6 +4980,123 @@ mod tests {
         tick_contact(&mut immune, &mut inventory);
         assert_eq!(immune.drain_vibrations().count(), 0);
         assert!(immune.ensure_rain_resolved().is_ok());
+        let bundle_source = temp.path().join("BundleDestroyedOracle.java");
+        let bundle_result = temp.path().join("bundle.json");
+        std::fs::write(
+            &bundle_source,
+            include_str!("../tests/java/BundleDestroyedOracle.java"),
+        )
+        .unwrap();
+        run(std::process::Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&bundle_source));
+        run(std::process::Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("BundleDestroyedOracle")
+            .arg(&bundle_result));
+        let bundle_oracle: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(bundle_result).unwrap()).unwrap();
+        for cause in ["cactus", "lava", "fire"] {
+            let item = |id: &str, count: i32| {
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String(id.into())),
+                    ("count".into(), Tag::Int(count)),
+                ])
+            };
+            let components = Tag::Compound(vec![(
+                "minecraft:bundle_contents".into(),
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::Compound,
+                    values: vec![item("minecraft:stone", 3), item("minecraft:dirt", 2)],
+                },
+            )]);
+            let mut items = ItemEntities::default();
+            items.set_damage_rules(Arc::clone(&rules.0), Arc::clone(&rules.1));
+            items.spawn_from_entity(
+                DVec3::new(3.5, 5.8, 4.5),
+                ItemStack::new("minecraft:bundle".into(), 1, 1, components).unwrap(),
+            );
+            items.entities[0].velocity = DVec3::ZERO;
+            items.entities[0].no_gravity = true;
+            items.entities[0]._damage_state.health = 1;
+            if cause == "fire" {
+                items.entities[0]._damage_state.fire_ticks = 20;
+            }
+            items.tick_with_fluid_bubbles_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                &mut inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| {
+                    Some(if cause == "lava" {
+                        vec![native_world::fluid::FluidKind::Lava]
+                    } else {
+                        Vec::new()
+                    })
+                },
+                |_, _| false,
+                |_| Some(false),
+                |_, _, _| Some(Vec::new()),
+                |_| {},
+                |_, _, _| Some(usize::from(cause == "cactus")),
+            );
+            assert_eq!(items.entities.len(), bundle_oracle.len(), "{cause}");
+            assert!(items.unresolved_destroyed_bundle, "{cause}");
+            assert!(items.ensure_rain_resolved().is_err(), "{cause}");
+            for (actual, expected) in items.entities.iter().zip(&bundle_oracle) {
+                assert_eq!(
+                    actual.item.stack.id(),
+                    expected["id"].as_str().unwrap(),
+                    "{cause}"
+                );
+                assert_eq!(
+                    u64::from(actual.item.stack.count()),
+                    expected["count"].as_u64().unwrap(),
+                    "{cause}"
+                );
+                assert_eq!(
+                    actual.item.position.to_array(),
+                    [
+                        expected["x"].as_f64().unwrap(),
+                        expected["y"].as_f64().unwrap(),
+                        expected["z"].as_f64().unwrap()
+                    ],
+                    "{cause}"
+                );
+                assert_eq!(
+                    actual.pickup_delay > 0,
+                    expected["pickup_delay"].as_bool().unwrap(),
+                    "{cause}"
+                );
+            }
+        }
+        let mut malformed = ItemEntities::default();
+        malformed.set_damage_rules(Arc::clone(&rules.0), Arc::clone(&rules.1));
+        malformed.spawn_from_entity(
+            DVec3::new(8.5, 10.0, 8.5),
+            ItemStack::new(
+                "minecraft:bundle".into(),
+                1,
+                1,
+                Tag::Compound(vec![("minecraft:bundle_contents".into(), Tag::Int(1))]),
+            )
+            .unwrap(),
+        );
+        malformed.entities[0]._damage_state.health = 1;
+        tick_contact(&mut malformed, &mut inventory);
+        assert_eq!(malformed.entities.len(), 1);
+        assert_eq!(malformed.entities[0].item.stack.id(), "minecraft:bundle");
+        assert!(malformed.unresolved_destroyed_bundle);
+        assert!(malformed.ensure_rain_resolved().is_err());
         let rain_oracle: Vec<bool> =
             serde_json::from_slice(&std::fs::read(rain_result).unwrap()).unwrap();
         let mut index = 0;

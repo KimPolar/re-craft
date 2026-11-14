@@ -1748,6 +1748,17 @@ fn liquid_state(state: &BlockState) -> Result<Option<native_world::fluid::FluidS
     native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)
 }
 
+fn bubble_column_drag(state: &BlockState) -> Option<bool> {
+    if state.name != "minecraft:bubble_column" || state.properties.len() != 1 {
+        return None;
+    }
+    match state.properties.get("drag")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 // Java's upward wet tips have no effect on merged fluid faces against the
 // supported water-flow shapes. Other thicknesses can occlude a stair face.
 fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
@@ -1986,6 +1997,14 @@ impl GeneratedBlockView<'_> {
         }
         if wet_upward_speleothem_tip(state) {
             return Cell::OpenWater(native_world::fluid::FluidState {
+                kind: native_world::fluid::FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            });
+        }
+        if bubble_column_drag(state).is_some() {
+            return Cell::BubbleWater(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
                 amount: 8,
                 source: true,
@@ -3250,6 +3269,7 @@ impl GeneratedBlockView<'_> {
                     Cell::Air
                         | Cell::Solid
                         | Cell::Fluid(_)
+                        | Cell::BubbleWater(_)
                         | Cell::FenceDry
                         | Cell::FenceWater(_)
                         | Cell::Ladder { .. }
@@ -3358,6 +3378,17 @@ impl GeneratedBlockView<'_> {
                 if updated != state {
                     self.destroy_ladder(p.to_array(), &state, depth - 1)?;
                 }
+            } else if bubble_column_drag(&state).is_some() {
+                let direction = [-d[0], -d[1], -d[2]];
+                self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
+            } else if supported_speleothem(&state) {
+                let direction = [-d[0], -d[1], -d[2]];
+                let updated =
+                    self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
+                ensure!(
+                    updated == state,
+                    "water change needs speleothem shape callbacks"
+                );
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
@@ -3506,6 +3537,7 @@ impl GeneratedBlockView<'_> {
                     Cell::Air
                         | Cell::Solid
                         | Cell::Fluid(_)
+                        | Cell::BubbleWater(_)
                         | Cell::FenceDry
                         | Cell::FenceWater(_)
                         | Cell::Ladder { .. }
@@ -3551,6 +3583,15 @@ impl GeneratedBlockView<'_> {
                 if updated != state {
                     self.destroy_ladder(neighbor, &state, depth - 1)?;
                 }
+            } else if bubble_column_drag(&state).is_some() {
+                self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
+            } else if supported_speleothem(&state) {
+                let updated =
+                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
+                ensure!(
+                    updated == state,
+                    "water change needs speleothem shape callbacks"
+                );
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let next =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
@@ -4201,6 +4242,37 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if bubble_column_drag(state).is_some() {
+            self.schedule_contained_water(pos)?;
+            let support = self.read([
+                pos[0],
+                pos[1].checked_sub(1).context("bubble support overflow")?,
+                pos[2],
+            ])?;
+            ensure!(
+                support.name != "minecraft:bubble_column" || bubble_column_drag(&support).is_some(),
+                "invalid bubble support state"
+            );
+            let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
+            let survives = bubble_column_drag(&support).is_some() || tags.enables(&support.name);
+            let changed_below = direction == [0, -1, 0];
+            let occupiable_above = direction == [0, 1, 0]
+                && neighbor.name != "minecraft:bubble_column"
+                && crate::bubble_column::can_occupy(neighbor, tags)?;
+            if !survives || changed_below || occupiable_above {
+                ensure!(
+                    self.ticks.schedule(
+                        TickRegistry::Block,
+                        "minecraft:bubble_column",
+                        pos,
+                        5,
+                        0
+                    )? != ScheduleOutcome::MissingChunk,
+                    "bubble tick container is missing"
+                );
+            }
+            return Ok(state.clone());
+        }
         if supported_speleothem(state) {
             if state.properties["waterlogged"] == "true" {
                 self.schedule_contained_water(pos)?;
@@ -4494,6 +4566,9 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         self.read(pos)
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
+        if bubble_column_drag(state).is_some() {
+            return Ok(self.fluid_cell_from_state(state).contained_fluid());
+        }
         if wet_upward_speleothem_tip(state) {
             return Ok(self.fluid_cell_from_state(state).contained_fluid());
         }
@@ -4581,11 +4656,37 @@ impl crate::bubble_column::ColumnWorld for GeneratedBlockView<'_> {
     }
 
     fn set_block(&mut self, pos: glam::IVec3, state: &BlockState) -> Result<bool> {
+        let old = self.read(pos.to_array())?;
+        if old == *state {
+            return Ok(false);
+        }
+        let source_water = |block: &BlockState| {
+            liquid_state(block).is_ok_and(|fluid| {
+                fluid.is_some_and(|fluid| {
+                    fluid.kind == native_world::fluid::FluidKind::Water && fluid.source
+                })
+            })
+        };
         ensure!(
-            self.read(pos.to_array())? == *state,
-            "bubble-column update requires block callbacks"
+            source_water(&old) || bubble_column_drag(&old).is_some(),
+            "unsupported bubble source"
         );
-        Ok(false)
+        ensure!(
+            source_water(state) || bubble_column_drag(state).is_some(),
+            "unsupported bubble replacement"
+        );
+        ensure!(
+            native_world::block_light::same_light_behavior(&old, state) == Some(true)
+                && native_world::sky_light::same_sky_behavior(&old, state) == Some(true),
+            "bubble conversion changes light behavior"
+        );
+        self.write_postprocessed_state(pos.to_array(), &old, state)?;
+        if source_water(state) {
+            self.schedule_water(pos.to_array(), state)?;
+            self.schedule_water_bubble(pos.to_array(), state)?;
+        }
+        self.update_water_shape_neighbors(pos.to_array(), state, 512)?;
+        Ok(true)
     }
 }
 
@@ -9253,6 +9354,38 @@ mod tests {
                     world.set_block_id(x, y, z, air).unwrap();
                 }
             }
+            "bubble_magma" | "bubble_magma_stack" | "bubble_magma_near" | "bubble_magma_both"
+            | "bubble_magma_spike" | "bubble_magma_guard" => {
+                let magma = world.intern_state(BlockState {
+                    name: "minecraft:magma_block".into(),
+                    properties: BTreeMap::new(),
+                });
+                world.set_block_id(8, 7, 8, magma).unwrap();
+                if case == "bubble_magma_stack" {
+                    world.set_block_id(8, 9, 8, water).unwrap();
+                }
+                if case == "bubble_magma_near" {
+                    world.set_block_id(9, 8, 8, water).unwrap();
+                }
+                if case == "bubble_magma_spike" {
+                    let spike = world.intern_state(BlockState {
+                        name: "minecraft:sulfur_spike".into(),
+                        properties: BTreeMap::from([
+                            ("thickness".into(), "tip".into()),
+                            ("vertical_direction".into(), "up".into()),
+                            ("waterlogged".into(), "true".into()),
+                        ]),
+                    });
+                    world.set_block_id(9, 8, 8, spike).unwrap();
+                }
+                if case == "bubble_magma_guard" {
+                    let sulfur = world.intern_state(BlockState {
+                        name: "minecraft:potent_sulfur".into(),
+                        properties: BTreeMap::from([("potent_sulfur_state".into(), "wet".into())]),
+                    });
+                    world.set_block_id(9, 8, 8, sulfur).unwrap();
+                }
+            }
             "wet_tip_neighbor_sulfur"
             | "wet_tip_neighbor_dripstone"
             | "wet_tip_neighbor_sulfur_merge" => {
@@ -9909,6 +10042,8 @@ mod tests {
             "sulfur",
             "cinnabar",
             "potent_sulfur",
+            "magma_block",
+            "bubble_column",
             "sand",
             "dirt",
             "chest",
@@ -9972,12 +10107,18 @@ mod tests {
         }
         stage.set_bubble_tags(Some(Arc::new(
             native_resources::fluid_tags::BubbleColumnTags::new(
-                if case == "convert_bubble" {
+                if case.starts_with("bubble_magma") {
+                    BTreeSet::from(["minecraft:magma_block".into()])
+                } else if case == "convert_bubble" {
                     BTreeSet::from(["minecraft:dirt".into()])
                 } else {
                     BTreeSet::new()
                 },
-                BTreeSet::new(),
+                if case == "bubble_magma_both" {
+                    BTreeSet::from(["minecraft:magma_block".into()])
+                } else {
+                    BTreeSet::new()
+                },
             ),
         )));
         stage.set_fluid_tags(
@@ -10111,6 +10252,16 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if case == "bubble_magma_guard" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert!(format!("{error:#}").contains("potent sulfur neighbor callbacks"));
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            assert_eq!(stage.world.block(9, 8, 8), source.block(9, 8, 8));
+            assert!(stage.edits.is_empty());
+            return vec!["rolled back".into()];
+        }
         if case == "potent_sulfur_neighbor_guard" {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let error = stage.try_poll(chunk, 1).unwrap_err();
@@ -10537,6 +10688,16 @@ mod tests {
                 ));
             }
         }
+        if case.starts_with("bubble_") {
+            for y in 8..=9 {
+                let state = result.world.block(8, y, 8).unwrap();
+                trace.push(format!(
+                    "column {y} {} {}",
+                    state.name,
+                    state.properties.get("drag").map_or("-", String::as_str)
+                ));
+            }
+        }
         if case.starts_with("ladder_break_") {
             let state = result.world.block(10, 8, 8).unwrap();
             trace.push(format!(
@@ -10568,7 +10729,8 @@ mod tests {
                 state.properties["waterlogged"]
             ));
         }
-        if case.starts_with("marked_stair_corner_")
+        if case.starts_with("bubble_")
+            || case.starts_with("marked_stair_corner_")
             || case == "fence_on_neighbor"
             || case.starts_with("marked_lichen_destroy_")
             || case.starts_with("lava_")
@@ -12077,6 +12239,27 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_bubble_column_matches_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["bubble_column"],
+        );
+        let expected: Vec<_> = [
+            "bubble_magma",
+            "bubble_magma_stack",
+            "bubble_magma_near",
+            "bubble_magma_both",
+            "bubble_magma_spike",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn potent_sulfur_barrier_matches_java_water_postprocessing() {
         let actual = java_results_with_args(
             "GeneratedWaterSpreadPostprocessingOracle",
@@ -12092,6 +12275,11 @@ mod tests {
             water_spread_trace("potent_sulfur_neighbor_guard"),
             ["rolled back"]
         );
+    }
+
+    #[test]
+    fn generated_bubble_column_rolls_back_unsupported_neighbor() {
+        assert_eq!(water_spread_trace("bubble_magma_guard"), ["rolled back"]);
     }
 
     #[test]

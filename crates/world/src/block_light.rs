@@ -420,6 +420,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 },
             )
         }
+        "minecraft:bubble_column" if state.properties.len() == 1 => {
+            boolean("drag")?;
+            (1, 0)
+        }
         _ if crate::collision::full_glass(state) => (0, 0),
         _ if crate::collision::full_terracotta(state) => (15, 0),
         _ if crate::collision::full_concrete(state) => (15, 0),
@@ -1443,6 +1447,27 @@ mod tests {
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn bubble_column_matches_source_water_light_and_validates_drag() {
+        let mut water = state("water", None);
+        water.properties.insert("level".into(), "0".into());
+        let mut bubble = state("bubble_column", None);
+        for drag in ["true", "false"] {
+            bubble.properties.insert("drag".into(), drag.into());
+            assert_eq!(properties(&bubble), Some((1, 0)));
+            assert_eq!(same_light_behavior(&water, &bubble), Some(true));
+            assert_eq!(
+                crate::sky_light::same_sky_behavior(&water, &bubble),
+                Some(true)
+            );
+        }
+        bubble.properties.insert("drag".into(), "invalid".into());
+        assert_eq!(properties(&bubble), None);
+        bubble.properties.insert("drag".into(), "true".into());
+        bubble.properties.insert("extra".into(), "true".into());
+        assert_eq!(properties(&bubble), None);
     }
 
     #[test]

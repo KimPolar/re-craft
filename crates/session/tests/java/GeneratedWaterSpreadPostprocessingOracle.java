@@ -97,6 +97,12 @@ public class GeneratedWaterSpreadPostprocessingOracle {
     }
     static void run(String[] args)throws Exception {
         var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
+        for(boolean drag:new boolean[]{false,true}) {
+            var bubble=Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,drag);
+            var water=Blocks.WATER.defaultBlockState();
+            if(LightEngine.hasDifferentLightProperties(water,bubble) || water.getLightDampening()!=bubble.getLightDampening() || !bubble.getFluidState().isSource())
+                throw new AssertionError("water/bubble light or fluid differs: "+bubble);
+        }
         BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK, Map.of(
             BlockTags.WASHED_AWAY_BY_FLUIDS,List.of(Blocks.AIR.builtInRegistryHolder(),Blocks.WATER.builtInRegistryHolder()),
             BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN,List.of(),BlockTags.ENABLES_BUBBLE_COLUMN_PUSH_UP,List.of(),
@@ -141,6 +147,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone","wet_tip_neighbor_sulfur_merge"));}
         if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack","marked_speleothem_sulfur_down","marked_speleothem_sulfur_falling"));}
         if(args.length>0 && args[0].equals("potent_sulfur_barrier")){scenarios.clear();scenarios.add("barrier_potent_sulfur_wet");}
+        if(args.length>0 && args[0].equals("bubble_column")){scenarios.clear();scenarios.addAll(List.of("bubble_magma","bubble_magma_stack","bubble_magma_near","bubble_magma_both","bubble_magma_spike"));}
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
             if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
@@ -199,6 +206,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             bind.invoke(Fluids.LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_flowing_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_source_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
+            bind.invoke(Blocks.MAGMA_BLOCK.builtInRegistryHolder(),scenario.equals("bubble_magma_both")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN,BlockTags.ENABLES_BUBBLE_COLUMN_PUSH_UP):scenario.startsWith("bubble_magma")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
+            bind.invoke(Blocks.SOUL_SAND.builtInRegistryHolder(),scenario.equals("bubble_soul")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_PUSH_UP):List.of());
             boolean snowyWater=scenario.startsWith("snow_water_");
             boolean snowyFence=scenario.startsWith("snow_fence_");
             boolean tagged=scenario.endsWith("_true");
@@ -308,6 +317,12 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     : BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+scenario.substring("barrier_".length()))).defaultBlockState();
                 for(var p:List.of(pos.below(),pos.north(),pos.south(),pos.west()))blocks.put(p,barrier);
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+            }
+            if(scenario.startsWith("bubble_")) {
+                blocks.put(pos.below(),scenario.equals("bubble_soul")?Blocks.SOUL_SAND.defaultBlockState():Blocks.MAGMA_BLOCK.defaultBlockState());
+                if(scenario.equals("bubble_magma_stack"))blocks.put(pos.above(),Blocks.WATER.defaultBlockState());
+                if(scenario.equals("bubble_magma_near"))blocks.put(pos.east(),Blocks.WATER.defaultBlockState());
+                if(scenario.equals("bubble_magma_spike"))blocks.put(pos.east(),Blocks.SULFUR_SPIKE.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,Direction.UP).setValue(BlockStateProperties.WATERLOGGED,true));
             }
             if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("down_wet_slab")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             if(scenario.equals("down_sand"))blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
@@ -465,10 +480,14 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
                 if(state.getBlock() instanceof FenceBlock)out.printf("fence %d,%d,%d %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(FenceBlock.NORTH),state.getValue(FenceBlock.EAST),state.getValue(FenceBlock.SOUTH),state.getValue(FenceBlock.WEST));
             }
+            if(scenario.startsWith("bubble_"))for(int y=8;y<=9;y++){
+                var s=get(new BlockPos(8,y,8));
+                out.printf("column %d %s %s%n",y,BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.is(Blocks.BUBBLE_COLUMN)?s.getValue(BubbleColumnBlock.DRAG_DOWN):"-");
+            }
             if(scenario.startsWith("ladder_break_")){var s=get(pos.east(2));out.printf("destroyed %s %s%n",BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.getBlock()==Blocks.WATER?s.getValue(LiquidBlock.LEVEL).toString():"-");}
             if(snowyWater || snowyFence){var p=snowyWater?pos.below(2):pos.below();var s=get(p);out.printf("snow %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.getValue(BlockStateProperties.SNOWY));}
             if(scenario.equals("fence_on_neighbor")){var s=get(pos.east(2));out.printf("neighbor %s %s %s %s %s%n",s.getValue(FenceBlock.NORTH),s.getValue(FenceBlock.EAST),s.getValue(FenceBlock.SOUTH),s.getValue(FenceBlock.WEST),s.getValue(BlockStateProperties.WATERLOGGED));}
-            if(scenario.startsWith("marked_stair_corner_")||scenario.equals("fence_on_neighbor")||scenario.startsWith("marked_lichen_destroy_")||scenario.startsWith("lava_")||scenario.startsWith("water_touch_lava_"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
+            if(scenario.startsWith("bubble_")||scenario.startsWith("marked_stair_corner_")||scenario.equals("fence_on_neighbor")||scenario.startsWith("marked_lichen_destroy_")||scenario.startsWith("lava_")||scenario.startsWith("water_touch_lava_"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
             for(var p:fizzEvents)out.printf("fizz %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
             if(scenario.startsWith("water_touch_lava_"))out.printf("reaction 9,7,8 %s%n",BuiltInRegistries.BLOCK.getKey(get(pos.below().east()).getBlock()));
             if(scenario.equals("water_touch_lava_cascade"))out.printf("reaction 7,7,8 %s%n",BuiltInRegistries.BLOCK.getKey(get(pos.below().west()).getBlock()));

@@ -502,6 +502,18 @@ pub(super) fn drain_postprocessing_light(
 }
 
 impl GeneratedPostprocessing {
+    /// Recorded candidates for a registered chunk. A missing outer option
+    /// means the chunk is not registered; an inner `None` means unknown.
+    /// These records alone do not prove sidecar or live-entity completeness.
+    pub fn recorded_entity_candidates(
+        &self,
+        position: ChunkPos,
+    ) -> Option<Option<&[native_persistence::nbt::Tag]>> {
+        self.entity_candidates
+            .get(&position)
+            .map(|records| records.as_deref().map(Vec::as_slice))
+    }
+
     /// Try a bounded pass without exposing partial callbacks on failure.
     /// The caller must preserve Java's callback order when supplying a missing
     /// chunk; merely processing that chunk first is not always equivalent.

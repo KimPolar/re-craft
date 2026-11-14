@@ -172,6 +172,21 @@ impl CarvedTerrainWorld {
         Ok(stage)
     }
 
+    /// Bind recorded proto-entities before callbacks start. `None` means the
+    /// caller could not establish the candidate records. `Some` is not proof
+    /// that saved sidecars or live entities are complete or unchanged.
+    pub fn bind_captured_postprocessing_entity_candidates(
+        &self,
+        stage: &mut GeneratedPostprocessing,
+        candidates: BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.world, &stage.source),
+            "postprocessing terrain revision differs"
+        );
+        stage.set_entity_candidates(candidates)
+    }
+
     /// Resume completed captured callbacks with the same terrain, frozen tags
     /// and light revision. The caller must keep live state unchanged.
     pub fn resume_captured_postprocessing(
@@ -484,6 +499,28 @@ impl CarvedTerrainWorld {
             registry,
         )?;
         stage.register_retry_neighbor(position, converted, entities, heightmaps, light)
+    }
+
+    /// Register a retry neighbor and its already captured proto-entity records.
+    /// The caller must still establish sidecar and live-entity completeness.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_captured_postprocessing_neighbor_with_entities(
+        &self,
+        stage: &mut GeneratedPostprocessing,
+        engine: &StagedGenerationLightEngine,
+        registry: &GeneratedBlockRegistry,
+        position: ChunkPos,
+        converted: ConvertedChunkPostprocessing,
+        heightmaps: FullHeightmaps,
+        candidates: Option<Arc<Vec<native_persistence::nbt::Tag>>>,
+    ) -> Result<()> {
+        self.register_captured_postprocessing_neighbor(
+            stage, engine, registry, position, converted, heightmaps,
+        )?;
+        if let Some(candidates) = candidates {
+            stage.set_registered_entity_candidates(position, candidates);
+        }
+        Ok(())
     }
 
     /// Drain checks recorded by captured postprocessing at an explicit caller

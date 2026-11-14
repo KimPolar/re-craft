@@ -715,6 +715,23 @@ impl CapturedPostprocessingSpawn<'_> {
             Self::Planned(spawn) => spawn.position,
         }
     }
+
+    fn entity_candidates(&self, structure_sources_present: bool) -> Result<Option<Arc<Vec<Tag>>>> {
+        match self {
+            Self::Empty(spawn) => captured_spawn_entity_candidates(
+                spawn.document(),
+                spawn.entity_sidecar_source(),
+                spawn.has_entity_free_feature_coverage(),
+                structure_sources_present,
+            ),
+            Self::Planned(spawn) => captured_spawn_entity_candidates(
+                spawn.document(),
+                spawn.entity_sidecar_source(),
+                spawn.has_entity_free_feature_coverage(),
+                structure_sources_present,
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -753,6 +770,7 @@ impl CapturedPostprocessingProof {
 /// Ordered converted chunks retaining either kind of spawn proof.
 pub(crate) struct CapturedMixedConvertedRegion {
     proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedPostprocessingProof>,
+    entity_candidates: BTreeMap<native_world::loaded::ChunkPos, Option<Arc<Vec<Tag>>>>,
     region: native_session::worldgen::postprocessing::ConvertedPostprocessingRegion,
 }
 
@@ -1276,6 +1294,27 @@ fn captured_generated_entities_are_empty(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Retain candidates only when the captured protochunk covers known generated
+/// sources. A caller must still recheck live entities and all save inputs.
+fn captured_spawn_entity_candidates(
+    document: &NamedTag,
+    entity_sidecar: Option<&NamedTag>,
+    feature_coverage: bool,
+    structure_sources_present: bool,
+) -> Result<Option<Arc<Vec<Tag>>>> {
+    if entity_sidecar.is_some() || !feature_coverage || structure_sources_present {
+        return Ok(None);
+    }
+    let original = unique_root_field(document, "entities")?;
+    let entities = native_persistence::generated_chunk::append_proto_entity_records(original, &[])?;
+    let records = match entities {
+        None => Vec::new(),
+        Some(Tag::List { values, .. }) => values,
+        _ => unreachable!("entity list was validated"),
+    };
+    Ok(Some(Arc::new(records)))
 }
 
 impl CapturedPostprocessedRegion {
@@ -2744,9 +2783,12 @@ impl PreparedExistingGenerator {
         let mut tasks = BTreeMap::new();
         let mut ticks = BTreeMap::new();
         let mut registration = Vec::new();
+        let mut entity_candidates = BTreeMap::new();
         for spawn in spawns {
             let position = spawn.position();
             ensure!(!proofs.contains_key(&position), "duplicate converted chunk");
+            let candidates = spawn
+                .entity_candidates(self.generate_structures || !batch.treasure_starts.is_empty())?;
             let (proof, converted) =
                 self.convert_postprocessing_spawn(batch, light, spawn, inputs)?;
             ensure!(
@@ -2754,6 +2796,7 @@ impl PreparedExistingGenerator {
                 "spawn inputs differ"
             );
             proofs.insert(position, proof);
+            entity_candidates.insert(position, candidates);
             tasks.insert(position, converted.task);
             ticks.insert(position, converted.ticks);
             registration.push(position);
@@ -2761,6 +2804,7 @@ impl PreparedExistingGenerator {
         ensure!(!proofs.is_empty(), "no converted chunks");
         Ok(CapturedMixedConvertedRegion {
             proofs,
+            entity_candidates,
             region: native_session::worldgen::postprocessing::ConvertedPostprocessingRegion {
                 tasks,
                 ticks: native_session::worldgen::chunk_ticks::RegionTicks::new_ordered(
@@ -2817,6 +2861,9 @@ impl PreparedExistingGenerator {
             heightmaps,
             Some(visible),
         )?;
+        batch
+            .terrain
+            .bind_captured_postprocessing_entity_candidates(&mut stage, region.entity_candidates)?;
         stage.set_water_source_conversion(inputs.water_source_conversion)?;
         stage.select_initial_targets(selected)?;
         Ok(CapturedMixedPostprocessingStage {
@@ -2853,6 +2900,8 @@ impl PreparedExistingGenerator {
             !stage.proofs.contains_key(&position),
             "postprocessing chunk is already registered"
         );
+        let candidates = spawn
+            .entity_candidates(self.generate_structures || !batch.treasure_starts.is_empty())?;
         let (proof, converted) = self.convert_postprocessing_spawn(batch, light, spawn, inputs)?;
         ensure!(
             proof.matches_state(batch, light, inputs),
@@ -2862,14 +2911,17 @@ impl PreparedExistingGenerator {
             .terrain_assets
             .as_ref()
             .context("terrain registry is missing")?;
-        batch.terrain.register_captured_postprocessing_neighbor(
-            &mut stage.stage,
-            &light.engine,
-            &assets.blocks,
-            position,
-            converted,
-            proof.heightmaps().clone(),
-        )?;
+        batch
+            .terrain
+            .register_captured_postprocessing_neighbor_with_entities(
+                &mut stage.stage,
+                &light.engine,
+                &assets.blocks,
+                position,
+                converted,
+                proof.heightmaps().clone(),
+                candidates,
+            )?;
         stage.proofs.insert(position, proof);
         stage.waiting_neighbor = None;
         Ok(())
@@ -10736,9 +10788,33 @@ mod tests {
             ],
             inputs,
         )?;
+        assert!(
+            region.entity_candidates[&target]
+                .as_ref()
+                .context("captured candidates missing")?
+                .iter()
+                .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into())))
+        );
+        assert!(
+            region.entity_candidates[&second]
+                .as_ref()
+                .is_some_and(|records| records.is_empty())
+        );
         let before_pass = batch.terrain.snapshot();
         let mut pass =
             actual.run_captured_mixed_postprocessing(&batch, &staged, region, [target], inputs)?;
+        assert!(
+            pass.stage
+                .recorded_entity_candidates(target)
+                .flatten()
+                .context("stage candidates missing")?
+                .iter()
+                .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into())))
+        );
+        assert!(matches!(
+            pass.stage.recorded_entity_candidates(neighbor),
+            None
+        ));
         assert!(pass.matches_state(&batch, &staged, inputs));
         assert!(!pass.matches_state(&batch, &staged, wrong_inputs));
         assert!(
@@ -10771,6 +10847,12 @@ mod tests {
             inputs,
         )?;
         assert_eq!(pass.waiting_neighbor(), None);
+        assert!(
+            pass.stage
+                .recorded_entity_candidates(neighbor)
+                .flatten()
+                .is_some()
+        );
         assert!(pass.try_poll(&batch, &staged, inputs, second, 1).is_err());
         let retry = pass.try_poll(&batch, &staged, inputs, target, 1)?;
         assert_ne!(
@@ -11742,6 +11824,47 @@ mod tests {
             actual
                 .propagate_captured_light(&mut batch, &mut staged, target)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_spawn_candidates_require_complete_known_sources() -> Result<()> {
+        let pig = Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]);
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![pig.clone()],
+                },
+            )]),
+        };
+        let sidecar = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        let records = captured_spawn_entity_candidates(&document, None, true, false)?.unwrap();
+        assert_eq!(records.as_slice(), &[pig]);
+        assert!(
+            captured_spawn_entity_candidates(&document, Some(&sidecar), true, false)?.is_none()
+        );
+        assert!(captured_spawn_entity_candidates(&document, None, false, false)?.is_none());
+        assert!(captured_spawn_entity_candidates(&document, None, true, true)?.is_none());
+        let invalid = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("entities".into(), Tag::Int(7))]),
+        };
+        assert!(captured_spawn_entity_candidates(&invalid, None, true, false).is_err());
+        let empty = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        assert!(
+            captured_spawn_entity_candidates(&empty, None, true, false)?
+                .unwrap()
+                .is_empty()
         );
         Ok(())
     }

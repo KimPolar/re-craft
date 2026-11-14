@@ -350,6 +350,7 @@ pub(crate) struct CapturedStagedLight {
     activated: BTreeSet<native_world::loaded::ChunkPos>,
     light_revision: Arc<()>,
     completed_empty_spawns: BTreeMap<native_world::loaded::ChunkPos, bool>,
+    completed_creature_spawns: BTreeMap<native_world::loaded::ChunkPos, Arc<()>>,
 }
 
 /// An in-memory LIGHT-stage draft for a previously absent terrain chunk.
@@ -425,6 +426,75 @@ impl CapturedSavedLitDraft {
 enum CapturedLitChunkDraft {
     New(CapturedNewLitDraft),
     Saved(CapturedSavedLitDraft),
+}
+
+/// Spawn draft containing planned creature records. It does not authorize a
+/// save or prove that live and uncaptured entity identities are unchanged.
+pub(crate) struct CapturedPlannedSpawn {
+    lit: CapturedLitChunkDraft,
+    position: native_world::loaded::ChunkPos,
+    clocks: BTreeMap<ResourceId, i64>,
+    border: Option<native_session::respawn::RespawnBorder>,
+    completion: Arc<()>,
+}
+
+impl CapturedPlannedSpawn {
+    pub fn document(&self) -> &NamedTag {
+        match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.document(),
+            CapturedLitChunkDraft::Saved(draft) => draft.document(),
+        }
+    }
+
+    pub fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        match (&self.lit, source) {
+            (CapturedLitChunkDraft::New(_), None) => Ok(true),
+            (CapturedLitChunkDraft::Saved(draft), Some(source)) => draft.matches_source(source),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn entity_sidecar_source(&self) -> Option<&NamedTag> {
+        match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.entity_sidecar_source(),
+            CapturedLitChunkDraft::Saved(draft) => draft.entity_sidecar_source(),
+        }
+    }
+
+    pub fn has_entity_free_feature_coverage(&self) -> bool {
+        match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.has_entity_free_feature_coverage(),
+            CapturedLitChunkDraft::Saved(draft) => draft.has_entity_free_feature_coverage(),
+        }
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: Option<native_session::respawn::RespawnBorder>,
+    ) -> bool {
+        let lit_matches = match &self.lit {
+            CapturedLitChunkDraft::New(draft) => draft.matches_state(batch, light),
+            CapturedLitChunkDraft::Saved(draft) => draft.matches_state(batch, light),
+        };
+        lit_matches
+            && spawn_mobs
+            && self.clocks == *clocks
+            && self.border == border
+            && light
+                .completed_creature_spawns
+                .get(&self.position)
+                .is_some_and(|completion| Arc::ptr_eq(completion, &self.completion))
+            && batch
+                .schedule
+                .completed(self.position)
+                .is_some_and(|stage| {
+                    stage >= native_session::worldgen::schedule::GenerationStage::Spawn
+                })
+    }
 }
 
 /// Intermediate SPAWN result with no original mob spawning. The source NBT is
@@ -1274,6 +1344,9 @@ impl CapturedCreaturePlan {
             && !light
                 .completed_empty_spawns
                 .contains_key(&self.inner.position)
+            && !light
+                .completed_creature_spawns
+                .contains_key(&self.inner.position)
     }
 
     /// Advance at most one group, retaining any unresolved candidate.
@@ -1643,6 +1716,7 @@ impl PreparedExistingGenerator {
             activated: BTreeSet::new(),
             light_revision: Arc::new(()),
             completed_empty_spawns: BTreeMap::new(),
+            completed_creature_spawns: BTreeMap::new(),
         })
     }
 
@@ -2009,7 +2083,8 @@ impl PreparedExistingGenerator {
             }
         }
         ensure!(
-            !light.completed_empty_spawns.contains_key(&position),
+            !light.completed_empty_spawns.contains_key(&position)
+                && !light.completed_creature_spawns.contains_key(&position),
             "spawn already completed"
         );
         Ok(())
@@ -3177,8 +3252,85 @@ impl PreparedExistingGenerator {
             z: plan.position.z,
         };
         let mut lit = self.draft_resumed_lit_chunk(world, light, position)?;
-        let records = plan
-            .additions
+        Self::append_creature_records(&mut lit.feature.document, position, &plan.additions)?;
+        schedule.complete(plan.position, GenerationStage::Spawn)?;
+        Ok(ResumedPlannedSpawn {
+            lit,
+            clocks: plan.clocks,
+            border: plan.border,
+        })
+    }
+
+    /// Complete a mixed-terrain creature plan into a source-bound draft.
+    /// Its caller must still check entity identities outside this capture,
+    /// sidecars, live state and all save dependencies before publication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_captured_creatures(
+        &mut self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedStagedLight,
+        plan: &CapturedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: Option<native_session::respawn::RespawnBorder>,
+        last_update: i64,
+    ) -> Result<CapturedPlannedSpawn> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            plan.matches_state(batch, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        ensure!(plan.inner.finished, "creature attempts are incomplete");
+        ensure!(plan.inner.border == border, "creature spawn border differs");
+        self.validate_captured_spawn(batch, light, plan.inner.position)?;
+        let position = native_persistence::world::ChunkPos {
+            x: plan.inner.position.x,
+            z: plan.inner.position.z,
+        };
+        let mut lit = match batch
+            .sources
+            .get(&position)
+            .context("terrain source was not captured")?
+        {
+            None => CapturedLitChunkDraft::New(self.draft_captured_new_lit_chunk(
+                batch,
+                light,
+                position,
+                last_update,
+            )?),
+            Some(_) => CapturedLitChunkDraft::Saved(
+                self.draft_captured_saved_lit_chunk(batch, light, position)?,
+            ),
+        };
+        let document = match &mut lit {
+            CapturedLitChunkDraft::New(draft) => &mut draft.document,
+            CapturedLitChunkDraft::Saved(draft) => &mut draft.document,
+        };
+        Self::append_creature_records(document, position, &plan.inner.additions)?;
+        replace_unique_root_field(document, "Status", Tag::String("minecraft:spawn".into()))?;
+        native_persistence::nbt::write(document)?;
+        batch
+            .schedule
+            .complete(plan.inner.position, GenerationStage::Spawn)?;
+        let completion = Arc::new(());
+        light
+            .completed_creature_spawns
+            .insert(plan.inner.position, Arc::clone(&completion));
+        Ok(CapturedPlannedSpawn {
+            lit,
+            position: plan.inner.position,
+            clocks: plan.inner.clocks.clone(),
+            border: plan.inner.border,
+            completion,
+        })
+    }
+
+    fn append_creature_records(
+        document: &mut NamedTag,
+        position: native_persistence::world::ChunkPos,
+        additions: &[native_session::worldgen::GeneratedEntityAddition],
+    ) -> Result<()> {
+        let records = additions
             .iter()
             .map(|addition| {
                 ensure!(
@@ -3192,19 +3344,14 @@ impl PreparedExistingGenerator {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        let original = unique_root_field(&lit.feature.document, "entities")?;
+        let original = unique_root_field(document, "entities")?;
         if let Some(entities) =
             native_persistence::generated_chunk::append_proto_entity_records(original, &records)?
         {
-            replace_unique_root_field(&mut lit.feature.document, "entities", entities)?;
+            replace_unique_root_field(document, "entities", entities)?;
         }
-        native_persistence::nbt::write(&lit.feature.document)?;
-        schedule.complete(plan.position, GenerationStage::Spawn)?;
-        Ok(ResumedPlannedSpawn {
-            lit,
-            clocks: plan.clocks,
-            border: plan.border,
-        })
+        native_persistence::nbt::write(document)?;
+        Ok(())
     }
 
     /// Check a pending supported creature against the captured terrain and
@@ -9686,6 +9833,155 @@ mod tests {
             break;
         }
         assert!(constructed, "no captured creature reached construction");
+        let saved_schedule = batch.schedule.clone();
+        assert!(
+            actual
+                .finish_captured_creatures(
+                    &mut batch,
+                    &mut staged,
+                    &animal,
+                    true,
+                    &clocks,
+                    Some(changed_border),
+                    42,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            batch.schedule.completed(target),
+            Some(GenerationStage::Light)
+        );
+        // Isolate draft assembly from the remaining deterministic spawn stream.
+        animal.inner.planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+            42,
+            target.x,
+            target.z,
+            true,
+            0.0,
+            Default::default(),
+        )?;
+        assert_eq!(
+            animal.advance(&batch, &staged, true, &clocks)?,
+            native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished,
+        );
+        assert!(
+            actual
+                .finish_captured_creatures(
+                    &mut batch,
+                    &mut staged,
+                    &animal,
+                    true,
+                    &wrong_clocks,
+                    Some(changed_border),
+                    42,
+                )
+                .is_err()
+        );
+        animal.inner.additions[0].block_position[0] += 16;
+        assert!(
+            actual
+                .finish_captured_creatures(
+                    &mut batch,
+                    &mut staged,
+                    &animal,
+                    true,
+                    &clocks,
+                    Some(changed_border),
+                    42,
+                )
+                .is_err()
+        );
+        animal.inner.additions[0].block_position[0] -= 16;
+        assert_eq!(
+            batch.schedule.completed(target),
+            Some(GenerationStage::Light)
+        );
+        let spawn = actual.finish_captured_creatures(
+            &mut batch,
+            &mut staged,
+            &animal,
+            true,
+            &clocks,
+            Some(changed_border),
+            42,
+        )?;
+        assert!(spawn.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
+        assert!(!spawn.matches_state(&batch, &staged, false, &clocks, Some(changed_border)));
+        assert!(!spawn.matches_state(&batch, &staged, true, &wrong_clocks, Some(changed_border)));
+        assert!(spawn.matches_source(None)?);
+        assert!(!spawn.matches_source(Some(&saved))?);
+        assert!(spawn.entity_sidecar_source().is_none());
+        assert!(spawn.has_entity_free_feature_coverage());
+        assert_eq!(
+            spawn.document().value.get("Status"),
+            Some(&Tag::String("minecraft:spawn".into()))
+        );
+        let Some(Tag::List { values, .. }) = spawn.document().value.get("entities") else {
+            bail!("captured creature records missing")
+        };
+        assert!(
+            values
+                .iter()
+                .any(|tag| tag.get("id") == Some(&Tag::String("minecraft:pig".into())))
+        );
+        assert!(
+            actual
+                .draft_captured_empty_spawn(&batch, &staged, saved_target, true, 42)
+                .is_err()
+        );
+        assert!(
+            actual
+                .finish_captured_creatures(
+                    &mut batch,
+                    &mut staged,
+                    &animal,
+                    true,
+                    &clocks,
+                    Some(changed_border),
+                    42,
+                )
+                .is_err()
+        );
+        batch.schedule = saved_schedule;
+        staged.completed_creature_spawns.remove(&target);
+        assert!(!spawn.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
+
+        let mut saved_animal =
+            actual.plan_captured_creatures(&batch, &staged, second, true, &clocks)?;
+        saved_animal.inner.planner =
+            native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+                42,
+                second.x,
+                second.z,
+                true,
+                0.0,
+                Default::default(),
+            )?;
+        assert_eq!(
+            saved_animal.advance(&batch, &staged, true, &clocks)?,
+            native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished,
+        );
+        let saved_schedule = batch.schedule.clone();
+        let saved_spawn = actual.finish_captured_creatures(
+            &mut batch,
+            &mut staged,
+            &saved_animal,
+            true,
+            &clocks,
+            None,
+            42,
+        )?;
+        assert!(saved_spawn.matches_state(&batch, &staged, true, &clocks, None));
+        assert!(saved_spawn.matches_source(Some(&saved))?);
+        assert!(saved_spawn.entity_sidecar_source().is_none());
+        assert!(saved_spawn.has_entity_free_feature_coverage());
+        assert_eq!(
+            saved_spawn.document().value.get("example:root"),
+            Some(&Tag::Int(73))
+        );
+        batch.schedule = saved_schedule;
+        staged.completed_creature_spawns.remove(&second);
+        assert!(!saved_spawn.matches_state(&batch, &staged, true, &clocks, None));
         let light_revision = Arc::clone(&staged.light_revision);
         staged.light_revision = Arc::new(());
         assert!(
@@ -10518,6 +10814,26 @@ mod tests {
                 String::from_utf8_lossy(&checked.stderr)
             );
         }
+        let animal_input = oracle.path().join("captured-planned-animal.nbt");
+        std::fs::write(
+            &animal_input,
+            native_persistence::nbt::write(spawn.document())?,
+        )?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ResumedLightOracle")
+            .arg(&animal_input)
+            .arg(lighting.min_y.to_string())
+            .arg(lighting.height.to_string())
+            .arg("entities:pig")
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java captured animal validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
         assert!(
             actual
                 .propagate_captured_light(&mut batch, &mut staged, target)

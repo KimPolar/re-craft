@@ -59,6 +59,8 @@ mod jigsaw;
 #[cfg(test)]
 mod kelp_tests;
 #[cfg(test)]
+mod magma_aquatic_tests;
+#[cfg(test)]
 mod magma_wood_tests;
 mod mineshaft;
 mod ocean_ruin;
@@ -7775,6 +7777,19 @@ impl SpringWorld for DecorationRegion<'_> {
 
 impl MagmaWorld for DecorationRegion<'_> {
     fn face_is_full(&mut self, state: &BlockState, direction: [i32; 3]) -> Result<bool> {
+        if matches!(
+            state.name.as_str(),
+            "minecraft:seagrass"
+                | "minecraft:tall_seagrass"
+                | "minecraft:kelp"
+                | "minecraft:kelp_plant"
+        ) {
+            ensure!(
+                native_world::block_light::same_light_behavior(state, state).is_some(),
+                "invalid magma neighbor aquatic plant state: {state:?}"
+            );
+            return Ok(false);
+        }
         if state.name == "minecraft:potent_sulfur" {
             ensure!(
                 super::generated_potent_sulfur::is_valid_state(state),
@@ -24812,6 +24827,28 @@ mod tests {
                 "{slab_type}"
             );
             assert_eq!(terrain.snapshot().block(9, 7, 8).unwrap(), &slab);
+        }
+        {
+            let (mut terrain, tags, motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut setup = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut water = state("water");
+            water.properties.insert("level".into(), "0".into());
+            setup.set_section_block([8, 8, 8], &water).unwrap();
+            setup.set_section_block([9, 7, 8], &state("seagrass"))
+                .unwrap();
+            setup.finish().unwrap();
+            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [false]);
+            assert_eq!(
+                terrain.snapshot().block(8, 7, 8).unwrap().name,
+                "minecraft:stone"
+            );
+            assert_eq!(
+                terrain.snapshot().block(9, 7, 8).unwrap().name,
+                "minecraft:seagrass"
+            );
         }
         for source in ["coal_ore", "deepslate_coal_ore"] {
             let (mut terrain, tags, motion, _) = fixture();

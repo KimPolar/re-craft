@@ -821,6 +821,7 @@ pub struct DecorationRegion<'a> {
     lake_block_write: bool,
     magma_block_write: bool,
     monster_room_block_write: bool,
+    geode_block_write: bool,
     failed: bool,
 }
 
@@ -3704,6 +3705,7 @@ impl CarvedTerrainWorld {
             lake_block_write: false,
             magma_block_write: false,
             monster_room_block_write: false,
+            geode_block_write: false,
             failed: false,
         })
     }
@@ -6732,7 +6734,10 @@ impl GeodeEnvironment for DecorationRegion<'_> {
             return Ok(());
         }
         geode_safe_state(&self.read(pos)?)?;
-        self.set_proto_block(pos, state)
+        self.geode_block_write = true;
+        let result = self.set_proto_block(pos, state);
+        self.geode_block_write = false;
+        result
     }
     fn schedule_geode_fluid(&mut self, pos: [i32; 3]) -> Result<()> {
         use native_world::fluid::{FluidKind, FluidState};
@@ -8281,6 +8286,18 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && (lake_source || generated_ore_state(&old)?)
                         && state.name == "minecraft:cave_air"
                         && state.properties.is_empty();
+                    let geode_light_update = self.geode_block_write
+                        && (((lake_source || generated_ore_state(&old)?)
+                            && state.name == "minecraft:air"
+                            && state.properties.is_empty())
+                            || ((old_air
+                                || (old.name == "minecraft:oak_fence"
+                                    && native_world::collision::fence_waterlogged(&old)
+                                        == Some(false)))
+                                && ((state.name == "minecraft:calcite"
+                                    && state.properties.is_empty())
+                                    || geode_full_cube(state)?
+                                    || (old_air && geode_crystal(state)?))));
                     // Transparent plants do not enqueue a block light check,
                     // but the first non-air block still allocates a section.
                     let vegetation_allocation = old_air
@@ -8308,6 +8325,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || lichen_write
                                 || lake_light_update
                                 || room_light_update
+                                || geode_light_update
                                 || magma_light_update
                                 || staged_patch_water
                                 || staged_patch_vines
@@ -8333,6 +8351,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lichen_write
                             || lake_light_update
                             || room_light_update
+                            || geode_light_update
                             || magma_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
@@ -8373,6 +8392,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || vine_write
                                 || pile_light_update
                                 || jigsaw_light_update
+                                || geode_light_update
                                 || vegetation_allocation
                                 || lichen_write);
                         ensure!(
@@ -8403,6 +8423,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || lichen_check
                         || lake_light_update
                         || room_light_update
+                        || geode_light_update
                         || magma_light_update
                         || new_section
                     {
@@ -8414,6 +8435,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lichen_write
                             || lake_light_update
                             || room_light_update
+                            || geode_light_update
                             || magma_light_update
                             || staged_patch_water
                             || staged_patch_vines
@@ -8427,6 +8449,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lichen_check
                             || lake_light_update
                             || room_light_update
+                            || geode_light_update
                             || magma_light_update
                             || patch_check
                             || staged_patch_vines
@@ -12889,6 +12912,29 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_geode_carving_matches_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_geode_sulfur_to_air",
+            "vine_active_self_geode_sulfur_to_air",
+            "vine_active_geode_stone_to_air",
+            "vine_active_self_geode_stone_to_air",
+            "vine_active_geode_cave_air_to_calcite",
+            "vine_active_self_geode_cave_air_to_calcite",
+            "vine_active_geode_oak_fence_to_calcite",
+            "vine_active_self_geode_oak_fence_to_calcite",
+            "vine_active_geode_cave_air_to_smooth_basalt",
+            "vine_active_self_geode_cave_air_to_amethyst_block",
+            "vine_active_geode_oak_fence_to_budding_amethyst",
+            "vine_active_geode_air_to_amethyst_cluster",
+            "vine_active_self_geode_air_to_amethyst_cluster",
+            "vine_active_geode_air_to_small_amethyst_bud",
+            "vine_active_geode_air_to_medium_amethyst_bud",
+            "vine_active_geode_air_to_large_amethyst_bud",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_village_piles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_pile_snow",
@@ -13464,8 +13510,16 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
-            if let Some(name) = mode.split("_room_").nth(1) {
-                let name = name.strip_suffix("_air").unwrap();
+            if let Some(name) = mode
+                .split("_room_")
+                .nth(1)
+                .or_else(|| mode.split("_geode_").nth(1))
+            {
+                let name = name
+                    .split_once("_to_")
+                    .map(|(source, _)| source)
+                    .or_else(|| name.strip_suffix("_air"))
+                    .unwrap();
                 let mut source = if name.starts_with("deepslate_") {
                     let mut source = state("deepslate");
                     source.properties.insert(
@@ -13478,6 +13532,15 @@ mod tests {
                 };
                 if name == "redstone_ore" {
                     source.properties.insert("lit".into(), "true".into());
+                }
+                if name == "oak_fence" {
+                    source.properties = BTreeMap::from([
+                        ("east".into(), "false".into()),
+                        ("north".into(), "true".into()),
+                        ("south".into(), "false".into()),
+                        ("waterlogged".into(), "false".into()),
+                        ("west".into(), "false".into()),
+                    ]);
                 }
                 let id = world.intern_state(source);
                 world.set_block_id(16, 10, 8, id).unwrap();
@@ -13627,6 +13690,18 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_geode_") {
+                    let (_, target) = mode.split_once("_to_").unwrap();
+                    let mut block = state(target);
+                    if target.ends_with("amethyst_bud") || target == "amethyst_cluster" {
+                        block.properties.insert("facing".into(), "up".into());
+                        block
+                            .properties
+                            .insert("waterlogged".into(), "false".into());
+                    }
+                    draft.set_geode_block(p, &block).unwrap();
+                    continue;
+                }
                 if mode.contains("_room_") {
                     native_resources::monster_room::MonsterRoomWorld::set_block(
                         &mut draft,
@@ -14023,7 +14098,7 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_room_") {
+            let expected_checks = if mode.contains("_room_") || mode.contains("_geode_") {
                 1
             } else if mode.contains("_plant_") || mode.contains("_kelp_") {
                 0

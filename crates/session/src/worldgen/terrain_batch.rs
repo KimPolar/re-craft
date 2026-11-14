@@ -4159,6 +4159,7 @@ impl FreshTerrainBatch {
                 "chunk was not selected for this postprocessing pass"
             );
             ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            processed.ensure_poi_unchanged(pos, registry)?;
             let poi_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
             let draft = native_persistence::poi::refresh_missing_chunk(
                 poi_pos,

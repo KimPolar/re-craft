@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use native_resources::tree_leaf_update::ShapeEdgeWorld;
 use native_world::{
     generation_light::VisibleLightSnapshot,
-    loaded::{BlockPosition, BlockState, ChunkPos, World},
+    loaded::{BlockPosition, BlockState, BlockStateId, ChunkPos, World},
 };
 
 use super::{
@@ -166,6 +166,7 @@ pub struct GeneratedPostprocessing {
     water_source_conversion: Option<bool>,
     block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     edits: Vec<BlockPosition>,
+    edit_states: Vec<(BlockStateId, BlockStateId)>,
     read_chunks: RefCell<BTreeSet<ChunkPos>>,
     light_reads: RefCell<BTreeSet<ChunkPos>>,
     pub(super) light_checks: Vec<BlockPosition>,
@@ -229,6 +230,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) source: Arc<World>,
     pub(super) sealed_world: Arc<World>,
     pub(super) sealed_edits: Vec<BlockPosition>,
+    edit_states: Vec<(BlockStateId, BlockStateId)>,
     pub(super) sealed_checks: Vec<BlockPosition>,
     pub(super) sealed_chunks: BTreeSet<ChunkPos>,
     pub(super) batch_revision: Option<u64>,
@@ -262,6 +264,81 @@ pub(super) struct PostprocessingLightCheckpoint {
 }
 
 impl PostprocessedGeneratedRegion {
+    /// Ordered block transitions for a converted chunk. The caller must first
+    /// validate the completed pass and still reconcile POIs and live tickets.
+    pub fn block_changes_for_chunk(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Vec<native_persistence::poi::PoiBlockChange>> {
+        ensure!(
+            self.chunks.contains(&pos) || self.deferred_tasks.contains_key(&pos),
+            "block change chunk was not converted"
+        );
+        ensure!(
+            self.edits == self.sealed_edits && self.edits.len() == self.edit_states.len(),
+            "postprocessing block history differs"
+        );
+        let mut changes = Vec::new();
+        let mut latest = BTreeMap::new();
+        for (position, &(before, after)) in self.edits.iter().zip(&self.edit_states) {
+            if position.chunk() != pos {
+                continue;
+            }
+            let before = self
+                .world
+                .state(before)
+                .context("original block state is missing")?;
+            let after = self
+                .world
+                .state(after)
+                .context("replacement block state is missing")?;
+            let coords = [position.x, position.y, position.z];
+            if let Some(previous) = latest.insert(coords, after) {
+                ensure!(
+                    previous == before,
+                    "postprocessing block history is discontinuous"
+                );
+            } else {
+                ensure!(
+                    self.source.block(coords[0], coords[1], coords[2]) == Some(before),
+                    "postprocessing block history source differs"
+                );
+            }
+            changes.push(native_persistence::poi::PoiBlockChange {
+                position: coords,
+                expected: before.clone(),
+                replacement: after.clone(),
+            });
+        }
+        for (coords, state) in latest {
+            ensure!(
+                self.world.block(coords[0], coords[1], coords[2]) == Some(state),
+                "postprocessing block history result differs"
+            );
+        }
+        Ok(changes)
+    }
+
+    pub(super) fn ensure_poi_unchanged(
+        &self,
+        pos: ChunkPos,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        for change in self.block_changes_for_chunk(pos)? {
+            for state in [&change.expected, &change.replacement] {
+                ensure!(
+                    registry.is_canonical_state(&state.name, &state.properties),
+                    "unknown postprocessing POI block state"
+                );
+            }
+            ensure!(
+                native_world::poi::change(&change.expected, &change.replacement).is_none(),
+                "postprocessing POI transitions require ordered reconciliation"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn permits_block_entity_edit(
         &self,
         pos: BlockPosition,
@@ -525,6 +602,7 @@ impl GeneratedPostprocessing {
             water_source_conversion: None,
             block_drops: None,
             edits: Vec::new(),
+            edit_states: Vec::new(),
             read_chunks: RefCell::new(BTreeSet::new()),
             light_reads: RefCell::new(BTreeSet::new()),
             light_checks: Vec::new(),
@@ -640,6 +718,7 @@ impl GeneratedPostprocessing {
         stage.water_source_conversion = completed.water_source_conversion;
         stage.block_drops = completed.block_drops.clone();
         stage.edits = completed.edits.clone();
+        stage.edit_states = completed.edit_states.clone();
         stage.read_chunks = RefCell::new(completed.read_chunks.clone());
         stage.light_reads = RefCell::new(completed.light_reads.clone());
         stage.light_checks = completed.light_checks.clone();
@@ -996,6 +1075,7 @@ impl GeneratedPostprocessing {
             water_source_conversion: self.water_source_conversion,
             block_drops: &mut self.block_drops,
             edits: &mut self.edits,
+            edit_states: &mut self.edit_states,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
             heightmap_tags: self.heightmap_tags.as_deref(),
@@ -1086,6 +1166,7 @@ impl GeneratedPostprocessing {
             water_source_conversion: self.water_source_conversion,
             block_drops: &mut self.block_drops,
             edits: &mut self.edits,
+            edit_states: &mut self.edit_states,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
             heightmap_tags: self.heightmap_tags.as_deref(),
@@ -1123,6 +1204,7 @@ impl GeneratedPostprocessing {
             chunks: self.completed,
             sealed_edits: self.edits.clone(),
             edits: self.edits,
+            edit_states: self.edit_states,
             sealed_read_chunks: read_chunks.clone(),
             read_chunks,
             sealed_light_reads: light_reads.clone(),
@@ -1177,6 +1259,7 @@ struct GeneratedBlockView<'a> {
     water_source_conversion: Option<bool>,
     block_drops: &'a mut Option<super::postprocessing_drops::GeneratedBlockDrops>,
     edits: &'a mut Vec<BlockPosition>,
+    edit_states: &'a mut Vec<(BlockStateId, BlockStateId)>,
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<&'a native_resources::heightmap_tags::HeightmapTags>,
@@ -2740,6 +2823,13 @@ impl GeneratedBlockView<'_> {
         let same_light = native_world::block_light::same_light_behavior(old, next)
             .context("postprocessing light behavior unavailable")?;
         let world = Arc::make_mut(self.world);
+        let previous = world
+            .block_id(pos[0], pos[1], pos[2])
+            .context("postprocessing original block is unavailable")?;
+        ensure!(
+            world.state(previous) == Some(old),
+            "postprocessing original block differs"
+        );
         let id = world.intern_state(next.clone());
         ensure!(
             world
@@ -2778,6 +2868,7 @@ impl GeneratedBlockView<'_> {
             z: pos[2],
         };
         self.edits.push(position);
+        self.edit_states.push((previous, id));
         if !same_light {
             self.light_checks.push(position);
         }
@@ -3998,6 +4089,74 @@ mod tests {
             world,
             pos,
         )
+    }
+
+    #[test]
+    fn postprocessed_block_history_keeps_intermediate_states_and_checks_provenance() {
+        let (mut stage, _, chunk) = fixture(false);
+        while !stage.poll(chunk, 10).unwrap() {}
+        let mut completed = stage.finish().unwrap();
+        let position = BlockPosition { x: 1, y: 8, z: 1 };
+        let world = Arc::make_mut(&mut completed.world);
+        let original = world.block_id(position.x, position.y, position.z).unwrap();
+        let barrel = world.intern_state(BlockState {
+            name: "minecraft:barrel".into(),
+            properties: BTreeMap::new(),
+        });
+        completed.sealed_world = Arc::clone(&completed.world);
+        completed.edits = vec![position, position];
+        completed.sealed_edits = completed.edits.clone();
+        completed.edit_states = vec![(original, barrel), (barrel, original)];
+
+        let changes = completed.block_changes_for_chunk(chunk).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].expected.name, "minecraft:stone");
+        assert_eq!(changes[0].replacement.name, "minecraft:barrel");
+        assert_eq!(changes[1].expected.name, "minecraft:barrel");
+        assert_eq!(changes[1].replacement.name, "minecraft:stone");
+        assert!(
+            completed
+                .block_changes_for_chunk(ChunkPos { x: 1, z: 0 })
+                .is_err()
+        );
+
+        completed.edit_states[1] = (original, original);
+        assert!(completed.block_changes_for_chunk(chunk).is_err());
+        completed.edit_states[1] = (barrel, barrel);
+        assert!(completed.block_changes_for_chunk(chunk).is_err());
+        completed.edit_states.pop();
+        assert!(completed.block_changes_for_chunk(chunk).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn postprocessed_poi_snapshot_rejects_intermediate_poi_changes() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let (mut stage, _, chunk) = fixture(false);
+        while !stage.poll(chunk, 10)? {}
+        let mut completed = stage.finish()?;
+        completed.ensure_poi_unchanged(chunk, &registry)?;
+        let position = BlockPosition { x: 1, y: 8, z: 1 };
+        let world = Arc::make_mut(&mut completed.world);
+        let original = world.block_id(position.x, position.y, position.z).unwrap();
+        let barrel = world.intern_state(BlockState {
+            name: "minecraft:barrel".into(),
+            properties: registry.default_properties("minecraft:barrel").unwrap(),
+        });
+        completed.sealed_world = Arc::clone(&completed.world);
+        completed.edits = vec![position, position];
+        completed.sealed_edits = completed.edits.clone();
+        completed.edit_states = vec![(original, barrel), (barrel, original)];
+        let error = completed
+            .ensure_poi_unchanged(chunk, &registry)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ordered reconciliation"));
+        Ok(())
     }
 
     #[test]
@@ -5653,6 +5812,18 @@ mod tests {
             9
         );
         assert_eq!(processed.edits.len(), 5);
+        let changes = processed.block_changes_for_chunk(chunk).unwrap();
+        assert_eq!(
+            changes.len(),
+            processed
+                .edits
+                .iter()
+                .filter(|edit| edit.chunk() == chunk)
+                .count()
+        );
+        assert!(changes.iter().any(|change| change.position == p
+            && change.expected.name == "minecraft:air"
+            && change.replacement.name == "minecraft:chest"));
         assert!(processed.light_checks.len() >= 4);
         let Tag::List { values, .. } = processed.block_entity_data(chunk).unwrap() else {
             panic!("missing entities")
@@ -5872,6 +6043,7 @@ mod tests {
         let baseline = baseline.finish().unwrap();
         assert_eq!(random.state(), baseline_random.state());
         assert_eq!(resumed.edits, baseline.edits);
+        assert_eq!(resumed.edit_states, baseline.edit_states);
         assert_eq!(resumed.light_checks, baseline.light_checks);
         assert_eq!(
             resumed.block_entity_data(center).unwrap(),

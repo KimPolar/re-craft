@@ -346,6 +346,7 @@ impl CarvedTerrainWorld {
                 "chunk was not postprocessed"
             );
             ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            completed.ensure_poi_unchanged(pos, registry)?;
             let draft = native_persistence::poi::refresh_missing_chunk(
                 native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
                 &completed.world,

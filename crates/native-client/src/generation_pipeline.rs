@@ -82,7 +82,7 @@ fn initial_player_area(generation: &GenerationReady) -> Result<InitialPlayerArea
     )
 }
 
-fn classify_initial_player_area(
+pub(crate) fn classify_initial_player_area(
     spawn: glam::IVec3,
     registered_positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
     completed: &std::collections::BTreeSet<native_world::loaded::ChunkPos>,
@@ -517,6 +517,16 @@ mod tests {
                 player_area,
             } => {
                 let player_area = player_area?;
+                assert!(
+                    player_area.missing.is_empty(),
+                    "initial player area has missing chunks: {:?}",
+                    player_area.missing
+                );
+                assert!(
+                    player_area.deferred.is_empty(),
+                    "initial player area has deferred chunks: {:?}",
+                    player_area.deferred
+                );
                 let StagedWorld::Structured(world) = &world else {
                     anyhow::bail!("structured generation returned an unstructured stage");
                 };

@@ -3528,6 +3528,26 @@ where
                             structure_source_expansion = true;
                             break source;
                         }
+                        if let Some(processed) = &ready.postprocessed {
+                            let area = crate::generation_pipeline::classify_initial_player_area(
+                                pos,
+                                processed.region.ticks().registration_order().iter().copied(),
+                                &processed.region.chunks,
+                                processed.region.deferred_chunks(),
+                            )?;
+                            if let Some(next) = area
+                                .missing
+                                .into_iter()
+                                .chain(area.deferred)
+                                .min_by_key(|chunk| (chunk.z, chunk.x))
+                            {
+                                ensure!(
+                                    !targets.contains(&next),
+                                    "initial player area target is not postprocessed"
+                                );
+                                break next;
+                            }
+                        }
                         ready.player_spawn = Some(pos);
                         return Ok(Some(ready));
                     }

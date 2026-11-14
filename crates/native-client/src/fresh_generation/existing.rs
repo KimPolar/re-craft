@@ -597,19 +597,98 @@ impl CapturedConvertedHeightmaps {
         light: &CapturedStagedLight,
         spawn_mobs: bool,
     ) -> bool {
+        self.matches_terrain_state(batch, light, spawn_mobs)
+            && light.completed_empty_spawns.get(&self.position) == Some(&spawn_mobs)
+    }
+
+    fn matches_terrain_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+    ) -> bool {
         Arc::ptr_eq(&self.identity, &batch.identity)
             && Arc::ptr_eq(&self.revision, &batch.revision)
             && Arc::ptr_eq(&self.identity, &light.identity)
             && Arc::ptr_eq(&self.revision, &light.revision)
             && Arc::ptr_eq(&self.light_revision, &light.light_revision)
             && self.spawn_mobs == spawn_mobs
-            && light.completed_empty_spawns.get(&self.position) == Some(&spawn_mobs)
             && batch
                 .schedule
                 .completed(self.position)
                 .is_some_and(|stage| {
                     stage >= native_session::worldgen::schedule::GenerationStage::Spawn
                 })
+    }
+}
+
+/// Converted heightmaps tied to a specific creature spawn and its live inputs.
+#[derive(Clone)]
+pub(crate) struct CapturedPlannedConvertedHeightmaps {
+    proof: CapturedConvertedHeightmaps,
+    completion: Arc<()>,
+    clocks: BTreeMap<ResourceId, i64>,
+    border: Option<native_session::respawn::RespawnBorder>,
+}
+
+impl CapturedPlannedConvertedHeightmaps {
+    pub fn heightmaps(&self) -> &native_persistence::heightmap::FullHeightmaps {
+        self.proof.heightmaps()
+    }
+
+    pub fn other_fields(&self) -> &[(native_persistence::nbt::JavaString, Tag)] {
+        self.proof.other_fields()
+    }
+
+    pub fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        self.proof.matches_source(source)
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: Option<native_session::respawn::RespawnBorder>,
+    ) -> bool {
+        spawn_mobs
+            && self.clocks == *clocks
+            && self.border == border
+            && self.proof.matches_terrain_state(batch, light, spawn_mobs)
+            && light
+                .completed_creature_spawns
+                .get(&self.proof.position)
+                .is_some_and(|completion| Arc::ptr_eq(completion, &self.completion))
+    }
+}
+
+/// Converted tick containers bound to a creature-spawn proof.
+pub(crate) struct CapturedPlannedConvertedPostprocessing {
+    proof: CapturedPlannedConvertedHeightmaps,
+    converted: native_session::worldgen::postprocessing::ConvertedChunkPostprocessing,
+}
+
+impl CapturedPlannedConvertedPostprocessing {
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: Option<native_session::respawn::RespawnBorder>,
+    ) -> bool {
+        self.proof
+            .matches_state(batch, light, spawn_mobs, clocks, border)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        CapturedPlannedConvertedHeightmaps,
+        native_session::worldgen::postprocessing::ConvertedChunkPostprocessing,
+    ) {
+        (self.proof, self.converted)
     }
 }
 
@@ -2153,19 +2232,70 @@ impl PreparedExistingGenerator {
                 && spawn.matches_state(batch, light, spawn.spawn_mobs),
             "spawn draft belongs to another generation revision"
         );
+        let source = batch
+            .sources
+            .get(&native_persistence::world::ChunkPos {
+                x: spawn.position.x,
+                z: spawn.position.z,
+            })
+            .context("terrain source was not captured")?;
+        ensure!(
+            spawn.matches_source(source.as_deref())?,
+            "spawn source differs"
+        );
+        self.convert_spawn_heightmaps(batch, light, spawn.position, spawn.spawn_mobs)
+    }
+
+    /// Convert heightmaps for a spawn containing planned creatures, retaining
+    /// its clock, border and completion identity for later validation.
+    pub fn convert_captured_planned_heightmaps(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn: &CapturedPlannedSpawn,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: Option<native_session::respawn::RespawnBorder>,
+    ) -> Result<CapturedPlannedConvertedHeightmaps> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && spawn.matches_state(batch, light, true, clocks, border),
+            "spawn draft belongs to another generation revision"
+        );
+        let source = batch
+            .sources
+            .get(&native_persistence::world::ChunkPos {
+                x: spawn.position.x,
+                z: spawn.position.z,
+            })
+            .context("terrain source was not captured")?;
+        ensure!(
+            spawn.matches_source(source.as_deref())?,
+            "spawn source differs"
+        );
+        Ok(CapturedPlannedConvertedHeightmaps {
+            proof: self.convert_spawn_heightmaps(batch, light, spawn.position, true)?,
+            completion: Arc::clone(&spawn.completion),
+            clocks: spawn.clocks.clone(),
+            border: spawn.border,
+        })
+    }
+
+    fn convert_spawn_heightmaps(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_position: native_world::loaded::ChunkPos,
+        spawn_mobs: bool,
+    ) -> Result<CapturedConvertedHeightmaps> {
         let position = native_persistence::world::ChunkPos {
-            x: spawn.position.x,
-            z: spawn.position.z,
+            x: spawn_position.x,
+            z: spawn_position.z,
         };
         let source = batch
             .sources
             .get(&position)
             .context("terrain source was not captured")?
             .clone();
-        ensure!(
-            spawn.matches_source(source.as_deref())?,
-            "spawn source differs"
-        );
         let other_fields = source
             .as_deref()
             .map(preserved_heightmap_fields)
@@ -2179,7 +2309,7 @@ impl PreparedExistingGenerator {
                 .checked_add(self.lighting.height)
                 .context("dimension height overflow")?,
         };
-        let source_maps = batch.terrain.generated_heightmap_data(spawn.position)?;
+        let source_maps = batch.terrain.generated_heightmap_data(spawn_position)?;
         let converted =
             native_persistence::heightmap::generated_full_heightmaps(bounds, &source_maps)?;
         let heightmaps =
@@ -2188,8 +2318,8 @@ impl PreparedExistingGenerator {
             identity: Arc::clone(&batch.identity),
             revision: Arc::clone(&batch.revision),
             light_revision: Arc::clone(&light.light_revision),
-            position: spawn.position,
-            spawn_mobs: spawn.spawn_mobs,
+            position: spawn_position,
+            spawn_mobs,
             source,
             heightmaps,
             other_fields,
@@ -2206,10 +2336,6 @@ impl PreparedExistingGenerator {
         spawn: &CapturedEmptySpawnDraft,
         proof: CapturedConvertedHeightmaps,
     ) -> Result<CapturedConvertedPostprocessing> {
-        use native_session::worldgen::{
-            chunk_ticks::{ChunkTicks, ConvertedChunkTicks, SavedTick},
-            postprocessing::{ConvertedChunkPostprocessing, PostprocessingTask},
-        };
         ensure!(
             Arc::ptr_eq(&self.identity, &batch.identity)
                 && spawn.matches_state(batch, light, spawn.spawn_mobs)
@@ -2229,12 +2355,62 @@ impl PreparedExistingGenerator {
             proof.matches_source(source.as_deref())? && spawn.matches_source(source.as_deref())?,
             "postprocessing source differs"
         );
+        let converted = self.convert_spawn_postprocessing(batch, position, spawn.document())?;
+        Ok(CapturedConvertedPostprocessing { proof, converted })
+    }
+
+    /// Prepare pending ticks and callbacks without discarding creature-spawn
+    /// provenance or publishing the converted chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_captured_planned_postprocessing(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn: &CapturedPlannedSpawn,
+        proof: CapturedPlannedConvertedHeightmaps,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: Option<native_session::respawn::RespawnBorder>,
+    ) -> Result<CapturedPlannedConvertedPostprocessing> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && spawn.matches_state(batch, light, true, clocks, border)
+                && proof.matches_state(batch, light, true, clocks, border)
+                && proof.proof.position == spawn.position
+                && Arc::ptr_eq(&proof.completion, &spawn.completion),
+            "postprocessing inputs belong to another generation revision"
+        );
+        let source = batch
+            .sources
+            .get(&native_persistence::world::ChunkPos {
+                x: spawn.position.x,
+                z: spawn.position.z,
+            })
+            .context("terrain source was not captured")?;
+        ensure!(
+            proof.matches_source(source.as_deref())? && spawn.matches_source(source.as_deref())?,
+            "postprocessing source differs"
+        );
+        let converted =
+            self.convert_spawn_postprocessing(batch, spawn.position, spawn.document())?;
+        Ok(CapturedPlannedConvertedPostprocessing { proof, converted })
+    }
+
+    fn convert_spawn_postprocessing(
+        &self,
+        batch: &CapturedTerrainBatch,
+        position: native_world::loaded::ChunkPos,
+        document: &NamedTag,
+    ) -> Result<native_session::worldgen::postprocessing::ConvertedChunkPostprocessing> {
+        use native_session::worldgen::{
+            chunk_ticks::{ChunkTicks, ConvertedChunkTicks, SavedTick},
+            postprocessing::{ConvertedChunkPostprocessing, PostprocessingTask},
+        };
         let assets = self
             .terrain_assets
             .as_ref()
             .context("terrain registry is missing")?;
         let upgrade =
-            parse_captured_upgrade_data(spawn.document(), self.lighting.height, &assets.block_ids)?;
+            parse_captured_upgrade_data(document, self.lighting.height, &assets.block_ids)?;
         let world = batch.terrain.snapshot();
         let block_ticks = world
             .saved_block_ticks
@@ -2253,8 +2429,8 @@ impl PreparedExistingGenerator {
         let encoded_fluids =
             native_persistence::generated_ticks::encode_fluid_ticks(position, fluid_ticks)?;
         ensure!(
-            unique_root_field(spawn.document(), "block_ticks")? == Some(&encoded_blocks)
-                && unique_root_field(spawn.document(), "fluid_ticks")? == Some(&encoded_fluids),
+            unique_root_field(document, "block_ticks")? == Some(&encoded_blocks)
+                && unique_root_field(document, "fluid_ticks")? == Some(&encoded_fluids),
             "spawn tick data differs from generation"
         );
         let marks = batch
@@ -2262,7 +2438,7 @@ impl PreparedExistingGenerator {
             .postprocessing_marks_to_date(position)
             .context("generation postprocessing history is missing")?;
         ensure!(
-            unique_root_field(spawn.document(), "PostProcessing")?
+            unique_root_field(document, "PostProcessing")?
                 == Some(&native_persistence::postprocessing::encode(&marks)),
             "spawn postprocessing marks differ from generation"
         );
@@ -2284,15 +2460,11 @@ impl PreparedExistingGenerator {
                 priority: tick.priority,
             })
             .collect();
-        Ok(CapturedConvertedPostprocessing {
-            proof,
-            converted: ConvertedChunkPostprocessing {
-                task: PostprocessingTask::new(Arc::new(marks), position)
-                    .with_upgrade_ticks(upgrade)?,
-                ticks: ConvertedChunkTicks {
-                    blocks: ChunkTicks::from_saved(position, blocks)?,
-                    fluids: ChunkTicks::from_saved(position, fluids)?,
-                },
+        Ok(ConvertedChunkPostprocessing {
+            task: PostprocessingTask::new(Arc::new(marks), position).with_upgrade_ticks(upgrade)?,
+            ticks: ConvertedChunkTicks {
+                blocks: ChunkTicks::from_saved(position, blocks)?,
+                fluids: ChunkTicks::from_saved(position, fluids)?,
             },
         })
     }
@@ -9912,6 +10084,69 @@ mod tests {
         assert!(!spawn.matches_source(Some(&saved))?);
         assert!(spawn.entity_sidecar_source().is_none());
         assert!(spawn.has_entity_free_feature_coverage());
+        assert!(
+            actual
+                .convert_captured_planned_heightmaps(
+                    &batch,
+                    &staged,
+                    &spawn,
+                    &wrong_clocks,
+                    Some(changed_border),
+                )
+                .is_err()
+        );
+        let proof = actual.convert_captured_planned_heightmaps(
+            &batch,
+            &staged,
+            &spawn,
+            &clocks,
+            Some(changed_border),
+        )?;
+        assert!(proof.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
+        assert!(!proof.matches_state(&batch, &staged, true, &wrong_clocks, Some(changed_border)));
+        assert!(!proof.matches_state(&batch, &staged, true, &clocks, None));
+        assert!(!proof.matches_state(&batch, &staged, false, &clocks, Some(changed_border)));
+        assert!(proof.matches_source(None)?);
+        assert!(proof.other_fields().is_empty());
+        let mut wrong_proof = proof.clone();
+        wrong_proof.completion = Arc::new(());
+        assert!(
+            actual
+                .begin_captured_planned_postprocessing(
+                    &batch,
+                    &staged,
+                    &spawn,
+                    wrong_proof,
+                    &clocks,
+                    Some(changed_border),
+                )
+                .is_err()
+        );
+        let converted = actual.begin_captured_planned_postprocessing(
+            &batch,
+            &staged,
+            &spawn,
+            proof.clone(),
+            &clocks,
+            Some(changed_border),
+        )?;
+        assert!(converted.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
+        assert!(!converted.matches_state(
+            &batch,
+            &staged,
+            true,
+            &wrong_clocks,
+            Some(changed_border)
+        ));
+        let (_, converted) = converted.into_parts();
+        assert!(
+            converted
+                .ticks
+                .blocks
+                .pack(42)
+                .iter()
+                .any(|tick| tick.kind == "minecraft:melon")
+        );
         assert_eq!(
             spawn.document().value.get("Status"),
             Some(&Tag::String("minecraft:spawn".into()))
@@ -9945,6 +10180,7 @@ mod tests {
         batch.schedule = saved_schedule;
         staged.completed_creature_spawns.remove(&target);
         assert!(!spawn.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
+        assert!(!proof.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
 
         let mut saved_animal =
             actual.plan_captured_creatures(&batch, &staged, second, true, &clocks)?;
@@ -9975,6 +10211,29 @@ mod tests {
         assert!(saved_spawn.matches_source(Some(&saved))?);
         assert!(saved_spawn.entity_sidecar_source().is_none());
         assert!(saved_spawn.has_entity_free_feature_coverage());
+        let saved_proof = actual.convert_captured_planned_heightmaps(
+            &batch,
+            &staged,
+            &saved_spawn,
+            &clocks,
+            None,
+        )?;
+        assert!(saved_proof.matches_source(Some(&saved))?);
+        assert!(
+            saved_proof
+                .other_fields()
+                .iter()
+                .any(|(name, value)| name.matches("example:map") && *value == Tag::Int(37))
+        );
+        let saved_converted = actual.begin_captured_planned_postprocessing(
+            &batch,
+            &staged,
+            &saved_spawn,
+            saved_proof.clone(),
+            &clocks,
+            None,
+        )?;
+        assert!(saved_converted.matches_state(&batch, &staged, true, &clocks, None));
         assert_eq!(
             saved_spawn.document().value.get("example:root"),
             Some(&Tag::Int(73))
@@ -9982,6 +10241,7 @@ mod tests {
         batch.schedule = saved_schedule;
         staged.completed_creature_spawns.remove(&second);
         assert!(!saved_spawn.matches_state(&batch, &staged, true, &clocks, None));
+        assert!(!saved_proof.matches_state(&batch, &staged, true, &clocks, None));
         let light_revision = Arc::clone(&staged.light_revision);
         staged.light_revision = Arc::new(());
         assert!(
@@ -10749,6 +11009,17 @@ mod tests {
             (second, &saved_maps),
             (third, &early_maps),
         ] {
+            heightmap_cases.push(Tag::Compound(vec![
+                ("min_y".into(), Tag::Int(lighting.min_y)),
+                ("height".into(), Tag::Int(lighting.height)),
+                (
+                    "source".into(),
+                    batch.terrain.generated_heightmap_data(position)?,
+                ),
+                ("expected".into(), maps.heightmaps().to_tag()?),
+            ]));
+        }
+        for (position, maps) in [(target, &proof), (second, &saved_proof)] {
             heightmap_cases.push(Tag::Compound(vec![
                 ("min_y".into(), Tag::Int(lighting.min_y)),
                 ("height".into(), Tag::Int(lighting.height)),

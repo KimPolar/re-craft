@@ -27,6 +27,12 @@ pub enum Cell {
     FenceDry,
     /// A dry, non-solid waterloggable block with no fully occluding face.
     OpenDry,
+    /// A position-dependent speleothem. Four face bits per direction encode
+    /// the half-block quadrants covered by its collision shape.
+    Speleothem {
+        faces: u32,
+        waterlogged: bool,
+    },
     /// A ladder's facing determines its full collision face.
     Ladder {
         facing: IVec3,
@@ -55,6 +61,48 @@ impl Cell {
     pub fn contained_fluid(self) -> Option<FluidState> {
         fluid(self)
     }
+}
+
+/// Build a cell from the actual collision box at an absolute world position.
+pub fn speleothem_cell(state: &crate::loaded::BlockState, position: IVec3) -> Option<Cell> {
+    let shape = crate::collision::positioned_speleothem_shape(state, position)?;
+    let bounds = shape.first()?;
+    let waterlogged = state.properties["waterlogged"] == "true";
+    // Narrower shapes cannot cover a complete half-block quadrant on any
+    // face, even at the largest horizontal model offset.
+    if state.properties["thickness"] != "base" {
+        return Some(Cell::Speleothem {
+            faces: 0,
+            waterlogged,
+        });
+    }
+    let mut faces = 0_u32;
+    // Java's SliceShape uses the original voxel grid's first/last slice.
+    // A horizontal model offset can move the box to a boundary, but the
+    // original outermost slices are empty for every speleothem shape.
+    for (index, (axis, positive, first, second)) in [(2, (1, true, 0, 2)), (3, (1, false, 0, 2))] {
+        let edge = if positive {
+            bounds.max[axis]
+        } else {
+            bounds.min[axis]
+        };
+        let target = if positive { 1.0 } else { 0.0 };
+        if (edge - target).abs() > 1.0e-7 {
+            continue;
+        }
+        for bit in 0..4 {
+            let a = if bit & 1 == 0 { 0.0 } else { 0.5 };
+            let b = if bit & 2 == 0 { 0.0 } else { 0.5 };
+            if bounds.min[first] <= a
+                && bounds.max[first] >= a + 0.5
+                && bounds.min[second] <= b
+                && bounds.max[second] >= b + 0.5
+            {
+                faces |= 1 << (index * 4 + bit);
+            }
+        }
+    }
+    Some(Cell::Speleothem { faces, waterlogged })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +194,7 @@ pub enum ChangedBlock {
     WaterloggedChest,
     WaterloggedFence,
     WaterloggedOpen,
+    WaterloggedSpeleothem { faces: u32 },
     WaterloggedLadder { facing: IVec3 },
 }
 
@@ -233,6 +282,7 @@ fn source(cell: Cell, kind: FluidKind) -> bool {
         || matches!(cell, Cell::Stairs { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Chest { waterlogged: true } if kind == FluidKind::Water)
         || matches!(cell, Cell::Ladder { waterlogged: true, .. } if kind == FluidKind::Water)
+        || matches!(cell, Cell::Speleothem { waterlogged: true, .. } if kind == FluidKind::Water)
 }
 
 fn fluid(cell: Cell) -> Option<FluidState> {
@@ -249,6 +299,9 @@ fn fluid(cell: Cell) -> Option<FluidState> {
             waterlogged: true, ..
         }
         | Cell::Chest { waterlogged: true }
+        | Cell::Speleothem {
+            waterlogged: true, ..
+        }
         | Cell::Ladder {
             waterlogged: true, ..
         } => Some(flowing(FluidKind::Water, 8, false)),
@@ -268,6 +321,22 @@ fn face(cell: Cell, direction: IVec3) -> u8 {
         | Cell::FenceDry
         | Cell::OpenDry
         | Cell::Chest { .. } => 0,
+        Cell::Speleothem { faces, .. } => {
+            let index = if direction == IVec3::X {
+                0
+            } else if direction == IVec3::NEG_X {
+                1
+            } else if direction == IVec3::Y {
+                2
+            } else if direction == IVec3::NEG_Y {
+                3
+            } else if direction == IVec3::Z {
+                4
+            } else {
+                5
+            };
+            ((faces >> (index * 4)) & 15) as u8
+        }
         Cell::Ladder { facing, .. } => {
             if direction == -facing {
                 15
@@ -321,7 +390,8 @@ fn face(cell: Cell, direction: IVec3) -> u8 {
     }
 }
 
-fn can_pass(from: Cell, to: Cell, direction: IVec3) -> bool {
+/// Whether the two supported collision faces leave a passage for fluid.
+pub fn can_pass(from: Cell, to: Cell, direction: IVec3) -> bool {
     face(from, direction) | face(to, -direction) != 15
 }
 
@@ -416,6 +486,7 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
         | Cell::Chest { .. }
         | Cell::FenceDry
         | Cell::OpenDry
+        | Cell::Speleothem { .. }
         | Cell::Ladder { .. } => !source(cell, kind),
         Cell::Solid
         | Cell::GrateWater(_)
@@ -441,6 +512,9 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool 
             waterlogged: true, ..
         }
         | Cell::Chest { waterlogged: true }
+        | Cell::Speleothem {
+            waterlogged: true, ..
+        }
         | Cell::Ladder {
             waterlogged: true, ..
         } => kind == FluidKind::Water,
@@ -463,6 +537,9 @@ fn can_replace(
             waterlogged: false, ..
         }
         | Cell::Chest { waterlogged: false }
+        | Cell::Speleothem {
+            waterlogged: false, ..
+        }
         | Cell::Ladder {
             waterlogged: false, ..
         } => incoming.kind == FluidKind::Water && incoming.source,
@@ -509,6 +586,7 @@ fn slope_distance(
                 | Cell::Chest { .. }
                 | Cell::FenceDry
                 | Cell::OpenDry
+                | Cell::Speleothem { .. }
                 | Cell::Ladder { .. }
         ) || !can_search(candidate, kind)
             || !can_pass(current, candidate, direction)
@@ -576,6 +654,7 @@ fn side_changes_from(
                 | Cell::Chest { .. }
                 | Cell::FenceDry
                 | Cell::OpenDry
+                | Cell::Speleothem { .. }
                 | Cell::Ladder { .. }
         ) && !(new.kind == FluidKind::Water && new.source)
         {
@@ -606,6 +685,9 @@ fn side_changes_from(
                         Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
                         Cell::FenceDry => ChangedBlock::WaterloggedFence,
                         Cell::OpenDry => ChangedBlock::WaterloggedOpen,
+                        Cell::Speleothem { faces, .. } => {
+                            ChangedBlock::WaterloggedSpeleothem { faces }
+                        }
                         Cell::Ladder { facing, .. } => ChangedBlock::WaterloggedLadder { facing },
                         _ => ChangedBlock::Fluid(new),
                     },
@@ -656,6 +738,7 @@ pub fn tick(
                     | Cell::BubbleWater(_)
                     | Cell::FenceWater(_)
                     | Cell::OpenWater(_)
+                    | Cell::Speleothem { .. }
                     | Cell::Ladder { .. }
             ) {
                 original
@@ -690,6 +773,8 @@ pub fn tick(
                 ChangedBlock::WaterloggedFence
             } else if let Cell::OpenDry = below {
                 ChangedBlock::WaterloggedOpen
+            } else if let Cell::Speleothem { faces, .. } = below {
+                ChangedBlock::WaterloggedSpeleothem { faces }
             } else if let Cell::Ladder { facing, .. } = below {
                 ChangedBlock::WaterloggedLadder { facing }
             } else {
@@ -723,6 +808,10 @@ pub fn tick(
                             ChangedBlock::WaterloggedOpen => {
                                 Cell::OpenWater(flowing(FluidKind::Water, 8, false))
                             }
+                            ChangedBlock::WaterloggedSpeleothem { faces } => Cell::Speleothem {
+                                faces,
+                                waterlogged: true,
+                            },
                             ChangedBlock::WaterloggedLadder { facing } => Cell::Ladder {
                                 facing,
                                 waterlogged: true,
@@ -953,6 +1042,7 @@ pub fn tick_live<W: LiveFluidWorld>(
             | ChangedBlock::WaterloggedChest
             | ChangedBlock::WaterloggedFence
             | ChangedBlock::WaterloggedOpen
+            | ChangedBlock::WaterloggedSpeleothem { .. }
             | ChangedBlock::WaterloggedLadder { .. } => flowing(FluidKind::Water, 8, false),
             ChangedBlock::Air | ChangedBlock::Solid(_) => {
                 unreachable!("side planning only emits fluid")

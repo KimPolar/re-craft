@@ -44,17 +44,18 @@ public class SpeleothemWaterTickOracle {
         world.rules = new GameRules(FeatureFlags.DEFAULT_FLAGS);
         var rows = new JsonArray();
         for (var spike : List.of(Blocks.POINTED_DRIPSTONE, Blocks.SULFUR_SPIKE)) {
-            for (var thickness : List.of(SpeleothemThickness.TIP, SpeleothemThickness.TIP_MERGE)) {
+            for (var direction : List.of(Direction.UP, Direction.DOWN)) for (var thickness : SpeleothemThickness.values()) {
                 world.blocks = new HashMap<>(); world.random = new LegacyRandomSource(1);
                 world.updater = new CollectingNeighborUpdater(world, 100000);
                 world.blockTicks = new JsonArray(); world.fluidTicks = new JsonArray(); world.pending = new HashSet<>();
-                var initial = spike.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION, Direction.UP)
+                var initial = spike.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION, direction)
                     .setValue(SpeleothemBlock.THICKNESS, thickness).setValue(SpeleothemBlock.WATERLOGGED, true);
                 world.blocks.put(CENTER, initial); world.blocks.put(CENTER.east(), Blocks.AIR.defaultBlockState());
                 Fluids.WATER.tick(world, CENTER, initial, initial.getFluidState());
                 var east = world.getBlockState(CENTER.east());
                 var row = new JsonObject(); row.addProperty("block", BuiltInRegistries.BLOCK.getKey(spike).toString());
                 row.addProperty("thickness", thickness.getSerializedName());
+                row.addProperty("direction", direction.getSerializedName());
                 row.addProperty("east", BuiltInRegistries.BLOCK.getKey(east.getBlock()).toString());
                 row.addProperty("level", east.is(Blocks.WATER) ? east.getValue(LiquidBlock.LEVEL) : -1);
                 row.addProperty("center_unchanged", world.getBlockState(CENTER) == initial);
@@ -62,5 +63,28 @@ public class SpeleothemWaterTickOracle {
             }
         }
         Files.writeString(Path.of(args[0]), rows.toString());
+        if (args.length > 1) {
+            var filled = new JsonArray();
+            for (var spike : List.of(Blocks.POINTED_DRIPSTONE, Blocks.SULFUR_SPIKE)) {
+                for (var direction : List.of(Direction.UP, Direction.DOWN)) for (var thickness : SpeleothemThickness.values()) {
+                    world.blocks = new HashMap<>(); world.random = new LegacyRandomSource(1);
+                    world.updater = new CollectingNeighborUpdater(world, 100000);
+                    world.blockTicks = new JsonArray(); world.fluidTicks = new JsonArray(); world.pending = new HashSet<>();
+                    var initial = spike.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION, direction)
+                        .setValue(SpeleothemBlock.THICKNESS, thickness).setValue(SpeleothemBlock.WATERLOGGED, false);
+                    var water = Blocks.WATER.defaultBlockState();
+                    world.blocks.put(CENTER, initial); world.blocks.put(CENTER.west(), water); world.blocks.put(CENTER.east(), water);
+                    Fluids.WATER.tick(world, CENTER.west(), water, water.getFluidState());
+                    var result = world.getBlockState(CENTER);
+                    var row = new JsonObject(); row.addProperty("block", BuiltInRegistries.BLOCK.getKey(spike).toString());
+                    row.addProperty("thickness", thickness.getSerializedName()); row.addProperty("direction", direction.getSerializedName());
+                    row.addProperty("same_block", result.getBlock() == spike);
+                    row.addProperty("waterlogged", result.getValue(SpeleothemBlock.WATERLOGGED));
+                    row.addProperty("unchanged_thickness", result.getValue(SpeleothemBlock.THICKNESS) == thickness);
+                    row.add("fluid_ticks", world.fluidTicks); filled.add(row);
+                }
+            }
+            Files.writeString(Path.of(args[1]), filled.toString());
+        }
     }
 }

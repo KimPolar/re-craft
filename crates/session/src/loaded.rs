@@ -17008,7 +17008,7 @@ impl LoadedSession {
         if leaf_state_distance(state).is_some() {
             return Some(fluid);
         }
-        if crate::worldgen::wet_upward_speleothem_tip(state) {
+        if native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO).is_some() {
             return Some(fluid);
         }
         if native_world::collision::fence_waterlogged(state) == Some(true) {
@@ -20107,8 +20107,7 @@ impl LoadedSession {
         true
     }
 
-    /// Apply supported speleothem neighbor updates, including source-water
-    /// ticks for upward tips whose fluid collision faces are modeled.
+    /// Apply supported speleothem neighbor updates and contained-water ticks.
     fn update_speleothem_neighbor(
         &mut self,
         position: IVec3,
@@ -20137,10 +20136,6 @@ impl LoadedSession {
             );
             let wet = state.properties["waterlogged"] == "true";
             if wet {
-                anyhow::ensure!(
-                    crate::worldgen::wet_upward_speleothem_tip(&state),
-                    "waterlogged speleothem fluid shape is not simulated"
-                );
                 let fluid = self
                     .simulated_fluid(id)
                     .context("speleothem water unavailable")?;
@@ -20238,13 +20233,6 @@ impl LoadedSession {
                 anyhow::ensure!(
                     self.set(position, next),
                     "speleothem shape could not be updated"
-                );
-                anyhow::ensure!(
-                    !wet || self
-                        .world
-                        .state(next)
-                        .is_some_and(crate::worldgen::wet_upward_speleothem_tip),
-                    "updated speleothem fluid shape is not simulated"
                 );
             }
             Ok(())
@@ -20931,10 +20919,10 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::GrateWater(fluid);
         }
-        if crate::worldgen::wet_upward_speleothem_tip(state)
-            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        if let Some(absolute) = add(self.origin, position)
+            && let Some(spike) = fluid_sim::speleothem_cell(state, absolute)
         {
-            return fluid_sim::Cell::OpenWater(fluid);
+            return spike;
         }
         if native_world::collision::glow_lichen_faces(state).is_some() {
             return if state.properties["waterlogged"] == "true" {
@@ -21091,6 +21079,7 @@ impl LoadedSession {
             fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
             fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
             fluid_sim::ChangedBlock::WaterloggedOpen
+            | fluid_sim::ChangedBlock::WaterloggedSpeleothem { .. }
             | fluid_sim::ChangedBlock::WaterloggedSlab { .. }
             | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
             | fluid_sim::ChangedBlock::WaterloggedChest
@@ -21098,6 +21087,12 @@ impl LoadedSession {
             | fluid_sim::ChangedBlock::WaterloggedLadder { .. } => {
                 let expected = match change.block {
                     fluid_sim::ChangedBlock::WaterloggedOpen => fluid_sim::Cell::OpenDry,
+                    fluid_sim::ChangedBlock::WaterloggedSpeleothem { faces } => {
+                        fluid_sim::Cell::Speleothem {
+                            faces,
+                            waterlogged: false,
+                        }
+                    }
                     fluid_sim::ChangedBlock::WaterloggedSlab { top } => fluid_sim::Cell::Slab {
                         top,
                         waterlogged: false,
@@ -21186,6 +21181,7 @@ impl LoadedSession {
                 change.block,
                 fluid_sim::ChangedBlock::WaterloggedSlab { .. }
                     | fluid_sim::ChangedBlock::WaterloggedOpen
+                    | fluid_sim::ChangedBlock::WaterloggedSpeleothem { .. }
                     | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
                     | fluid_sim::ChangedBlock::WaterloggedChest
                     | fluid_sim::ChangedBlock::WaterloggedFence
@@ -24211,6 +24207,12 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             FluidCell::OpenDry if fluid.kind == FluidKind::Water && fluid.source => {
                 ChangedBlock::WaterloggedOpen
             }
+            FluidCell::Speleothem {
+                faces,
+                waterlogged: false,
+            } if fluid.kind == FluidKind::Water && fluid.source => {
+                ChangedBlock::WaterloggedSpeleothem { faces }
+            }
             FluidCell::Ladder {
                 facing,
                 waterlogged: false,
@@ -24222,6 +24224,7 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             | FluidCell::Chest { .. }
             | FluidCell::FenceDry
             | FluidCell::OpenDry
+            | FluidCell::Speleothem { .. }
             | FluidCell::Ladder { .. } => {
                 return Ok(());
             }
@@ -79225,21 +79228,13 @@ pub(crate) mod tests {
             let spike = session.intern_block(state(
                 "minecraft:pointed_dripstone",
                 &[
-                    (
-                        "vertical_direction",
-                        if waterlogged { "down" } else { "up" },
-                    ),
+                    ("vertical_direction", "up"),
                     ("thickness", "tip"),
                     ("waterlogged", if waterlogged { "true" } else { "false" }),
                 ],
             ));
             assert!(session.set(position, spike));
-            if waterlogged {
-                let stone = session.states[3];
-                assert!(session.set(position + IVec3::X, stone));
-            } else {
-                assert!(session.set(position + IVec3::NEG_Y, session.states[0]));
-            }
+            assert!(session.set(position + IVec3::NEG_Y, session.states[0]));
             assert!(session.unresolved_speleothem_shape);
             assert!(session.validate_speleothem_updates().is_err());
             assert!(session.validate_generation_terrain_readiness().is_err());
@@ -79247,19 +79242,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wet_speleothem_tips_schedule_and_spread_source_water() {
+    fn wet_speleothems_schedule_and_spread_source_water() {
         for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
-            for thickness in ["tip", "tip_merge"] {
+            for (direction, thickness) in ["up", "down"].into_iter().flat_map(|direction| {
+                ["tip", "tip_merge", "frustum", "middle", "base"]
+                    .into_iter()
+                    .map(move |thickness| (direction, thickness))
+            }) {
                 let mut session = session();
                 let pos = IVec3::new(10, 1, 8);
                 let spike = session.intern_block(state(
                     name,
                     &[
-                        ("vertical_direction", "up"),
+                        ("vertical_direction", direction),
                         ("thickness", thickness),
                         ("waterlogged", "true"),
                     ],
                 ));
+                if direction == "down" {
+                    let stone = session.states[3];
+                    assert!(session.set_with_notify(pos + IVec3::Y, stone, false));
+                }
                 assert!(session.set_with_notify(pos, spike, false));
                 for offset in [IVec3::NEG_X, IVec3::NEG_Z, IVec3::Z] {
                     let stone = session.states[3];
@@ -79268,10 +79271,12 @@ pub(crate) mod tests {
                 session.fluid_ticks.clear();
                 session.fluid_pending.clear();
                 let source = session.simulated_fluid(spike).expect("contained water");
-                assert_eq!(
-                    session.simulation_cell(pos),
-                    fluid_sim::Cell::OpenWater(source)
-                );
+                let expected = fluid_sim::speleothem_cell(
+                    session.world.state(spike).unwrap(),
+                    session.origin + pos,
+                )
+                .unwrap();
+                assert_eq!(session.simulation_cell(pos), expected);
                 assert!(source.source && source.kind == FluidKind::Water);
                 let stone = session.states[3];
                 assert!(session.set(pos + IVec3::X, stone));
@@ -79308,11 +79313,69 @@ pub(crate) mod tests {
                 );
                 assert!(matches!(session.simulation_cell(pos + IVec3::X),
                     fluid_sim::Cell::Fluid(water) if water.kind == FluidKind::Water && water.amount == 7));
-                assert_eq!(
-                    session.simulation_cell(pos),
-                    fluid_sim::Cell::OpenWater(source)
-                );
+                assert_eq!(session.simulation_cell(pos), expected);
                 assert!(!session.unresolved_speleothem_shape);
+            }
+        }
+    }
+
+    #[test]
+    fn source_water_waterlogs_speleothems_without_replacing_the_block() {
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for direction in ["up", "down"] {
+                for thickness in ["tip", "tip_merge", "frustum", "middle", "base"] {
+                    let mut session = session();
+                    session.sky_lighting.set_enabled(false);
+                    let pos = IVec3::new(8, 4, 8);
+                    let spike = session.intern_block(state(
+                        name,
+                        &[
+                            ("vertical_direction", direction),
+                            ("thickness", thickness),
+                            ("waterlogged", "false"),
+                        ],
+                    ));
+                    let water = FluidState {
+                        kind: FluidKind::Water,
+                        amount: 8,
+                        source: true,
+                        falling: false,
+                    };
+                    let water_id = session.intern_liquid(water);
+                    let stone = session.states[3];
+                    for offset in [
+                        IVec3::NEG_Y,
+                        IVec3::Y,
+                        IVec3::NEG_X + IVec3::NEG_Y,
+                        IVec3::NEG_X * 2,
+                        IVec3::NEG_X + IVec3::NEG_Z,
+                        IVec3::NEG_X + IVec3::Z,
+                    ] {
+                        assert!(session.set_with_notify(pos + offset, stone, false));
+                    }
+                    assert!(session.set_with_notify(pos, spike, false));
+                    assert!(session.set_with_notify(pos + IVec3::NEG_X, water_id, false));
+                    assert!(session.set_with_notify(pos + IVec3::X, water_id, false));
+                    session.fluid_ticks.clear();
+                    session.fluid_pending.clear();
+                    session.schedule_fluid(pos + IVec3::NEG_X, water, 0);
+                    session.advance_fluid_ticks();
+                    let absolute = session.origin + pos;
+                    let actual = session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap();
+                    assert_eq!(actual.name, name, "{name} {direction} {thickness}");
+                    assert_eq!(actual.properties["vertical_direction"], direction);
+                    assert_eq!(actual.properties["thickness"], thickness);
+                    assert_eq!(actual.properties["waterlogged"], "true");
+                    assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+                        && key.y == absolute.y
+                        && key.z == absolute.z
+                        && key.kind == FluidKind::Water
+                        && key.source));
+                    assert!(!session.unresolved_speleothem_shape);
+                }
             }
         }
     }
@@ -79346,6 +79409,7 @@ pub(crate) mod tests {
         let source = temp.path().join("SpeleothemWaterTickOracle.java");
         let dependency = temp.path().join("IceBubbleTagOracle.java");
         let output = temp.path().join("output.json");
+        let filled_output = temp.path().join("filled.json");
         std::fs::write(
             &source,
             include_str!("../tests/java/SpeleothemWaterTickOracle.java"),
@@ -79366,7 +79430,8 @@ pub(crate) mod tests {
                 .arg("-cp")
                 .arg(&classpath)
                 .arg("SpeleothemWaterTickOracle")
-                .arg(&output),
+                .arg(&output)
+                .arg(&filled_output),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -79378,7 +79443,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 20);
         let center = IVec3::new(8, 10, 8);
         for row in rows {
             let mut session = session();
@@ -79386,7 +79451,7 @@ pub(crate) mod tests {
             let spike = session.intern_block(state(
                 row["block"].as_str().unwrap(),
                 &[
-                    ("vertical_direction", "up"),
+                    ("vertical_direction", row["direction"].as_str().unwrap()),
                     ("thickness", row["thickness"].as_str().unwrap()),
                     ("waterlogged", "true"),
                 ],
@@ -79423,8 +79488,92 @@ pub(crate) mod tests {
                 "{row}"
             );
             assert_eq!(
-                session.simulation_cell(center) == fluid_sim::Cell::OpenWater(source),
+                session.simulation_cell(center)
+                    == fluid_sim::speleothem_cell(
+                        session.world.state(spike).unwrap(),
+                        session.origin + center
+                    )
+                    .unwrap(),
                 row["center_unchanged"].as_bool().unwrap(),
+                "{row}"
+            );
+            let mut fluids: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    (
+                        order.3,
+                        serde_json::json!([
+                            if key.source { "water" } else { "flowing_water" },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            fluids.sort_by_key(|entry| entry.0);
+            assert_eq!(
+                serde_json::json!(fluids.into_iter().map(|entry| entry.1).collect::<Vec<_>>()),
+                row["fluid_ticks"],
+                "{row}"
+            );
+            assert!(!session.unresolved_speleothem_shape, "{row}");
+        }
+        let filled: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(filled_output).unwrap()).unwrap();
+        assert_eq!(filled.len(), 20);
+        for row in filled {
+            let mut session = session();
+            session.sky_lighting.set_enabled(false);
+            let spike = session.intern_block(state(
+                row["block"].as_str().unwrap(),
+                &[
+                    ("vertical_direction", row["direction"].as_str().unwrap()),
+                    ("thickness", row["thickness"].as_str().unwrap()),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            let water = FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            let water_id = session.intern_liquid(water);
+            let stone = session.states[3];
+            let chunk = session.player_chunk().unwrap();
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            let blocks = section.blocks.as_mut().unwrap();
+            blocks.fill(stone);
+            let index = |p: IVec3| (p.x + p.z * 16 + p.y * 256) as usize;
+            blocks[index(center)] = spike;
+            blocks[index(center + IVec3::NEG_X)] = water_id;
+            blocks[index(center + IVec3::X)] = water_id;
+            session.schedule_fluid(center + IVec3::NEG_X, water, 0);
+            session.advance_fluid_ticks();
+            let absolute = session.origin + center;
+            let block = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(
+                block.name == row["block"].as_str().unwrap(),
+                row["same_block"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                block.properties["waterlogged"] == "true",
+                row["waterlogged"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                block.properties["thickness"] == row["thickness"].as_str().unwrap(),
+                row["unchanged_thickness"].as_bool().unwrap(),
                 "{row}"
             );
             let mut fluids: Vec<_> = session

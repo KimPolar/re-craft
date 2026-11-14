@@ -1762,7 +1762,7 @@ fn bubble_column_drag(state: &BlockState) -> Option<bool> {
 
 // Java's upward wet tips have no effect on merged fluid faces against the
 // supported water-flow shapes. Other thicknesses can occlude a stair face.
-pub(crate) fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
+fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
     matches!(
         state.name.as_str(),
         "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"

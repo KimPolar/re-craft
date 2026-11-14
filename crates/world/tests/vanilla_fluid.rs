@@ -169,6 +169,95 @@ fn run(command: &mut Command) -> String {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn speleothem_fluid_faces_match_java_at_world_positions() {
+    use native_world::fluid_sim::{self, Cell as FluidCell};
+    let game = game_dir();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("SpeleothemFluidFacesOracle.java");
+    let output = temp.path().join("faces.json");
+    std::fs::write(
+        &source,
+        include_str!("java/SpeleothemFluidFacesOracle.java"),
+    )
+    .unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("SpeleothemFluidFacesOracle")
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert!(rows.len() > 10_000);
+    let decode = |value: &Value| BlockState {
+        name: value["id"].as_str().unwrap().into(),
+        properties: value["properties"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+            .collect(),
+    };
+    let cell = |state: &BlockState, pos: IVec3| -> FluidCell {
+        match state.name.as_str() {
+            "minecraft:air" => FluidCell::Air,
+            "minecraft:stone" => FluidCell::Solid,
+            "minecraft:stone_slab" if state.properties["type"] == "double" => FluidCell::Solid,
+            "minecraft:stone_slab" => FluidCell::Slab {
+                top: state.properties["type"] == "top",
+                waterlogged: state.properties["waterlogged"] == "true",
+            },
+            "minecraft:oak_stairs" => FluidCell::Stairs {
+                voxels: fluid_sim::octants(&native_world::collision::block_shape(state).unwrap())
+                    .unwrap(),
+                waterlogged: state.properties["waterlogged"] == "true",
+            },
+            "minecraft:pointed_dripstone" | "minecraft:sulfur_spike" => {
+                fluid_sim::speleothem_cell(state, pos).unwrap()
+            }
+            other => panic!("unexpected Java neighbor {other}"),
+        }
+    };
+    let directions = [
+        IVec3::X,
+        IVec3::NEG_X,
+        IVec3::Y,
+        IVec3::NEG_Y,
+        IVec3::Z,
+        IVec3::NEG_Z,
+    ];
+    for row in rows {
+        let spike = decode(&row["spike"]);
+        let other = decode(&row["other"]);
+        let pos = IVec3::new(
+            row["pos"][0].as_i64().unwrap() as i32,
+            row["pos"][1].as_i64().unwrap() as i32,
+            row["pos"][2].as_i64().unwrap() as i32,
+        );
+        let from = cell(&spike, pos);
+        let mut forward = 0_u64;
+        let mut reverse = 0_u64;
+        for (index, direction) in directions.into_iter().enumerate() {
+            let to = cell(&other, pos + direction);
+            forward |= u64::from(fluid_sim::can_pass(from, to, direction)) << index;
+            reverse |= u64::from(fluid_sim::can_pass(to, from, -direction)) << index;
+        }
+        assert_eq!(
+            forward,
+            row["forward"].as_u64().unwrap(),
+            "{row}; other native shape {:?}; spike native shape {:?}",
+            native_world::collision::block_shape(&other),
+            native_world::collision::positioned_speleothem_shape(&spike, pos)
+        );
+        assert_eq!(reverse, row["reverse"].as_u64().unwrap(), "{row}");
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn item_current_matches_java_accumulator_in_shallow_flow() {
     use native_world::movement::BoundingBox;
     let java_source = r#"

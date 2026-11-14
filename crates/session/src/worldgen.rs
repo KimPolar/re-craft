@@ -69,9 +69,7 @@ pub(crate) use ore::directional_multiface_support;
 pub mod postprocessing;
 pub mod postprocessing_drops;
 mod postprocessing_world;
-pub(crate) use postprocessing_world::{
-    fence_connection, speleothem_thickness, wet_upward_speleothem_tip,
-};
+pub(crate) use postprocessing_world::{fence_connection, speleothem_thickness};
 pub mod ruined_portal;
 pub mod saved_structure_starts;
 pub mod schedule;

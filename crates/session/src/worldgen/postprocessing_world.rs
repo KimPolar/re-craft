@@ -1760,25 +1760,6 @@ fn bubble_column_drag(state: &BlockState) -> Option<bool> {
     }
 }
 
-// Java's upward wet tips have no effect on merged fluid faces against the
-// supported water-flow shapes. Other thicknesses can occlude a stair face.
-fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
-    matches!(
-        state.name.as_str(),
-        "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"
-    ) && state.properties.len() == 3
-        && state
-            .properties
-            .get("vertical_direction")
-            .map(String::as_str)
-            == Some("up")
-        && matches!(
-            state.properties.get("thickness").map(String::as_str),
-            Some("tip" | "tip_merge")
-        )
-        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
-}
-
 fn supported_speleothem(state: &BlockState) -> bool {
     matches!(
         state.name.as_str(),
@@ -2006,11 +1987,18 @@ impl GeneratedBlockView<'_> {
         let Ok(state) = self.read(pos.to_array()) else {
             return Cell::Unknown;
         };
-        self.fluid_cell_from_state(&state)
+        self.fluid_cell_from_state(&state, pos)
     }
 
-    fn fluid_cell_from_state(&self, state: &BlockState) -> native_world::fluid_sim::Cell {
+    fn fluid_cell_from_state(
+        &self,
+        state: &BlockState,
+        pos: glam::IVec3,
+    ) -> native_world::fluid_sim::Cell {
         use native_world::fluid_sim::Cell;
+        if let Some(cell) = native_world::fluid_sim::speleothem_cell(state, pos) {
+            return cell;
+        }
         if let Some((facing, waterlogged)) = ladder_state(state) {
             return Cell::Ladder {
                 facing,
@@ -2039,14 +2027,6 @@ impl GeneratedBlockView<'_> {
             } else {
                 Cell::OpenDry
             };
-        }
-        if wet_upward_speleothem_tip(state) {
-            return Cell::OpenWater(native_world::fluid::FluidState {
-                kind: native_world::fluid::FluidKind::Water,
-                amount: 8,
-                source: true,
-                falling: false,
-            });
         }
         if bubble_column_drag(state).is_some() {
             return Cell::BubbleWater(native_world::fluid::FluidState {
@@ -2299,9 +2279,10 @@ impl GeneratedBlockView<'_> {
                             && next.falling
                             && next.amount == 8)
                             || (direction != glam::IVec3::NEG_Y
-                                && !next.falling
-                                && ((next.source && next.amount == 8)
-                                    || (!next.source && (1..=7).contains(&next.amount)))))
+                                && ((!next.source && next.falling && next.amount == 8)
+                                    || (!next.falling
+                                        && ((next.source && next.amount == 8)
+                                            || (!next.source && (1..=7).contains(&next.amount)))))))
                 }
                 ChangedBlock::WaterloggedSlab { top } => matches!(
                     self.fluid_cell_for_spread(change.position),
@@ -2317,6 +2298,10 @@ impl GeneratedBlockView<'_> {
                 ChangedBlock::WaterloggedOpen => {
                     matches!(self.fluid_cell_for_spread(change.position), Cell::OpenDry)
                 }
+                ChangedBlock::WaterloggedSpeleothem { faces } => matches!(
+                    self.fluid_cell_for_spread(change.position),
+                    Cell::Speleothem { faces: actual, waterlogged: false } if actual == faces
+                ),
                 ChangedBlock::WaterloggedLadder { facing } => matches!(
                     self.fluid_cell_for_spread(change.position),
                     Cell::Ladder { facing: actual, waterlogged: false } if actual == facing
@@ -2325,7 +2310,7 @@ impl GeneratedBlockView<'_> {
             };
             ensure!(
                 valid_direction && valid_target,
-                "generated fluid tick requires unsupported block callbacks"
+                "generated fluid tick requires unsupported block callbacks: {change:?}"
             );
         }
         let settings = Settings {
@@ -2394,6 +2379,9 @@ impl GeneratedBlockView<'_> {
             | Cell::Ladder {
                 waterlogged: false, ..
             }
+            | Cell::Speleothem {
+                waterlogged: false, ..
+            }
             | Cell::FenceDry
             | Cell::OpenDry) => cell,
             Cell::Fluid(fluid) if fluid.kind == FluidKind::Lava => Cell::Fluid(fluid),
@@ -2407,6 +2395,9 @@ impl GeneratedBlockView<'_> {
                 waterlogged: true, ..
             }
             | Cell::Ladder {
+                waterlogged: true, ..
+            }
+            | Cell::Speleothem {
                 waterlogged: true, ..
             }
             | Cell::FenceWater(_)
@@ -2614,7 +2605,7 @@ impl GeneratedBlockView<'_> {
         {
             let p = pos + delta;
             let state = self.read(p.to_array())?;
-            let contained = self.fluid_cell_from_state(&state).contained_fluid();
+            let contained = self.fluid_cell_from_state(&state, p).contained_fluid();
             let kind = if let Some(fluid) = contained {
                 let id = match (fluid.kind, fluid.source) {
                     (FluidKind::Water, true) => "minecraft:water",
@@ -3125,6 +3116,10 @@ impl GeneratedBlockView<'_> {
                 ..
             } | Cell::FenceDry
                 | Cell::OpenDry
+                | Cell::Speleothem {
+                    waterlogged: false,
+                    ..
+                }
                 | Cell::Ladder {
                     waterlogged: false,
                     ..
@@ -3201,11 +3196,14 @@ impl GeneratedBlockView<'_> {
         let next_ladder = ladder_state(next);
         let next_lichen =
             super::ore::valid_lichen(next) && next.properties["waterlogged"] == "true";
+        let next_speleothem =
+            supported_speleothem(next) && next.properties["waterlogged"] == "true";
         let contained_source = next_slab.is_some_and(|(_, wet)| wet)
             || next_stair.is_some_and(|(_, wet)| wet)
             || next_fence == Some(true)
             || next_ladder.is_some_and(|(_, wet)| wet)
-            || next_lichen;
+            || next_lichen
+            || next_speleothem;
         ensure!(
             next_fluid.is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
                 || (next.name == "minecraft:air" && next.properties.is_empty())
@@ -3233,6 +3231,16 @@ impl GeneratedBlockView<'_> {
                 || (super::ore::valid_lichen(old)
                     && old.properties["waterlogged"] == "false"
                     && next_lichen
+                    && {
+                        let mut expected = old.clone();
+                        expected
+                            .properties
+                            .insert("waterlogged".into(), "true".into());
+                        *next == expected
+                    })
+                || (supported_speleothem(old)
+                    && old.properties["waterlogged"] == "false"
+                    && next_speleothem
                     && {
                         let mut expected = old.clone();
                         expected
@@ -3320,6 +3328,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::Ladder { .. }
                         | Cell::OpenWater(_)
                         | Cell::OpenDry
+                        | Cell::Speleothem { .. }
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
                 ),
@@ -3430,10 +3439,10 @@ impl GeneratedBlockView<'_> {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
                     self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
-                ensure!(
-                    updated == state,
-                    "water change needs speleothem shape callbacks"
-                );
+                if updated != state {
+                    self.write_postprocessed_state(p.to_array(), &state, &updated)?;
+                    self.update_water_shape_neighbors(p.to_array(), &updated, depth - 1)?;
+                }
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
@@ -3588,6 +3597,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::Ladder { .. }
                         | Cell::OpenWater(_)
                         | Cell::OpenDry
+                        | Cell::Speleothem { .. }
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
                 ),
@@ -3633,10 +3643,10 @@ impl GeneratedBlockView<'_> {
             } else if supported_speleothem(&state) {
                 let updated =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
-                ensure!(
-                    updated == state,
-                    "water change needs speleothem shape callbacks"
-                );
+                if updated != state {
+                    self.write_postprocessed_state(neighbor, &state, &updated)?;
+                    self.update_water_shape_neighbors(neighbor, &updated, depth - 1)?;
+                }
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let next =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
@@ -4244,6 +4254,10 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                 ..
             } | Cell::FenceDry
                 | Cell::OpenDry
+                | Cell::Speleothem {
+                    waterlogged: false,
+                    ..
+                }
                 | Cell::Ladder {
                     waterlogged: false,
                     ..
@@ -4263,9 +4277,10 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                         && !fluid.falling
                         && fluid.amount == 8)
                     || (horizontal
-                        && !fluid.falling
-                        && ((fluid.source && fluid.amount == 8)
-                            || (!fluid.source && (1..=7).contains(&fluid.amount))))),
+                        && ((!fluid.source && fluid.falling && fluid.amount == 8)
+                            || (!fluid.falling
+                                && ((fluid.source && fluid.amount == 8)
+                                    || (!fluid.source && (1..=7).contains(&fluid.amount))))))),
             "unsupported generated water spread"
         );
         self.view.spread_water(pos, fluid)
@@ -4595,13 +4610,14 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
         if bubble_column_drag(state).is_some() {
-            return Ok(self.fluid_cell_from_state(state).contained_fluid());
+            return Ok(self
+                .fluid_cell_from_state(state, glam::IVec3::ZERO)
+                .contained_fluid());
         }
-        if wet_upward_speleothem_tip(state) {
-            return Ok(self.fluid_cell_from_state(state).contained_fluid());
-        }
-        if supported_speleothem(state) && state.properties["waterlogged"] == "false" {
-            return Ok(None);
+        if supported_speleothem(state) {
+            return Ok(self
+                .fluid_cell_from_state(state, glam::IVec3::ZERO)
+                .contained_fluid());
         }
         if let Some((facing, waterlogged)) = ladder_state(state) {
             return Ok(native_world::fluid_sim::Cell::Ladder {
@@ -9486,6 +9502,58 @@ mod tests {
                         .unwrap();
                 }
             }
+            case if case.starts_with("speleothem_water_") => {
+                let parts: Vec<_> = case.split('_').collect();
+                let [_, _, wet, material, direction, thickness] = parts.as_slice() else {
+                    panic!("invalid speleothem water case")
+                };
+                let block = world.intern_state(BlockState {
+                    name: if *material == "sulfur" {
+                        "minecraft:sulfur_spike"
+                    } else {
+                        "minecraft:pointed_dripstone"
+                    }
+                    .into(),
+                    properties: BTreeMap::from([
+                        ("vertical_direction".into(), (*direction).into()),
+                        (
+                            "thickness".into(),
+                            if *thickness == "merge" {
+                                "tip_merge"
+                            } else {
+                                *thickness
+                            }
+                            .into(),
+                        ),
+                        ("waterlogged".into(), (*wet == "wet").to_string()),
+                    ]),
+                });
+                if *wet == "wet" {
+                    world.set_block_id(8, 8, 8, block).unwrap();
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                } else {
+                    world.set_block_id(9, 8, 8, block).unwrap();
+                    world.set_block_id(9, 8, 7, water).unwrap();
+                }
+            }
+            case if case.starts_with("speleothem_shape_") => {
+                let wet = case.contains("_wet_");
+                let block = world.intern_state(BlockState {
+                    name: if case.ends_with("_sulfur") {
+                        "minecraft:sulfur_spike"
+                    } else {
+                        "minecraft:pointed_dripstone"
+                    }
+                    .into(),
+                    properties: BTreeMap::from([
+                        ("vertical_direction".into(), "down".into()),
+                        ("thickness".into(), "base".into()),
+                        ("waterlogged".into(), wet.to_string()),
+                    ]),
+                });
+                world.set_block_id(9, 8, 8, air).unwrap();
+                world.set_block_id(9, 9, 8, block).unwrap();
+            }
             "barrier_sulfur"
             | "barrier_cinnabar"
             | "barrier_potent_sulfur_wet"
@@ -10118,7 +10186,10 @@ mod tests {
             native_resources::ore_feature::OreBlockTags::load(&mut Tags, &registry, &fence_tags)
                 .unwrap(),
         )));
-        if case.starts_with("marked_speleothem_") {
+        if case.starts_with("marked_speleothem_")
+            || case.starts_with("speleothem_water_")
+            || case.starts_with("speleothem_shape_")
+        {
             let tag = native_resources::packs::ResourceId::parse("minecraft:speleothems").unwrap();
             stage.set_speleothem_tags(Some(Arc::new(
                 native_resources::ore_feature::OreBlockTags::load(
@@ -10235,6 +10306,8 @@ mod tests {
         if case.starts_with("down_container_")
             || case.starts_with("wet_tip_neighbor_")
             || case.starts_with("marked_speleothem_")
+            || case.starts_with("speleothem_water_")
+            || case.starts_with("speleothem_shape_")
             || matches!(
                 case,
                 "dry_lichen_on"
@@ -10424,11 +10497,53 @@ mod tests {
             assert!(stage.clone().finish().is_err());
         }
         let heightmap_tags = stage.heightmap_tags.clone().unwrap();
-        while !stage.poll(chunk, 1).unwrap() {}
+        while !stage
+            .poll(chunk, 1)
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"))
+        {}
         if case == "edge" {
             while !stage.poll(east_chunk, 1).unwrap() {}
         }
         let result = stage.finish().unwrap();
+        if case.starts_with("speleothem_water_") || case.starts_with("speleothem_shape_") {
+            let player = crate::PlayerState {
+                position: glam::Vec3::new(8.5, 10.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: crate::PlayerPose::Standing,
+            };
+            let mut session = crate::loaded::LoadedSession::new(
+                (*result.world).clone(),
+                glam::IVec3::ZERO,
+                crate::loaded::BuildBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                player,
+            )
+            .unwrap();
+            session
+                .install_generated_ticks(&result.ticks.activated_snapshot())
+                .unwrap();
+            let expected: Vec<_> = result
+                .ticks
+                .chunk(chunk)
+                .unwrap()
+                .fluids
+                .pack(100)
+                .into_iter()
+                .map(|tick| (tick.kind, tick.position, tick.delay, tick.priority))
+                .collect();
+            let actual: Vec<_> = session
+                .draft_fluid_ticks(chunk)
+                .unwrap()
+                .into_iter()
+                .map(|tick| (tick.fluid, tick.position, tick.delay, tick.priority))
+                .collect();
+            assert_eq!(actual, expected, "{case}: generated fluid queue handoff");
+        }
         if case == "water_touch_lava_cascade" {
             let resumed = GeneratedPostprocessing::from_completed(
                 &result,
@@ -10630,6 +10745,8 @@ mod tests {
                 case if case.starts_with("down_container_") => Some(case.ends_with("_true")),
                 case if case.starts_with("wet_tip_neighbor_") => Some(true),
                 case if case.starts_with("marked_speleothem_") => Some(true),
+                case if case.starts_with("speleothem_water_") => Some(true),
+                case if case.starts_with("speleothem_shape_") => Some(true),
                 "dry_lichen_off"
                 | "convert_off"
                 | "origin_source_off"
@@ -10715,6 +10832,16 @@ mod tests {
                     state.properties["east"]
                 ));
             }
+        }
+        if case.starts_with("speleothem_shape_") {
+            let state = result.world.block(9, 9, 8).unwrap();
+            trace.push(format!(
+                "shape_above {} {} {} {}",
+                state.name,
+                state.properties["vertical_direction"],
+                state.properties["thickness"],
+                state.properties["waterlogged"]
+            ));
         }
         if case.starts_with("bubble_") {
             for y in 8..=9 {
@@ -12118,40 +12245,6 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_valid_wet_upward_speleothem_tips() {
-        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
-            let mut state = BlockState {
-                name: name.into(),
-                properties: BTreeMap::from([
-                    ("thickness".into(), "tip".into()),
-                    ("vertical_direction".into(), "up".into()),
-                    ("waterlogged".into(), "true".into()),
-                ]),
-            };
-            assert!(wet_upward_speleothem_tip(&state));
-            state
-                .properties
-                .insert("thickness".into(), "tip_merge".into());
-            assert!(wet_upward_speleothem_tip(&state));
-            state.properties.insert("thickness".into(), "tip".into());
-            for (property, value) in [
-                ("thickness", "base"),
-                ("vertical_direction", "down"),
-                ("waterlogged", "false"),
-            ] {
-                let old = state
-                    .properties
-                    .insert(property.into(), value.into())
-                    .unwrap();
-                assert!(!wet_upward_speleothem_tip(&state));
-                state.properties.insert(property.into(), old);
-            }
-            state.properties.insert("unexpected".into(), "true".into());
-            assert!(!wet_upward_speleothem_tip(&state));
-        }
-    }
-
-    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn wet_speleothem_fluid_faces_match_java() {
         let actual = java_results(
@@ -12178,6 +12271,106 @@ mod tests {
         .into_iter()
         .flat_map(water_spread_trace)
         .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_speleothem_water_ticks_match_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["speleothem_water"],
+        );
+        let mut expected = Vec::new();
+        for wet in ["wet", "dry"] {
+            for material in ["sulfur", "dripstone"] {
+                for direction in ["up", "down"] {
+                    for thickness in ["base", "middle", "frustum", "tip", "merge"] {
+                        expected.extend(water_spread_trace(&format!(
+                            "speleothem_water_{wet}_{material}_{direction}_{thickness}"
+                        )));
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_speleothem_water_and_tick_handoff_are_preserved() {
+        for wet in ["wet", "dry"] {
+            for material in ["sulfur", "dripstone"] {
+                for direction in ["up", "down"] {
+                    for thickness in ["base", "middle", "frustum", "tip", "merge"] {
+                        let case =
+                            format!("speleothem_water_{wet}_{material}_{direction}_{thickness}");
+                        let trace = water_spread_trace(&case);
+                        let x = if wet == "wet" { 8 } else { 9 };
+                        let block = if material == "sulfur" {
+                            "minecraft:sulfur_spike"
+                        } else {
+                            "minecraft:pointed_dripstone"
+                        };
+                        assert!(
+                            trace
+                                .iter()
+                                .any(|line| line == &format!("state {x},8,8 {block} true")),
+                            "{case}: {trace:?}"
+                        );
+                        assert!(
+                            trace
+                                .iter()
+                                .any(|line| line == &format!("fluid minecraft:water {x},8,8 5")),
+                            "{case}: {trace:?}"
+                        );
+                    }
+                }
+            }
+        }
+        for wet in ["wet", "dry"] {
+            for material in ["sulfur", "dripstone"] {
+                let case = format!("speleothem_shape_{wet}_{material}");
+                let trace = water_spread_trace(&case);
+                let block = if material == "sulfur" {
+                    "minecraft:sulfur_spike"
+                } else {
+                    "minecraft:pointed_dripstone"
+                };
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line
+                            == &format!("shape_above {block} down tip {}", wet == "wet")),
+                    "{case}: {trace:?}"
+                );
+                let water_level = if wet == "wet" { 8 } else { 1 };
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == &format!("state 9,8,8 minecraft:water {water_level}")),
+                    "{case}: {trace:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_water_speleothem_shape_updates_match_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["speleothem_shape"],
+        );
+        let mut expected = Vec::new();
+        for wet in ["wet", "dry"] {
+            for material in ["sulfur", "dripstone"] {
+                expected.extend(water_spread_trace(&format!(
+                    "speleothem_shape_{wet}_{material}"
+                )));
+            }
+        }
         assert_eq!(actual, expected);
     }
 

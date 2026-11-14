@@ -146,6 +146,17 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("dry_lichen")){scenarios.clear();scenarios.addAll(List.of("dry_lichen_on","dry_lichen_off","dry_lichen_down","dry_lichen_support"));}
         if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone","wet_tip_neighbor_sulfur_merge"));}
         if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack","marked_speleothem_sulfur_down","marked_speleothem_sulfur_falling"));}
+        if(args.length>0 && args[0].equals("speleothem_water")) {
+            scenarios.clear();
+            for(var wet:List.of("wet","dry")) for(var material:List.of("sulfur","dripstone"))
+                for(var direction:List.of("up","down")) for(var thickness:List.of("base","middle","frustum","tip","merge"))
+                    scenarios.add("speleothem_water_"+wet+"_"+material+"_"+direction+"_"+thickness);
+        }
+        if(args.length>0 && args[0].equals("speleothem_shape")) {
+            scenarios.clear();
+            for(var wet:List.of("wet","dry")) for(var material:List.of("sulfur","dripstone"))
+                scenarios.add("speleothem_shape_"+wet+"_"+material);
+        }
         if(args.length>0 && args[0].equals("potent_sulfur_barrier")){scenarios.clear();scenarios.add("barrier_potent_sulfur_wet");}
         if(args.length>0 && args[0].equals("bubble_column")){scenarios.clear();scenarios.addAll(List.of("bubble_magma","bubble_magma_stack","bubble_magma_near","bubble_magma_both","bubble_magma_spike"));}
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
@@ -302,6 +313,23 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 blocks.put(pos,spike);
                 if(down){blocks.put(pos.below(),Blocks.AIR.defaultBlockState());if(scenario.endsWith("_falling"))blocks.put(pos.above(),Blocks.AIR.defaultBlockState());}
                 else blocks.put(pos.above(),scenario.endsWith("_stack")?get(pos):Blocks.AIR.defaultBlockState());
+            }
+            if(scenario.startsWith("speleothem_water_")) {
+                var parts=scenario.split("_");
+                var block=parts[3].equals("sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
+                var direction=parts[4].equals("up")?Direction.UP:Direction.DOWN;
+                var thickness=net.minecraft.world.level.block.state.properties.SpeleothemThickness.valueOf(parts[5].equals("merge")?"TIP_MERGE":parts[5].toUpperCase(Locale.ROOT));
+                var spike=block.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION,direction)
+                    .setValue(SpeleothemBlock.THICKNESS,thickness).setValue(SpeleothemBlock.WATERLOGGED,parts[2].equals("wet"));
+                if(parts[2].equals("wet")){blocks.put(pos,spike);blocks.put(pos.east(),Blocks.AIR.defaultBlockState());}
+                else {blocks.put(pos.east(),spike);blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());}
+            }
+            if(scenario.startsWith("speleothem_shape_")) {
+                var block=scenario.endsWith("_sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
+                var spike=block.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION,Direction.DOWN)
+                    .setValue(SpeleothemBlock.THICKNESS,net.minecraft.world.level.block.state.properties.SpeleothemThickness.BASE)
+                    .setValue(SpeleothemBlock.WATERLOGGED,scenario.contains("_wet_"));
+                blocks.put(pos.east(),Blocks.AIR.defaultBlockState());blocks.put(pos.east().above(),spike);
             }
             if(snowyWater || snowyFence) {
                 var parts=scenario.split("_");
@@ -479,6 +507,11 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 if(state.getBlock() instanceof MultifaceBlock)out.printf("lichen %d,%d,%d %s %s %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(MultifaceBlock.getFaceProperty(Direction.DOWN)),state.getValue(MultifaceBlock.getFaceProperty(Direction.UP)),state.getValue(MultifaceBlock.getFaceProperty(Direction.NORTH)),state.getValue(MultifaceBlock.getFaceProperty(Direction.SOUTH)),state.getValue(MultifaceBlock.getFaceProperty(Direction.WEST)),state.getValue(MultifaceBlock.getFaceProperty(Direction.EAST)));
                 if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
                 if(state.getBlock() instanceof FenceBlock)out.printf("fence %d,%d,%d %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(FenceBlock.NORTH),state.getValue(FenceBlock.EAST),state.getValue(FenceBlock.SOUTH),state.getValue(FenceBlock.WEST));
+            }
+            if(scenario.startsWith("speleothem_shape_")) {
+                var spike=get(pos.east().above());
+                out.printf("shape_above %s %s %s %s%n",BuiltInRegistries.BLOCK.getKey(spike.getBlock()),
+                    spike.getValue(SpeleothemBlock.TIP_DIRECTION),spike.getValue(SpeleothemBlock.THICKNESS),spike.getValue(SpeleothemBlock.WATERLOGGED));
             }
             if(scenario.startsWith("bubble_"))for(int y=8;y<=9;y++){
                 var s=get(new BlockPos(8,y,8));

@@ -3318,6 +3318,7 @@ mod tests {
             let writable = terrain.snapshot().chunks.keys().copied().collect();
             let mut region = terrain.decoration_region(&tags, &motion, writable)?;
             let mut expected_beds = BTreeSet::new();
+            let mut expected_bed_order = Vec::new();
             for block in &template.blocks {
                 let raw = &template.palettes[0][block.state];
                 let Some(Tag::String(id)) = raw.get("id") else {
@@ -3354,6 +3355,7 @@ mod tests {
                 }
                 if id.ends_with("_bed") && state.properties["part"] == "head" {
                     expected_beds.insert(block.position);
+                    expected_bed_order.push(block.position);
                 }
                 let mut random = DecorationRandom::new(42);
                 assert!(
@@ -3371,6 +3373,14 @@ mod tests {
                 found.insert(id);
             }
             region.finish()?;
+            let changes = terrain.recorded_generation_poi_changes(ChunkPos { x: 0, z: 0 })?;
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|change| change.position)
+                    .collect::<Vec<_>>(),
+                expected_bed_order
+            );
             let poi_pos = native_persistence::world::ChunkPos { x: 0, z: 0 };
             let snapshot = terrain.snapshot();
             let poi = native_persistence::poi::refresh_missing_chunk(

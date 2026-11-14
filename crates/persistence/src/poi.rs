@@ -10,6 +10,7 @@ use crate::{
     world::{ChunkPos, SavedPoiChunk, SavedPoiRecord, TARGET_DATA_VERSION, decode_poi_chunk},
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoiBlockChange {
     pub position: [i32; 3],
     pub expected: BlockState,

@@ -4159,6 +4159,14 @@ impl FreshTerrainBatch {
                 "chunk was not selected for this postprocessing pass"
             );
             ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            ensure!(
+                self.terrain
+                    .as_ref()
+                    .context("generated terrain is missing")?
+                    .recorded_generation_poi_changes(pos)?
+                    .is_empty(),
+                "generation POI changes require ordered reconciliation"
+            );
             processed.ensure_poi_unchanged(pos, registry)?;
             let poi_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
             let draft = native_persistence::poi::refresh_missing_chunk(

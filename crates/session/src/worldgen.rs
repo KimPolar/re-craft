@@ -263,6 +263,12 @@ pub struct CarvedTerrainWorld {
         BTreeMap<native_world::loaded::ChunkPos, Arc<entity_order::PendingPositions>>,
     generated_entities:
         Arc<BTreeMap<native_world::loaded::ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
+    generated_poi_changes: Arc<
+        BTreeMap<
+            native_world::loaded::ChunkPos,
+            Arc<Vec<native_persistence::poi::PoiBlockChange>>,
+        >,
+    >,
 }
 
 /// Registration history for a newly created generation light engine. The
@@ -1581,6 +1587,7 @@ impl CarvedTerrainWorld {
             generated_entity_order: BTreeMap::new(),
             generated_pending_order: BTreeMap::new(),
             generated_entities: Arc::new(BTreeMap::new()),
+            generated_poi_changes: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -1902,6 +1909,26 @@ impl CarvedTerrainWorld {
             .generated_entities
             .get(&pos)
             .map(|values| values.as_slice())
+            .unwrap_or_default())
+    }
+
+    /// POI-changing WorldGenRegion writes submitted by completed feature
+    /// attempts, in their recorded order for this chunk. This does not include
+    /// loaded POIs, direct section writes, queued server task ordering, or
+    /// postprocessing. Same-POI block changes are omitted, so these records
+    /// are not a complete block history, POI snapshot, or save authority.
+    pub fn recorded_generation_poi_changes(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<&[native_persistence::poi::PoiBlockChange]> {
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "generated POI chunk is missing"
+        );
+        Ok(self
+            .generated_poi_changes
+            .get(&pos)
+            .map(|changes| changes.as_slice())
             .unwrap_or_default())
     }
 

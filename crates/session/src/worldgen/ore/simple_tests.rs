@@ -150,6 +150,7 @@ fn terrain() -> CarvedTerrainWorld {
         generated_entity_order: BTreeMap::new(),
         generated_pending_order: BTreeMap::new(),
         generated_entities: Arc::new(BTreeMap::new()),
+        generated_poi_changes: Arc::new(BTreeMap::new()),
     }
 }
 struct Data;

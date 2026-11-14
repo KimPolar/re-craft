@@ -809,6 +809,7 @@ pub struct DecorationRegion<'a> {
     entity_order: BTreeMap<ChunkPos, Arc<super::entity_order::LivePositions>>,
     pending_order: BTreeMap<ChunkPos, Arc<super::entity_order::PendingPositions>>,
     generated_entities: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
+    poi_changes: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::poi::PoiBlockChange>>>>,
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
@@ -3659,6 +3660,7 @@ impl CarvedTerrainWorld {
         let entity_order = self.generated_entity_order.clone();
         let pending_order = self.generated_pending_order.clone();
         let generated_entities = self.generated_entities.clone();
+        let poi_changes = self.generated_poi_changes.clone();
         Ok(DecorationRegion {
             target: self,
             world,
@@ -3690,6 +3692,7 @@ impl CarvedTerrainWorld {
             entity_order,
             pending_order,
             generated_entities,
+            poi_changes,
             pending_monster_spawners: 0,
             light_guard: None,
             tree_block_write: false,
@@ -3965,6 +3968,7 @@ impl DecorationRegion<'_> {
         self.target.generated_entity_order = self.entity_order;
         self.target.generated_pending_order = self.pending_order;
         self.target.generated_entities = self.generated_entities;
+        self.target.generated_poi_changes = self.poi_changes;
         Ok(Arc::clone(&self.target.world))
     }
 
@@ -4192,8 +4196,24 @@ impl DecorationRegion<'_> {
                 return Ok(());
             }
         }
+        let original = self
+            .world
+            .block(p[0], p[1], p[2])
+            .context("generation POI source block is missing")?;
+        let changed_poi = native_world::poi::change(original, state).map(|_| original.clone());
         self.set_section_block(p, state)?;
-        self.update_final_heightmaps(p, state)
+        self.update_final_heightmaps(p, state)?;
+        if let Some(original) = changed_poi {
+            let changes = Arc::make_mut(&mut self.poi_changes)
+                .entry(chunk(p))
+                .or_default();
+            Arc::make_mut(changes).push(native_persistence::poi::PoiBlockChange {
+                position: p,
+                expected: original,
+                replacement: state.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
@@ -9221,8 +9241,61 @@ mod tests {
             generated_entity_order: BTreeMap::new(),
             generated_pending_order: BTreeMap::new(),
             generated_entities: Arc::new(BTreeMap::new()),
+            generated_poi_changes: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
+    }
+
+    #[test]
+    fn generation_poi_changes_follow_worldgen_writes_and_transaction_rollback() -> Result<()> {
+        let (mut terrain, tags, _, _) = fixture();
+        let registry = ["air", "stone", "diamond_ore", "red_bed"]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}"))
+            .collect();
+        let motion = HeightmapTags::load(&mut Data, &registry)?;
+        let pos = ChunkPos { x: 0, z: 0 };
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let target = [1, 8, 1];
+        let direct = [2, 8, 1];
+        let mut head = state("red_bed");
+        head.properties.insert("part".into(), "head".into());
+        let mut foot = head.clone();
+        foot.properties.insert("part".into(), "foot".into());
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        region.set_proto_block(target, &head)?;
+        region.set_proto_block(target, &head)?;
+        region.set_proto_block(target, &foot)?;
+        region.set_proto_block(target, &head)?;
+        region.set_proto_block(target, &state("air"))?;
+        // Java's direct section writes do not call WorldGenRegion.setBlock.
+        region.set_section_block(direct, &head)?;
+        region.finish()?;
+        let events = terrain.recorded_generation_poi_changes(pos)?;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].position, target);
+        assert_eq!(events[0].expected.name, "minecraft:air");
+        assert_eq!(events[0].replacement, head);
+        assert_eq!((&events[1].expected, &events[1].replacement), (&head, &foot));
+        assert_eq!((&events[2].expected, &events[2].replacement), (&foot, &head));
+        assert_eq!(events[3].expected, head);
+        assert_eq!(events[3].replacement.name, "minecraft:air");
+        assert!(terrain.recorded_generation_poi_changes(neighbor)?.is_empty());
+        assert!(
+            terrain
+                .recorded_generation_poi_changes(ChunkPos { x: 4, z: 0 })
+                .is_err()
+        );
+
+        let before = events.to_vec();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut discarded = terrain.decoration_region(&tags, &motion, writable)?;
+        discarded.set_proto_block(target, &head)?;
+        assert!(OreWorld::set_block(&mut discarded, target, &state("stone"), 2).is_err());
+        assert!(discarded.finish().is_err());
+        assert_eq!(terrain.recorded_generation_poi_changes(pos)?, before);
+        Ok(())
     }
 
     #[test]

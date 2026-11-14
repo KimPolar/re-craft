@@ -346,6 +346,10 @@ impl CarvedTerrainWorld {
                 "chunk was not postprocessed"
             );
             ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            ensure!(
+                self.recorded_generation_poi_changes(pos)?.is_empty(),
+                "generation POI changes require ordered reconciliation"
+            );
             completed.ensure_poi_unchanged(pos, registry)?;
             let draft = native_persistence::poi::refresh_missing_chunk(
                 native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
@@ -795,6 +799,22 @@ mod tests {
                 &registry,
                 [first],
             )?;
+            let mut with_generation_poi = terrain.clone();
+            Arc::make_mut(&mut with_generation_poi.generated_poi_changes).insert(
+                first,
+                Arc::new(vec![native_persistence::poi::PoiBlockChange {
+                    position: [1, 2, 1],
+                    expected: BlockState {
+                        name: "minecraft:stone".into(),
+                        properties: BTreeMap::new(),
+                    },
+                    replacement: completed.world.block(1, 2, 1).unwrap().clone(),
+                }]),
+            );
+            let error = with_generation_poi
+                .captured_postprocessed_missing_poi_snapshot(&completed, &registry, [first])
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("generation POI changes"));
             let document = poi[&first].clone().context("barrel POI missing")?;
             let decoded = native_persistence::world::SavedPoiChunk::from_document(
                 document,

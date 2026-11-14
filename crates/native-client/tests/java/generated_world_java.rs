@@ -270,28 +270,41 @@ fn new_player_round_trips_through_java_player() -> Result<()> {
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_spawn_chunk_round_trips_through_java() -> Result<()> {
-    generated_world_round_trips_through_java(-1, false)
+    generated_world_round_trips_through_java(-1, GenerationCheck::RoundTrip)
 }
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_seed_one_round_trips_through_java() -> Result<()> {
-    generated_world_round_trips_through_java(1, false)
+    generated_world_round_trips_through_java(1, GenerationCheck::RoundTrip)
 }
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; currently fails on unsettled live light"]
 fn generated_world_seed_one_captures_live_inputs_for_missing_shape_chunk() -> Result<()> {
-    generated_world_round_trips_through_java(1, true)
+    generated_world_round_trips_through_java(1, GenerationCheck::LiveInputs)
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
+fn generated_world_seed_one_stages_dirty_terrain() -> Result<()> {
+    generated_world_round_trips_through_java(1, GenerationCheck::StagedTerrain)
 }
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_seed_42_round_trips_through_java() -> Result<()> {
-    generated_world_round_trips_through_java(42, false)
+    generated_world_round_trips_through_java(42, GenerationCheck::RoundTrip)
 }
 
-fn generated_world_round_trips_through_java(seed: i64, check_live_inputs: bool) -> Result<()> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GenerationCheck {
+    RoundTrip,
+    LiveInputs,
+    StagedTerrain,
+}
+
+fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -> Result<()> {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -937,7 +950,7 @@ fn generated_world_round_trips_through_java(seed: i64, check_live_inputs: bool) 
             );
             std::thread::sleep(Duration::from_millis(10));
         };
-        if check_live_inputs {
+        if check != GenerationCheck::RoundTrip {
             let generation_reader = native_persistence::world::WorldReader::open_with_session(
                 &staged_world_path,
                 dimension.clone(),
@@ -978,8 +991,61 @@ fn generated_world_round_trips_through_java(seed: i64, check_live_inputs: bool) 
                 );
                 std::thread::sleep(Duration::from_millis(2));
             };
-            let (_, generator, restored, observed) =
+            let (schedule, generator, restored, observed) =
                 prepared.into_checked_parts(&streamer, session)?;
+            if check == GenerationCheck::StagedTerrain {
+                ensure!(
+                    !session.dirty_chunk_positions().is_empty(),
+                    "seed 1 fixture has no live dirty chunks"
+                );
+                ensure!(
+                    generator.capture_live_terrain(session, &restored).is_err(),
+                    "seed 1 fixture did not exercise the strict live guard"
+                );
+                let stage = generator
+                    .capture_live_terrain_stage(session, &restored, &schedule)
+                    .context("cannot stage seed 1 live terrain")?;
+                generator.verify_live_terrain_stage(session, &stage)?;
+                ensure!(
+                    observed.is_current(&streamer, session),
+                    "generation observation changed"
+                );
+                let live = session.snapshot();
+                let world = live
+                    .world
+                    .loaded()
+                    .context("loaded world snapshot missing")?;
+                let edited = world
+                    .block_edits()
+                    .find(|edit| {
+                        stage
+                            .block(edit.position.x, edit.position.y, edit.position.z)
+                            .is_some()
+                            && world
+                                .block(edit.position.x, edit.position.y, edit.position.z)
+                                .is_some()
+                    })
+                    .context("no live block edit was included in staged terrain")?;
+                ensure!(
+                    stage.block(edited.position.x, edited.position.y, edited.position.z)
+                        == Some(&edited.replacement),
+                    "staged terrain does not include the live block edit"
+                );
+                let biome = world
+                    .biome(edited.position.x, edited.position.y, edited.position.z)
+                    .context("edited block biome is unavailable")?;
+                ensure!(
+                    stage.biome(edited.position.x, edited.position.y, edited.position.z)
+                        == Some(biome),
+                    "staged terrain biome differs from the live world"
+                );
+                eprintln!(
+                    "Staged dirty chunks: {:?}; missing sky chunks: {:?}",
+                    session.dirty_chunk_positions(),
+                    session.missing_sky_chunks()
+                );
+                return Ok(());
+            }
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             let live_inputs = loop {
                 match generator.capture_live_inputs_with_deferred_shapes(session, &restored) {

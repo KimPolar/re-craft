@@ -432,6 +432,7 @@ pub(crate) struct BiomedMissingGeneration {
     work: crate::fresh_generation::existing::CapturedBiomeSchedule,
     generator: crate::fresh_generation::existing::PreparedExistingGenerator,
     terrain: crate::fresh_generation::existing::RestoredSavedTerrain,
+    live_terrain: crate::fresh_generation::existing::LiveGenerationTerrainStage,
     evaluator: native_resources::density::DensityEvaluator,
     observed: MissingGenerationTargets,
 }
@@ -439,6 +440,10 @@ pub(crate) struct BiomedMissingGeneration {
 impl BiomedMissingGeneration {
     pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
         self.observed.is_current(streamer, session)
+            && self
+                .generator
+                .verify_live_terrain_stage(session, &self.live_terrain)
+                .is_ok()
     }
 
     pub fn targets(&self) -> &[ChunkPos] {
@@ -453,6 +458,7 @@ impl BiomedMissingGeneration {
         crate::fresh_generation::existing::CapturedBiomeSchedule,
         crate::fresh_generation::existing::PreparedExistingGenerator,
         crate::fresh_generation::existing::RestoredSavedTerrain,
+        crate::fresh_generation::existing::LiveGenerationTerrainStage,
         native_resources::density::DensityEvaluator,
         MissingGenerationTargets,
     )> {
@@ -464,6 +470,7 @@ impl BiomedMissingGeneration {
             self.work,
             self.generator,
             self.terrain,
+            self.live_terrain,
             self.evaluator,
             self.observed,
         ))
@@ -495,13 +502,26 @@ impl MissingGenerationBiomeWorker {
                 error: anyhow::anyhow!("prepared missing generation is stale"),
             });
         }
+        let live_draft = match prepared.generator.capture_live_terrain_stage_draft(
+            session,
+            &prepared.terrain,
+            &prepared.schedule,
+        ) {
+            Ok(draft) => draft,
+            Err(error) => {
+                return Err(MissingGenerationBiomeStartError {
+                    prepared,
+                    error: error.context("cannot capture intermediate live terrain"),
+                });
+            }
+        };
         let observed = prepared.observed.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, result) = mpsc::channel();
         crate::generation_staging::spawn_with_payload(
-            prepared,
-            move |prepared| {
+            (prepared, live_draft),
+            move |(prepared, live_draft)| {
                 let result = (|| -> Result<BiomedMissingGeneration> {
                     use native_session::worldgen::schedule::GenerationStage;
                     anyhow::ensure!(
@@ -518,6 +538,17 @@ impl MissingGenerationBiomeWorker {
                         terrain,
                         observed,
                     } = prepared;
+                    let live_terrain = live_draft.validate_checked(|| {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "biome generation cancelled"
+                        );
+                        anyhow::ensure!(
+                            observed.stamp.is_current(),
+                            "prepared missing generation is stale"
+                        );
+                        Ok(())
+                    })?;
                     let mut work =
                         generator.begin_captured_generation_schedule_checked(schedule, || {
                             anyhow::ensure!(
@@ -566,6 +597,7 @@ impl MissingGenerationBiomeWorker {
                         work,
                         generator,
                         terrain,
+                        live_terrain,
                         evaluator,
                         observed,
                     })
@@ -579,7 +611,7 @@ impl MissingGenerationBiomeWorker {
                     .map(|_| ())
             },
         )
-        .map_err(|(prepared, error)| MissingGenerationBiomeStartError {
+        .map_err(|((prepared, _), error)| MissingGenerationBiomeStartError {
             prepared,
             error: anyhow::Error::new(error).context("cannot start biome generation"),
         })?;
@@ -618,7 +650,12 @@ impl MissingGenerationBiomeWorker {
             }
             anyhow::bail!("biome generation was cancelled or became stale");
         }
-        Ok(Some(result?))
+        let work = result?;
+        if !work.is_current(streamer, session) {
+            crate::generation_staging::discard_async(work);
+            anyhow::bail!("biome generation live inputs became stale");
+        }
+        Ok(Some(work))
     }
 }
 
@@ -877,7 +914,12 @@ impl MissingGenerationTerrainWorker {
             }
             anyhow::bail!("terrain generation was cancelled or became stale");
         }
-        Ok(Some(result?))
+        let work = result?;
+        if !work.is_current(streamer, session) {
+            crate::generation_staging::discard_async(work);
+            anyhow::bail!("terrain generation live inputs became stale");
+        }
+        Ok(Some(work))
     }
 }
 
@@ -995,6 +1037,7 @@ impl MissingGenerationAssemblyWorker {
                         work,
                         generator,
                         terrain: restored,
+                        live_terrain: _,
                         evaluator,
                         observed,
                     } = state;
@@ -3497,12 +3540,13 @@ mod tests {
             .generator
             .capture_live_inputs(&session, &biomed.terrain)?;
         biomed.generator.verify_live_inputs(&session, &biome_live)?;
-        let (work, generator, terrain, evaluator, observed) =
+        let (work, generator, terrain, live_terrain, evaluator, observed) =
             biomed.into_checked_parts(&streamer, &session)?;
         let biomed = BiomedMissingGeneration {
             work,
             generator,
             terrain,
+            live_terrain,
             evaluator,
             observed,
         };
@@ -3692,7 +3736,103 @@ mod tests {
             anyhow::ensure!(Instant::now() < deadline, "terrain cancellation timed out");
             thread::sleep(Duration::from_millis(2));
         }
+        // Keep the selected missing target unchanged while another staged
+        // neighbor acquires pending streaming. Both workers must reject their
+        // results based on the live terrain guard, not just target selection.
         let stale_capture = capture_again()?;
+        let captured_for_stale_biomes = capture_again()?;
+        let mut prepare_stale_biomes = MissingGenerationPrepareWorker::start(
+            captured_for_stale_biomes,
+            &streamer,
+            &session,
+            game.clone(),
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared_for_stale_biomes = loop {
+            if let Some(result) = prepare_stale_biomes.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stale biome setup timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let staged_neighbor = prepared_for_stale_biomes
+            .schedule
+            .requirements()
+            .find_map(|(pos, stage)| {
+                (stage >= GenerationStage::Biomes
+                    && pos != target
+                    && !streamer.missing.contains(&pos))
+                .then_some(pos)
+            })
+            .context("no independent staged neighbor")?;
+        let captured_for_stale_terrain = capture_again()?;
+        let mut prepare_stale_terrain = MissingGenerationPrepareWorker::start(
+            captured_for_stale_terrain,
+            &streamer,
+            &session,
+            game.clone(),
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prepared_for_stale_terrain = loop {
+            if let Some(result) = prepare_stale_terrain.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stale terrain setup timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut prepare_terrain_biomes =
+            MissingGenerationBiomeWorker::start(prepared_for_stale_terrain, &streamer, &session)
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let biomed_for_stale_terrain = loop {
+            if let Some(result) = prepare_terrain_biomes.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stale terrain biomes timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let mut stale_biomes =
+            MissingGenerationBiomeWorker::start(prepared_for_stale_biomes, &streamer, &session)
+                .map_err(|failure| failure.error)?;
+        let mut stale_terrain = MissingGenerationTerrainWorker::start(
+            biomed_for_stale_terrain,
+            &streamer,
+            &session,
+            1,
+            BTreeMap::new(),
+        )
+        .map_err(|failure| failure.error)?;
+        session.queue_loaded_chunk(staged_neighbor, chunk_world(staged_neighbor));
+        assert!(stale_biomes.observed.is_current(&streamer, &session));
+        assert!(stale_terrain.observed.is_current(&streamer, &session));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match stale_biomes.try_result(&streamer, &session) {
+                Err(error) => {
+                    assert!(error.to_string().contains("live inputs became stale"));
+                    break;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("stale biome result was accepted"),
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stale biome check timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match stale_terrain.try_result(&streamer, &session) {
+                Err(error) => {
+                    assert!(error.to_string().contains("live inputs became stale"));
+                    break;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("stale terrain result was accepted"),
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stale terrain check timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
         session.queue_loaded_chunk(target, chunk_world(target));
         assert!(!prepared.is_current(&streamer, &session));
         assert!(!second_terrain.is_current(&streamer, &session));
@@ -3737,6 +3877,11 @@ mod tests {
         drop(terrain_worker);
         drop(cancelled_biomes);
         drop(cancelled_terrain);
+        drop(stale_biomes);
+        drop(stale_terrain);
+        drop(prepare_terrain_biomes);
+        drop(prepare_stale_biomes);
+        drop(prepare_stale_terrain);
         drop(terrain_biomes);
         drop(prepare_cancelled_terrain);
         drop(prepare_cancelled_biomes);

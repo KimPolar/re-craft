@@ -256,7 +256,7 @@ impl SavedDecorationContext {
 /// session changes or prove that the chunks can resume every generation stage.
 pub(crate) struct RestoredSavedTerrain {
     identity: Arc<()>,
-    world: native_world::loaded::World,
+    world: Arc<native_world::loaded::World>,
     biomes:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_session::worldgen::QuartBiomeChunk>>,
     heightmaps: BTreeMap<
@@ -1696,6 +1696,40 @@ pub(crate) struct LiveGenerationInputs {
     terrain: native_session::loaded::GenerationTerrainGuard,
     poi: native_session::loaded::GenerationPoiGuard,
     entities: native_session::loaded::GenerationEntityGuard,
+}
+
+/// Block and biome inputs for intermediate work. Lighting, ticks, entities,
+/// POIs and publication still require their own coordinated validation.
+pub(crate) struct LiveGenerationTerrainStage {
+    identity: Arc<()>,
+    terrain: native_session::loaded::GenerationTerrainStage,
+}
+
+pub(crate) struct LiveGenerationTerrainStageDraft {
+    identity: Arc<()>,
+    terrain: native_session::loaded::GenerationTerrainStageDraft,
+}
+
+impl LiveGenerationTerrainStageDraft {
+    pub fn validate_checked(
+        self,
+        check: impl FnMut() -> Result<()>,
+    ) -> Result<LiveGenerationTerrainStage> {
+        Ok(LiveGenerationTerrainStage {
+            identity: self.identity,
+            terrain: self.terrain.validate_checked(check)?,
+        })
+    }
+}
+
+impl LiveGenerationTerrainStage {
+    pub fn block(&self, x: i32, y: i32, z: i32) -> Option<&BlockState> {
+        self.terrain.block(x, y, z)
+    }
+
+    pub fn biome(&self, x: i32, y: i32, z: i32) -> Option<&str> {
+        self.terrain.biome(x, y, z)
+    }
 }
 
 /// One regenerated TERRAIN-stage chunk, tied to the captured source and packs.
@@ -8465,10 +8499,10 @@ impl PreparedExistingGenerator {
             let dimension = sources.dimension();
             return Ok(RestoredSavedTerrain {
                 identity: Arc::clone(&self.identity),
-                world: native_world::loaded::World::new(format!(
+                world: Arc::new(native_world::loaded::World::new(format!(
                     "{}:{}",
                     dimension.namespace, dimension.path
-                )),
+                ))),
                 biomes: BTreeMap::new(),
                 heightmaps: BTreeMap::new(),
                 postprocessing: BTreeMap::new(),
@@ -8606,7 +8640,7 @@ impl PreparedExistingGenerator {
         }
         Ok(RestoredSavedTerrain {
             identity: Arc::clone(&self.identity),
-            world,
+            world: Arc::new(world),
             biomes,
             heightmaps,
             postprocessing,
@@ -8625,24 +8659,79 @@ impl PreparedExistingGenerator {
         self.capture_live_terrain_inner(session, restored, false)
     }
 
-    fn capture_live_terrain_inner(
+    /// Prepare a source-bound block and biome snapshot while shape and light
+    /// work waits. This remains an intermediate input, not a save guard.
+    pub fn capture_live_terrain_stage(
         &self,
         session: &native_session::loaded::LoadedSession,
         restored: &RestoredSavedTerrain,
-        deferred_shapes: bool,
-    ) -> Result<native_session::loaded::GenerationTerrainGuard> {
+        schedule: &GenerationSchedule,
+    ) -> Result<LiveGenerationTerrainStage> {
+        self.capture_live_terrain_stage_draft(session, restored, schedule)?
+            .validate_checked(|| Ok(()))
+    }
+
+    pub fn capture_live_terrain_stage_draft(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        restored: &RestoredSavedTerrain,
+        schedule: &GenerationSchedule,
+    ) -> Result<LiveGenerationTerrainStageDraft> {
+        self.validate_restored_capture(restored)?;
+        use native_session::worldgen::schedule::GenerationStage;
+        let positions: Vec<_> = schedule
+            .requirements()
+            .filter_map(|(pos, required)| (required >= GenerationStage::Biomes).then_some(pos))
+            .collect();
+        let captured = self.context.inputs().sources().chunks();
+        for pos in &positions {
+            ensure!(
+                captured.contains_key(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z }),
+                "terrain stage includes an uncaptured chunk"
+            );
+        }
+        Ok(LiveGenerationTerrainStageDraft {
+            identity: Arc::clone(&self.identity),
+            terrain: session
+                .capture_generation_terrain_stage_draft(Arc::clone(&restored.world), positions)?,
+        })
+    }
+
+    pub fn verify_live_terrain_stage(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        stage: &LiveGenerationTerrainStage,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &stage.identity),
+            "terrain belongs to another generation capture"
+        );
+        session.verify_generation_terrain_stage(&stage.terrain)
+    }
+
+    fn validate_restored_capture(&self, restored: &RestoredSavedTerrain) -> Result<()> {
         ensure!(
             Arc::ptr_eq(&self.identity, &restored.identity),
             "restored terrain belongs to another capture"
         );
-        let sources = self.context.inputs().sources().chunks();
-        for (pos, source) in sources {
+        for (pos, source) in self.context.inputs().sources().chunks() {
             let key = native_world::loaded::ChunkPos { x: pos.x, z: pos.z };
             ensure!(
                 source.terrain.is_some() == restored.world.chunks.contains_key(&key),
                 "captured terrain was not fully restored at {key:?}"
             );
         }
+        Ok(())
+    }
+
+    fn capture_live_terrain_inner(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        restored: &RestoredSavedTerrain,
+        deferred_shapes: bool,
+    ) -> Result<native_session::loaded::GenerationTerrainGuard> {
+        self.validate_restored_capture(restored)?;
+        let sources = self.context.inputs().sources().chunks();
         let positions = sources
             .keys()
             .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z });

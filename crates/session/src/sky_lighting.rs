@@ -36,7 +36,7 @@ struct Computed {
 
 struct Reply {
     generation: u64,
-    result: Option<Computed>,
+    result: Option<(Computed, Vec<usize>)>,
 }
 
 #[derive(Default)]
@@ -138,12 +138,33 @@ impl SkyLighting {
                 Ok(reply) => {
                     self.worker = None;
                     if self.enabled && reply.generation == self.generation {
-                        match reply.result.and_then(|result| apply(world, result)) {
-                            Some((updated, sources, originals)) => {
-                                self.pending.clear();
+                        let result = reply.result.and_then(|(result, completed)| {
+                            if completed.is_empty()
+                                || completed
+                                    .last()
+                                    .is_none_or(|&index| index >= self.pending.len())
+                                || completed.windows(2).any(|pair| pair[0] >= pair[1])
+                            {
+                                return None;
+                            }
+                            apply(world, result).map(|updated| (updated, completed))
+                        });
+                        match result {
+                            Some(((updated, sources, originals), completed)) => {
+                                let mut completed = completed.into_iter().peekable();
+                                let mut index = 0;
+                                self.pending.retain(|_| {
+                                    let finished = completed.peek() == Some(&index);
+                                    if finished {
+                                        completed.next();
+                                    }
+                                    index += 1;
+                                    !finished
+                                });
                                 self.sources = sources;
-                                self.failed_generation = None;
-                                self.retry_delay = 0;
+                                self.failed_generation =
+                                    (!self.pending.is_empty()).then_some(self.generation);
+                                self.retry_delay = if self.pending.is_empty() { 0 } else { 20 };
                                 self.applied_originals.extend(originals);
                                 changed = updated;
                             }
@@ -186,7 +207,7 @@ impl SkyLighting {
         let spawned = std::thread::Builder::new()
             .name("sky-light".into())
             .spawn(move || {
-                let result = compute(&snapshot, bounds, &edits, &originals, sources);
+                let result = compute_available(&snapshot, bounds, &edits, &originals, sources);
                 let _ = tx.send(Reply { generation, result });
             });
         if spawned.is_ok() {
@@ -227,6 +248,93 @@ impl SkyLighting {
         assert!(tx.send(reply).is_ok());
         self.worker = Some((generation, rx));
     }
+}
+
+/// Group edits conservatively by 32-block cells. Sky propagation uses at most
+/// a 15-block horizontal halo, including saved-layer restoration. Nonadjacent
+/// cells cannot share a touched light section or propagation boundary. Joining
+/// adjacent cells may combine independent work but never separates dependent
+/// edits. Within each group the original callback order is retained.
+fn independent_edit_groups(edits: &[Edit]) -> Vec<Vec<usize>> {
+    let cell = |edit: &Edit| {
+        (
+            edit.position.x.div_euclid(32),
+            edit.position.z.div_euclid(32),
+        )
+    };
+    let mut remaining = BTreeMap::<(i32, i32), Vec<usize>>::new();
+    for (index, edit) in edits.iter().enumerate() {
+        remaining.entry(cell(edit)).or_default().push(index);
+    }
+    let mut groups = Vec::new();
+    for edit in edits {
+        let first = cell(edit);
+        let Some(mut group) = remaining.remove(&first) else {
+            continue;
+        };
+        let mut queue = vec![first];
+        while let Some((x, z)) = queue.pop() {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(next) = x.checked_add(dx).zip(z.checked_add(dz)) else {
+                        continue;
+                    };
+                    if let Some(indices) = remaining.remove(&next) {
+                        group.extend(indices);
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        group.sort_unstable();
+        groups.push(group);
+    }
+    groups
+}
+
+/// Prefer one atomic pass. If it cannot run, commit only spatially independent
+/// groups that have complete input, retaining all other edits for a later retry.
+fn compute_available(
+    snapshot: &World,
+    bounds: LightBounds,
+    edits: &[Edit],
+    originals: &BTreeMap<ChunkPos, Arc<Chunk>>,
+    sources: SkySources,
+) -> Option<(Computed, Vec<usize>)> {
+    let groups = independent_edit_groups(edits);
+    if groups.len() <= 1 {
+        return compute(snapshot, bounds, edits, originals, sources)
+            .map(|result| (result, (0..edits.len()).collect()));
+    }
+    if let Some(result) = compute(snapshot, bounds, edits, originals, sources.clone()) {
+        return Some((result, (0..edits.len()).collect()));
+    }
+
+    let mut world = snapshot.clone();
+    let mut sources = sources;
+    let mut changed = BTreeSet::new();
+    let mut completed = Vec::new();
+    for indices in groups {
+        let group: Vec<_> = indices.iter().map(|&index| edits[index]).collect();
+        if let Some(result) = compute(&world, bounds, &group, originals, sources.clone()) {
+            world = result.world;
+            sources = result.sources;
+            changed.extend(result.changed);
+            completed.extend(indices);
+        }
+    }
+    if completed.is_empty() {
+        return None;
+    }
+    completed.sort_unstable();
+    Some((
+        Computed {
+            world,
+            changed,
+            sources,
+        },
+        completed,
+    ))
 }
 
 fn source_for(
@@ -681,6 +789,114 @@ mod tests {
         assert_eq!(world.light(15, 14, 15, true), Some(14));
         assert_eq!(world.light(16, 14, 15, true), Some(14));
     }
+
+    #[test]
+    fn missing_distant_light_does_not_block_independent_updates() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        for x in 3..=6 {
+            for z in -1..=2 {
+                let mut chunk = world.chunks[&ChunkPos { x: 0, z }].as_ref().clone();
+                chunk.position = ChunkPos { x, z };
+                Arc::make_mut(&mut world)
+                    .chunks
+                    .insert(chunk.position, Arc::new(chunk));
+            }
+        }
+        let mut baseline_world = Arc::clone(&world);
+        let mut baseline = SkyLighting::default();
+        baseline.set_enabled(true);
+        let first = BlockPosition { x: 0, y: 15, z: 15 };
+        let second = BlockPosition {
+            x: 64,
+            y: 15,
+            z: 15,
+        };
+        let third = BlockPosition { x: 65, ..second };
+        edit(
+            &mut baseline,
+            &mut baseline_world,
+            second,
+            state("stone", &[]),
+        );
+        edit(
+            &mut baseline,
+            &mut baseline_world,
+            first,
+            state("stone", &[]),
+        );
+        edit(
+            &mut baseline,
+            &mut baseline_world,
+            third,
+            state("stone", &[]),
+        );
+        finish(&mut baseline, &mut baseline_world, bounds);
+        assert!(baseline.settled());
+
+        let missing = ChunkPos { x: 3, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, third, state("stone", &[]));
+        let changed = finish(&mut sky, &mut world, bounds);
+        assert!(changed.contains(&first.chunk()));
+        assert_eq!(sky.pending.len(), 2);
+        assert_eq!(sky.pending[0].position, second);
+        assert_eq!(sky.pending[1].position, third);
+        assert_eq!(world.light(0, 14, 15, true), Some(14));
+        assert_eq!(world.light(64, 14, 15, true), Some(15));
+        assert!(!sky.settled());
+
+        sky.advance(&mut world, Some(bounds));
+        assert!(
+            sky.worker.is_none(),
+            "unavailable data should not cause a busy retry"
+        );
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for (pos, expected) in &baseline_world.chunks {
+            let actual = &world.chunks[pos];
+            for (y, section) in &expected.sections {
+                assert_eq!(
+                    actual.sections[y].sky_light, section.sky_light,
+                    "{pos:?}, {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_light_keeps_overlapping_updates_together() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let first = BlockPosition { x: 3, y: 15, z: 15 };
+        let second = BlockPosition {
+            x: 31,
+            y: 15,
+            z: 15,
+        };
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.pending.len(), 2);
+        assert_eq!(world.light(3, 14, 15, true), Some(15));
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        assert!(!finish(&mut sky, &mut world, bounds).is_empty());
+        assert!(sky.settled());
+        assert_eq!(world.light(3, 14, 15, true), Some(14));
+        assert_eq!(world.light(31, 14, 15, true), Some(14));
+    }
+
     #[test]
     fn later_column_uses_original_section_air_status() {
         let bounds = LightBounds::new(0, 32).unwrap();
@@ -771,6 +987,8 @@ mod tests {
         actions.extend([
             (14, 24, 15, "air", true),
             (16, 24, 15, "air", false),
+            (-1, 24, 15, "stone", true),
+            (32, 24, 15, "stone", false),
             (14, 24, 15, "water", true),
             (16, 24, 15, "slab_bottom", false),
             (15, 24, 15, "air", true),
@@ -800,7 +1018,14 @@ mod tests {
         let mut sky = SkyLighting::default();
         sky.set_enabled(true);
         let bounds = LightBounds::new(0, 32).unwrap();
+        let missing_pos = ChunkPos { x: 2, z: 1 };
+        let mut missing_chunk = None;
         for (x, y, z, name, defer) in actions {
+            if x == -1 {
+                missing_chunk = Arc::make_mut(&mut world).chunks.remove(&missing_pos);
+                assert!(missing_chunk.is_some());
+                sky.streaming_changed();
+            }
             let block = match name {
                 "water" => state("water", &[("level", "0")]),
                 "slab_bottom" => state(
@@ -814,8 +1039,27 @@ mod tests {
                 continue;
             }
             finish(&mut sky, &mut world, bounds);
-            assert!(sky.pending.is_empty());
             let expected = expected.next().unwrap();
+            if x == 32 {
+                assert_eq!(sky.pending.len(), 1);
+                assert_eq!(sky.pending[0].position, BlockPosition { x, y, z });
+                // Java also ran the distant edit, but its light cannot reach
+                // this part of the grid while the first update is checked.
+                for y in -15..47 {
+                    for z in 0..31 {
+                        for x in 0..14 {
+                            let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                            assert_eq!(world.light(x, y, z, true).unwrap(), expected[index]);
+                        }
+                    }
+                }
+                Arc::make_mut(&mut world)
+                    .chunks
+                    .insert(missing_pos, missing_chunk.take().unwrap());
+                sky.streaming_changed();
+                finish(&mut sky, &mut world, bounds);
+            }
+            assert!(sky.pending.is_empty());
             for y in -15..47 {
                 for z in 0..31 {
                     for x in 0..31 {

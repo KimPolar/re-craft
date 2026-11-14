@@ -449,6 +449,70 @@ pub fn refresh_section(
     })
 }
 
+/// Preview the build-height consistency checks for an existing POI chunk.
+/// Records discarded by invalid-section refresh are reported to the caller;
+/// this result does not establish ticket safety or authorize a world save.
+pub fn refresh_existing_chunk(
+    source: &SavedPoiChunk,
+    position: ChunkPos,
+    world: &native_world::loaded::World,
+    min_y: i32,
+    height: i32,
+    mut validate_state: impl FnMut(&BlockState) -> Result<()>,
+    mut validate_type: impl FnMut(&JavaString) -> Result<()>,
+) -> Result<PoiRefreshDraft> {
+    ensure!(
+        source.position == position,
+        "POI source belongs to another chunk"
+    );
+    ensure!(
+        min_y.rem_euclid(16) == 0 && height > 0 && height % 16 == 0,
+        "invalid POI refresh bounds"
+    );
+    let end = min_y
+        .checked_add(height)
+        .context("POI refresh height overflow")?
+        .div_euclid(16);
+    let first = min_y.div_euclid(16);
+    ensure!(
+        first >= i32::from(i8::MIN) && end - 1 <= i32::from(i8::MAX),
+        "POI refresh section out of range"
+    );
+    let original = (*source.document).clone();
+    let mut current = decode_poi_chunk(original.clone(), position)?;
+    for section in current.sections.values() {
+        for record in &section.records {
+            validate_type(&record.type_id)?;
+        }
+    }
+    let mut discarded_positions = BTreeSet::new();
+    let mut changed = false;
+    for section_y in first..end {
+        let draft = refresh_section(
+            Some(&current),
+            position,
+            i8::try_from(section_y)?,
+            world,
+            &mut validate_state,
+            &mut validate_type,
+        )?;
+        discarded_positions.extend(draft.discarded_positions);
+        if draft.changed {
+            current = decode_poi_chunk(
+                draft.document.context("refreshed POI data is missing")?,
+                position,
+            )?;
+            changed = true;
+        }
+    }
+    Ok(PoiRefreshDraft {
+        source: Some(original),
+        document: Some((*current.document).clone()),
+        discarded_positions,
+        changed,
+    })
+}
+
 /// Model Java's missing-section consistency check for every build-height
 /// section of one chunk. The caller must know there is no prior POI storage
 /// or ticket activity; this block-derived snapshot is not a save authorization.
@@ -1459,6 +1523,110 @@ mod tests {
         assert!(section.valid);
         assert_eq!(section.records[0].position, [2, 4, 0]);
         assert_eq!(section.records[0].free_tickets, 32);
+    }
+
+    #[test]
+    fn existing_chunk_refresh_preserves_metadata_and_reports_discarded_records() {
+        let original = source(false);
+        let before = (*original.document).clone();
+        let mut world = terrain(&[(0, "bell"), (2, "bell")]);
+        let air = world.intern_state(state("air", &[]));
+        let bell = world.intern_state(state("bell", &[]));
+        let mut upper_blocks = Box::new([air; BLOCK_COUNT]);
+        upper_blocks[0] = bell;
+        let chunk = Arc::make_mut(
+            world
+                .chunks
+                .get_mut(&loaded::ChunkPos { x: 0, z: 0 })
+                .unwrap(),
+        );
+        let mut upper = chunk.sections[&0].as_ref().clone();
+        upper.blocks = Some(upper_blocks);
+        chunk.sections.insert(1, Arc::new(upper));
+        let draft = refresh_existing_chunk(
+            &original,
+            original.position,
+            &world,
+            0,
+            32,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(draft.changed);
+        assert_eq!(draft.source.as_ref(), Some(&before));
+        assert_eq!(draft.discarded_positions, BTreeSet::from([[1, 4, 0]]));
+        let document = draft.document.unwrap();
+        assert_eq!(document.value.get("unrecognized"), Some(&Tag::Int(77)));
+        assert_eq!(
+            document
+                .value
+                .get("Sections")
+                .and_then(|s| s.get("0"))
+                .and_then(|s| s.get("future_section")),
+            Some(&Tag::Int(88))
+        );
+        let decoded = decode_poi_chunk(document, original.position).unwrap();
+        assert_eq!(decoded.sections[&0].records.len(), 2);
+        assert_eq!(decoded.sections[&1].records[0].position, [0, 16, 0]);
+        let retained = decoded.sections[&0]
+            .records
+            .iter()
+            .find(|record| record.position == [0, 4, 0])
+            .unwrap();
+        assert!(retained.type_id.matches("minecraft:home"));
+        assert_eq!(retained.free_tickets, 0);
+        assert_eq!(*original.document, before);
+
+        let valid = source(true);
+        let unchanged = refresh_existing_chunk(
+            &valid,
+            valid.position,
+            &world,
+            0,
+            16,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.document.as_ref(), Some(&*valid.document));
+        assert!(
+            refresh_existing_chunk(
+                &original,
+                original.position,
+                &world,
+                0,
+                48,
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            refresh_existing_chunk(
+                &original,
+                original.position,
+                &world,
+                0,
+                32,
+                |_| Ok(()),
+                |_| anyhow::bail!("unknown type")
+            )
+            .is_err()
+        );
+        assert!(
+            refresh_existing_chunk(
+                &original,
+                ChunkPos { x: 1, z: 0 },
+                &world,
+                0,
+                32,
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1020,6 +1020,12 @@ pub(crate) struct CapturedMixedFullDrafts {
     chunks: BTreeMap<native_world::loaded::ChunkPos, CapturedMixedFullDraft>,
 }
 
+/// Existing POI drafts bound to the same sealed postprocessing pass.
+pub(crate) struct CapturedMixedExistingPoi {
+    result_identity: Arc<()>,
+    documents: BTreeMap<native_world::loaded::ChunkPos, NamedTag>,
+}
+
 /// An isolated storage candidate. It intentionally exposes no write plan
 /// until the remaining live-state and generation effects are reconciled.
 pub(crate) struct CapturedMixedSaveCandidate {
@@ -3423,6 +3429,53 @@ impl PreparedExistingGenerator {
         })
     }
 
+    /// Preview captured existing POIs. Disk provenance, live tickets and all
+    /// generation effects remain separate requirements for publication.
+    pub fn draft_captured_mixed_existing_poi(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedMixedPostprocessedRegion,
+        components: &CapturedMixedPostprocessedComponents,
+        inputs: CapturedPostprocessingInputs<'_>,
+        validate_type: impl FnMut(&native_persistence::nbt::JavaString) -> Result<()>,
+    ) -> Result<CapturedMixedExistingPoi> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && components.matches_state(completed, batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        let sources = self.context.inputs().sources().chunks();
+        let mut selected = Vec::new();
+        for &pos in components.chunks.keys() {
+            let key = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let source = sources
+                .get(&key)
+                .context("captured POI source is missing")?;
+            if let Some(poi) = &source.poi {
+                selected.push((pos, poi));
+            }
+        }
+        let documents = if selected.is_empty() {
+            BTreeMap::new()
+        } else {
+            let assets = self
+                .terrain_assets
+                .as_ref()
+                .context("terrain registry is missing")?;
+            batch.terrain.captured_postprocessed_existing_poi_snapshot(
+                &completed.region,
+                &assets.blocks,
+                selected,
+                validate_type,
+            )?
+        };
+        Ok(CapturedMixedExistingPoi {
+            result_identity: Arc::clone(&completed.identity),
+            documents,
+        })
+    }
+
     /// Assemble a source-bound storage plan for the selected FULL drafts.
     /// This is only an isolated candidate: callers must still account for
     /// unselected and deferred chunks, structure edits, drops, events, live
@@ -3434,6 +3487,7 @@ impl PreparedExistingGenerator {
         completed: &CapturedMixedPostprocessedRegion,
         components: &CapturedMixedPostprocessedComponents,
         drafts: &CapturedMixedFullDrafts,
+        existing_poi: &CapturedMixedExistingPoi,
         inputs: CapturedPostprocessingInputs<'_>,
         region_timestamp_seconds: u32,
     ) -> Result<CapturedMixedSaveCandidate> {
@@ -3442,7 +3496,8 @@ impl PreparedExistingGenerator {
         ensure!(
             Arc::ptr_eq(&self.identity, &batch.identity)
                 && components.matches_state(completed, batch, light, inputs)
-                && drafts.matches_state(completed, batch, light, inputs),
+                && drafts.matches_state(completed, batch, light, inputs)
+                && Arc::ptr_eq(&existing_poi.result_identity, &completed.identity),
             "captured postprocessing inputs changed"
         );
         ensure!(
@@ -3466,14 +3521,28 @@ impl PreparedExistingGenerator {
                 "captured terrain source differs"
             );
             ensure!(
-                source.entities.is_none() && source.poi.is_none(),
-                "existing entity or POI sidecars require reconciliation"
+                source.entities.is_none(),
+                "existing entity sidecars require reconciliation"
             );
-            let poi = components
-                .missing_poi
-                .get(&position)
-                .context("generated POI coverage is missing")?
-                .as_ref();
+            let (poi_source, poi) = match &source.poi {
+                Some(source) => (
+                    Some(source.document.as_ref()),
+                    Some(
+                        existing_poi
+                            .documents
+                            .get(&position)
+                            .context("existing POI coverage is missing")?,
+                    ),
+                ),
+                None => (
+                    None,
+                    components
+                        .missing_poi
+                        .get(&position)
+                        .context("generated POI coverage is missing")?
+                        .as_ref(),
+                ),
+            };
             let Some(Tag::List { values, .. }) = draft.entity_chunk.value.get("Entities") else {
                 bail!("generated entity records are missing")
             };
@@ -3481,7 +3550,7 @@ impl PreparedExistingGenerator {
                 position: key,
                 source_terrain: terrain,
                 source_entities: None,
-                source_poi: None,
+                source_poi: poi_source,
                 terrain: &draft.chunk,
                 entities: (!values.is_empty()).then_some(&draft.entity_chunk),
                 poi,
@@ -9695,6 +9764,49 @@ mod tests {
         let region_dir = root.join("dimensions/minecraft/overworld/region");
         std::fs::create_dir_all(&region_dir)?;
         std::fs::write(region_dir.join("r.0.0.mca"), region)?;
+        let existing_poi_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("example:poi_root".into(), Tag::Int(86)),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "0".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: TagType::End,
+                                    values: vec![],
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let poi_bytes = native_persistence::nbt::write(&existing_poi_source)?;
+        let poi_sectors = (poi_bytes.len() + 5).div_ceil(4096);
+        let mut poi_region = vec![0; 8192 + poi_sectors * 4096];
+        let poi_header = usize::try_from((second.x + second.z * 32) * 4)?;
+        poi_region[poi_header..poi_header + 4]
+            .copy_from_slice(&((2u32 << 8) | poi_sectors as u32).to_be_bytes());
+        poi_region[8192..8196].copy_from_slice(&u32::try_from(poi_bytes.len() + 1)?.to_be_bytes());
+        poi_region[8196] = 3;
+        poi_region[8197..8197 + poi_bytes.len()].copy_from_slice(&poi_bytes);
+        let poi_dir = root.join("dimensions/minecraft/overworld/poi");
+        std::fs::create_dir_all(&poi_dir)?;
+        std::fs::write(poi_dir.join("r.0.0.mca"), poi_region)?;
+        let existing_poi_source =
+            Arc::new(native_persistence::world::SavedPoiChunk::from_document(
+                existing_poi_source,
+                native_persistence::world::ChunkPos {
+                    x: second.x,
+                    z: second.z,
+                },
+            )?);
         // Keep earlier protochunks far outside the test generation schedule.
         // Their original NBT must be captured without assuming biome data exists.
         let early_positions = [
@@ -9958,7 +10070,10 @@ mod tests {
         )
         .map_err(anyhow::Error::msg)?;
         assert!(actual.capture_live_inputs(&live, &restored).is_err());
-        live.set_initial_poi_chunk(second, native_session::loaded::SavedPoiData::Missing)?;
+        live.set_initial_poi_chunk(
+            second,
+            native_session::loaded::SavedPoiData::Present(Arc::clone(&existing_poi_source)),
+        )?;
         live.set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
         live.set_initial_poi_chunk(third, native_session::loaded::SavedPoiData::Missing)?;
         live.set_initial_entity_chunk(third, native_session::loaded::SavedEntityData::Empty)?;
@@ -10033,7 +10148,10 @@ mod tests {
             early_live
                 .set_initial_entity_chunk(key, native_session::loaded::SavedEntityData::Empty)?;
         }
-        early_live.set_initial_poi_chunk(second, native_session::loaded::SavedPoiData::Missing)?;
+        early_live.set_initial_poi_chunk(
+            second,
+            native_session::loaded::SavedPoiData::Present(Arc::clone(&existing_poi_source)),
+        )?;
         early_live
             .set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
         let early_guard = early_generator.capture_live_inputs(&early_live, &early_restored)?;
@@ -10727,8 +10845,12 @@ mod tests {
         )
         .map_err(anyhow::Error::msg)?;
         for pos in [second, third] {
-            worker_session
-                .set_initial_poi_chunk(pos, native_session::loaded::SavedPoiData::Missing)?;
+            let poi = if pos == second {
+                native_session::loaded::SavedPoiData::Present(Arc::clone(&existing_poi_source))
+            } else {
+                native_session::loaded::SavedPoiData::Missing
+            };
+            worker_session.set_initial_poi_chunk(pos, poi)?;
             worker_session
                 .set_initial_entity_chunk(pos, native_session::loaded::SavedEntityData::Empty)?;
         }
@@ -11676,6 +11798,20 @@ mod tests {
         )?;
         assert!(full_drafts.matches_state(&completed, &batch, &staged, inputs));
         assert!(!full_drafts.matches_state(&completed, &batch, &staged, wrong_inputs));
+        let existing_poi = actual.draft_captured_mixed_existing_poi(
+            &batch,
+            &staged,
+            &completed,
+            &components,
+            inputs,
+            |_| Ok(()),
+        )?;
+        assert_eq!(
+            existing_poi.documents[&second]
+                .value
+                .get("example:poi_root"),
+            Some(&Tag::Int(86))
+        );
         assert!(
             actual
                 .stage_captured_mixed_full_save_plan(
@@ -11684,6 +11820,7 @@ mod tests {
                     &completed,
                     &components,
                     &full_drafts,
+                    &existing_poi,
                     wrong_inputs,
                     10,
                 )
@@ -11695,6 +11832,7 @@ mod tests {
             &completed,
             &components,
             &full_drafts,
+            &existing_poi,
             inputs,
             10,
         )?;

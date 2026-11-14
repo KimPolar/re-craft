@@ -833,6 +833,21 @@ public class FreshPoiOrderOracle {
             .unwrap()
             .document
             .unwrap();
+            let whole_chunk = native_persistence::poi::refresh_existing_chunk(
+                &source,
+                source.position,
+                &world,
+                0,
+                16,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(whole_chunk.document.as_ref(), Some(&draft));
+            assert_eq!(
+                whole_chunk.discarded_positions.len(),
+                old_count.saturating_sub(count)
+            );
             let actual: Vec<_> =
                 native_persistence::world::SavedPoiChunk::from_document(draft, source.position)
                     .unwrap()

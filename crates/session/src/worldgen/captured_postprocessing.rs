@@ -390,6 +390,55 @@ impl CarvedTerrainWorld {
         Ok(output)
     }
 
+    /// Preview existing POI sidecars after a sealed captured pass. The caller
+    /// must bind each source to the original terrain and recheck live tickets;
+    /// this result does not authorize a world save.
+    pub fn captured_postprocessed_existing_poi_snapshot<'a>(
+        &self,
+        completed: &super::PostprocessedGeneratedRegion,
+        registry: &GeneratedBlockRegistry,
+        sources: impl IntoIterator<Item = (ChunkPos, &'a native_persistence::world::SavedPoiChunk)>,
+        mut validate_type: impl FnMut(&native_persistence::nbt::JavaString) -> Result<()>,
+    ) -> Result<BTreeMap<ChunkPos, native_persistence::nbt::NamedTag>> {
+        self.validate_captured_postprocessing(completed)?;
+        let mut output = BTreeMap::new();
+        for (pos, source) in sources {
+            ensure!(
+                completed.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+            ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            ensure!(
+                self.recorded_generation_poi_changes(pos)?.is_empty(),
+                "generation POI changes require ordered reconciliation"
+            );
+            completed.ensure_poi_unchanged(pos, registry)?;
+            let position = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let draft = native_persistence::poi::refresh_existing_chunk(
+                source,
+                position,
+                &completed.world,
+                self.min_y,
+                self.height,
+                |state| {
+                    ensure!(
+                        registry.is_canonical_state(&state.name, &state.properties),
+                        "unknown POI block state"
+                    );
+                    Ok(())
+                },
+                &mut validate_type,
+            )?;
+            ensure!(
+                draft.discarded_positions.is_empty(),
+                "existing POI refresh would discard records"
+            );
+            output.insert(pos, draft.document.context("existing POI data is missing")?);
+        }
+        ensure!(!output.is_empty(), "no postprocessed chunks selected");
+        Ok(output)
+    }
+
     /// Preview the light after pending postprocessing checks at a caller-chosen
     /// drain boundary. The result and the staged engine remain unchanged.
     pub fn captured_postprocessed_light_snapshot(
@@ -868,6 +917,46 @@ mod tests {
                 decoded.sections[&0].records[0]
                     .type_id
                     .matches("minecraft:fisherman")
+            );
+            let existing = terrain.captured_postprocessed_existing_poi_snapshot(
+                &completed,
+                &registry,
+                [(first, &decoded)],
+                |kind| {
+                    ensure!(kind.matches("minecraft:fisherman"), "unknown POI type");
+                    Ok(())
+                },
+            )?;
+            assert_eq!(existing[&first], *decoded.document);
+            assert!(
+                terrain
+                    .captured_postprocessed_existing_poi_snapshot(
+                        &completed,
+                        &registry,
+                        [(first, &decoded)],
+                        |_| anyhow::bail!("unknown POI type"),
+                    )
+                    .is_err()
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_existing_poi_snapshot(
+                        &completed,
+                        &registry,
+                        [(first, &decoded), (first, &decoded)],
+                        |_| Ok(()),
+                    )
+                    .is_err()
+            );
+            assert!(
+                with_generation_poi
+                    .captured_postprocessed_existing_poi_snapshot(
+                        &completed,
+                        &registry,
+                        [(first, &decoded)],
+                        |_| Ok(()),
+                    )
+                    .is_err()
             );
             assert!(
                 terrain

@@ -751,6 +751,19 @@ fn prepare_existing_world(
     options: ViewOptions<'_>,
     assets: Option<Arc<MenuAssets>>,
 ) -> Result<PreparedWorld> {
+    prepare_world_with_session(world_dir, minecraft_dir, packs, options, assets, None)
+}
+
+/// Reuse the world lock held by publication when entering a newly created
+/// world, so another process cannot acquire it between creation and play.
+fn prepare_world_with_session(
+    world_dir: &std::path::Path,
+    minecraft_dir: &std::path::Path,
+    packs: &[PathBuf],
+    options: ViewOptions<'_>,
+    assets: Option<Arc<MenuAssets>>,
+    session: Option<native_persistence::save::WorldSessionGuard>,
+) -> Result<PreparedWorld> {
     let ViewOptions {
         dimension,
         chunk,
@@ -760,10 +773,11 @@ fn prepare_existing_world(
         play,
         video,
     } = options;
-    let mut reader = WorldReader::open_for_session(
-        world_dir,
-        DimensionId::parse(dimension.unwrap_or("minecraft:overworld"))?,
-    )?;
+    let initial_dimension = DimensionId::parse(dimension.unwrap_or("minecraft:overworld"))?;
+    let mut reader = match session {
+        Some(session) => WorldReader::open_with_session(world_dir, initial_dimension, session)?,
+        None => WorldReader::open_for_session(world_dir, initial_dimension)?,
+    };
     let player_data = match reader.read_player() {
         Ok(player) => player,
         Err(error) if chunk.is_some() => {

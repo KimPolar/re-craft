@@ -527,10 +527,10 @@ mod tests {
                     "initial player area has deferred chunks: {:?}",
                     player_area.deferred
                 );
-                let StagedWorld::Structured(world) = &world else {
+                let StagedWorld::Structured(staged_world) = &world else {
                     anyhow::bail!("structured generation returned an unstructured stage");
                 };
-                let (path, uuid) = (world.path(), world.initial.uuid);
+                let (path, uuid) = (staged_world.path(), staged_world.initial.uuid);
                 let mut reader = native_persistence::world::WorldReader::open(
                     path,
                     native_persistence::world::DimensionId::parse("overworld")?,
@@ -641,7 +641,7 @@ mod tests {
                     anyhow::bail!("staged world did not reopen as a play session");
                 };
                 use native_session::GameSession;
-                let before = world.initial.session.snapshot();
+                let before = staged_world.initial.session.snapshot();
                 let after = reopened.session.snapshot();
                 let before_position = before.origin.as_vec3() + before.player.position;
                 let after_position = after.origin.as_vec3() + after.player.position;
@@ -686,6 +686,42 @@ mod tests {
                         .collect::<std::collections::BTreeSet<_>>(),
                     reopened_world.missing_chunks,
                 );
+                drop(reopened);
+
+                // Publish only into the temporary test directory. Keep the
+                // reservation's lock throughout the new-world handoff.
+                let (initial, stage) = world.into_parts();
+                assert_eq!(initial.uuid, uuid);
+                let published = stage.publish(parent.path(), "Test", "New World")?;
+                let published_path = published.path.clone();
+                let prepared = crate::prepare_world_with_session(
+                    &published_path,
+                    &game,
+                    &[],
+                    crate::ViewOptions {
+                        dimension: None,
+                        chunk: None,
+                        radius: 1,
+                        smoke_test: false,
+                        block_report: None,
+                        play: true,
+                        video: crate::menu_settings::VideoSettings::default(),
+                    },
+                    None,
+                    Some(published.session().clone()),
+                )?;
+                let crate::PreparedWorld::Play(reopened) = prepared else {
+                    anyhow::bail!("published world did not reopen as a play session");
+                };
+                let reopened_snapshot = reopened.session.snapshot();
+                let reopened_position =
+                    reopened_snapshot.origin.as_vec3() + reopened_snapshot.player.position;
+                assert!((before_position - reopened_position).length() < 0.0001);
+                drop(published);
+                assert!(
+                    native_persistence::save::WorldWriteGuard::acquire(&published_path).is_err()
+                );
+                drop(reopened);
             }
             InitialWorldResult::Failed { error, .. } => return Err(error),
             InitialWorldResult::Cancelled { .. } => {

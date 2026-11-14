@@ -47,6 +47,22 @@ pub enum StagedWorld {
     Structured(StagedStructureInitialWorld),
 }
 
+impl StagedWorld {
+    /// Transfer ownership without implying that the world is ready to publish.
+    /// The caller still has to verify the complete generation and save inputs.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::generation_worker::GeneratedInitialPlayer,
+        native_persistence::save::FreshWorldStage,
+    ) {
+        match self {
+            Self::Regular(world) => world.into_parts(),
+            Self::Structured(world) => world.into_parts(),
+        }
+    }
+}
+
 pub enum StagingResult {
     Ready {
         generation: GenerationReady,

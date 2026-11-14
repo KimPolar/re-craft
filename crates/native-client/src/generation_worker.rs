@@ -215,6 +215,15 @@ impl StagedInitialWorld {
     pub fn path(&self) -> &std::path::Path {
         self.stage.path()
     }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GeneratedInitialPlayer,
+        native_persistence::save::FreshWorldStage,
+    ) {
+        (self.initial, self.stage)
+    }
 }
 
 /// A structure-aware staging tree for verification. Publication remains
@@ -227,6 +236,15 @@ pub struct StagedStructureInitialWorld {
 impl StagedStructureInitialWorld {
     pub fn path(&self) -> &std::path::Path {
         self.stage.path()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GeneratedInitialPlayer,
+        native_persistence::save::FreshWorldStage,
+    ) {
+        (self.initial, self.stage)
     }
 }
 

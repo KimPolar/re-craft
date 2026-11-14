@@ -11027,6 +11027,19 @@ mod tests {
             })?
             .is_some()
         {}
+        let captured = structures.capture_starts(target)?;
+        assert!(matches!(
+            captured.starts()[&structure],
+            PreparedStructureStart::OceanRuin(_)
+        ));
+        if mixed {
+            let hut = ResourceId::parse("example:hut")?;
+            assert!(matches!(
+                captured.starts()[&hut],
+                PreparedStructureStart::Simple(_)
+            ));
+            assert_eq!(captured.reference_bounds().len(), 2);
+        }
         let tags = CarverBlockTags::load(&mut data, &blocks)?;
         let mut batch = preparation.into_expandable_terrain_batch(
             structures,
@@ -11628,6 +11641,7 @@ mod tests {
                 vec![sparse],
             )
             .unwrap();
+            assert!(batch.capture_starts(target).is_err());
             batch.request_references(target).unwrap();
             while batch
                 .step(&mut data, &mut |v| classify(v))
@@ -11638,6 +11652,23 @@ mod tests {
             assert!(batch.starts(target).is_none());
             let start = &batch.mineshaft_starts(target).unwrap()[&structure_id];
             assert!(!start.pieces.is_empty());
+            let captured = batch.capture_starts(target).unwrap();
+            assert_eq!(captured.position(), target);
+            assert!(matches!(
+                captured.starts()[&structure_id],
+                PreparedStructureStart::Mineshaft(_)
+            ));
+            let pieces = captured.terrain_pieces(&structure_id).unwrap();
+            assert_eq!(pieces.len(), start.pieces.len());
+            for (captured_piece, source_piece) in pieces.iter().zip(&start.pieces) {
+                assert_eq!(captured_piece.bounds, source_piece.piece.bounds);
+                assert_eq!(captured_piece.adjustment, start.terrain_adjustment);
+            }
+            assert!(
+                captured
+                    .terrain_pieces(&ResourceId::parse("example:missing").unwrap())
+                    .is_err()
+            );
             let packed = (target.x as u32 as u64 | ((target.z as u32 as u64) << 32)) as i64;
             assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
             let order = batch
@@ -11944,12 +11975,35 @@ mod tests {
             let scheduled = &batch.ocean_ruin_starts(target).unwrap()[&structure_id];
             assert!(scheduled.pieces.len() > 1);
             let piece_count = scheduled.pieces.len();
+            let captured = batch.capture_starts(target).unwrap();
+            assert!(matches!(
+                captured.starts()[&structure_id],
+                PreparedStructureStart::OceanRuin(_)
+            ));
+            assert_eq!(captured.reference_bounds().len(), 1);
+            assert_eq!(captured.reference_bounds()[0].structure, structure_id);
+            let pieces = captured.terrain_pieces(&structure_id).unwrap();
+            assert_eq!(pieces.len(), piece_count);
+            for (captured_piece, source_piece) in pieces.iter().zip(&scheduled.pieces) {
+                assert_eq!(captured_piece.bounds, source_piece.bounds);
+            }
             batch.request_references(target).unwrap();
             while batch
                 .step(&mut data, &mut |v| classify(v))
                 .unwrap()
                 .is_some()
             {}
+            let empty = (-8..=8)
+                .flat_map(|dx| {
+                    (-8..=8).map(move |dz| ChunkPos {
+                        x: target.x + dx,
+                        z: target.z + dz,
+                    })
+                })
+                .filter_map(|pos| batch.capture_starts(pos).ok())
+                .find(|starts| starts.starts().is_empty())
+                .expect("expected an empty completed start stage");
+            assert!(empty.reference_bounds().is_empty());
             let packed =
                 i64::from((target.x as u32 as u64 | ((target.z as u32 as u64) << 32)) as i64);
             assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
@@ -12683,6 +12737,7 @@ mod tests {
         assert!(format!("{error:#}").contains("structure set example:sparse at chunk"));
         assert!(!failing.is_complete());
         assert!(failing.starts(target).is_none());
+        assert!(failing.capture_starts(target).is_err());
         assert!(failing.references(target).is_none());
         assert!(failing.request_references(target).is_err());
     }

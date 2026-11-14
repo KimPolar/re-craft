@@ -80,6 +80,78 @@ impl PlannedStructureStart<'_> {
             Self::Shipwreck(start) => start.chunk,
         }
     }
+
+    fn terrain_pieces(&self) -> Result<Vec<StructurePiece>> {
+        let piece = |bounds, adjustment| StructurePiece {
+            bounds,
+            adjustment,
+            ground_delta: 0,
+            projection: PieceProjection::NonPool,
+            junctions: Vec::new(),
+        };
+        Ok(match self {
+            Self::Simple(start) => vec![start.terrain_piece()],
+            Self::OceanRuin(start) => start
+                .pieces
+                .iter()
+                .map(|value| piece(value.bounds, start.terrain_adjustment))
+                .collect(),
+            Self::Mineshaft(start) => start
+                .pieces
+                .iter()
+                .map(|value| piece(value.piece.bounds, start.terrain_adjustment))
+                .collect(),
+            Self::Jigsaw(start) => start.terrain_pieces()?,
+            Self::RuinedPortal(start) => {
+                vec![piece(start.piece.bounds, start.terrain_adjustment)]
+            }
+            Self::Shipwreck(start) => vec![piece(start.bounds, start.terrain_adjustment)],
+        })
+    }
+}
+
+impl PreparedStructureStart {
+    fn planned(&self) -> PlannedStructureStart<'_> {
+        match self {
+            Self::Simple(start) => PlannedStructureStart::Simple(start),
+            Self::OceanRuin(start) => PlannedStructureStart::OceanRuin(start),
+            Self::Mineshaft(start) => PlannedStructureStart::Mineshaft(start),
+            Self::Jigsaw(start) => PlannedStructureStart::Jigsaw(start),
+            Self::RuinedPortal(start) => PlannedStructureStart::RuinedPortal(start),
+            Self::Shipwreck(start) => PlannedStructureStart::Shipwreck(start),
+        }
+    }
+}
+
+/// A complete, immutable start stage for one newly generated source chunk.
+/// This preserves the generated pieces but does not authorize a world save.
+pub struct CapturedStructureStarts {
+    position: ChunkPos,
+    starts: BTreeMap<ResourceId, PreparedStructureStart>,
+    bounds: Vec<StructureStartBounds>,
+}
+
+impl CapturedStructureStarts {
+    pub fn position(&self) -> ChunkPos {
+        self.position
+    }
+
+    pub fn starts(&self) -> &BTreeMap<ResourceId, PreparedStructureStart> {
+        &self.starts
+    }
+
+    /// Retain the original generation order for reference collection.
+    pub fn reference_bounds(&self) -> &[StructureStartBounds] {
+        &self.bounds
+    }
+
+    pub fn terrain_pieces(&self, id: &ResourceId) -> Result<Vec<StructurePiece>> {
+        self.starts
+            .get(id)
+            .context("generated structure start is missing")?
+            .planned()
+            .terrain_pieces()
+    }
 }
 
 /// Starts for one registry entry in Java's reference-set order.
@@ -1377,6 +1449,72 @@ impl StructureGenerationBatch {
         !self.failed && self.starts.contains_key(&pos)
     }
 
+    /// Capture every supported start from a completed chunk, including mixed
+    /// simple and multi-piece starts. An unfinished or failed batch cannot be
+    /// mistaken for an empty start stage.
+    pub fn capture_starts(&self, pos: ChunkPos) -> Result<CapturedStructureStarts> {
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        let simple = self
+            .starts
+            .get(&pos)
+            .context("structure starts are missing")?;
+        let bounds = self
+            .bounds
+            .get(&pos)
+            .context("structure start bounds are missing")?;
+        let mut starts = BTreeMap::new();
+        let mut insert = |id: &ResourceId, value: PreparedStructureStart| -> Result<()> {
+            ensure!(
+                value.planned().chunk() == [pos.x, pos.z],
+                "structure start source differs"
+            );
+            ensure!(
+                starts.insert(id.clone(), value).is_none(),
+                "duplicate structure start"
+            );
+            Ok(())
+        };
+        for (id, start) in simple {
+            insert(id, PreparedStructureStart::Simple(start.clone()))?;
+        }
+        if let Some(values) = self.ocean_starts.get(&pos) {
+            for (id, start) in values {
+                insert(id, PreparedStructureStart::OceanRuin(start.clone()))?;
+            }
+        }
+        if let Some(values) = self.mineshafts.get(&pos) {
+            for (id, start) in values {
+                insert(id, PreparedStructureStart::Mineshaft(start.clone()))?;
+            }
+        }
+        if let Some(values) = self.jigsaw_starts.get(&pos) {
+            for (id, start) in values {
+                insert(id, PreparedStructureStart::Jigsaw(start.clone()))?;
+            }
+        }
+        if let Some(values) = self.ruined_portal_starts.get(&pos) {
+            for (id, start) in values {
+                insert(id, PreparedStructureStart::RuinedPortal(start.clone()))?;
+            }
+        }
+        if let Some(values) = self.shipwreck_starts.get(&pos) {
+            for (id, start) in values {
+                insert(id, PreparedStructureStart::Shipwreck(start.clone()))?;
+            }
+        }
+        let bound_keys: BTreeSet<_> = bounds.iter().map(|entry| &entry.structure).collect();
+        ensure!(
+            bounds.len() == bound_keys.len()
+                && bound_keys == starts.keys().collect::<BTreeSet<_>>(),
+            "structure start bounds differ from generated starts"
+        );
+        Ok(CapturedStructureStarts {
+            position: pos,
+            starts,
+            bounds: bounds.clone(),
+        })
+    }
+
     /// Return all ocean ruins generated for a completed start chunk.
     pub fn ocean_ruin_starts(&self, pos: ChunkPos) -> Option<&OceanRuinStarts> {
         (!self.failed && self.starts.contains_key(&pos))
@@ -1778,70 +1916,45 @@ impl StructureGenerationBatch {
         structure: &ResourceId,
         source: ChunkPos,
     ) -> Result<Vec<StructurePiece>> {
-        let mut pieces = Vec::new();
-        if let Some(start) = self
+        let start = if let Some(start) = self
             .starts
             .get(&source)
             .and_then(|starts| starts.get(structure))
         {
-            pieces.push(start.terrain_piece());
+            PlannedStructureStart::Simple(start)
         } else if let Some(start) = self
             .ocean_starts
             .get(&source)
             .and_then(|starts| starts.get(structure))
         {
-            pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
-                bounds: piece.bounds,
-                adjustment: start.terrain_adjustment,
-                ground_delta: 0,
-                projection: PieceProjection::NonPool,
-                junctions: vec![],
-            }));
+            PlannedStructureStart::OceanRuin(start)
         } else if let Some(start) = self
             .jigsaw_starts
             .get(&source)
             .and_then(|starts| starts.get(structure))
         {
-            pieces.extend(start.terrain_pieces()?);
+            PlannedStructureStart::Jigsaw(start)
         } else if let Some(start) = self
             .ruined_portal_starts
             .get(&source)
             .and_then(|starts| starts.get(structure))
         {
-            pieces.push(StructurePiece {
-                bounds: start.piece.bounds,
-                adjustment: start.terrain_adjustment,
-                ground_delta: 0,
-                projection: PieceProjection::NonPool,
-                junctions: vec![],
-            });
+            PlannedStructureStart::RuinedPortal(start)
         } else if let Some(start) = self
             .shipwreck_starts
             .get(&source)
             .and_then(|starts| starts.get(structure))
         {
-            pieces.push(StructurePiece {
-                bounds: start.bounds,
-                adjustment: start.terrain_adjustment,
-                ground_delta: 0,
-                projection: PieceProjection::NonPool,
-                junctions: vec![],
-            });
+            PlannedStructureStart::Shipwreck(start)
         } else {
             let start = self
                 .mineshafts
                 .get(&source)
                 .and_then(|starts| starts.get(structure))
                 .context("referenced structure start is missing")?;
-            pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
-                bounds: piece.piece.bounds,
-                adjustment: start.terrain_adjustment,
-                ground_delta: 0,
-                projection: PieceProjection::NonPool,
-                junctions: vec![],
-            }));
-        }
-        Ok(pieces)
+            PlannedStructureStart::Mineshaft(start)
+        };
+        start.terrain_pieces()
     }
 
     /// Generate intermediate terrain using the referenced simple pieces. The

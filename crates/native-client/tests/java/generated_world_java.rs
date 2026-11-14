@@ -783,8 +783,10 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     if seed == 1 {
         use native_session::{GameSession, PlayerCommand, SystemMessageKind};
 
-        let stream_reader =
-            native_persistence::world::WorldReader::open(stage.path(), dimension.clone())?;
+        let stream_reader = native_persistence::world::WorldReader::open_for_session(
+            stage.path(),
+            dimension.clone(),
+        )?;
         let mut streamer = crate::chunk_stream::ChunkStreamer::start(
             stream_reader,
             defaults.clone(),
@@ -885,6 +887,39 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             "Fence updates still waiting after streaming: {:?}; dependencies not staged: {missing_dependencies:?}",
             session.pending_fence_update_chunks().collect::<Vec<_>>(),
         );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            streamer.service(session)?;
+            let required_missing: Vec<_> = session
+                .required_shape_update_chunks()
+                .into_iter()
+                .filter(|pos| !positions.contains(&ChunkPos { x: pos.x, z: pos.z }))
+                .collect();
+            if let Some(targets) = streamer.missing_generation_targets(session, usize::MAX) {
+                if !required_missing.is_empty() && targets.targets().starts_with(&required_missing)
+                {
+                    ensure!(
+                        targets.is_current(&streamer, session),
+                        "generation targets are stale"
+                    );
+                    eprintln!(
+                        "Missing shape dependencies prioritized for generation: {required_missing:?}"
+                    );
+                    break;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "missing shape generation targets timed out"
+            );
+            session.update(Duration::from_millis(50));
+            let errors = session.take_stream_errors();
+            ensure!(
+                errors.is_empty(),
+                "generation target streaming errors: {errors:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         match session.draft_new_player_state() {
             Ok(draft) => {
                 let ticked_player_file = oracle.path().join("ticked-player.nbt");

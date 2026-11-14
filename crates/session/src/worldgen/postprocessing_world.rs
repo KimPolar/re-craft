@@ -2780,7 +2780,7 @@ impl GeneratedBlockView<'_> {
                 matches!(
                     supported_postprocessing_block(&state),
                     Ok(DryBlock::Plain | DryBlock::Falling)
-                ),
+                ) || self.lava_shape_neighbor(&state),
                 "exhausted lava requires unsupported neighbor callbacks"
             );
         }
@@ -2832,10 +2832,7 @@ impl GeneratedBlockView<'_> {
         ] {
             let neighbor = target + delta;
             let state = self.read(neighbor.to_array())?;
-            if matches!(
-                supported_postprocessing_block(&state),
-                Ok(DryBlock::Falling)
-            ) {
+            if self.lava_shape_neighbor(&state) {
                 self.update_lava_shape_neighbor(neighbor, &state, target, &air, 511)?;
             }
         }
@@ -8630,13 +8627,19 @@ mod tests {
             {
                 let lava = world.intern_state(BlockState {
                     name: "minecraft:lava".into(),
-                    properties: BTreeMap::from([("level".into(), "0".into())]),
+                    properties: BTreeMap::from([(
+                        "level".into(),
+                        if case.ends_with("_drain") { "4" } else { "0" }.into(),
+                    )]),
                 });
                 world.set_block_id(origin_x, 8, 8, lava).unwrap();
                 if case.starts_with("lava_wet_") || case.starts_with("lava_dry_") {
                     world.set_block_id(origin_x + 1, 8, 8, air).unwrap();
                     let wet_case = case.replacen("lava_dry_", "lava_wet_", 1);
-                    let fixture_case = wet_case.strip_suffix("_target").unwrap_or(&wet_case);
+                    let fixture_case = wet_case
+                        .strip_suffix("_target")
+                        .or_else(|| wet_case.strip_suffix("_drain"))
+                        .unwrap_or(&wet_case);
                     let (name, properties): (&str, Vec<(&str, &str)>) = match fixture_case {
                         "lava_wet_slab_bottom" => (
                             "stone_slab",
@@ -8694,17 +8697,22 @@ mod tests {
                         properties: properties
                             .into_iter()
                             .map(|(key, value)| {
-                                let value = if key == "waterlogged" && case.starts_with("lava_dry_")
-                                {
-                                    "false"
-                                } else {
-                                    value
+                                let value = match (key, case) {
+                                    ("waterlogged", case) if case.starts_with("lava_dry_") => {
+                                        "false"
+                                    }
+                                    ("facing", case) if case.ends_with("ladder_drain") => "west",
+                                    _ => value,
                                 };
                                 (key.into(), value.into())
                             })
                             .collect(),
                     });
-                    let z = if case.ends_with("_target") { 8 } else { 7 };
+                    let z = if case.ends_with("_target") || case.ends_with("_drain") {
+                        8
+                    } else {
+                        7
+                    };
                     world.set_block_id(origin_x + 1, 8, z, block).unwrap();
                 }
                 if case.starts_with("lava_touch_") {
@@ -10134,7 +10142,11 @@ mod tests {
             }
         }
         if case.starts_with("lava_wet_") || case.starts_with("lava_dry_") {
-            let z = if case.ends_with("_target") { 8 } else { 7 };
+            let z = if case.ends_with("_target") || case.ends_with("_drain") {
+                8
+            } else {
+                7
+            };
             let state = result.world.block(9, 8, z).unwrap();
             trace.push(format!(
                 "wet 9,8,{z} {} {}",
@@ -11896,6 +11908,68 @@ mod tests {
         .into_iter()
         .flat_map(water_spread_trace)
         .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exhausted_generated_lava_updates_shaped_neighbors() {
+        for wet in ["dry", "wet"] {
+            for block in [
+                "slab_bottom",
+                "slab_top",
+                "stair",
+                "fence",
+                "ladder",
+                "lichen",
+                "leaves",
+            ] {
+                let case = format!("lava_{wet}_{block}_drain");
+                let trace = water_spread_trace(&case);
+                assert_eq!(trace[1], "state 8,8,8 minecraft:air -", "{case}");
+                if wet == "wet" {
+                    assert!(
+                        trace
+                            .iter()
+                            .any(|line| line == "fluid minecraft:water 9,8,8 5"),
+                        "{case}: {trace:?}"
+                    );
+                }
+                if block == "leaves" {
+                    assert!(
+                        trace
+                            .iter()
+                            .any(|line| line == "block minecraft:oak_leaves 9,8,8 1"),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn exhausted_generated_lava_shaped_neighbors_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_drain_shapes"],
+        );
+        let expected = ["dry", "wet"]
+            .into_iter()
+            .flat_map(|wet| {
+                [
+                    "slab_bottom",
+                    "slab_top",
+                    "stair",
+                    "fence",
+                    "ladder",
+                    "lichen",
+                    "leaves",
+                ]
+                .map(move |block| format!("lava_{wet}_{block}_drain"))
+            })
+            .flat_map(|case| water_spread_trace(&case))
+            .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
 

@@ -165,6 +165,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lava_falling")){
             scenarios.clear();for(var block:List.of("sand","red_sand","gravel")){scenarios.add("lava_down_"+block);scenarios.add("lava_drain_"+block);}scenarios.add("lava_drain_sand_all");
         }
+        if(args.length>0 && args[0].equals("lava_drain_shapes")){
+            scenarios.clear();for(var wet:List.of("dry","wet"))for(var block:List.of("slab_bottom","slab_top","stair","fence","ladder","lichen","leaves"))scenarios.add("lava_"+wet+"_"+block+"_drain");
+        }
         if(args.length>0 && args[0].equals("down_containers")){
             scenarios.clear();
             for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
@@ -198,8 +201,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             rules.set(GameRules.LAVA_SOURCE_CONVERSION,scenario.equals("lava_convert_on")||scenario.equals("lava_convert_on_water"),null);
             blocks.clear();lightChecks.clear();fizzEvents.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.startsWith("lava_wet_")||scenario.startsWith("lava_dry_")){
-                blocks.put(pos,Blocks.LAVA.defaultBlockState());blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
-                BlockState wet=switch(scenario.replace("lava_dry_","lava_wet_").replace("_target","")){
+                blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,scenario.endsWith("_drain")?4:0));blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                BlockState wet=switch(scenario.replace("lava_dry_","lava_wet_").replace("_target","").replace("_drain","")){
                     case "lava_wet_slab_bottom" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.BOTTOM).setValue(BlockStateProperties.WATERLOGGED,true);
                     case "lava_wet_slab_top" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.TOP).setValue(BlockStateProperties.WATERLOGGED,true);
                     case "lava_wet_stair" -> Blocks.OAK_STAIRS.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING,Direction.NORTH).setValue(BlockStateProperties.HALF,Half.BOTTOM).setValue(BlockStateProperties.WATERLOGGED,true);
@@ -210,7 +213,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     default -> throw new AssertionError(scenario);
                 };
                 if(scenario.startsWith("lava_dry_"))wet=wet.setValue(BlockStateProperties.WATERLOGGED,false);
-                blocks.put(scenario.endsWith("_target")?pos.east():pos.east().north(),wet);
+                if(scenario.endsWith("ladder_drain"))wet=wet.setValue(LadderBlock.FACING,Direction.WEST);
+                blocks.put(scenario.endsWith("_target")||scenario.endsWith("_drain")?pos.east():pos.east().north(),wet);
                 attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,false).build()).build();
             }
             if(scenario.startsWith("lava_touch_")){
@@ -435,7 +439,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(scenario.startsWith("water_touch_lava_"))out.printf("reaction 9,7,8 %s%n",BuiltInRegistries.BLOCK.getKey(get(pos.below().east()).getBlock()));
             if(scenario.equals("water_touch_lava_cascade"))out.printf("reaction 7,7,8 %s%n",BuiltInRegistries.BLOCK.getKey(get(pos.below().west()).getBlock()));
             if(scenario.startsWith("lava_wet_")||scenario.startsWith("lava_dry_")){
-                var wetPos=scenario.endsWith("_target")?pos.east():pos.east().north();
+                var wetPos=scenario.endsWith("_target")||scenario.endsWith("_drain")?pos.east():pos.east().north();
                 var wet=get(wetPos);
                 out.printf("wet %d,%d,%d %s %s%n",wetPos.getX(),wetPos.getY(),wetPos.getZ(),BuiltInRegistries.BLOCK.getKey(wet.getBlock()),wet.getValue(BlockStateProperties.WATERLOGGED));
                 if(wet.getBlock() instanceof StairBlock)out.printf("wet_stair %s%n",wet.getValue(BlockStateProperties.STAIRS_SHAPE));

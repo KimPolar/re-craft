@@ -835,6 +835,74 @@ fn implemented_collision_shapes_match_vanilla_states() {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn positioned_flower_outlines_match_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("FlowerOutlineOracle.java");
+    let output = temp.path().join("flowers.json");
+    std::fs::write(&source, include_str!("java/FlowerOutlineOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("FlowerOutlineOracle")
+        .arg(&output));
+    let records: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let records = records.as_array().unwrap();
+    assert_eq!(records.len(), 17 * 6);
+    for record in records {
+        let state = BlockState {
+            name: record["id"].as_str().unwrap().into(),
+            properties: record["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap().into()))
+                .collect(),
+        };
+        let p = record["position"].as_array().unwrap();
+        let pos = glam::IVec3::new(
+            p[0].as_i64().unwrap() as i32,
+            p[1].as_i64().unwrap() as i32,
+            p[2].as_i64().unwrap() as i32,
+        );
+        let actual = native_world::collision::positioned_flower_outline(&state, pos).unwrap();
+        let expected = record["outline"].as_array().unwrap();
+        assert_eq!(actual.len(), expected.len(), "{state:?} {pos:?}");
+        for (shape, expected) in actual.iter().zip(expected) {
+            let values = [
+                shape.min.x,
+                shape.min.y,
+                shape.min.z,
+                shape.max.x,
+                shape.max.y,
+                shape.max.z,
+            ];
+            for (value, expected) in values.into_iter().zip(expected.as_array().unwrap()) {
+                assert!(
+                    (f64::from(value) - expected.as_f64().unwrap()).abs() < 1.0e-7,
+                    "{state:?} {pos:?}: {value} vs {expected}"
+                );
+            }
+        }
+        assert_eq!(record["emptyCollision"], true, "{state:?}");
+        assert_eq!(block_shape(&state), Some(Vec::new()), "{state:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn positioned_speleothem_shapes_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

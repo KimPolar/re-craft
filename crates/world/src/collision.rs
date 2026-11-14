@@ -1513,6 +1513,56 @@ pub fn positioned_speleothem_shape(state: &BlockState, pos: IVec3) -> Option<&'s
     Some(std::slice::from_ref(&shapes[kind][x | (z << 4)]))
 }
 
+fn is_positioned_flower(state: &BlockState) -> bool {
+    state.properties.is_empty()
+        && matches!(
+            state.name.as_str(),
+            "minecraft:dandelion"
+                | "minecraft:golden_dandelion"
+                | "minecraft:torchflower"
+                | "minecraft:poppy"
+                | "minecraft:blue_orchid"
+                | "minecraft:allium"
+                | "minecraft:azure_bluet"
+                | "minecraft:red_tulip"
+                | "minecraft:orange_tulip"
+                | "minecraft:white_tulip"
+                | "minecraft:pink_tulip"
+                | "minecraft:oxeye_daisy"
+                | "minecraft:cornflower"
+                | "minecraft:wither_rose"
+                | "minecraft:lily_of_the_valley"
+                | "minecraft:open_eyeblossom"
+                | "minecraft:closed_eyeblossom"
+        )
+}
+
+/// Java's position-offset outline for the verified single-block flowers.
+/// Their collision shapes are empty; this shape is only for targeting.
+pub fn positioned_flower_outline(state: &BlockState, pos: IVec3) -> Option<&'static [Aabb]> {
+    use std::sync::OnceLock;
+    if !is_positioned_flower(state) {
+        return None;
+    }
+    static SHAPES: OnceLock<[Aabb; 256]> = OnceLock::new();
+    let shapes = SHAPES.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let dx = block_axis_offset(index & 15, 0.25);
+            let dz = block_axis_offset(index >> 4, 0.25);
+            Aabb {
+                min: Vec3::new((5.0 / 16.0 + dx) as f32, 0.0, (5.0 / 16.0 + dz) as f32),
+                max: Vec3::new(
+                    (11.0 / 16.0 + dx) as f32,
+                    10.0 / 16.0,
+                    (11.0 / 16.0 + dz) as f32,
+                ),
+            }
+        })
+    });
+    let (x, _, z) = block_offset_indices(pos);
+    Some(std::slice::from_ref(&shapes[x | (z << 4)]))
+}
+
 fn crop_outline_height(state: &BlockState) -> Option<f32> {
     let (max, step) = match state.name.as_str() {
         "minecraft:wheat" => (7, 2),
@@ -1713,6 +1763,9 @@ pub fn copper_bulb_state(state: &BlockState) -> Option<(bool, bool)> {
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if is_positioned_flower(state) {
+        return Some(EMPTY.to_vec());
+    }
     if rail_ascending(state).is_some() || bubble_column_state(state) {
         return Some(EMPTY.to_vec());
     }

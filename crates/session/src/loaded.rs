@@ -12828,6 +12828,8 @@ impl LoadedSession {
                 shape.is_none()
                     && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
                         .is_none()
+                    && native_world::collision::positioned_flower_outline(state, IVec3::ZERO)
+                        .is_none()
             })
             .count()
     }
@@ -26247,6 +26249,7 @@ fn shape_at_absolute<'a>(
         .or_else(|| {
             native_world::collision::positioned_speleothem_shape(world.state(id)?, position)
         })
+        .or_else(|| native_world::collision::positioned_flower_outline(world.state(id)?, position))
 }
 
 fn shape_at_relative<'a>(
@@ -81838,6 +81841,64 @@ pub(crate) mod tests {
                 "{row}"
             );
             assert!(!session.unresolved_speleothem_shape, "{row}");
+        }
+    }
+
+    #[test]
+    fn positioned_flowers_are_targetable_without_blocking_movement() {
+        for name in ["minecraft:dandelion", "minecraft:poppy"] {
+            let (mut world, origin, mut player) = fixture();
+            let block = state(name, &[]);
+            let id = world.intern_state(block.clone());
+            let relative = IVec3::new(9, 2, 8);
+            let absolute = origin + relative;
+            world
+                .set_block_id(absolute.x, absolute.y, absolute.z, id)
+                .unwrap();
+            let shape =
+                native_world::collision::positioned_flower_outline(&block, absolute).unwrap()[0];
+            let center_z = relative.z as f32 + (shape.min.z + shape.max.z) * 0.5;
+            player.position = Vec3::new(8.0, 1.0, center_z);
+            player.yaw = std::f32::consts::FRAC_PI_2;
+            let mut session = LoadedSession::new(
+                world,
+                origin,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            assert_eq!(session.unsupported_states(), 0, "{name}");
+            assert_eq!(session.unsupported_outlines(), 0, "{name}");
+            let hit = session.ray_hit_with_range(3.0).unwrap();
+            assert_eq!(hit.position, relative, "{name}");
+            assert_eq!(hit.face, IVec3::NEG_X, "{name}");
+            assert!(
+                (hit.location.x - f64::from(relative.x) - f64::from(shape.min.x)).abs() < 1.0e-6
+            );
+            let mut walking = Vec3::new(8.0, 2.0, center_z);
+            assert!(
+                !move_axis(
+                    &session.world,
+                    &session.shapes,
+                    origin,
+                    session.bounds,
+                    session.states[0],
+                    &mut walking,
+                    0,
+                    2.0,
+                ),
+                "{name}"
+            );
+            let clear_z = if shape.min.z > 0.05 {
+                shape.min.z - 0.05
+            } else {
+                shape.max.z + 0.05
+            };
+            session.player.position.z = relative.z as f32 + clear_z;
+            assert!(session.ray_hit_with_range(3.0).is_none(), "{name}");
         }
     }
 

@@ -640,10 +640,6 @@ mod tests {
                 let crate::PreparedWorld::Play(reopened) = prepared else {
                     anyhow::bail!("staged world did not reopen as a play session");
                 };
-                if seed == -1 {
-                    assert_eq!(reopened.session.unsupported_states(), 0);
-                    assert_eq!(reopened.session.unsupported_outlines(), 0);
-                }
                 use native_session::GameSession;
                 let before = world.initial.session.snapshot();
                 let after = reopened.session.snapshot();
@@ -667,14 +663,21 @@ mod tests {
                     };
                     let collision =
                         native_world::collision::block_shape(state).is_none() && !positioned();
-                    let outline =
-                        native_world::collision::block_outline(state).is_none() && !positioned();
+                    let outline = native_world::collision::block_outline(state).is_none()
+                        && !positioned()
+                        && native_world::collision::positioned_flower_outline(
+                            state,
+                            glam::IVec3::ZERO,
+                        )
+                        .is_none();
                     if collision || outline {
                         eprintln!(
                             "unsupported shape: collision={collision} outline={outline} {state:?}"
                         );
                     }
                 }
+                assert_eq!(reopened.session.unsupported_states(), 0);
+                assert_eq!(reopened.session.unsupported_outlines(), 0);
                 assert_eq!(
                     player_area
                         .missing

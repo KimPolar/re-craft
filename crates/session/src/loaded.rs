@@ -20138,6 +20138,22 @@ impl LoadedSession {
         if native_world::collision::positioned_speleothem_shape(&block, IVec3::ZERO).is_none() {
             return false;
         }
+        let Some(tags) = &self.speleothem_tags else {
+            return false;
+        };
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:speleothems").expect("static tag")
+        });
+        let Ok(tagged) = tags.contains(tag, &block.name) else {
+            return false;
+        };
+        if !tagged {
+            // Both isStalagmite and isStalactite consult the active tag.
+            // An untagged block therefore consumes the tick without falling.
+            self.mark_tick_chunk_dirty(key.x, key.z);
+            return true;
+        }
         if block.properties["vertical_direction"] == "down" {
             // A stalactite creates falling entities, including tip-specific
             // damage. Do not consume its tick until those effects are modeled.
@@ -20158,13 +20174,6 @@ impl LoadedSession {
         let Some(support) = self.world.state(support_id) else {
             return false;
         };
-        let Some(tags) = &self.speleothem_tags else {
-            return false;
-        };
-        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
-        let tag = TAG.get_or_init(|| {
-            native_resources::packs::ResourceId::parse("minecraft:speleothems").expect("static tag")
-        });
         let Ok(tagged) = tags.contains(tag, &support.name) else {
             return false;
         };
@@ -79536,17 +79545,25 @@ pub(crate) mod tests {
     }
 
     fn test_speleothem_tags() -> Arc<native_resources::ore_feature::OreBlockTags> {
+        test_speleothem_tags_with_values(true)
+    }
+
+    fn test_speleothem_tags_with_values(
+        tagged: bool,
+    ) -> Arc<native_resources::ore_feature::OreBlockTags> {
         use native_resources::packs::{ResourceId, ResourceProvider};
-        struct Tags;
+        struct Tags(bool);
         impl ResourceProvider for Tags {
             fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 Ok(None)
             }
             fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
-                Ok(vec![
+                Ok(vec![if self.0 {
                     br#"{"values":["minecraft:pointed_dripstone","minecraft:sulfur_spike"]}"#
-                        .to_vec(),
-                ])
+                        .to_vec()
+                } else {
+                    br#"{"values":[]}"#.to_vec()
+                }])
             }
         }
         let registry = [
@@ -79561,7 +79578,7 @@ pub(crate) mod tests {
         let tag = ResourceId::parse("minecraft:speleothems").unwrap();
         Arc::new(
             native_resources::ore_feature::OreBlockTags::load(
-                &mut Tags,
+                &mut Tags(tagged),
                 &registry,
                 &BTreeSet::from([tag]),
             )
@@ -79582,6 +79599,74 @@ pub(crate) mod tests {
             }
         }
         Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    #[test]
+    fn untagged_speleothem_ticks_are_consumed_without_changes() {
+        for kind in [SpeleothemKind::Dripstone, SpeleothemKind::Sulfur] {
+            for direction in ["up", "down"] {
+                for wet in [false, true] {
+                    let mut session = session();
+                    session.set_speleothem_tags(test_speleothem_tags());
+                    let relative = IVec3::new(8, 8, 8);
+                    let absolute = session.origin + relative;
+                    let spike = session.intern_block(state(
+                        kind.id(),
+                        &[
+                            ("vertical_direction", direction),
+                            ("thickness", "tip"),
+                            ("waterlogged", if wet { "true" } else { "false" }),
+                        ],
+                    ));
+                    assert!(session.set_with_notify(relative, spike, false));
+                    session.schedule_speleothem(absolute, kind, 1);
+                    session.set_speleothem_tags(test_speleothem_tags_with_values(false));
+                    session.tick = 1;
+                    session.advance_block_ticks();
+                    assert_eq!(
+                        session.world.block(absolute.x, absolute.y, absolute.z),
+                        session.world.state(spike)
+                    );
+                    assert!(session.speleothem_pending.is_empty());
+                    assert!(session.speleothem_deferred.is_empty());
+                    assert!(session.falling_sand.is_empty());
+                    assert!(session.dropped_items.snapshot().is_empty());
+                    assert!(session.validate_speleothem_updates().is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_stalactite_tick_uses_reloaded_tags() {
+        let mut session = session();
+        session.set_speleothem_tags(test_speleothem_tags());
+        let relative = IVec3::new(8, 8, 8);
+        let absolute = session.origin + relative;
+        let spike = session.intern_block(state(
+            "minecraft:pointed_dripstone",
+            &[
+                ("vertical_direction", "down"),
+                ("thickness", "tip"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        assert!(session.set_with_notify(relative, spike, false));
+        session.schedule_speleothem(absolute, SpeleothemKind::Dripstone, 1);
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(session.speleothem_deferred.len(), 1);
+        assert!(session.validate_speleothem_updates().is_err());
+        session.set_speleothem_tags(test_speleothem_tags_with_values(false));
+        session.tick = 2;
+        session.advance_block_ticks();
+        assert!(session.speleothem_pending.is_empty());
+        assert!(session.speleothem_deferred.is_empty());
+        assert!(session.validate_speleothem_updates().is_ok());
+        assert_eq!(
+            session.world.block(absolute.x, absolute.y, absolute.z),
+            session.world.state(spike)
+        );
     }
 
     #[test]
@@ -79817,6 +79902,12 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn speleothem_support_ticks_match_java() {
+        for tagged in [true, false] {
+            compare_speleothem_support_ticks_with_java(tagged);
+        }
+    }
+
+    fn compare_speleothem_support_ticks_with_java(tagged: bool) {
         use native_resources::packs::ResourceStack;
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -79865,7 +79956,11 @@ pub(crate) mod tests {
             .arg(classpath)
             .args([
                 "GeneratedWaterSpreadPostprocessingOracle",
-                "speleothem_tick",
+                if tagged {
+                    "speleothem_tick"
+                } else {
+                    "speleothem_tick_untagged"
+                },
             ])
             .output()
             .unwrap();
@@ -79921,6 +80016,9 @@ pub(crate) mod tests {
             if restored {
                 assert!(session.set(support, stone));
             }
+            if !tagged {
+                session.set_speleothem_tags(test_speleothem_tags_with_values(false));
+            }
             session.tick = delay as u64;
             session.advance_block_ticks();
             let p = session.origin + pos;
@@ -79929,7 +80027,11 @@ pub(crate) mod tests {
                 parts[5],
                 "{row}"
             );
-            if up && !restored {
+            if !tagged {
+                assert!(session.speleothem_pending.is_empty(), "{row}");
+                assert!(session.speleothem_deferred.is_empty(), "{row}");
+                assert!(session.dropped_items.snapshot().is_empty(), "{row}");
+            } else if up && !restored {
                 let drops = session.dropped_items.snapshot();
                 assert_eq!(drops.len(), 1, "{row}");
                 assert_eq!(drops[0].stack.id(), kind.id(), "{row}");

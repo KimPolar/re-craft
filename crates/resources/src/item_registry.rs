@@ -271,6 +271,36 @@ impl ItemRegistry {
     pub fn id(&self, id: &str) -> Option<i32> {
         self.ids.get(id).copied()
     }
+    /// Whether this 26.3 item inherits BlockItem's destruction behavior.
+    /// Most block items use block description keys; the exceptions were checked
+    /// against every item in the Java registry.
+    pub fn has_block_item_destruction(&self, id: &str) -> Option<bool> {
+        self.ids.contains_key(id).then(|| {
+            if id == "minecraft:air" {
+                return false;
+            }
+            self.block_descriptions.contains(id)
+                || matches!(
+                    id,
+                    "minecraft:resin_clump"
+                        | "minecraft:redstone"
+                        | "minecraft:string"
+                        | "minecraft:wheat_seeds"
+                        | "minecraft:powder_snow_bucket"
+                        | "minecraft:cocoa_beans"
+                        | "minecraft:pumpkin_seeds"
+                        | "minecraft:melon_seeds"
+                        | "minecraft:nether_wart"
+                        | "minecraft:carrot"
+                        | "minecraft:potato"
+                        | "minecraft:torchflower_seeds"
+                        | "minecraft:pitcher_pod"
+                        | "minecraft:beetroot_seeds"
+                        | "minecraft:sweet_berries"
+                        | "minecraft:glow_berries"
+                )
+        })
+    }
     /// The default translatable description key decoded from item registration.
     pub fn description_key(&self, id: &str) -> Option<String> {
         self.ids.contains_key(id).then(|| {

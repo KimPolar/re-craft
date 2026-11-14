@@ -79,7 +79,7 @@ pub struct SavedChest {
 }
 
 /// Validate item-carried contents without recursively resolving item prototypes.
-fn container_entries(container: &Tag) -> Result<Vec<(usize, &Tag)>> {
+pub(crate) fn container_entries(container: &Tag) -> Result<Vec<(usize, &Tag)>> {
     let Tag::List {
         element_type,
         values,

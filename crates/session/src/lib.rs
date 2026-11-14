@@ -55,6 +55,7 @@ pub mod physics;
 pub mod player_data;
 pub mod redstone;
 pub mod respawn;
+pub mod save_capture;
 mod saved_banner;
 pub mod saved_chest;
 mod saved_entity;

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use crate::{GameplayKey, PlayerCommand};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GameplayKeys {
     hotbar: [u32; 9],
     swap: u32,

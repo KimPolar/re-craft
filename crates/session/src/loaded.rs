@@ -317,6 +317,65 @@ pub struct PartialSessionPoiSaveDraft {
     poi: BTreeMap<ChunkPos, native_persistence::poi::ReconciledPoiDraft>,
 }
 
+/// Owns a session while its partial save inputs are captured. It cannot be
+/// ticked or mutated until returned with `resume`; this is not save approval.
+#[must_use]
+pub struct FrozenPartialSave {
+    session: Box<LoadedSession>,
+    paused_commands: VecDeque<PlayerCommand>,
+    positions: BTreeSet<native_persistence::world::ChunkPos>,
+}
+
+impl FrozenPartialSave {
+    pub fn session(&self) -> &LoadedSession {
+        &self.session
+    }
+
+    pub fn source_positions(&self) -> &BTreeSet<native_persistence::world::ChunkPos> {
+        &self.positions
+    }
+
+    pub fn dimension(&self) -> &str {
+        &self.session.world.dimension
+    }
+
+    pub fn belongs_to_world(&self, stamp: &native_persistence::save::WorldReadStamp) -> bool {
+        self.session
+            .saved_world_session
+            .as_ref()
+            .is_some_and(|session| stamp.belongs_to_session(session))
+    }
+
+    /// Restore the exact queued controls if the save is cancelled or fails.
+    pub fn resume(self) -> LoadedSession {
+        debug_assert!(self.session.commands.is_empty());
+        let mut session = *self.session;
+        session.commands = self.paused_commands;
+        session
+    }
+}
+
+/// A failed freeze returns the live session so no gameplay state is lost.
+pub struct FreezePartialSaveError {
+    session: Box<LoadedSession>,
+    error: anyhow::Error,
+}
+
+impl FreezePartialSaveError {
+    pub fn into_parts(self) -> (LoadedSession, anyhow::Error) {
+        (*self.session, self.error)
+    }
+}
+
+impl std::fmt::Debug for FreezePartialSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FreezePartialSaveError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PartialSessionPoiSaveDraft {
     pub fn session(&self) -> &PartialSessionSaveDraft {
         &self.session
@@ -4261,6 +4320,63 @@ impl LoadedSession {
             validate_state,
             validate_poi_type,
         )
+    }
+
+    /// Freeze a tick-boundary session while collecting partial save inputs.
+    /// Queued screen-release controls are set aside without being applied;
+    /// cancelling restores them in their original order. Gameplay commands and
+    /// pending chunk attachments must reach a tick before freezing.
+    pub fn freeze_partial_save(mut self) -> Result<FrozenPartialSave, FreezePartialSaveError> {
+        let validate = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.saved_world_session.is_some(),
+                "loaded session has no bound world lock"
+            );
+            anyhow::ensure!(!self.advancing_tick, "a simulation tick is in progress");
+            anyhow::ensure!(
+                self.incoming.is_empty()
+                    && self.pending_window.is_none()
+                    && self.pending_respawn_window.is_none(),
+                "streaming updates have not reached the session"
+            );
+            let mut keys = self.gameplay_keys.clone();
+            let mut commands = self.commands.clone();
+            keys.prepare(&mut commands);
+            anyhow::ensure!(
+                commands.iter().all(|command| matches!(
+                    command,
+                    PlayerCommand::Move { .. }
+                        | PlayerCommand::Sprint { .. }
+                        | PlayerCommand::Sneak(_)
+                        | PlayerCommand::StopBreak
+                        | PlayerCommand::StopUse
+                )),
+                "pending gameplay commands have not reached a tick"
+            );
+            Ok(())
+        };
+        if let Err(error) = validate() {
+            return Err(FreezePartialSaveError {
+                session: Box::new(self),
+                error,
+            });
+        }
+        let paused_commands = std::mem::take(&mut self.commands);
+        let positions = match self.partial_save_source_positions() {
+            Ok(positions) => positions,
+            Err(error) => {
+                self.commands = paused_commands;
+                return Err(FreezePartialSaveError {
+                    session: Box::new(self),
+                    error,
+                });
+            }
+        };
+        Ok(FrozenPartialSave {
+            session: Box::new(self),
+            paused_commands,
+            positions,
+        })
     }
 
     /// Assemble the tracked session changes from a single locked disk capture.
@@ -30118,6 +30234,253 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    fn locked_session_for_save() -> (
+        tempfile::TempDir,
+        native_persistence::world::WorldReader,
+        LoadedSession,
+    ) {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::{
+            nbt::{self, NamedTag, Tag},
+            world::{DimensionId, WorldReader},
+        };
+        use std::io::Write;
+
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/session-save-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("frozen-session-")
+            .tempdir_in(parent)
+            .unwrap();
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            )]),
+        };
+        let mut compressed = GzEncoder::new(Vec::new(), Compression::default());
+        compressed.write_all(&nbt::write(&level).unwrap()).unwrap();
+        std::fs::write(
+            directory.path().join("level.dat"),
+            compressed.finish().unwrap(),
+        )
+        .unwrap();
+        let reader = WorldReader::open_for_session(
+            directory.path(),
+            DimensionId::parse("overworld").unwrap(),
+        )
+        .unwrap();
+        let mut session = session();
+        session
+            .bind_saved_world_session(reader.session_guard().unwrap())
+            .unwrap();
+        (directory, reader, session)
+    }
+
+    fn wait_save_capture(
+        mut worker: crate::save_capture::PartialSaveCaptureWorker,
+    ) -> (
+        FrozenPartialSave,
+        anyhow::Result<native_persistence::world::SessionSaveSources>,
+    ) {
+        use crate::save_capture::PartialSaveCapturePoll;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match worker.poll() {
+                PartialSaveCapturePoll::Pending(next) => worker = next,
+                PartialSaveCapturePoll::Ready { frozen, result } => return (frozen, result),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "save capture timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn frozen_partial_save_restores_paused_controls_without_advancing_ticks() {
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        session.submit_command(PlayerCommand::GameplayKey(crate::GameplayKey::Hotbar(4)));
+        session.submit_command(PlayerCommand::GameplayKey(crate::GameplayKey::Hotbar(4)));
+        session.update(TICK);
+        assert_eq!(session.snapshot().inventory.selected(), 4);
+        session.submit_command(PlayerCommand::ClearGameplayKeys);
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        session.submit_command(PlayerCommand::Sprint {
+            pressed: false,
+            backward_pressed: false,
+        });
+        session.submit_command(PlayerCommand::Sneak(false));
+        session.submit_command(PlayerCommand::StopBreak);
+        session.submit_command(PlayerCommand::StopUse);
+        let before = session.snapshot();
+        let frozen = session.freeze_partial_save().unwrap();
+        assert!(Arc::ptr_eq(&before, &frozen.session().snapshot()));
+        assert!(frozen.session().commands.is_empty());
+        assert!(frozen.source_positions().is_empty());
+        let mut resumed = frozen.resume();
+        assert_eq!(resumed.commands.len(), 6);
+        assert_eq!(resumed.snapshot().tick, before.tick);
+        resumed.update(TICK);
+        assert_eq!(resumed.snapshot().tick, before.tick + 1);
+        assert_eq!(resumed.snapshot().inventory.selected(), 4);
+        assert!(resumed.commands.is_empty());
+    }
+
+    #[test]
+    fn failed_partial_save_freeze_preserves_session_and_queued_actions() {
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        session.submit_command(PlayerCommand::Place);
+        session.submit_command(PlayerCommand::ClearGameplayKeys);
+        session.submit_command(PlayerCommand::StopUse);
+        let before = session.snapshot();
+        let (mut session, error) = session.freeze_partial_save().err().unwrap().into_parts();
+        assert!(error.to_string().contains("pending gameplay commands"));
+        assert!(Arc::ptr_eq(&before, &session.snapshot()));
+        assert!(matches!(
+            session.commands.front(),
+            Some(PlayerCommand::Place)
+        ));
+        assert_eq!(session.commands.len(), 3);
+
+        session.commands.clear();
+        session.submit_command(PlayerCommand::StopBreak);
+        session.uncoordinated_falling_lifecycle = true;
+        let (mut session, error) = session.freeze_partial_save().err().unwrap().into_parts();
+        assert!(error.to_string().contains("falling-block lifecycle"));
+        assert!(matches!(
+            session.commands.front(),
+            Some(PlayerCommand::StopBreak)
+        ));
+        session.uncoordinated_falling_lifecycle = false;
+        session.queue_chunk_window(session.player_chunk().unwrap(), 1);
+        let (session, error) = session.freeze_partial_save().err().unwrap().into_parts();
+        assert!(error.to_string().contains("streaming updates"));
+        assert!(matches!(
+            session.commands.front(),
+            Some(PlayerCommand::StopBreak)
+        ));
+    }
+
+    #[test]
+    fn background_save_capture_preserves_frozen_session_on_success_and_failure() {
+        use crate::save_capture::PartialSaveCaptureWorker;
+
+        let (_directory, reader, mut session) = locked_session_for_save();
+        session.submit_command(PlayerCommand::ClearGameplayKeys);
+        session.submit_command(PlayerCommand::StopUse);
+        let before = session.snapshot();
+        let frozen = session.freeze_partial_save().unwrap();
+        let worker = PartialSaveCaptureWorker::start(frozen, reader).unwrap();
+        let (frozen, result) = wait_save_capture(worker);
+        let sources = result.unwrap();
+        assert!(sources.player().is_none());
+        assert!(sources.stamp().is_current());
+        assert!(Arc::ptr_eq(&before, &frozen.session().snapshot()));
+        let session = frozen.resume();
+        assert_eq!(session.commands.len(), 2);
+
+        let frozen = session.freeze_partial_save().unwrap();
+        let worker = PartialSaveCaptureWorker::start_with_test_work(frozen, || {
+            anyhow::bail!("injected capture failure")
+        })
+        .unwrap();
+        let (frozen, result) = wait_save_capture(worker);
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("injected capture failure")
+        );
+        let session = frozen.resume();
+        assert!(Arc::ptr_eq(&before, &session.snapshot()));
+        assert_eq!(session.commands.len(), 2);
+    }
+
+    #[test]
+    fn cancelling_background_capture_returns_session_without_waiting_for_io() {
+        use crate::save_capture::{PartialSaveCapturePoll, PartialSaveCaptureWorker};
+        use std::sync::mpsc;
+
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        session.submit_command(PlayerCommand::StopBreak);
+        let before = session.snapshot();
+        let frozen = session.freeze_partial_save().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let worker = PartialSaveCaptureWorker::start_with_test_work(frozen, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            anyhow::bail!("cancelled capture")
+        })
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let PartialSaveCapturePoll::Pending(worker) = worker.poll() else {
+            panic!("capture completed before it was released")
+        };
+        let session = worker.into_frozen().resume();
+        assert!(Arc::ptr_eq(&before, &session.snapshot()));
+        assert!(matches!(
+            session.commands.front(),
+            Some(PlayerCommand::StopBreak)
+        ));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn background_capture_rejects_wrong_reader_and_recovers_from_panic() {
+        use crate::save_capture::PartialSaveCaptureWorker;
+        use native_persistence::world::{DimensionId, WorldReader};
+
+        let (directory, reader, mut session) = locked_session_for_save();
+        let (_other_directory, other_reader, _other_session) = locked_session_for_save();
+        session.submit_command(PlayerCommand::StopUse);
+        let before = session.snapshot();
+        let frozen = session.freeze_partial_save().unwrap();
+        let (frozen, error) = PartialSaveCaptureWorker::start(frozen, other_reader)
+            .err()
+            .unwrap()
+            .into_parts();
+        assert!(error.to_string().contains("another world session"));
+        let wrong_dimension = WorldReader::open_with_session(
+            directory.path(),
+            DimensionId::parse("the_nether").unwrap(),
+            reader.session_guard().unwrap(),
+        )
+        .unwrap();
+        let (frozen, error) = PartialSaveCaptureWorker::start(frozen, wrong_dimension)
+            .err()
+            .unwrap()
+            .into_parts();
+        assert!(error.to_string().contains("another dimension"));
+        let worker = PartialSaveCaptureWorker::start_with_test_work(frozen, || {
+            panic!("injected capture panic")
+        })
+        .unwrap();
+        let (frozen, result) = wait_save_capture(worker);
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("stopped unexpectedly")
+        );
+        let session = frozen.resume();
+        assert!(Arc::ptr_eq(&before, &session.snapshot()));
+        assert!(matches!(
+            session.commands.front(),
+            Some(PlayerCommand::StopUse)
+        ));
     }
 
     #[test]
@@ -59366,9 +59729,6 @@ pub(crate) mod tests {
                 z: home.z,
             }])
         );
-        let captured = capture_reader
-            .capture_session_save_sources(positions)
-            .unwrap();
         let other_world = tempfile::Builder::new()
             .prefix("other-world-")
             .tempdir_in(root.path().parent().unwrap())
@@ -59387,6 +59747,24 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("another world session")
         );
+        let frozen = session.freeze_partial_save().unwrap();
+        assert_eq!(frozen.source_positions(), &positions);
+        let worker =
+            crate::save_capture::PartialSaveCaptureWorker::start(frozen, capture_reader).unwrap();
+        let (frozen, captured) = wait_save_capture(worker);
+        let captured = captured.unwrap();
+        let session = frozen.session();
+        let assemble = |sources: &native_persistence::world::SessionSaveSources| {
+            session.draft_captured_partial_save(
+                sources,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+                resolve,
+                validate,
+                |_| Ok(()),
+                1,
+            )
+        };
         let plan = assemble(&captured).unwrap();
         drop(draft);
         assert_eq!(plan.chunk_count(), 1);

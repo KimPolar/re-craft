@@ -60,7 +60,7 @@ pub fn mob_spawn_leaf_support(state: &BlockState, namespace: &str, entity: &str)
     match entity {
         "ocelot" | "parrot" => Some(true),
         "pig" | "cow" | "sheep" | "goat" | "chicken" | "horse" | "donkey" | "rabbit" | "slime"
-        | "magma_cube" | "sulfur_cube" => Some(false),
+        | "turtle" | "magma_cube" | "sulfur_cube" => Some(false),
         _ => None,
     }
 }
@@ -94,6 +94,14 @@ pub fn common_mob_spawn_block_facts(state: &BlockState) -> Option<MobSpawnBlockF
         | "minecraft:gravel"
         | "minecraft:sand"
         | "minecraft:red_sand"
+        | "minecraft:sandstone"
+        | "minecraft:cut_sandstone"
+        | "minecraft:chiseled_sandstone"
+        | "minecraft:smooth_sandstone"
+        | "minecraft:red_sandstone"
+        | "minecraft:cut_red_sandstone"
+        | "minecraft:chiseled_red_sandstone"
+        | "minecraft:smooth_red_sandstone"
         | "minecraft:granite"
         | "minecraft:diorite"
         | "minecraft:andesite"

@@ -174,6 +174,34 @@ mod tests {
         }
     }
     #[test]
+    fn sandstone_blocks_spawn_boxes_without_accepting_invalid_states() {
+        let air = state("air", &[]);
+        let bounds = box_at([0.25, 0.25, 0.25], [0.75, 0.75, 0.75]);
+        for name in [
+            "sandstone",
+            "cut_sandstone",
+            "chiseled_sandstone",
+            "smooth_sandstone",
+            "red_sandstone",
+            "cut_red_sandstone",
+            "chiseled_red_sandstone",
+            "smooth_red_sandstone",
+        ] {
+            let block = state(name, &[]);
+            assert!(
+                !no_block_collision(bounds, |pos| Ok(if pos == IVec3::ZERO {
+                    &block
+                } else {
+                    &air
+                }))
+                .unwrap(),
+                "{name}"
+            );
+            let invalid = state(name, &[("unexpected", "true")]);
+            assert!(shape(&invalid).is_err(), "{name}");
+        }
+    }
+    #[test]
     fn full_face_and_fence_overhang_are_distinguished() {
         let air = state("air", &[]);
         let stone = state("stone", &[]);

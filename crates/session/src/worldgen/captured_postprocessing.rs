@@ -39,6 +39,7 @@ struct CapturedPostprocessingTags {
     bubble: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed: Option<Arc<BTreeSet<String>>>,
     lava: Option<Arc<BTreeSet<String>>>,
+    water: Option<Arc<BTreeSet<String>>>,
 }
 
 impl CapturedPostprocessingTags {
@@ -82,6 +83,9 @@ impl CapturedPostprocessingTags {
             lava: native_resources::fluid_tags::load_lava(provider)
                 .ok()
                 .map(Arc::new),
+            water: native_resources::fluid_tags::load_water(provider)
+                .ok()
+                .map(Arc::new),
         })
     }
 
@@ -91,6 +95,7 @@ impl CapturedPostprocessingTags {
         stage.set_fence_tags(self.fence);
         stage.set_bubble_tags(self.bubble);
         stage.set_fluid_tags(self.washed, self.lava);
+        stage.set_water_fluid_tags(self.water);
     }
 }
 

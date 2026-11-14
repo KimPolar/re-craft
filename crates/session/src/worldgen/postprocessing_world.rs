@@ -163,7 +163,9 @@ pub struct GeneratedPostprocessing {
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
+    water_fluids: Option<Arc<BTreeSet<String>>>,
     water_source_conversion: Option<bool>,
+    lava_rules: Option<GeneratedLavaRules>,
     block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     edits: Vec<BlockPosition>,
     edit_states: Vec<(BlockStateId, BlockStateId)>,
@@ -192,6 +194,14 @@ pub enum InitialBonusChestAttempt {
 pub enum PostprocessingAttempt {
     Progress { complete: bool },
     NeedsChunk(ChunkPos),
+}
+
+/// Fixed settings for one isolated postprocessing pass. The caller must sample
+/// the active environment and game rule from the same world snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratedLavaRules {
+    pub fast_lava: bool,
+    pub source_conversion: bool,
 }
 
 #[derive(Debug)]
@@ -244,8 +254,10 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     pub(super) washed_blocks: Option<Arc<BTreeSet<String>>>,
     pub(super) lava_fluids: Option<Arc<BTreeSet<String>>>,
+    pub(super) water_fluids: Option<Arc<BTreeSet<String>>>,
     pub(super) heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     water_source_conversion: Option<bool>,
+    lava_rules: Option<GeneratedLavaRules>,
     block_drops: Option<super::postprocessing_drops::GeneratedBlockDrops>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
     entity_candidates: BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
@@ -396,6 +408,11 @@ impl PostprocessedGeneratedRegion {
     /// The explicit rule used for this pass, if supplied by its caller.
     pub fn water_source_conversion(&self) -> Option<bool> {
         self.water_source_conversion
+    }
+
+    /// Lava settings used by this postprocessing pass, when supplied.
+    pub fn lava_rules(&self) -> Option<GeneratedLavaRules> {
+        self.lava_rules
     }
 
     /// Intermediate drop records and random streams from this pass. The
@@ -599,7 +616,9 @@ impl GeneratedPostprocessing {
             bubble_tags: None,
             washed_blocks: None,
             lava_fluids: None,
+            water_fluids: None,
             water_source_conversion: None,
+            lava_rules: None,
             block_drops: None,
             edits: Vec::new(),
             edit_states: Vec::new(),
@@ -715,7 +734,9 @@ impl GeneratedPostprocessing {
         stage.bubble_tags = completed.bubble_tags.clone();
         stage.washed_blocks = completed.washed_blocks.clone();
         stage.lava_fluids = completed.lava_fluids.clone();
+        stage.water_fluids = completed.water_fluids.clone();
         stage.water_source_conversion = completed.water_source_conversion;
+        stage.lava_rules = completed.lava_rules;
         stage.block_drops = completed.block_drops.clone();
         stage.edits = completed.edits.clone();
         stage.edit_states = completed.edit_states.clone();
@@ -892,6 +913,20 @@ impl GeneratedPostprocessing {
     ) {
         self.washed_blocks = washed;
         self.lava_fluids = lava;
+    }
+
+    pub(super) fn set_water_fluid_tags(&mut self, water: Option<Arc<BTreeSet<String>>>) {
+        self.water_fluids = water;
+    }
+
+    /// Bind the actual lava rule and sampled environment before any chunk runs.
+    pub fn set_lava_rules(&mut self, rules: GeneratedLavaRules) -> Result<()> {
+        ensure!(
+            !self.failed && self.active.is_none() && self.completed.is_empty(),
+            "lava rules must be set before postprocessing begins"
+        );
+        self.lava_rules = Some(rules);
+        Ok(())
     }
 
     /// Supply the level's actual gamerule before executing any chunk. The
@@ -1072,7 +1107,9 @@ impl GeneratedPostprocessing {
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
+            water_fluids: self.water_fluids.as_deref(),
             water_source_conversion: self.water_source_conversion,
+            lava_rules: self.lava_rules,
             block_drops: &mut self.block_drops,
             edits: &mut self.edits,
             edit_states: &mut self.edit_states,
@@ -1163,7 +1200,9 @@ impl GeneratedPostprocessing {
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
+            water_fluids: self.water_fluids.as_deref(),
             water_source_conversion: self.water_source_conversion,
+            lava_rules: self.lava_rules,
             block_drops: &mut self.block_drops,
             edits: &mut self.edits,
             edit_states: &mut self.edit_states,
@@ -1224,8 +1263,10 @@ impl GeneratedPostprocessing {
             bubble_tags: self.bubble_tags,
             washed_blocks: self.washed_blocks,
             lava_fluids: self.lava_fluids,
+            water_fluids: self.water_fluids,
             heightmap_tags: self.heightmap_tags,
             water_source_conversion: self.water_source_conversion,
+            lava_rules: self.lava_rules,
             block_drops: self.block_drops,
             block_entities: self.block_entities,
             entity_candidates: self.entity_candidates,
@@ -1256,7 +1297,9 @@ struct GeneratedBlockView<'a> {
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     washed_blocks: Option<&'a BTreeSet<String>>,
     lava_fluids: Option<&'a BTreeSet<String>>,
+    water_fluids: Option<&'a BTreeSet<String>>,
     water_source_conversion: Option<bool>,
+    lava_rules: Option<GeneratedLavaRules>,
     block_drops: &'a mut Option<super::postprocessing_drops::GeneratedBlockDrops>,
     edits: &'a mut Vec<BlockPosition>,
     edit_states: &'a mut Vec<(BlockStateId, BlockStateId)>,
@@ -1922,8 +1965,22 @@ impl GeneratedBlockView<'_> {
             {
                 continue;
             }
+            if fluid.kind == FluidKind::Lava
+                && self
+                    .lava_rules
+                    .is_some_and(|rules| rules.source_conversion != converts)
+            {
+                continue;
+            }
             for fast_lava in [false, true] {
                 if fluid.kind == FluidKind::Water && fast_lava {
+                    continue;
+                }
+                if fluid.kind == FluidKind::Lava
+                    && self
+                        .lava_rules
+                        .is_some_and(|rules| rules.fast_lava != fast_lava)
+                {
                     continue;
                 }
                 let settings = Settings {
@@ -1955,11 +2012,15 @@ impl GeneratedBlockView<'_> {
         use native_world::fluid_sim::ChangedBlock;
         if fluid.kind == FluidKind::Lava
             && !fluid.source
+            && self.lava_rules.is_none()
             && planned.len() == 1
             && planned[0].position == glam::IVec3::from_array(pos)
             && matches!(planned[0].block, ChangedBlock::Air)
         {
             return self.remove_exhausted_lava(pos, fluid);
+        }
+        if fluid.kind == FluidKind::Lava {
+            return self.tick_generated_lava(pos, fluid, &planned);
         }
         ensure!(
             fluid.kind == FluidKind::Water,
@@ -2066,6 +2127,240 @@ impl GeneratedBlockView<'_> {
                 return Err(live
                     .view
                     .fluid_incomplete_error(error, "generated water tick"));
+            }
+        }
+        Ok(())
+    }
+
+    fn lava_cell_for_spread(&self, pos: glam::IVec3) -> native_world::fluid_sim::Cell {
+        use native_world::{fluid::FluidKind, fluid_sim::Cell};
+        match self.fluid_cell(pos) {
+            Cell::Air => Cell::Air,
+            Cell::Solid => Cell::Solid,
+            Cell::Fluid(fluid) if fluid.kind == FluidKind::Lava => Cell::Fluid(fluid),
+            _ => Cell::Unknown,
+        }
+    }
+
+    fn tick_generated_lava(
+        &mut self,
+        pos: [i32; 3],
+        fluid: native_world::fluid::FluidState,
+        planned: &[native_world::fluid_sim::Change],
+    ) -> Result<()> {
+        use native_world::fluid_sim::{ChangedBlock, Settings, try_tick};
+        let rules = self
+            .lava_rules
+            .context("generated lava settings unavailable")?;
+        let water = self.water_fluids.context("water fluid tags unavailable")?;
+        ensure!(
+            !water.contains("minecraft:empty")
+                && !water.contains("minecraft:lava")
+                && !water.contains("minecraft:flowing_lava"),
+            "empty fluid or lava is in the water fluid tag"
+        );
+        let bubble = self.bubble_tags.context("bubble-column tags unavailable")?;
+        ensure!(
+            !bubble.can_occupy_fluid("minecraft:lava")
+                && !bubble.can_occupy_fluid("minecraft:flowing_lava"),
+            "lava can trigger bubble-column callbacks"
+        );
+        self.lava_fluids.context("lava fluid tags unavailable")?;
+        let settings = Settings {
+            water_source_conversion: false,
+            lava_source_conversion: rules.source_conversion,
+            fast_lava: rules.fast_lava,
+        };
+        let origin = glam::IVec3::from_array(pos);
+        let strict = try_tick(&|p| self.lava_cell_for_spread(p), origin, fluid, settings)
+            .map_err(|error| self.fluid_incomplete_error(error, "generated lava path"))?;
+        ensure!(
+            strict == planned,
+            "lava path uses unsupported block callbacks"
+        );
+        for change in planned {
+            ensure!(
+                matches!(change.block, ChangedBlock::Air | ChangedBlock::Fluid(_)),
+                "lava reaction requires unsupported callbacks"
+            );
+        }
+        let mut live = GeneratedLavaTick {
+            view: self,
+            origin,
+            settings,
+        };
+        match native_world::fluid_sim::tick_live(&mut live, origin, fluid, settings) {
+            Ok(()) => Ok(()),
+            Err(native_world::fluid_sim::LiveTickError::World(error)) => {
+                Err(error.context("generated lava tick failed"))
+            }
+            Err(native_world::fluid_sim::LiveTickError::Incomplete(error)) => Err(live
+                .view
+                .fluid_incomplete_error(error, "generated lava tick")),
+        }
+    }
+
+    /// Ensure lava neighbor callbacks cannot encounter water, basalt formation,
+    /// or blocks whose effects have not yet been implemented.
+    fn validate_lava_neighbors(&self, target: glam::IVec3) -> Result<()> {
+        use native_world::fluid::FluidKind;
+        for delta in [
+            glam::IVec3::NEG_X,
+            glam::IVec3::X,
+            glam::IVec3::NEG_Y,
+            glam::IVec3::Y,
+            glam::IVec3::NEG_Z,
+            glam::IVec3::Z,
+        ] {
+            let state = self.read((target + delta).to_array())?;
+            if let Some(fluid) = liquid_state(&state)? {
+                ensure!(
+                    fluid.kind == FluidKind::Lava,
+                    "lava touches unsupported liquid"
+                );
+            } else {
+                ensure!(
+                    matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain)),
+                    "lava requires unsupported neighbor callbacks"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_lava(
+        &mut self,
+        pos: glam::IVec3,
+        fluid: native_world::fluid::FluidState,
+        delay: u64,
+    ) -> Result<()> {
+        use native_world::fluid::FluidKind;
+        ensure!(fluid.kind == FluidKind::Lava, "scheduled fluid is not lava");
+        let id = if fluid.source {
+            "minecraft:lava"
+        } else {
+            "minecraft:flowing_lava"
+        };
+        let delay = i32::try_from(delay).context("lava delay is out of range")?;
+        ensure!(
+            self.ticks
+                .schedule(TickRegistry::Fluid, id, pos.to_array(), delay, 0)?
+                != ScheduleOutcome::MissingChunk,
+            "lava tick container is missing"
+        );
+        Ok(())
+    }
+
+    fn apply_lava_change(
+        &mut self,
+        target: glam::IVec3,
+        next: Option<native_world::fluid::FluidState>,
+        delay: u64,
+    ) -> Result<()> {
+        use native_world::fluid::FluidKind;
+        let old = self.read(target.to_array())?;
+        let old_air = matches!(
+            old.name.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        ) && old.properties.is_empty();
+        ensure!(
+            old_air || liquid_state(&old)?.is_some_and(|fluid| fluid.kind == FluidKind::Lava),
+            "lava replacement requires unsupported callbacks"
+        );
+        if let Some(fluid) = next {
+            ensure!(
+                fluid.kind == FluidKind::Lava
+                    && (1..=8).contains(&fluid.amount)
+                    && (!fluid.source || (fluid.amount == 8 && !fluid.falling)),
+                "invalid lava state"
+            );
+        }
+        let next_state = match next {
+            Some(fluid) => BlockState {
+                name: "minecraft:lava".into(),
+                properties: BTreeMap::from([(
+                    "level".into(),
+                    (8 - fluid.amount + if fluid.falling { 8 } else { 0 }).to_string(),
+                )]),
+            },
+            None => BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            },
+        };
+        self.validate_lava_neighbors(target)?;
+        let directions = [
+            glam::IVec3::NEG_X,
+            glam::IVec3::X,
+            glam::IVec3::NEG_Y,
+            glam::IVec3::Y,
+            glam::IVec3::NEG_Z,
+            glam::IVec3::Z,
+        ];
+        for delta in directions {
+            let p = target + delta;
+            if liquid_state(&self.read(p.to_array())?)?.is_some() {
+                self.validate_lava_neighbors(p)?;
+            }
+        }
+        if old_air != next.is_none() {
+            let chunk = ChunkPos {
+                x: target.x.div_euclid(16),
+                z: target.z.div_euclid(16),
+            };
+            let section_y =
+                i8::try_from(target.y.div_euclid(16)).context("lava section out of range")?;
+            let blocks = self
+                .world
+                .chunks
+                .get(&chunk)
+                .and_then(|c| c.sections.get(&section_y))
+                .and_then(|s| s.blocks.as_ref())
+                .context("lava section unavailable")?;
+            let mut count = 0;
+            for id in blocks.iter() {
+                let state = self
+                    .world
+                    .state(*id)
+                    .context("lava section state missing")?;
+                if !matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ) {
+                    count += 1;
+                    if count >= if old_air { 1 } else { 2 } {
+                        break;
+                    }
+                }
+            }
+            ensure!(
+                count >= if old_air { 1 } else { 2 },
+                "lava change requires light section allocation update"
+            );
+        }
+        self.write_postprocessed_state(target.to_array(), &old, &next_state)?;
+        if let Some(fluid) = next {
+            self.schedule_lava(target, fluid, delay)?;
+        }
+        for delta in directions {
+            let p = target + delta;
+            if let Some(fluid) = liquid_state(&self.read(p.to_array())?)? {
+                self.schedule_lava(p, fluid, delay)?;
+            }
+        }
+        for delta in [
+            glam::IVec3::NEG_X,
+            glam::IVec3::X,
+            glam::IVec3::NEG_Z,
+            glam::IVec3::Z,
+            glam::IVec3::NEG_Y,
+            glam::IVec3::Y,
+        ] {
+            let p = target + delta;
+            if let Some(fluid) = liquid_state(&self.read(p.to_array())?)?
+                && (fluid.source || next.is_some_and(|value| value.source))
+            {
+                self.schedule_lava(p, fluid, delay)?;
             }
         }
         Ok(())
@@ -3044,6 +3339,103 @@ impl GeneratedBlockView<'_> {
             self.light_checks.push(position);
         }
         Ok(())
+    }
+}
+
+struct GeneratedLavaTick<'a, 'b> {
+    view: &'a mut GeneratedBlockView<'b>,
+    origin: glam::IVec3,
+    settings: native_world::fluid_sim::Settings,
+}
+
+impl native_world::fluid_sim::LiveFluidWorld for GeneratedLavaTick<'_, '_> {
+    type Error = anyhow::Error;
+
+    fn cell(&self, pos: glam::IVec3) -> native_world::fluid_sim::Cell {
+        self.view.lava_cell_for_spread(pos)
+    }
+
+    fn delay(
+        &mut self,
+        pos: glam::IVec3,
+        old: native_world::fluid::FluidState,
+        next: Option<native_world::fluid::FluidState>,
+    ) -> Result<u64> {
+        use native_world::{
+            fluid::FluidKind,
+            fluid_sim::{self, Cell},
+        };
+        let above = self.cell(pos + glam::IVec3::Y);
+        ensure!(above != Cell::Unknown, "lava height above is unavailable");
+        let same_above = matches!(above, Cell::Fluid(value) if value.kind == FluidKind::Lava);
+        let mut random = self
+            .view
+            .block_drops
+            .as_ref()
+            .map(|drops| drops.level_random().clone());
+        let mut missing = false;
+        let delay = fluid_sim::spread_delay(
+            self.settings,
+            FluidKind::Lava,
+            Some(old),
+            next,
+            same_above,
+            || {
+                if let Some(random) = random.as_mut() {
+                    random.next_int_bound(4).expect("positive bound") as u32
+                } else {
+                    missing = true;
+                    0
+                }
+            },
+        );
+        ensure!(
+            !missing,
+            "lava delay requires the shared level random stream"
+        );
+        if let (Some(drops), Some(random)) = (self.view.block_drops.as_mut(), random) {
+            drops.set_level_random(random);
+        }
+        Ok(delay)
+    }
+
+    fn update_origin(
+        &mut self,
+        pos: glam::IVec3,
+        next: Option<native_world::fluid::FluidState>,
+    ) -> Result<()> {
+        ensure!(pos == self.origin, "lava origin changed unexpectedly");
+        self.view.apply_lava_change(
+            pos,
+            next,
+            self.settings.delay(native_world::fluid::FluidKind::Lava),
+        )
+    }
+
+    fn schedule(
+        &mut self,
+        pos: glam::IVec3,
+        fluid: native_world::fluid::FluidState,
+        delay: u64,
+    ) -> Result<()> {
+        ensure!(pos == self.origin, "lava schedule is not at the origin");
+        self.view.schedule_lava(pos, fluid, delay)
+    }
+
+    fn spread_to(
+        &mut self,
+        pos: glam::IVec3,
+        old: native_world::fluid_sim::Cell,
+        fluid: native_world::fluid::FluidState,
+        direction: glam::IVec3,
+    ) -> Result<()> {
+        use native_world::{fluid::FluidKind, fluid_sim::Cell};
+        ensure!(
+            pos == self.origin + direction && old == Cell::Air && fluid.kind == FluidKind::Lava,
+            "lava spread requires unsupported callbacks"
+        );
+        self.view
+            .apply_lava_change(pos, Some(fluid), self.settings.delay(FluidKind::Lava))
     }
 }
 
@@ -7778,6 +8170,38 @@ mod tests {
         }
         world.set_block_id(origin_x, 8, 8, water).unwrap();
         match case {
+            case if case.starts_with("lava_down_")
+                || case.starts_with("lava_sides_")
+                || case.starts_with("lava_rise_")
+                || case.starts_with("lava_convert_") =>
+            {
+                let lava = world.intern_state(BlockState {
+                    name: "minecraft:lava".into(),
+                    properties: BTreeMap::from([("level".into(), "0".into())]),
+                });
+                world.set_block_id(origin_x, 8, 8, lava).unwrap();
+                if case.starts_with("lava_rise_") || case.starts_with("lava_convert_") {
+                    let flowing = world.intern_state(BlockState {
+                        name: "minecraft:lava".into(),
+                        properties: BTreeMap::from([("level".into(), "4".into())]),
+                    });
+                    world.set_block_id(origin_x, 8, 8, flowing).unwrap();
+                    world.set_block_id(origin_x - 1, 8, 8, lava).unwrap();
+                    if case.starts_with("lava_convert_") {
+                        world.set_block_id(origin_x, 8, 7, lava).unwrap();
+                    }
+                }
+                if case.starts_with("lava_down_") {
+                    world.set_block_id(origin_x, 7, 8, air).unwrap();
+                    if case == "lava_down_sand" {
+                        world.set_block_id(origin_x + 1, 7, 8, sand).unwrap();
+                    }
+                } else if case.starts_with("lava_sides_") {
+                    for [x, y, z] in [[8, 8, 7], [8, 8, 9], [7, 8, 8], [9, 8, 8]] {
+                        world.set_block_id(x, y, z, air).unwrap();
+                    }
+                }
+            }
             case if case.starts_with("lava_drain_") => {
                 let level = if case == "lava_drain_sand" {
                     4
@@ -8527,6 +8951,45 @@ mod tests {
                 "minecraft:flowing_lava".into(),
             ]))),
         );
+        if case.starts_with("lava_down_")
+            || case.starts_with("lava_sides_")
+            || case.starts_with("lava_rise_")
+            || case.starts_with("lava_convert_")
+        {
+            let mut water =
+                BTreeSet::from(["minecraft:water".into(), "minecraft:flowing_water".into()]);
+            if case == "lava_down_tagged" {
+                water.insert("minecraft:lava".into());
+            }
+            if case == "lava_down_empty_tagged" {
+                water.insert("minecraft:empty".into());
+            }
+            stage.set_water_fluid_tags(Some(Arc::new(water)));
+            if case != "lava_down_unknown" {
+                stage
+                    .set_lava_rules(GeneratedLavaRules {
+                        fast_lava: case.ends_with("_fast"),
+                        source_conversion: case == "lava_convert_on",
+                    })
+                    .unwrap();
+            }
+        }
+        if (case.starts_with("lava_rise_") && case != "lava_rise_no_random")
+            || case.starts_with("lava_convert_")
+        {
+            stage
+                .set_block_drops(
+                    super::super::postprocessing_drops::GeneratedBlockDrops::new(
+                        Arc::new(native_resources::loot::BlockLootTables::load(&mut Tags).unwrap()),
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                        native_core::random::LegacyRandom::new(42),
+                        native_core::random::XoroshiroRandom::new(77),
+                        true,
+                    ),
+                )
+                .unwrap();
+        }
         if (case.starts_with("snow_water_") || case.starts_with("snow_fence_"))
             && !case.ends_with("_missing")
         {
@@ -8649,6 +9112,22 @@ mod tests {
             );
             return vec!["rolled back".into()];
         }
+        if matches!(
+            case,
+            "lava_down_unknown"
+                | "lava_down_tagged"
+                | "lava_down_empty_tagged"
+                | "lava_down_sand"
+                | "lava_rise_no_random"
+        ) {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            assert_eq!(stage.world.block(8, 7, 8), source.block(8, 7, 8));
+            assert!(stage.edits.is_empty());
+            return vec![format!("{error:#}")];
+        }
         if case == "lava_drain_sand" {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let error = stage.try_poll(chunk, 1).unwrap_err();
@@ -8692,6 +9171,21 @@ mod tests {
             while !stage.poll(east_chunk, 1).unwrap() {}
         }
         let result = stage.finish().unwrap();
+        if case == "lava_down_slow" {
+            let expected = Some(GeneratedLavaRules {
+                fast_lava: false,
+                source_conversion: false,
+            });
+            assert_eq!(result.lava_rules(), expected);
+            let resumed = GeneratedPostprocessing::from_completed(
+                &result,
+                None,
+                None,
+                Arc::clone(&heightmap_tags),
+            )
+            .unwrap();
+            assert_eq!(resumed.lava_rules, expected);
+        }
         if case.starts_with("marked_lichen_destroy_") {
             let drops = result.block_drops().unwrap();
             assert_eq!(drops.operations(), 1);
@@ -8975,6 +9469,7 @@ mod tests {
         if case.starts_with("marked_stair_corner_")
             || case == "fence_on_neighbor"
             || case.starts_with("marked_lichen_destroy_")
+            || case.starts_with("lava_")
         {
             for check in &result.light_checks {
                 trace.push(format!("light {},{},{}", check.x, check.y, check.z));
@@ -9006,6 +9501,17 @@ mod tests {
             }
         }
         trace.push(format!("counter {}", result.ticks.next_sub_tick()));
+        if case.starts_with("lava_rise_") || case.starts_with("lava_convert_") {
+            trace.push(format!(
+                "random {}",
+                result
+                    .block_drops()
+                    .unwrap()
+                    .level_random()
+                    .clone()
+                    .next_long()
+            ));
+        }
         trace
     }
 
@@ -10397,6 +10903,63 @@ mod tests {
         let expected = (1..=15)
             .flat_map(|level| water_spread_trace(&format!("lava_drain_{level}")))
             .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_lava_spreads_down_and_sideways_with_dimension_delays() {
+        for case in [
+            "lava_down_slow",
+            "lava_down_fast",
+            "lava_sides_slow",
+            "lava_sides_fast",
+            "lava_rise_slow",
+            "lava_rise_fast",
+            "lava_convert_off",
+            "lava_convert_on",
+        ] {
+            let trace = water_spread_trace(case);
+            if case == "lava_convert_on" {
+                assert_eq!(trace[1], "state 8,8,8 minecraft:lava 0");
+            } else {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line.starts_with("fluid minecraft:flowing_lava ")),
+                    "{case}: {trace:?}"
+                );
+            }
+        }
+        assert!(water_spread_trace("lava_down_unknown")[0].contains("settings unavailable"));
+        assert!(water_spread_trace("lava_down_tagged")[0].contains("water fluid tag"));
+        assert!(water_spread_trace("lava_down_empty_tagged")[0].contains("water fluid tag"));
+        assert!(water_spread_trace("lava_down_sand")[0].contains("unsupported neighbor callbacks"));
+        assert!(
+            water_spread_trace("lava_rise_no_random")[0].contains("shared level random stream")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_lava_spread_matches_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_spread"],
+        );
+        let expected = [
+            "lava_down_slow",
+            "lava_down_fast",
+            "lava_sides_slow",
+            "lava_sides_fast",
+            "lava_rise_slow",
+            "lava_rise_fast",
+            "lava_convert_off",
+            "lava_convert_on",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
 

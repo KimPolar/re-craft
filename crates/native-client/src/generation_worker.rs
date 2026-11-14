@@ -75,6 +75,18 @@ pub struct GenerationReady {
     pub postprocessed: Option<PostprocessedGeneration>,
 }
 
+fn initial_lava_rules(
+    ready: &GenerationReady,
+) -> Option<native_session::worldgen::GeneratedLavaRules> {
+    let level = ready.level_settings.as_ref()?;
+    let clocks = ready.initial_clocks.as_ref()?;
+    let environment = clocks.fluid_environment.fast_lava.as_ref()?;
+    Some(native_session::worldgen::GeneratedLavaRules {
+        fast_lava: environment.sample(|id| clocks.ticks.get(id).copied())?,
+        source_conversion: level.game_rules.lava_source_conversion,
+    })
+}
+
 /// Inputs for a finite, structure-aware generation request. They must all
 /// originate from the same immutable resource stack and dimension settings.
 pub(crate) struct StructuredGenerationInputs<P, C, R, H, F> {
@@ -321,6 +333,12 @@ impl GenerationReady {
             .region
             .water_source_conversion()
             .context("postprocessed water conversion rule is missing")?;
+        if let Some(lava_rules) = processed.region.lava_rules() {
+            ensure!(
+                Some(lava_rules) == initial_lava_rules(self),
+                "lava settings differ from postprocessing"
+            );
+        }
         let drop_sequences = processed
             .region
             .block_drops()
@@ -961,7 +979,13 @@ impl GenerationReady {
             .postprocessed
             .as_ref()
             .and_then(|processed| processed.initial_bonus_chest.as_ref())
-            .map(|bonus| bonus.level_random.clone());
+            .map(|bonus| bonus.level_random.clone())
+            .or_else(|| {
+                self.postprocessed
+                    .as_ref()
+                    .and_then(|processed| processed.region.block_drops())
+                    .map(|drops| drops.level_random().clone())
+            });
         let mut session = if let Some(random) = initial_random {
             LoadedSession::new_with_initial_level_random(
                 world,
@@ -1085,6 +1109,12 @@ impl GenerationReady {
                         == Some(rules.water_source_conversion),
                     "water conversion rule differs from postprocessing"
                 );
+                if let Some(lava_rules) = processed.region.lava_rules() {
+                    ensure!(
+                        Some(lava_rules) == initial_lava_rules(self),
+                        "lava settings differ from postprocessing"
+                    );
+                }
             }
             session.set_game_mode(settings.mode);
             session.set_game_master_permission(settings.allow_commands);
@@ -1569,6 +1599,9 @@ impl GenerationWorker {
                 next_sub_tick,
             )?;
             stage.set_water_source_conversion(water_source_conversion)?;
+            if let Some(rules) = initial_lava_rules(&ready) {
+                stage.set_lava_rules(rules)?;
+            }
             for &pos in &positions {
                 loop {
                     if cancelled.load(Ordering::Relaxed) {
@@ -2999,6 +3032,9 @@ where
                 0,
             )?;
             stage.set_water_source_conversion(water_source_conversion)?;
+            if let Some(rules) = initial_lava_rules(&ready) {
+                stage.set_lava_rules(rules)?;
+            }
             if let Some(drops) = &initial_drops {
                 stage.set_block_drops(drops.clone())?;
             }
@@ -3174,6 +3210,9 @@ where
         .batch
         .begin_generated_postprocessing(targets.iter().copied(), 0, 0)?;
     stage.set_water_source_conversion(water_source_conversion)?;
+    if let Some(rules) = initial_lava_rules(&ready) {
+        stage.set_lava_rules(rules)?;
+    }
     let uses_drop_checkpoint = if let Some(settings) = &ready.level_settings {
         stage.set_block_drops(ready.batch.fresh_postprocessing_drops_with_level_random(
             settings.session.seed,

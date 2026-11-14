@@ -482,6 +482,7 @@ struct DecorationConfig {
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
+    water_fluids: Option<Arc<BTreeSet<String>>>,
     session_blocks: GeneratedSessionBlockTags,
 }
 
@@ -2254,6 +2255,9 @@ impl FreshTerrainBatch {
         let lava_fluids = native_resources::fluid_tags::load_lava(provider)
             .ok()
             .map(Arc::new);
+        let water_fluids = native_resources::fluid_tags::load_water(provider)
+            .ok()
+            .map(Arc::new);
         let session_blocks = GeneratedSessionBlockTags::load(provider, &block_registry);
         self.decoration = Some(DecorationConfig {
             schedule,
@@ -2269,6 +2273,7 @@ impl FreshTerrainBatch {
             bubble_tags,
             washed_blocks,
             lava_fluids,
+            water_fluids,
             session_blocks,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
@@ -3159,6 +3164,11 @@ impl FreshTerrainBatch {
                 .as_ref()
                 .and_then(|config| config.lava_fluids.clone()),
         );
+        stage.set_water_fluid_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.water_fluids.clone()),
+        );
         Ok(stage)
     }
 
@@ -3310,6 +3320,7 @@ impl FreshTerrainBatch {
         stage.set_fence_tags(config.fence_tags.clone());
         stage.set_bubble_tags(config.bubble_tags.clone());
         stage.set_fluid_tags(config.washed_blocks.clone(), config.lava_fluids.clone());
+        stage.set_water_fluid_tags(config.water_fluids.clone());
         Ok(stage)
     }
 
@@ -4609,16 +4620,24 @@ impl FreshTerrainBatch {
         };
         let chest_id = world.intern_state(chest_state.clone());
         world
-            .set_block_id(chest_position[0], chest_position[1], chest_position[2], chest_id)
+            .set_block_id(
+                chest_position[0],
+                chest_position[1],
+                chest_position[2],
+                chest_id,
+            )
             .map_err(|error| anyhow::anyhow!("fixture chest: {error:?}"))?;
         Arc::make_mut(&mut terrain.generated_monster_entities).insert(
             chest_position,
-            Some(super::GeneratedMonsterRoomEntity::EmptyChest(super::GeneratedEmptyChest {
-                position: chest_position,
-                state: chest_state,
-            })),
+            Some(super::GeneratedMonsterRoomEntity::EmptyChest(
+                super::GeneratedEmptyChest {
+                    position: chest_position,
+                    state: chest_state,
+                },
+            )),
         );
-        Arc::make_mut(terrain.generated_entity_order.entry(pos).or_default()).insert(chest_position);
+        Arc::make_mut(terrain.generated_entity_order.entry(pos).or_default())
+            .insert(chest_position);
         let marks = terrain
             .feature_postprocessing
             .entry(pos)

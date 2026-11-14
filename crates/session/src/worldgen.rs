@@ -122,8 +122,8 @@ pub use ore::{
     PreparedDecoration, PreparedPortalPlacement, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{
-    GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,
-    PostprocessingAttempt,
+    GeneratedLavaRules, GeneratedPostprocessing, InitialBonusChestAttempt,
+    PostprocessedGeneratedRegion, PostprocessingAttempt,
 };
 pub use terrain_batch::{
     FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents, PostprocessedChunkDraft,
@@ -264,10 +264,7 @@ pub struct CarvedTerrainWorld {
     generated_entities:
         Arc<BTreeMap<native_world::loaded::ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
     generated_poi_changes: Arc<
-        BTreeMap<
-            native_world::loaded::ChunkPos,
-            Arc<Vec<native_persistence::poi::PoiBlockChange>>,
-        >,
+        BTreeMap<native_world::loaded::ChunkPos, Arc<Vec<native_persistence::poi::PoiBlockChange>>>,
     >,
 }
 

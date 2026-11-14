@@ -1944,6 +1944,7 @@ impl WorldSavePlan {
         validate_known_generation_entity_identities(
             &dimension,
             &self.generation_dependencies,
+            self.generated_chunks.iter().chain(&terrain),
             self.entity_chunks.iter().chain(&entities),
         )?;
         self.generated_chunks.extend(terrain);
@@ -2613,10 +2614,21 @@ pub(crate) fn collect_fresh_entity_identities(
     document: &nbt::NamedTag,
     seen: &mut BTreeSet<[i32; 4]>,
 ) -> Result<()> {
+    collect_entity_identities(document.value.get("Entities"), seen)
+}
+
+fn collect_entity_identities(list: Option<&Tag>, seen: &mut BTreeSet<[i32; 4]>) -> Result<()> {
     use nbt::TagType;
-    let mut pending: Vec<&Tag> = match document.value.get("Entities") {
+    let mut pending: Vec<&Tag> = match list {
         None => Vec::new(),
-        Some(Tag::List { values, .. }) => values.iter().collect(),
+        Some(Tag::List {
+            element_type: TagType::Compound,
+            values,
+        }) => values.iter().collect(),
+        Some(Tag::List {
+            element_type: TagType::End,
+            values,
+        }) if values.is_empty() => Vec::new(),
         _ => anyhow::bail!("generated entity list is invalid"),
     };
     while let Some(entity) = pending.pop() {
@@ -2657,20 +2669,50 @@ pub(crate) fn collect_fresh_entity_identities(
     Ok(())
 }
 
-/// Check explicit UUIDs in final staged entity documents and unchanged entity
-/// sidecars included in the same capture. Other chunks and live entities are
-/// not covered by this check.
+/// Check explicit UUIDs in staged entity documents and unchanged sidecars and
+/// protochunks included in the same capture. Other chunks and live entities
+/// are not covered by this check.
 fn validate_known_generation_entity_identities<'a>(
     dimension: &DimensionId,
     dependencies: &[PlannedGenerationDependency],
+    terrain: impl IntoIterator<Item = &'a PlannedGeneratedChunk>,
     planned: impl IntoIterator<Item = &'a PlannedEntityChunk>,
 ) -> Result<()> {
+    let replaced_terrain: BTreeSet<_> = terrain
+        .into_iter()
+        .filter(|entry| &entry.dimension == dimension)
+        .map(|entry| entry.position)
+        .collect();
     let planned: Vec<_> = planned
         .into_iter()
         .filter(|entry| &entry.dimension == dimension)
         .collect();
     let replaced: BTreeSet<_> = planned.iter().map(|entry| entry.position).collect();
     let mut seen = BTreeSet::new();
+    for dependency in dependencies.iter().filter(|entry| {
+        &entry.dimension == dimension
+            && entry.kind == RegionKind::Blocks
+            && !replaced_terrain.contains(&entry.position)
+    }) {
+        if let Some(source) = &dependency.source_nbt {
+            let document = nbt::read(source)?;
+            if matches!(document.value.get("Status"), Some(Tag::String(status)) if status.matches("minecraft:full"))
+            {
+                continue;
+            }
+            let Tag::Compound(fields) = &document.value else {
+                anyhow::bail!("captured protochunk root is invalid")
+            };
+            let mut lists = fields.iter().filter(|(name, _)| name.matches("entities"));
+            let list = lists.next().map(|(_, value)| value);
+            ensure!(
+                lists.next().is_none(),
+                "duplicate protochunk entities field"
+            );
+            collect_entity_identities(list, &mut seen)
+                .context("captured protochunk entity identities conflict")?;
+        }
+    }
     for dependency in dependencies.iter().filter(|entry| {
         &entry.dimension == dimension
             && entry.kind == RegionKind::Entities
@@ -3270,6 +3312,7 @@ impl WorldWriteGuard {
             validate_known_generation_entity_identities(
                 dimension,
                 &plan.generation_dependencies,
+                &plan.generated_chunks,
                 &plan.entity_chunks,
             )?;
         }
@@ -9851,7 +9894,7 @@ mod tests {
     #[test]
     fn captured_generated_batch_rejects_known_cross_chunk_uuid_conflicts() -> Result<()> {
         let world = test_world();
-        let (region_path, original_region, _) = fixture(world.path());
+        let (region_path, mut original_region, _) = fixture(world.path());
         let dimension = DimensionId::parse("overworld")?;
         let positions = [2, 32, 33, 34].map(|x| ChunkPos { x, z: 0 });
         let settings_dir = world.path().join("data/minecraft");
@@ -9875,6 +9918,38 @@ mod tests {
                 ("UUID".into(), Tag::IntArray(vec![0, 0, 0, uuid])),
             ])
         };
+        let mut proto_entity = entity(5);
+        let Tag::Compound(fields) = &mut proto_entity else {
+            unreachable!()
+        };
+        fields.push((
+            "Passengers".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity(4)],
+            },
+        ));
+        let mut proto = editable_chunk(1);
+        *unique_treasure_field_mut(&mut proto.value, "Status")? =
+            Tag::String("minecraft:biomes".into());
+        let Tag::Compound(fields) = &mut proto.value else {
+            unreachable!()
+        };
+        fields.push((
+            "entities".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![proto_entity.clone()],
+            },
+        ));
+        store_record(&mut original_region, 1, 3, &proto, 1001);
+        let mut full_neighbor = editable_chunk(0);
+        let Tag::Compound(fields) = &mut full_neighbor.value else {
+            unreachable!()
+        };
+        fields.push(("entities".into(), Tag::Int(123)));
+        store_record(&mut original_region, 0, 2, &full_neighbor, 1000);
+        fs::write(&region_path, &original_region)?;
         let existing = entity_chunk(2, vec![entity(1)]);
         let entity_dir = world.path().join("dimensions/minecraft/overworld/entities");
         fs::create_dir_all(&entity_dir)?;
@@ -9885,11 +9960,17 @@ mod tests {
         let mut reader =
             crate::world::WorldReader::open_for_session(world.path(), dimension.clone())?;
         let session = reader.session_guard().context("session missing")?;
-        let capture = reader.capture_generation_context(positions)?;
+        let proto_pos = ChunkPos { x: 1, z: 0 };
+        let capture = reader.capture_generation_context(
+            positions
+                .into_iter()
+                .chain([proto_pos, ChunkPos { x: 0, z: 0 }]),
+        )?;
         let terrain_a = editable_chunk(32);
         let terrain_b = editable_chunk(33);
         let terrain_c = editable_chunk(34);
         let conflicts_existing = entity_chunk(32, vec![entity(1)]);
+        let conflicts_proto = entity_chunk(32, vec![entity(4)]);
         let entities_a = entity_chunk(32, vec![entity(2)]);
         let entities_b = entity_chunk(33, vec![entity(3)]);
         let duplicate_b = entity_chunk(33, vec![entity(2)]);
@@ -9920,6 +10001,15 @@ mod tests {
             .is_err()
         );
         assert_eq!(plan.chunk_count(), 0);
+        let error = plan
+            .add_captured_generated_chunks(
+                dimension.clone(),
+                &[entry(positions[1], &terrain_a, &conflicts_proto)],
+            )
+            .err()
+            .context("protochunk passenger UUID conflict was accepted")?;
+        assert!(format!("{error:#}").contains("entity identities conflict"));
+        assert_eq!(plan.chunk_count(), 0);
         assert!(
             plan.add_captured_generated_chunks(
                 dimension.clone(),
@@ -9931,6 +10021,23 @@ mod tests {
             .is_err()
         );
         assert_eq!(plan.chunk_count(), 0);
+        let proto_full = editable_chunk(1);
+        let proto_entities = entity_chunk(1, vec![proto_entity]);
+        let mut converted = WorldSavePlan::new();
+        converted.add_generation_context(&capture)?;
+        converted.add_captured_generated_chunks(
+            dimension.clone(),
+            &[CapturedGeneratedChunk {
+                position: proto_pos,
+                source_terrain: Some(&proto),
+                source_entities: None,
+                source_poi: None,
+                terrain: &proto_full,
+                entities: Some(&proto_entities),
+                poi: None,
+                region_timestamp_seconds: 1,
+            }],
+        )?;
         plan.add_captured_generated_chunks(
             dimension.clone(),
             &[

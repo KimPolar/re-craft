@@ -221,6 +221,7 @@ pub fn reconcile_and_draft_block_changes(
         );
     }
     let mut sections = BTreeSet::new();
+    let mut visited = BTreeMap::<[i32; 3], &BlockState>::new();
     for change in changes {
         let [x, y, z] = change.position;
         ensure!(
@@ -229,6 +230,12 @@ pub fn reconcile_and_draft_block_changes(
         );
         validate_state(&change.expected)?;
         validate_state(&change.replacement)?;
+        if let Some(previous) = visited.insert(change.position, &change.replacement) {
+            ensure!(
+                previous == &change.expected,
+                "POI block transition history is discontinuous"
+            );
+        }
         if poi::change(&change.expected, &change.replacement).is_some() {
             sections.insert(i8::try_from(y.div_euclid(16)).context("POI section is out of range")?);
         }
@@ -253,50 +260,16 @@ pub fn reconcile_and_draft_block_changes(
             .map(|document| decode_poi_chunk(document, position))
             .transpose()?;
     }
-    // Adding a POI to an empty section causes Java to create that section.
-    let mut document = current
-        .map(|chunk| (*chunk.document).clone())
-        .unwrap_or_else(|| NamedTag {
-            name: "".into(),
-            value: Tag::Compound(vec![
-                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
-                ("Sections".into(), Tag::Compound(vec![])),
-            ]),
-        });
-    let Tag::Compound(root) = &mut document.value else {
-        unreachable!()
-    };
-    let Tag::Compound(raw_sections) = &mut root
-        .iter_mut()
-        .find(|(key, _)| key.matches("Sections"))
-        .unwrap()
-        .1
-    else {
-        unreachable!()
-    };
-    for y in sections {
-        let name = y.to_string();
-        if !raw_sections.iter().any(|(key, _)| key.matches(&name)) {
-            raw_sections.push((
-                name.as_str().into(),
-                Tag::Compound(vec![
-                    ("Valid".into(), Tag::Byte(1)),
-                    (
-                        "Records".into(),
-                        Tag::List {
-                            element_type: TagType::End,
-                            values: vec![],
-                        },
-                    ),
-                ]),
-            ));
-        }
-    }
-    let prepared = decode_poi_chunk(document, position)?;
-    let draft = draft_changes(&prepared, changes, true, true, validate_state)?;
+    let draft = draft_ordered_poi_notifications(
+        current.as_ref(),
+        position,
+        changes,
+        validate_state,
+        validate_type,
+    )?;
     Ok(ReconciledPoiDraft {
         source: captured,
-        document: draft.document,
+        document: draft.document.context("POI storage remains absent")?,
         position,
         discarded_positions,
     })
@@ -609,7 +582,7 @@ pub fn draft_block_changes(
     changes: &[PoiBlockChange],
     validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
-    draft_changes(source, changes, false, false, validate_state)
+    draft_changes(source, changes, false, false, true, validate_state)
 }
 
 /// Apply transitions in their original order, retaining intermediate POI
@@ -619,7 +592,138 @@ pub fn draft_ordered_block_changes(
     changes: &[PoiBlockChange],
     validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
-    draft_changes(source, changes, true, false, validate_state)
+    draft_changes(source, changes, true, false, true, validate_state)
+}
+
+/// A POI snapshot after a caller-supplied sequence of server notifications.
+/// It does not prove the sequence, ticket activity, or authorization to save.
+pub struct PoiNotificationDraft {
+    source: Option<NamedTag>,
+    document: Option<NamedTag>,
+    changed_positions: BTreeSet<[i32; 3]>,
+}
+
+impl PoiNotificationDraft {
+    pub fn source(&self) -> Option<&NamedTag> {
+        self.source.as_ref()
+    }
+
+    pub fn document(&self) -> Option<&NamedTag> {
+        self.document.as_ref()
+    }
+
+    pub fn changed_positions(&self) -> &BTreeSet<[i32; 3]> {
+        &self.changed_positions
+    }
+}
+
+/// Replay ordered POI notifications against their captured storage state.
+/// Notifications need not form a complete block history: same-POI state
+/// changes and direct section writes may have occurred between them. The
+/// caller must independently establish execution order, active registry,
+/// dimension bounds, live tickets, and all other save dependencies. Invalid
+/// affected POI sections must first be reconciled with their original blocks.
+pub fn draft_ordered_poi_notifications(
+    source: Option<&SavedPoiChunk>,
+    position: ChunkPos,
+    changes: &[PoiBlockChange],
+    mut validate_state: impl FnMut(&BlockState) -> Result<()>,
+    mut validate_type: impl FnMut(&JavaString) -> Result<()>,
+) -> Result<PoiNotificationDraft> {
+    let original = source.map(|source| (*source.document).clone());
+    let decoded = match source {
+        Some(source) => {
+            ensure!(
+                source.position == position,
+                "POI source belongs to another chunk"
+            );
+            let decoded = decode_poi_chunk((*source.document).clone(), position)?;
+            for section in decoded.sections.values() {
+                for record in &section.records {
+                    validate_type(&record.type_id)?;
+                }
+            }
+            Some(decoded)
+        }
+        None => None,
+    };
+    let mut additions = BTreeSet::new();
+    for change in changes {
+        let [x, y, z] = change.position;
+        ensure!(
+            x.div_euclid(16) == position.x && z.div_euclid(16) == position.z,
+            "POI change is outside its chunk"
+        );
+        validate_state(&change.expected)?;
+        validate_state(&change.replacement)?;
+        if let Some((_, after)) = poi::change(&change.expected, &change.replacement) {
+            let section = i8::try_from(y.div_euclid(16)).context("POI section is out of range")?;
+            if after.is_some() {
+                additions.insert(i32::from(section));
+            }
+        }
+    }
+    let existing: BTreeSet<_> = decoded
+        .as_ref()
+        .into_iter()
+        .flat_map(|chunk| chunk.sections.keys().copied())
+        .collect();
+    let selected: Vec<_> = changes
+        .iter()
+        .filter(|change| {
+            poi::change(&change.expected, &change.replacement).is_some()
+                && (existing.contains(&change.position[1].div_euclid(16))
+                    || additions.contains(&change.position[1].div_euclid(16)))
+        })
+        .cloned()
+        .collect();
+    if selected.is_empty() {
+        return Ok(PoiNotificationDraft {
+            source: original.clone(),
+            document: original,
+            changed_positions: BTreeSet::new(),
+        });
+    }
+    let mut document = original.clone().unwrap_or_else(|| NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+            ("Sections".into(), Tag::Compound(vec![])),
+        ]),
+    });
+    let Tag::Compound(root) = &mut document.value else {
+        unreachable!()
+    };
+    let Tag::Compound(sections) = &mut root
+        .iter_mut()
+        .find(|(key, _)| key.matches("Sections"))
+        .context("POI sections are missing")?
+        .1
+    else {
+        bail!("POI sections are invalid")
+    };
+    for section in additions.difference(&existing) {
+        sections.push((
+            section.to_string().as_str().into(),
+            Tag::Compound(vec![
+                ("Valid".into(), Tag::Byte(1)),
+                (
+                    "Records".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+            ]),
+        ));
+    }
+    let prepared = decode_poi_chunk(document, position)?;
+    let draft = draft_changes(&prepared, &selected, true, true, false, validate_state)?;
+    Ok(PoiNotificationDraft {
+        source: original,
+        document: Some(draft.document),
+        changed_positions: draft.changed_positions,
+    })
 }
 
 fn draft_changes(
@@ -627,6 +731,7 @@ fn draft_changes(
     changes: &[PoiBlockChange],
     ordered: bool,
     java_stale_poi: bool,
+    require_continuity: bool,
     mut validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
     let original = (*source.document).clone();
@@ -643,10 +748,12 @@ fn draft_changes(
         );
         if let Some(previous) = visited.insert(change.position, &change.replacement) {
             ensure!(ordered, "duplicate POI block change");
-            ensure!(
-                previous == &change.expected,
-                "POI block transition history is discontinuous"
-            );
+            if require_continuity {
+                ensure!(
+                    previous == &change.expected,
+                    "POI block transition history is discontinuous"
+                );
+            }
         }
         validate_state(&change.expected)?;
         validate_state(&change.replacement)?;
@@ -670,6 +777,11 @@ fn draft_changes(
                 && let (Some(index), Some(kind)) = (index, after)
                 && section.records[index].type_id.matches(kind.id)
             {
+                continue;
+            }
+            // PoiManager.remove on a position with no record is a no-op. It
+            // does not dirty or repack an otherwise unchanged section.
+            if before.is_some() && after.is_none() && index.is_none() {
                 continue;
             }
         } else {
@@ -717,6 +829,25 @@ fn draft_changes(
         else {
             unreachable!()
         };
+        if java_stale_poi
+            && before.is_none()
+            && let (Some(index), Some(kind)) = (index, after)
+        {
+            // PoiSection.add uses map.put when a different type already exists.
+            // Replacing the value keeps the key's hash slot and map size.
+            values[index] = Tag::Compound(vec![
+                ("pos".into(), Tag::IntArray(change.position.to_vec())),
+                ("type".into(), Tag::String(kind.id.into())),
+                ("free_tickets".into(), Tag::Int(i32::from(kind.max_tickets))),
+            ]);
+            section.records[index] = SavedPoiRecord {
+                position: change.position,
+                type_id: kind.id.into(),
+                free_tickets: i32::from(kind.max_tickets),
+            };
+            changed_positions.insert(change.position);
+            continue;
+        }
         if let Some(index) = index {
             ensure!(
                 order.remove(section_key(change.position)),
@@ -762,7 +893,10 @@ fn draft_changes(
         else {
             unreachable!()
         };
-        let Tag::List { values, .. } = &mut section
+        let Tag::List {
+            element_type,
+            values,
+        } = &mut section
             .iter_mut()
             .find(|(key, _)| key.matches("Records"))
             .unwrap()
@@ -782,6 +916,9 @@ fn draft_changes(
             values.push(keyed.remove(&key).context("POI ordering lost a record")?);
         }
         ensure!(keyed.is_empty(), "POI ordering omitted a record");
+        if values.is_empty() {
+            *element_type = TagType::End;
+        }
     }
     // Revalidate the assembled document before exposing it to callers.
     decode_poi_chunk(document.clone(), source.position)?;
@@ -966,6 +1103,172 @@ mod tests {
             edit(0, state("stone", &[]), head),
         ];
         assert!(draft_ordered_block_changes(&source, &bad, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn stale_poi_replacement_keeps_map_slot_and_missing_removal_is_inert() {
+        let source = source(true);
+        let before = (*source.document).clone();
+        let air = state("air", &[]);
+        let bell = state("bell", &[]);
+        let head = state("red_bed", &[("part", "head")]);
+        let world = terrain(&[]);
+        let absent = reconcile_and_draft_block_changes(
+            Some(&source),
+            source.position,
+            &world,
+            &[edit(2, head, air.clone())],
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(absent.document(), &before);
+
+        let changed = reconcile_and_draft_block_changes(
+            Some(&source),
+            source.position,
+            &world,
+            &[edit(0, air, bell)],
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let section = decode_poi_chunk(changed.document().clone(), source.position)
+            .unwrap()
+            .sections
+            .remove(&0)
+            .unwrap();
+        let mut order = JavaPoiOrder::new();
+        for record in &source.sections[&0].records {
+            order.insert(section_key(record.position));
+        }
+        assert_eq!(
+            section
+                .records
+                .iter()
+                .map(|record| section_key(record.position))
+                .collect::<Vec<_>>(),
+            order.keys().collect::<Vec<_>>()
+        );
+        let replaced = section
+            .records
+            .iter()
+            .find(|record| record.position == [0, 4, 0])
+            .unwrap();
+        assert!(replaced.type_id.matches("minecraft:meeting"));
+        assert_eq!(replaced.free_tickets, 32);
+        assert_eq!(*source.document, before);
+    }
+
+    #[test]
+    fn poi_notifications_handle_absent_sections_and_incomplete_block_history() {
+        let position = ChunkPos { x: 0, z: 0 };
+        let air = state("air", &[]);
+        let head = state("red_bed", &[("part", "head"), ("facing", "north")]);
+        let turned = state("red_bed", &[("part", "head"), ("facing", "south")]);
+        let removal = edit(0, head.clone(), air.clone());
+        let absent = draft_ordered_poi_notifications(
+            None,
+            position,
+            std::slice::from_ref(&removal),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(absent.source().is_none());
+        assert!(absent.document().is_none());
+        assert!(absent.changed_positions().is_empty());
+
+        let changes = [
+            edit(0, air.clone(), head.clone()),
+            edit(0, turned, air.clone()),
+        ];
+        let draft =
+            draft_ordered_poi_notifications(None, position, &changes, |_| Ok(()), |_| Ok(()))
+                .unwrap();
+        let section = decode_poi_chunk(draft.document().unwrap().clone(), position).unwrap();
+        assert!(section.sections[&0].valid);
+        assert!(section.sections[&0].records.is_empty());
+        assert_eq!(draft.changed_positions(), &BTreeSet::from([[0, 4, 0]]));
+
+        let saved = source(true);
+        let occupied = edit(0, air.clone(), head.clone());
+        let result = draft_ordered_poi_notifications(
+            Some(&saved),
+            position,
+            &[occupied],
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.source(), Some(saved.document.as_ref()));
+        assert_eq!(result.document(), Some(saved.document.as_ref()));
+        assert!(result.changed_positions().is_empty());
+        assert!(
+            draft_ordered_poi_notifications(
+                Some(&saved),
+                ChunkPos { x: 1, z: 0 },
+                &changes,
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            draft_ordered_poi_notifications(
+                Some(&saved),
+                position,
+                &changes,
+                |_| Ok(()),
+                |_| anyhow::bail!("unknown type")
+            )
+            .is_err()
+        );
+        assert!(
+            draft_ordered_poi_notifications(
+                Some(&source(false)),
+                position,
+                &changes,
+                |_| Ok(()),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reconciled_removal_does_not_create_a_missing_poi_section() {
+        let saved = source(true);
+        let mut world = terrain(&[]);
+        let pos = loaded::ChunkPos { x: 0, z: 0 };
+        let chunk = Arc::make_mut(world.chunks.get_mut(&pos).unwrap());
+        chunk.sections.insert(1, Arc::clone(&chunk.sections[&0]));
+        let change = PoiBlockChange {
+            position: [1, 20, 0],
+            expected: state("red_bed", &[("part", "head")]),
+            replacement: state("air", &[]),
+        };
+        let draft = reconcile_and_draft_block_changes(
+            Some(&saved),
+            saved.position,
+            &world,
+            std::slice::from_ref(&change),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(draft.document(), saved.document.as_ref());
+        assert!(
+            reconcile_and_draft_block_changes(
+                None,
+                saved.position,
+                &world,
+                &[change],
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .is_err()
+        );
     }
 
     fn terrain(pois: &[(usize, &str)]) -> loaded::World {

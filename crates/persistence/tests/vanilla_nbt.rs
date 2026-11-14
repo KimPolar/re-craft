@@ -1004,6 +1004,196 @@ public class PoiEditOrderOracle {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn stale_poi_additions_keep_java_hash_order_and_tickets() {
+    use native_persistence::poi::{
+        PoiBlockChange, draft_ordered_poi_notifications, reconcile_and_draft_block_changes,
+    };
+    use native_world::loaded::{BlockState, World};
+
+    let game = minecraft_dir();
+    let java = java_bin();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("StalePoiOracle.java");
+    std::fs::write(&source, r#"
+import com.google.gson.*;
+import java.util.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.core.*;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.ai.village.poi.*;
+public class StalePoiOracle {
+  static BlockPos pos(int i) { int k = (i * 109) & 4095; return new BlockPos(k >> 8, k & 15, (k >> 4) & 15); }
+  public static void main(String[] args) {
+    var out = System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+    var meeting = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.MEETING);
+    var home = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.HOME);
+    var rows = new JsonArray();
+    for (int count : new int[]{2, 8, 24, 25, 49, 100}) {
+      var records = new ArrayList<PoiRecord.Packed>();
+      for (int i = 0; i < count; i++) records.add(new PoiRecord.Packed(pos(i), meeting, 0));
+      var section = new PoiSection.Packed(true, records).unpack(() -> {});
+      for (int i = 0; i < count; i += 3) section.add(pos(i), home);
+      for (int i = 1; i < count; i += 3) section.add(pos(i), meeting);
+      section.remove(pos(3000));
+      var row = new JsonArray();
+      for (var record : section.pack().records()) {
+        var p = record.pos(); var v = new JsonArray();
+        v.add(p.getX()); v.add(p.getY()); v.add(p.getZ());
+        v.add(record.poiType().getRegisteredName()); v.add(record.freeTickets()); row.add(v);
+      }
+      rows.add(row);
+    }
+    out.println(rows);
+  }
+}
+"#).unwrap();
+    let cp = classpath(&game, Some(temp.path()));
+    run_checked(
+        Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source),
+    );
+    let output = run_checked(
+        Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StalePoiOracle"),
+    );
+    let expected: Vec<Vec<(i32, i32, i32, String, i32)>> =
+        serde_json::from_str(output.lines().last().unwrap()).unwrap();
+    let state = |name: &str, props: &[(&str, &str)]| BlockState {
+        name: format!("minecraft:{name}"),
+        properties: props
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect(),
+    };
+    let position = |i: usize| {
+        let k = (i * 109) & 4095;
+        [(k >> 8) as i32, (k & 15) as i32, ((k >> 4) & 15) as i32]
+    };
+    for (case, count) in [2usize, 8, 24, 25, 49, 100].into_iter().enumerate() {
+        let values = (0..count)
+            .map(|i| {
+                Tag::Compound(vec![
+                    ("pos".into(), Tag::IntArray(position(i).to_vec())),
+                    ("type".into(), Tag::String("minecraft:meeting".into())),
+                    ("free_tickets".into(), Tag::Int(0)),
+                ])
+            })
+            .collect();
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "0".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: nbt::TagType::Compound,
+                                    values,
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let source = native_persistence::world::SavedPoiChunk::from_document(
+            document,
+            ChunkPos { x: 0, z: 0 },
+        )
+        .unwrap();
+        let air = state("air", &[]);
+        let bed = state("red_bed", &[("part", "head")]);
+        let bell = state("bell", &[]);
+        let mut changes = Vec::new();
+        for i in (0..count).step_by(3) {
+            changes.push(PoiBlockChange {
+                position: position(i),
+                expected: air.clone(),
+                replacement: bed.clone(),
+            });
+        }
+        for i in (1..count).step_by(3) {
+            changes.push(PoiBlockChange {
+                position: position(i),
+                expected: air.clone(),
+                replacement: bell.clone(),
+            });
+        }
+        changes.push(PoiBlockChange {
+            position: position(3000),
+            expected: bed,
+            replacement: air,
+        });
+        let draft = reconcile_and_draft_block_changes(
+            Some(&source),
+            source.position,
+            &World::new("minecraft:overworld"),
+            &changes,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let result = native_persistence::world::SavedPoiChunk::from_document(
+            draft.document().clone(),
+            source.position,
+        )
+        .unwrap();
+        let actual: Vec<_> = result.sections[&0]
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.position[0],
+                    record.position[1],
+                    record.position[2],
+                    record.type_id.to_string_lossy(),
+                    record.free_tickets,
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected[case], "count {count}");
+        let notifications = draft_ordered_poi_notifications(
+            Some(&source),
+            source.position,
+            &changes,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let result = native_persistence::world::SavedPoiChunk::from_document(
+            notifications.document().unwrap().clone(),
+            source.position,
+        )
+        .unwrap();
+        let replayed: Vec<_> = result.sections[&0]
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.position[0],
+                    record.position[1],
+                    record.position[2],
+                    record.type_id.to_string_lossy(),
+                    record.free_tickets,
+                )
+            })
+            .collect();
+        assert_eq!(replayed, expected[case], "notification count {count}");
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_poi_sections_are_decoded_from_dimension_region() {
     let game = minecraft_dir();
     let java = java_bin();
@@ -1073,6 +1263,9 @@ public class PoiOracle {
     var ordered = occupied.unpack(() -> {}); ordered.remove(new BlockPos(-1,-1,0)); ordered.add(new BlockPos(-1,-1,0), home);
     orderedSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, ordered.pack()).getOrThrow());
     NbtIo.write(orderedRoot, Path.of(args[0], "ordered-expected.nbt"));
+    var empty = occupied.unpack(() -> {}); empty.remove(new BlockPos(-1,-1,0));
+    orderedSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, empty.pack()).getOrThrow());
+    NbtIo.write(orderedRoot, Path.of(args[0], "empty-expected.nbt"));
     var data = new CompoundTag(); data.putInt("DataVersion", 5023);
     var level = new CompoundTag(); level.put("Data", data);
     NbtIo.writeCompressed(level, Path.of(args[0], "level.dat"));
@@ -1316,6 +1509,35 @@ public class PoiOracle {
     let expected =
         nbt::read(&std::fs::read(temp.path().join("ordered-expected.nbt")).unwrap()).unwrap();
     assert_eq!(records(ordered.document()), records(&expected));
+    let empty = native_persistence::poi::draft_ordered_poi_notifications(
+        Some(&ordered_source),
+        ordered_source.position,
+        &[PoiBlockChange {
+            position: [-1, -1, 0],
+            expected: state("red_bed", &[("part", "head")]),
+            replacement: state("air", &[]),
+        }],
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let expected_empty =
+        nbt::read(&std::fs::read(temp.path().join("empty-expected.nbt")).unwrap()).unwrap();
+    let section_records = |document: &NamedTag| {
+        document
+            .value
+            .get("Sections")
+            .unwrap()
+            .get("-1")
+            .unwrap()
+            .get("Records")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        section_records(empty.document().unwrap()),
+        section_records(&expected_empty)
+    );
 }
 
 #[test]

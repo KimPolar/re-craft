@@ -1845,13 +1845,18 @@ impl GeneratedBlockView<'_> {
         let Ok(state) = self.read(pos.to_array()) else {
             return Cell::Unknown;
         };
-        if let Some((facing, waterlogged)) = ladder_state(&state) {
+        self.fluid_cell_from_state(&state)
+    }
+
+    fn fluid_cell_from_state(&self, state: &BlockState) -> native_world::fluid_sim::Cell {
+        use native_world::fluid_sim::Cell;
+        if let Some((facing, waterlogged)) = ladder_state(state) {
             return Cell::Ladder {
                 facing,
                 waterlogged,
             };
         }
-        if native_world::collision::fence_waterlogged(&state) == Some(true) {
+        if native_world::collision::fence_waterlogged(state) == Some(true) {
             return Cell::FenceWater(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
                 amount: 8,
@@ -1859,10 +1864,10 @@ impl GeneratedBlockView<'_> {
                 falling: false,
             });
         }
-        if native_world::collision::fence_waterlogged(&state) == Some(false) {
+        if native_world::collision::fence_waterlogged(state) == Some(false) {
             return Cell::FenceDry;
         }
-        if super::ore::valid_lichen(&state) {
+        if super::ore::valid_lichen(state) {
             return if state.properties["waterlogged"] == "true" {
                 Cell::OpenWater(native_world::fluid::FluidState {
                     kind: native_world::fluid::FluidKind::Water,
@@ -1874,16 +1879,16 @@ impl GeneratedBlockView<'_> {
                 Cell::OpenDry
             };
         }
-        if let Some((top, waterlogged)) = self.slab(&state) {
+        if let Some((top, waterlogged)) = self.slab(state) {
             return Cell::Slab { top, waterlogged };
         }
-        if let Some((voxels, waterlogged)) = self.stair(&state) {
+        if let Some((voxels, waterlogged)) = self.stair(state) {
             return Cell::Stairs {
                 voxels,
                 waterlogged,
             };
         }
-        if leaf_distance(&state).ok().flatten().is_some()
+        if leaf_distance(state).ok().flatten().is_some()
             && state
                 .properties
                 .get("waterlogged")
@@ -1897,12 +1902,12 @@ impl GeneratedBlockView<'_> {
             });
         }
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
-            return liquid_state(&state)
+            return liquid_state(state)
                 .ok()
                 .flatten()
                 .map_or(Cell::Unknown, Cell::Fluid);
         }
-        if inert_generated_pillar(&state) || snowy_fluid_barrier(&state) {
+        if inert_generated_pillar(state) || snowy_fluid_barrier(state) {
             return Cell::Solid;
         }
         if !state.properties.is_empty() {
@@ -2168,27 +2173,59 @@ impl GeneratedBlockView<'_> {
 
     fn lava_cell_for_spread(&self, pos: glam::IVec3) -> native_world::fluid_sim::Cell {
         use native_world::{fluid::FluidKind, fluid_sim::Cell};
+        let tagged_water = || {
+            self.water_fluids.is_some_and(|tags| {
+                tags.contains("minecraft:water")
+                    && tags.contains("minecraft:flowing_water")
+                    && !tags.contains("minecraft:empty")
+                    && !tags.contains("minecraft:lava")
+                    && !tags.contains("minecraft:flowing_lava")
+            }) && self.lava_fluids.is_some_and(|tags| {
+                tags.contains("minecraft:lava")
+                    && tags.contains("minecraft:flowing_lava")
+                    && !tags.contains("minecraft:water")
+                    && !tags.contains("minecraft:flowing_water")
+                    && !tags.contains("minecraft:empty")
+            })
+        };
         match self.fluid_cell(pos) {
             Cell::Air => Cell::Air,
             Cell::Solid => Cell::Solid,
             Cell::Fluid(fluid) if fluid.kind == FluidKind::Lava => Cell::Fluid(fluid),
-            Cell::Fluid(fluid)
-                if fluid.kind == FluidKind::Water
-                    && self.water_fluids.is_some_and(|tags| {
-                        tags.contains("minecraft:water") && tags.contains("minecraft:flowing_water")
-                    })
-                    && self.lava_fluids.is_some_and(|tags| {
-                        tags.contains("minecraft:lava")
-                            && tags.contains("minecraft:flowing_lava")
-                            && !tags.contains("minecraft:water")
-                            && !tags.contains("minecraft:flowing_water")
-                            && !tags.contains("minecraft:empty")
-                    }) =>
-            {
+            Cell::Fluid(fluid) if fluid.kind == FluidKind::Water && tagged_water() => {
                 Cell::Fluid(fluid)
+            }
+            cell @ (Cell::Slab {
+                waterlogged: true, ..
+            }
+            | Cell::Stairs {
+                waterlogged: true, ..
+            }
+            | Cell::Ladder {
+                waterlogged: true, ..
+            }
+            | Cell::FenceWater(_)
+            | Cell::OpenWater(_)
+            | Cell::GrateWater(_))
+                if tagged_water() =>
+            {
+                cell
             }
             _ => Cell::Unknown,
         }
+    }
+
+    fn lava_wet_neighbor(&self, state: &BlockState) -> bool {
+        self.slab(state).is_some_and(|(_, wet)| wet)
+            || self.stair(state).is_some_and(|(_, wet)| wet)
+            || native_world::collision::fence_waterlogged(state) == Some(true)
+            || ladder_state(state).is_some_and(|(_, wet)| wet)
+            || (super::ore::valid_lichen(state) && state.properties["waterlogged"] == "true")
+            || leaf_distance(state).ok().flatten().is_some()
+                && state
+                    .properties
+                    .get("waterlogged")
+                    .is_some_and(|value| value == "true")
     }
 
     fn tick_generated_lava(
@@ -2267,10 +2304,45 @@ impl GeneratedBlockView<'_> {
             let state = self.read(pos.to_array())?;
             if liquid_state(&state)?.is_none() {
                 ensure!(
-                    matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain)),
+                    matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain))
+                        || self.lava_wet_neighbor(&state),
                     "lava requires unsupported neighbor callbacks"
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn update_lava_wet_neighbor(
+        &mut self,
+        pos: glam::IVec3,
+        state: &BlockState,
+        changed_pos: glam::IVec3,
+        changed: &BlockState,
+        depth: usize,
+    ) -> Result<()> {
+        ensure!(
+            depth > 0 && self.lava_wet_neighbor(state),
+            "unsupported lava neighbor shape"
+        );
+        let direction = changed_pos - pos;
+        let updated = self.update_shape(
+            pos.to_array(),
+            state,
+            direction.to_array(),
+            changed_pos.to_array(),
+            changed,
+        )?;
+        if updated == *state {
+            return Ok(());
+        }
+        if ladder_state(state).is_some() {
+            self.destroy_ladder(pos.to_array(), state, depth - 1)?;
+        } else if super::ore::valid_lichen(state) {
+            self.update_water_lichen(pos.to_array(), &updated, depth - 1)?;
+        } else {
+            self.write_postprocessed_state(pos.to_array(), state, &updated)?;
+            self.update_water_shape_neighbors(pos.to_array(), &updated, depth - 1)?;
         }
         Ok(())
     }
@@ -2327,7 +2399,8 @@ impl GeneratedBlockView<'_> {
         {
             let p = pos + delta;
             let state = self.read(p.to_array())?;
-            let kind = if let Some(fluid) = liquid_state(&state)? {
+            let contained = self.fluid_cell_from_state(&state).contained_fluid();
+            let kind = if let Some(fluid) = contained {
                 let id = match (fluid.kind, fluid.source) {
                     (FluidKind::Water, true) => "minecraft:water",
                     (FluidKind::Water, false) => "minecraft:flowing_water",
@@ -2341,7 +2414,8 @@ impl GeneratedBlockView<'_> {
                 }
             } else {
                 ensure!(
-                    matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain)),
+                    matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain))
+                        || self.lava_wet_neighbor(&state),
                     "lava reaction encounters unsupported neighbor"
                 );
                 match state.name.as_str() {
@@ -2436,32 +2510,35 @@ impl GeneratedBlockView<'_> {
         ] {
             let pos = target + delta;
             let state = self.read(pos.to_array())?;
-            if let Some(fluid) = liquid_state(&state)?
-                && fluid.source
-            {
-                match fluid.kind {
-                    FluidKind::Lava => self.schedule_lava(pos, fluid, delay)?,
-                    FluidKind::Water => {
-                        self.schedule_water(pos.to_array(), &state)?;
-                        if delta == glam::IVec3::Y {
-                            let tags =
-                                self.bubble_tags.context("bubble-column tags unavailable")?;
-                            if tags.can_occupy_fluid("minecraft:water") && tags.enables(&solid.name)
-                            {
-                                ensure!(
-                                    self.ticks.schedule(
-                                        TickRegistry::Block,
-                                        "minecraft:water",
-                                        pos.to_array(),
-                                        20,
-                                        0
-                                    )? != ScheduleOutcome::MissingChunk,
-                                    "bubble tick container is missing"
-                                );
+            if let Some(fluid) = liquid_state(&state)? {
+                if fluid.source {
+                    match fluid.kind {
+                        FluidKind::Lava => self.schedule_lava(pos, fluid, delay)?,
+                        FluidKind::Water => {
+                            self.schedule_water(pos.to_array(), &state)?;
+                            if delta == glam::IVec3::Y {
+                                let tags =
+                                    self.bubble_tags.context("bubble-column tags unavailable")?;
+                                if tags.can_occupy_fluid("minecraft:water")
+                                    && tags.enables(&solid.name)
+                                {
+                                    ensure!(
+                                        self.ticks.schedule(
+                                            TickRegistry::Block,
+                                            "minecraft:water",
+                                            pos.to_array(),
+                                            20,
+                                            0
+                                        )? != ScheduleOutcome::MissingChunk,
+                                        "bubble tick container is missing"
+                                    );
+                                }
                             }
                         }
                     }
                 }
+            } else if self.lava_wet_neighbor(&state) {
+                self.update_lava_wet_neighbor(pos, &state, target, &solid, depth - 1)?;
             }
         }
         self.lava_fizz.push(BlockPosition {
@@ -2621,33 +2698,35 @@ impl GeneratedBlockView<'_> {
         ] {
             let p = target + delta;
             let state = self.read(p.to_array())?;
-            if let Some(fluid) = liquid_state(&state)?
-                && (fluid.source || next.is_some_and(|value| value.source))
-            {
-                match fluid.kind {
-                    FluidKind::Lava => self.schedule_lava(p, fluid, delay)?,
-                    FluidKind::Water => {
-                        self.schedule_water(p.to_array(), &state)?;
-                        if delta == glam::IVec3::Y && fluid.source {
-                            let tags =
-                                self.bubble_tags.context("bubble-column tags unavailable")?;
-                            if tags.can_occupy_fluid("minecraft:water")
-                                && tags.enables(&next_state.name)
-                            {
-                                ensure!(
-                                    self.ticks.schedule(
-                                        TickRegistry::Block,
-                                        "minecraft:water",
-                                        p.to_array(),
-                                        20,
-                                        0
-                                    )? != ScheduleOutcome::MissingChunk,
-                                    "bubble tick container is missing"
-                                );
+            if let Some(fluid) = liquid_state(&state)? {
+                if fluid.source || next.is_some_and(|value| value.source) {
+                    match fluid.kind {
+                        FluidKind::Lava => self.schedule_lava(p, fluid, delay)?,
+                        FluidKind::Water => {
+                            self.schedule_water(p.to_array(), &state)?;
+                            if delta == glam::IVec3::Y && fluid.source {
+                                let tags =
+                                    self.bubble_tags.context("bubble-column tags unavailable")?;
+                                if tags.can_occupy_fluid("minecraft:water")
+                                    && tags.enables(&next_state.name)
+                                {
+                                    ensure!(
+                                        self.ticks.schedule(
+                                            TickRegistry::Block,
+                                            "minecraft:water",
+                                            p.to_array(),
+                                            20,
+                                            0
+                                        )? != ScheduleOutcome::MissingChunk,
+                                        "bubble tick container is missing"
+                                    );
+                                }
                             }
                         }
                     }
                 }
+            } else if self.lava_wet_neighbor(&state) {
+                self.update_lava_wet_neighbor(p, &state, target, &next_state, 511)?;
             }
         }
         Ok(())
@@ -8501,13 +8580,77 @@ mod tests {
                 || case.starts_with("lava_rise_")
                 || case.starts_with("lava_convert_")
                 || case.starts_with("lava_water_down_")
-                || case.starts_with("lava_touch_") =>
+                || case.starts_with("lava_touch_")
+                || case.starts_with("lava_wet_") =>
             {
                 let lava = world.intern_state(BlockState {
                     name: "minecraft:lava".into(),
                     properties: BTreeMap::from([("level".into(), "0".into())]),
                 });
                 world.set_block_id(origin_x, 8, 8, lava).unwrap();
+                if case.starts_with("lava_wet_") {
+                    world.set_block_id(origin_x + 1, 8, 8, air).unwrap();
+                    let (name, properties): (&str, Vec<(&str, &str)>) = match case {
+                        "lava_wet_slab_bottom" => (
+                            "stone_slab",
+                            vec![("type", "bottom"), ("waterlogged", "true")],
+                        ),
+                        "lava_wet_slab_top" => {
+                            ("stone_slab", vec![("type", "top"), ("waterlogged", "true")])
+                        }
+                        "lava_wet_stair" => (
+                            "oak_stairs",
+                            vec![
+                                ("facing", "north"),
+                                ("half", "bottom"),
+                                ("shape", "straight"),
+                                ("waterlogged", "true"),
+                            ],
+                        ),
+                        "lava_wet_fence" => (
+                            "oak_fence",
+                            vec![
+                                ("north", "false"),
+                                ("east", "false"),
+                                ("south", "false"),
+                                ("west", "false"),
+                                ("waterlogged", "true"),
+                            ],
+                        ),
+                        "lava_wet_ladder" => {
+                            ("ladder", vec![("facing", "east"), ("waterlogged", "true")])
+                        }
+                        "lava_wet_lichen" => (
+                            "glow_lichen",
+                            vec![
+                                ("down", "false"),
+                                ("up", "false"),
+                                ("north", "false"),
+                                ("south", "false"),
+                                ("west", "false"),
+                                ("east", "true"),
+                                ("waterlogged", "true"),
+                            ],
+                        ),
+                        "lava_wet_leaves" => (
+                            "oak_leaves",
+                            vec![
+                                ("distance", "7"),
+                                ("persistent", "false"),
+                                ("waterlogged", "true"),
+                            ],
+                        ),
+                        _ => panic!("unknown lava waterlogged fixture"),
+                    };
+                    let block = world.intern_state(BlockState {
+                        name: format!("minecraft:{name}"),
+                        properties: properties
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                    });
+                    world.set_block_id(origin_x + 1, 8, 7, block).unwrap();
+                }
                 if case.starts_with("lava_touch_") {
                     world.set_block_id(origin_x + 1, 8, 8, air).unwrap();
                     if case.starts_with("lava_touch_water") {
@@ -9358,6 +9501,7 @@ mod tests {
             || case.starts_with("lava_convert_")
             || case.starts_with("lava_water_down_")
             || case.starts_with("lava_touch_")
+            || case.starts_with("lava_wet_")
             || case.starts_with("water_touch_lava_")
         {
             let mut water =
@@ -9907,11 +10051,28 @@ mod tests {
                 trace.push(format!("reaction 7,7,8 {}", state.name));
             }
         }
-        for change in &result.edits {
-            assert_ne!(
-                source.block(change.x, change.y, change.z),
-                result.world.block(change.x, change.y, change.z)
-            );
+        if case.starts_with("lava_wet_") {
+            let state = result.world.block(9, 8, 7).unwrap();
+            trace.push(format!(
+                "wet 9,8,7 {} {}",
+                state.name, state.properties["waterlogged"]
+            ));
+            if state.name == "minecraft:oak_stairs" {
+                trace.push(format!("wet_stair {}", state.properties["shape"]));
+            }
+            if state.name == "minecraft:oak_fence" {
+                trace.push(format!(
+                    "wet_fence {} {} {} {}",
+                    state.properties["north"],
+                    state.properties["east"],
+                    state.properties["south"],
+                    state.properties["west"]
+                ));
+            }
+        }
+        assert_eq!(result.edits.len(), result.edit_states.len());
+        for (old, new) in &result.edit_states {
+            assert_ne!(result.world.state(*old), result.world.state(*new));
         }
         for kind in [TickRegistry::Block, TickRegistry::Fluid] {
             for tick_chunk in if case.starts_with("edge") {
@@ -11484,6 +11645,52 @@ mod tests {
             "water_touch_lava_flow",
             "water_touch_lava_cascade",
             "lava_convert_on_water",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_lava_reacts_to_waterlogged_neighbors() {
+        for case in [
+            "lava_wet_slab_bottom",
+            "lava_wet_slab_top",
+            "lava_wet_stair",
+            "lava_wet_fence",
+            "lava_wet_ladder",
+            "lava_wet_lichen",
+            "lava_wet_leaves",
+        ] {
+            let trace = water_spread_trace(case);
+            assert_eq!(trace[6], "state 9,8,8 minecraft:cobblestone -", "{case}");
+            assert!(trace.iter().any(|line| line == "fizz 9,8,8"), "{case}");
+            assert!(
+                trace
+                    .iter()
+                    .any(|line| line.starts_with("fluid minecraft:water 9,8,7 ")),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_lava_waterlogged_neighbors_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_waterlogged"],
+        );
+        let expected = [
+            "lava_wet_slab_bottom",
+            "lava_wet_slab_top",
+            "lava_wet_stair",
+            "lava_wet_fence",
+            "lava_wet_ladder",
+            "lava_wet_lichen",
+            "lava_wet_leaves",
         ]
         .into_iter()
         .flat_map(water_spread_trace)

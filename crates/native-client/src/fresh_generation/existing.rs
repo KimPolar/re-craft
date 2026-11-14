@@ -1020,6 +1020,19 @@ pub(crate) struct CapturedMixedFullDrafts {
     chunks: BTreeMap<native_world::loaded::ChunkPos, CapturedMixedFullDraft>,
 }
 
+/// An isolated storage candidate. It intentionally exposes no write plan
+/// until the remaining live-state and generation effects are reconciled.
+pub(crate) struct CapturedMixedSaveCandidate {
+    _plan: native_persistence::save::WorldSavePlan,
+}
+
+#[cfg(test)]
+impl CapturedMixedSaveCandidate {
+    fn chunk_count(&self) -> usize {
+        self._plan.chunk_count()
+    }
+}
+
 pub(crate) struct CapturedMixedFullDraft {
     source_nbt: Option<Vec<u8>>,
     chunk: NamedTag,
@@ -3408,6 +3421,77 @@ impl PreparedExistingGenerator {
             result_identity: Arc::clone(&completed.identity),
             chunks,
         })
+    }
+
+    /// Assemble a source-bound storage plan for the selected FULL drafts.
+    /// This is only an isolated candidate: callers must still account for
+    /// unselected and deferred chunks, structure edits, drops, events, live
+    /// entities and world clocks before publishing anything to a live world.
+    pub fn stage_captured_mixed_full_save_plan(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedMixedPostprocessedRegion,
+        components: &CapturedMixedPostprocessedComponents,
+        drafts: &CapturedMixedFullDrafts,
+        inputs: CapturedPostprocessingInputs<'_>,
+        region_timestamp_seconds: u32,
+    ) -> Result<CapturedMixedSaveCandidate> {
+        use native_persistence::save::{CapturedGeneratedChunk, WorldSavePlan};
+
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && components.matches_state(completed, batch, light, inputs)
+                && drafts.matches_state(completed, batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        ensure!(
+            !drafts.chunks.is_empty() && drafts.chunks.keys().eq(components.chunks.keys()),
+            "captured FULL draft coverage differs"
+        );
+        let sources = self.context.inputs().sources();
+        let mut chunks = Vec::with_capacity(drafts.chunks.len());
+        for (&position, draft) in &drafts.chunks {
+            let key = native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let source = sources
+                .chunks()
+                .get(&key)
+                .context("captured chunk source is missing")?;
+            let terrain = source.terrain.as_ref().map(|chunk| chunk.document.as_ref());
+            ensure!(
+                draft.matches_source(terrain)?,
+                "captured terrain source differs"
+            );
+            ensure!(
+                source.entities.is_none() && source.poi.is_none(),
+                "existing entity or POI sidecars require reconciliation"
+            );
+            let poi = components
+                .missing_poi
+                .get(&position)
+                .context("generated POI coverage is missing")?
+                .as_ref();
+            let Some(Tag::List { values, .. }) = draft.entity_chunk.value.get("Entities") else {
+                bail!("generated entity records are missing")
+            };
+            chunks.push(CapturedGeneratedChunk {
+                position: key,
+                source_terrain: terrain,
+                source_entities: None,
+                source_poi: None,
+                terrain: &draft.chunk,
+                entities: (!values.is_empty()).then_some(&draft.entity_chunk),
+                poi,
+                region_timestamp_seconds,
+            });
+        }
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_context(&self.context)?;
+        plan.add_captured_generated_chunks(sources.dimension().clone(), &chunks)?;
+        Ok(CapturedMixedSaveCandidate { _plan: plan })
     }
 
     /// Prepare an isolated converted region in the caller's registration
@@ -11592,6 +11676,29 @@ mod tests {
         )?;
         assert!(full_drafts.matches_state(&completed, &batch, &staged, inputs));
         assert!(!full_drafts.matches_state(&completed, &batch, &staged, wrong_inputs));
+        assert!(
+            actual
+                .stage_captured_mixed_full_save_plan(
+                    &batch,
+                    &staged,
+                    &completed,
+                    &components,
+                    &full_drafts,
+                    wrong_inputs,
+                    10,
+                )
+                .is_err()
+        );
+        let save_candidate = actual.stage_captured_mixed_full_save_plan(
+            &batch,
+            &staged,
+            &completed,
+            &components,
+            &full_drafts,
+            inputs,
+            10,
+        )?;
+        assert_eq!(save_candidate.chunk_count(), 2);
         let full_new = &full_drafts.chunks()[&target];
         let full_saved = &full_drafts.chunks()[&second];
         assert!(full_new.matches_source(None)?);

@@ -1747,7 +1747,7 @@ fn liquid_state(state: &BlockState) -> Result<Option<native_world::fluid::FluidS
     native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)
 }
 
-// Java's upward wet tip has no effect on merged fluid faces against the
+// Java's upward wet tips have no effect on merged fluid faces against the
 // supported water-flow shapes. Other thicknesses can occlude a stair face.
 fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
     matches!(
@@ -1759,7 +1759,10 @@ fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
             .get("vertical_direction")
             .map(String::as_str)
             == Some("up")
-        && state.properties.get("thickness").map(String::as_str) == Some("tip")
+        && matches!(
+            state.properties.get("thickness").map(String::as_str),
+            Some("tip" | "tip_merge")
+        )
         && state.properties.get("waterlogged").map(String::as_str) == Some("true")
 }
 
@@ -9248,16 +9251,26 @@ mod tests {
                     world.set_block_id(x, y, z, air).unwrap();
                 }
             }
-            "wet_tip_neighbor_sulfur" | "wet_tip_neighbor_dripstone" => {
+            "wet_tip_neighbor_sulfur"
+            | "wet_tip_neighbor_dripstone"
+            | "wet_tip_neighbor_sulfur_merge" => {
                 let spike = world.intern_state(BlockState {
-                    name: if case.ends_with("sulfur") {
+                    name: if case.contains("_sulfur") {
                         "minecraft:sulfur_spike"
                     } else {
                         "minecraft:pointed_dripstone"
                     }
                     .into(),
                     properties: BTreeMap::from([
-                        ("thickness".into(), "tip".into()),
+                        (
+                            "thickness".into(),
+                            if case.ends_with("_merge") {
+                                "tip_merge"
+                            } else {
+                                "tip"
+                            }
+                            .into(),
+                        ),
                         ("vertical_direction".into(), "up".into()),
                         ("waterlogged".into(), "true".into()),
                     ]),
@@ -11924,6 +11937,11 @@ mod tests {
                 ]),
             };
             assert!(wet_upward_speleothem_tip(&state));
+            state
+                .properties
+                .insert("thickness".into(), "tip_merge".into());
+            assert!(wet_upward_speleothem_tip(&state));
+            state.properties.insert("thickness".into(), "tip".into());
             for (property, value) in [
                 ("thickness", "base"),
                 ("vertical_direction", "down"),
@@ -11949,7 +11967,7 @@ mod tests {
             include_str!("../../tests/java/SpeleothemFluidShapeOracle.java"),
         );
         let count: usize = actual[0].strip_prefix("checked ").unwrap().parse().unwrap();
-        assert!(count >= 2_000);
+        assert!(count >= 4_000);
     }
 
     #[test]
@@ -11960,10 +11978,14 @@ mod tests {
             include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
             &["wet_tip_neighbor"],
         );
-        let expected: Vec<_> = ["wet_tip_neighbor_sulfur", "wet_tip_neighbor_dripstone"]
-            .into_iter()
-            .flat_map(water_spread_trace)
-            .collect();
+        let expected: Vec<_> = [
+            "wet_tip_neighbor_sulfur",
+            "wet_tip_neighbor_dripstone",
+            "wet_tip_neighbor_sulfur_merge",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
         assert_eq!(actual, expected);
     }
 

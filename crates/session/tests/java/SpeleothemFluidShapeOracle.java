@@ -19,7 +19,7 @@ public class SpeleothemFluidShapeOracle {
                 if (!state.getValue(BlockStateProperties.WATERLOGGED)) continue;
                 if (state.getValue(BlockStateProperties.VERTICAL_DIRECTION) != Direction.UP
                         || state.getValues().noneMatch(entry -> entry.property().getName().equals("thickness")
-                                && entry.valueName().equals("tip"))) continue;
+                                && List.of("tip", "tip_merge").contains(entry.valueName()))) continue;
                 if (!state.getFluidState().isSource()) throw new AssertionError(state);
                 var shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
                 for (var neighbor : List.of(Blocks.AIR, Blocks.WATER, Blocks.STONE,

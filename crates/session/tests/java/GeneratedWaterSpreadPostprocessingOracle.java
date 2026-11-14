@@ -138,7 +138,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lichen_transition")){scenarios.clear();scenarios.add("marked_lichen_lose_east");}
         if(args.length>0 && args[0].equals("lichen_destroy")){scenarios.clear();scenarios.addAll(List.of("marked_lichen_destroy_on","marked_lichen_destroy_off"));}
         if(args.length>0 && args[0].equals("dry_lichen")){scenarios.clear();scenarios.addAll(List.of("dry_lichen_on","dry_lichen_off","dry_lichen_down","dry_lichen_support"));}
-        if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone"));}
+        if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone","wet_tip_neighbor_sulfur_merge"));}
         if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack","marked_speleothem_sulfur_down","marked_speleothem_sulfur_falling"));}
         if(args.length>0 && args[0].equals("potent_sulfur_barrier")){scenarios.clear();scenarios.add("barrier_potent_sulfur_wet");}
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
@@ -279,8 +279,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 else blocks.put(target.north(),Blocks.WATER.defaultBlockState());
             }
             if(scenario.startsWith("wet_tip_neighbor_")) {
-                var block=scenario.endsWith("sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
-                blocks.put(pos.north(),block.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,Direction.UP).setValue(BlockStateProperties.WATERLOGGED,true));
+                var block=scenario.contains("_sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
+                var spike=block.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,Direction.UP).setValue(BlockStateProperties.WATERLOGGED,true);
+                if(scenario.endsWith("_merge"))spike=spike.setValue(SpeleothemBlock.THICKNESS,net.minecraft.world.level.block.state.properties.SpeleothemThickness.TIP_MERGE);
+                blocks.put(pos.north(),spike);
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
             }
             if(scenario.startsWith("marked_speleothem_")) {

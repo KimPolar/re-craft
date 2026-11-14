@@ -1210,6 +1210,12 @@ impl ResumedCreaturePlan {
             self.matches_state(world, light, spawn_mobs, clocks),
             "creature plan is stale"
         );
+        self.advance_planner()
+    }
+
+    fn advance_planner(
+        &mut self,
+    ) -> Result<native_resources::worldgen_mob_spawner::CreatureSpawnProgress> {
         let progress = self.planner.next(1)?;
         if matches!(
             progress,
@@ -1231,6 +1237,53 @@ impl ResumedCreaturePlan {
             native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished
         );
         Ok(progress)
+    }
+}
+
+/// Candidate stream for a captured mixed terrain and light revision. Entity
+/// construction, collision, live rules and publication remain separate.
+pub(crate) struct CapturedCreaturePlan {
+    inner: ResumedCreaturePlan,
+}
+
+impl CapturedCreaturePlan {
+    fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+    ) -> bool {
+        spawn_mobs
+            && self.inner.clocks == *clocks
+            && Arc::ptr_eq(&self.inner.identity, &batch.identity)
+            && Arc::ptr_eq(&self.inner.revision, &batch.revision)
+            && Arc::ptr_eq(&light.identity, &batch.identity)
+            && Arc::ptr_eq(&light.revision, &batch.revision)
+            && Arc::ptr_eq(&self.inner.light_revision, &light.light_revision)
+            && light.activated.contains(&self.inner.position)
+            && batch.schedule.ready(
+                self.inner.position,
+                native_session::worldgen::schedule::GenerationStage::Spawn,
+            )
+            && !light
+                .completed_empty_spawns
+                .contains_key(&self.inner.position)
+    }
+
+    /// Advance at most one group, retaining any unresolved candidate.
+    pub fn advance(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+    ) -> Result<native_resources::worldgen_mob_spawner::CreatureSpawnProgress> {
+        ensure!(
+            self.matches_state(batch, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.inner.advance_planner()
     }
 }
 
@@ -1883,6 +1936,27 @@ impl PreparedExistingGenerator {
         spawn_mobs: bool,
     ) -> Result<()> {
         use native_session::worldgen::schedule::GenerationStage;
+        self.validate_captured_spawn(batch, light, position)?;
+        let disabled = self
+            .generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")?;
+        ensure!(
+            disabled || !spawn_mobs,
+            "world-generation mob spawning needs a complete spawn context"
+        );
+        batch.schedule.complete(position, GenerationStage::Spawn)?;
+        light.completed_empty_spawns.insert(position, spawn_mobs);
+        Ok(())
+    }
+
+    fn validate_captured_spawn(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
         ensure!(
             Arc::ptr_eq(&self.identity, &batch.identity)
                 && Arc::ptr_eq(&light.identity, &batch.identity)
@@ -1933,16 +2007,6 @@ impl PreparedExistingGenerator {
             !light.completed_empty_spawns.contains_key(&position),
             "spawn already completed"
         );
-        let disabled = self
-            .generator
-            .disable_mob_generation()
-            .context("noise settings are missing disable_mob_generation")?;
-        ensure!(
-            disabled || !spawn_mobs,
-            "world-generation mob spawning needs a complete spawn context"
-        );
-        batch.schedule.complete(position, GenerationStage::Spawn)?;
-        light.completed_empty_spawns.insert(position, spawn_mobs);
         Ok(())
     }
 
@@ -2963,6 +3027,53 @@ impl PreparedExistingGenerator {
                 .context("noise settings are missing disable_mob_generation")?,
             "generator disables mob generation"
         );
+        self.build_creature_plan(
+            position,
+            &context.biomes,
+            &world.revision,
+            &light.light_revision,
+            clocks,
+        )
+    }
+
+    /// Prepare the same world-generation creature stream for mixed saved and
+    /// newly generated terrain. No candidates are skipped or entities written.
+    pub fn plan_captured_creatures(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        position: native_world::loaded::ChunkPos,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+    ) -> Result<CapturedCreaturePlan> {
+        self.validate_captured_spawn(batch, light, position)?;
+        ensure!(spawn_mobs, "use the disabled-mob spawn path");
+        ensure!(
+            !self
+                .generator
+                .disable_mob_generation()
+                .context("noise settings are missing disable_mob_generation")?,
+            "generator disables mob generation"
+        );
+        Ok(CapturedCreaturePlan {
+            inner: self.build_creature_plan(
+                position,
+                &batch.biomes,
+                &batch.revision,
+                &light.light_revision,
+                clocks,
+            )?,
+        })
+    }
+
+    fn build_creature_plan(
+        &mut self,
+        position: native_world::loaded::ChunkPos,
+        biomes: &native_session::worldgen::BiomeNeighborhood,
+        revision: &Arc<()>,
+        light_revision: &Arc<()>,
+        clocks: &BTreeMap<ResourceId, i64>,
+    ) -> Result<ResumedCreaturePlan> {
         let x = position.x.checked_mul(16).context("mob biome X overflow")?;
         let z = position.z.checked_mul(16).context("mob biome Z overflow")?;
         let y = self
@@ -2971,8 +3082,8 @@ impl PreparedExistingGenerator {
             .checked_add(self.lighting.height)
             .and_then(|v| v.checked_sub(1))
             .context("mob biome Y overflow")?;
-        let spawn_biome = context.biomes.biome_at_block(x, y, z)?.clone();
-        let probability_biome = context.biomes.noise_biome_at_block(x, y, z)?.clone();
+        let spawn_biome = biomes.biome_at_block(x, y, z)?.clone();
+        let probability_biome = biomes.noise_biome_at_block(x, y, z)?.clone();
         if self.creature_environment.is_none() {
             let categories = self.resources.vanilla_entity_category_registry()?;
             let environment = native_resources::creature_timeline::CreatureSpawnEnvironment::from_definition_with_registry(&mut self.resources, &self.dimension_definition, &categories)?;
@@ -3012,8 +3123,8 @@ impl PreparedExistingGenerator {
         )?;
         Ok(ResumedCreaturePlan {
             identity: Arc::clone(&self.identity),
-            revision: Arc::clone(&world.revision),
-            light_revision: Arc::clone(&light.light_revision),
+            revision: Arc::clone(revision),
+            light_revision: Arc::clone(light_revision),
             position,
             clocks: clocks.clone(),
             planner,
@@ -9005,6 +9116,92 @@ mod tests {
             batch.schedule().completed(target),
             Some(GenerationStage::Light)
         );
+        let clocks: BTreeMap<_, _> =
+            native_resources::world_clock::registered_clocks(&mut actual.resources)?
+                .into_iter()
+                .map(|id| (id, 0))
+                .collect();
+        let mut captured_plan =
+            actual.plan_captured_creatures(&batch, &staged, target, true, &clocks)?;
+        let x = target.x * 16;
+        let z = target.z * 16;
+        let y = lighting.min_y + lighting.height - 1;
+        let spawn_biome = batch.biomes.biome_at_block(x, y, z)?.clone();
+        let probability_biome = batch.biomes.noise_biome_at_block(x, y, z)?.clone();
+        let (environment, categories) = actual.creature_environment.as_ref().unwrap();
+        let layers = environment.sample_layers(|id| clocks.get(id).copied())?;
+        let spawn = native_resources::mob_spawns::load_biome_spawn_attributes(
+            &mut actual.resources,
+            &spawn_biome,
+        )?;
+        let probability = native_resources::mob_spawns::load_biome_spawn_attributes(
+            &mut actual.resources,
+            &probability_biome,
+        )?;
+        let settings = native_resources::mob_spawns::resolve_creature_spawns(
+            environment.dimension_attributes(),
+            &spawn,
+            &probability,
+            &layers,
+            |id| categories.is_misc(id),
+        )?;
+        let mut expected = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+            actual.context.inputs().settings().seed(),
+            target.x,
+            target.z,
+            true,
+            settings.probability,
+            settings.spawns,
+        )?;
+        assert!(captured_plan.matches_state(&batch, &staged, true, &clocks));
+        assert!(!captured_plan.matches_state(&batch, &staged, false, &clocks));
+        let mut wrong_clocks = clocks.clone();
+        wrong_clocks.insert(ResourceId::parse("example:changed_clock")?, 1);
+        assert!(
+            captured_plan
+                .advance(&batch, &staged, true, &wrong_clocks)
+                .is_err()
+        );
+        assert_eq!(
+            captured_plan.advance(&batch, &staged, true, &clocks)?,
+            expected.next(1)?
+        );
+        let attrs = json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":"minecraft:pig","weight":1,"count":1}]},"spawn_costs":{}}});
+        let forced = native_resources::mob_spawns::resolve_creature_spawns(
+            &json!({}),
+            &attrs,
+            &json!({}),
+            &[],
+            |_| Some(false),
+        )?;
+        let mut pending = actual.plan_captured_creatures(&batch, &staged, target, true, &clocks)?;
+        pending.inner.planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+            42,
+            target.x,
+            target.z,
+            true,
+            0.999_999_9_f32,
+            forced.spawns,
+        )?;
+        let attempt = pending.advance(&batch, &staged, true, &clocks)?;
+        assert!(matches!(
+            attempt,
+            native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_)
+        ));
+        assert_eq!(pending.advance(&batch, &staged, true, &clocks)?, attempt);
+        let light_revision = Arc::clone(&staged.light_revision);
+        staged.light_revision = Arc::new(());
+        assert!(
+            captured_plan
+                .advance(&batch, &staged, true, &clocks)
+                .is_err()
+        );
+        staged.light_revision = light_revision;
+        assert!(
+            actual
+                .plan_captured_creatures(&batch, &staged, target, false, &clocks)
+                .is_err()
+        );
         assert!(
             actual
                 .draft_captured_empty_spawn(&batch, &staged, saved_target, false, 42)
@@ -9020,6 +9217,11 @@ mod tests {
             Some(GenerationStage::Light)
         );
         actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, target, false)?;
+        assert!(
+            captured_plan
+                .advance(&batch, &staged, true, &clocks)
+                .is_err()
+        );
         actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, second, false)?;
         actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, third, false)?;
         actual.complete_captured_spawn_without_mobs(&mut batch, &mut staged, neighbor, false)?;

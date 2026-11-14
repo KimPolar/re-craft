@@ -1224,6 +1224,59 @@ mod face_tests {
         };
         assert!(block_shape(&extra).is_none());
     }
+
+    #[test]
+    fn desert_plants_match_age_dependent_state_schemas_and_shapes() {
+        for age in 0..=15 {
+            let state = |name: &str| BlockState {
+                name: format!("minecraft:{name}"),
+                properties: [("age".into(), age.to_string())].into(),
+            };
+            let cactus = state("cactus");
+            assert_eq!(
+                block_shape(&cactus),
+                Some(vec![pixel_box(1.0, 0.0, 1.0, 15.0, 15.0, 15.0)])
+            );
+            assert_eq!(
+                block_outline(&cactus),
+                Some(vec![pixel_box(1.0, 0.0, 1.0, 15.0, 16.0, 15.0)])
+            );
+            let cane = state("sugar_cane");
+            assert_eq!(block_shape(&cane), Some(vec![]));
+            assert_eq!(
+                block_outline(&cane),
+                Some(vec![pixel_box(2.0, 0.0, 2.0, 14.0, 16.0, 14.0)])
+            );
+        }
+        let mut flower = BlockState {
+            name: "minecraft:cactus_flower".into(),
+            properties: Default::default(),
+        };
+        assert_eq!(block_shape(&flower), Some(vec![]));
+        assert_eq!(
+            block_outline(&flower),
+            Some(vec![pixel_box(1.0, 0.0, 1.0, 15.0, 12.0, 15.0)])
+        );
+        flower.properties.insert("extra".into(), "true".into());
+        assert!(block_shape(&flower).is_none());
+        assert!(block_outline(&flower).is_none());
+        for name in ["cactus", "sugar_cane"] {
+            for age in ["-1", "16", "01", "invalid"] {
+                let state = BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: [("age".into(), age.into())].into(),
+                };
+                assert!(block_shape(&state).is_none());
+                assert!(block_outline(&state).is_none());
+            }
+            let state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: Default::default(),
+            };
+            assert!(block_shape(&state).is_none());
+            assert!(block_outline(&state).is_none());
+        }
+    }
 }
 
 pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
@@ -1255,6 +1308,17 @@ fn crop_outline_height(state: &BlockState) -> Option<f32> {
         return None;
     }
     Some(f32::from(2 + step * age) / 16.0)
+}
+
+fn age_0_to_15(state: &BlockState) -> bool {
+    if state.properties.len() != 1 {
+        return false;
+    }
+    state.properties.get("age").is_some_and(|value| {
+        value
+            .parse::<u8>()
+            .is_ok_and(|age| age <= 15 && age.to_string() == *value)
+    })
 }
 
 /// Vanilla 26.3 flower-pot states verified against the block registry.
@@ -1501,6 +1565,15 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         )]);
     }
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "cactus" {
+        return age_0_to_15(state).then(|| vec![pixel_box(1.0, 0.0, 1.0, 15.0, 15.0, 15.0)]);
+    }
+    if id == "sugar_cane" {
+        return age_0_to_15(state).then(|| EMPTY.to_vec());
+    }
+    if id == "cactus_flower" {
+        return state.properties.is_empty().then(|| EMPTY.to_vec());
+    }
     if id == "iron_chain" {
         if state.properties.len() != 2
             || !matches!(
@@ -1985,6 +2058,18 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
         return Some(vec![cuboid(0.0, 0.0, 0.0, 1.0, height, 1.0)]);
     }
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "cactus" {
+        return age_0_to_15(state).then(|| vec![pixel_box(1.0, 0.0, 1.0, 15.0, 16.0, 15.0)]);
+    }
+    if id == "sugar_cane" {
+        return age_0_to_15(state).then(|| vec![pixel_box(2.0, 0.0, 2.0, 14.0, 16.0, 14.0)]);
+    }
+    if id == "cactus_flower" {
+        return state
+            .properties
+            .is_empty()
+            .then(|| vec![pixel_box(1.0, 0.0, 1.0, 15.0, 12.0, 15.0)]);
+    }
     if id.ends_with("_wall") {
         return Some(wall_boxes(crate::wall::Wall::from_state(state)?, false));
     }

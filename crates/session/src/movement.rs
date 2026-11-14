@@ -285,6 +285,28 @@ mod tests {
     }
 
     #[test]
+    fn desert_plants_use_their_real_player_collision_shapes() {
+        let state = |name: &str| native_world::loaded::BlockState {
+            name: format!("minecraft:{name}"),
+            properties: [("age".into(), "0".into())].into(),
+        };
+        let cactus = native_world::collision::block_shape(&state("cactus")).unwrap();
+        let cane = native_world::collision::block_shape(&state("sugar_cane")).unwrap();
+        let player = BoundingBox {
+            min: DVec3::new(-0.6, 0.0, 0.2),
+            max: DVec3::new(0.0, 1.8, 0.8),
+        };
+        let movement = DVec3::new(0.8, 0.0, 0.0);
+        let travel = |shape: &[Aabb]| {
+            resolve_box(player, movement, false, 0.0, |cell| {
+                if cell == IVec3::ZERO { shape } else { &[] }
+            })
+        };
+        assert!((travel(&cactus).x - 1.0 / 16.0).abs() < 1.0e-12);
+        assert_eq!(travel(&cane), movement);
+    }
+
+    #[test]
     fn supporting_block_breaks_ties_and_checks_the_previous_footprint_once() {
         const FULL: &[Aabb] = &[Aabb {
             min: glam::Vec3::ZERO,

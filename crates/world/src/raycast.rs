@@ -279,6 +279,31 @@ mod tests {
     }
 
     #[test]
+    fn desert_plant_targeting_respects_the_outline_instead_of_collision() {
+        for (name, properties, height) in [
+            ("cactus", [("age".into(), "0".into())].into(), 1.0),
+            ("sugar_cane", [("age".into(), "15".into())].into(), 1.0),
+            ("cactus_flower", Default::default(), 0.75),
+        ] {
+            let state = crate::loaded::BlockState {
+                name: format!("minecraft:{name}"),
+                properties,
+            };
+            let outline = crate::collision::block_outline(&state).unwrap();
+            let trace = |x| {
+                raycast_shapes(Vec3::new(x, 2.0, 0.5), Vec3::NEG_Y, 3.0, |cell| {
+                    Some(if cell == IVec3::ZERO { &outline } else { &[] })
+                })
+            };
+            let hit = trace(0.5).unwrap();
+            assert_eq!(hit.position, IVec3::ZERO);
+            assert_eq!(hit.face, IVec3::Y);
+            assert_eq!(hit.location.y, height);
+            assert!(trace(0.01).is_none());
+        }
+    }
+
+    #[test]
     fn anvil_targeting_ignores_empty_space_beside_the_anvil() {
         let state = crate::loaded::BlockState {
             name: "minecraft:anvil".into(),

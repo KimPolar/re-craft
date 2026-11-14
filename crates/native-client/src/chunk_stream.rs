@@ -1301,6 +1301,176 @@ impl Drop for MissingGenerationFeatureWorker {
     }
 }
 
+/// Initialized light remains an intermediate result: saved and live lighting
+/// must be reconciled before the generated chunks can be published.
+pub(crate) struct InitializedMissingGenerationLight {
+    state: AssembledMissingGeneration,
+    light: crate::fresh_generation::existing::CapturedStagedLight,
+}
+
+impl InitializedMissingGenerationLight {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.state.is_current(streamer, session)
+    }
+
+    pub fn into_checked_parts(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<(
+        AssembledMissingGeneration,
+        crate::fresh_generation::existing::CapturedStagedLight,
+    )> {
+        if !self.is_current(streamer, session) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("initialized generation light is stale");
+        }
+        Ok((self.state, self.light))
+    }
+}
+
+pub(crate) struct MissingGenerationLightStartError {
+    pub assembled: AssembledMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationLightWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<InitializedMissingGenerationLight>>,
+    finished: bool,
+}
+
+impl MissingGenerationLightWorker {
+    /// Initialize the caller-selected, feature-complete chunks in order.
+    /// The caller must independently establish the source light provenance.
+    /// Failure after the worker starts discards the partially initialized batch;
+    /// it must be regenerated rather than retried from an unknown revision.
+    pub fn start(
+        assembled: AssembledMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        positions: Vec<ChunkPos>,
+    ) -> std::result::Result<Self, MissingGenerationLightStartError> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let unique: BTreeSet<_> = positions.iter().copied().collect();
+        let error = if !assembled.is_current(streamer, session) {
+            Some("terrain assembly is stale")
+        } else if positions.is_empty() || unique.len() != positions.len() {
+            Some("light initialization requires distinct chunk positions")
+        } else if positions.iter().any(|&pos| {
+            !assembled
+                .batch
+                .schedule()
+                .ready(pos, GenerationStage::InitializeLight)
+        }) {
+            Some("light initialization dependencies are incomplete")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(MissingGenerationLightStartError {
+                assembled,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = assembled.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            assembled,
+            move |mut state| {
+                let work = (|| -> Result<InitializedMissingGenerationLight> {
+                    let check = || -> Result<()> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "light initialization cancelled"
+                        );
+                        anyhow::ensure!(
+                            state.observed.stamp.is_current(),
+                            "terrain assembly is stale"
+                        );
+                        Ok(())
+                    };
+                    check()?;
+                    let mut light = state.generator.begin_captured_initial_light(&state.batch)?;
+                    for pos in positions {
+                        check()?;
+                        state.generator.initialize_captured_light(
+                            &mut state.batch,
+                            &mut light,
+                            pos,
+                        )?;
+                    }
+                    check()?;
+                    let light = state.generator.seal_captured_light(&state.batch, light)?;
+                    Ok(InitializedMissingGenerationLight { state, light })
+                })();
+                let _ = sender.send(work);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-light".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(assembled, error)| MissingGenerationLightStartError {
+            assembled,
+            error: anyhow::Error::new(error).context("cannot start light initialization"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<InitializedMissingGenerationLight>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("light initialization stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(light) = result {
+                crate::generation_staging::discard_async(light);
+            }
+            anyhow::bail!("light initialization was cancelled or became stale");
+        }
+        let initialized = result?;
+        if !initialized.is_current(streamer, session) {
+            crate::generation_staging::discard_async(initialized);
+            anyhow::bail!("live generation inputs changed during light initialization");
+        }
+        Ok(Some(initialized))
+    }
+}
+
+impl Drop for MissingGenerationLightWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 impl MissingGenerationTargets {
     pub fn targets(&self) -> &[ChunkPos] {
         &self.targets
@@ -3259,6 +3429,55 @@ mod tests {
             Some("minecraft:air")
         );
         assert_eq!(std::fs::read(&region_path)?, region);
+        let failure =
+            match MissingGenerationLightWorker::start(assembled, &streamer, &session, Vec::new()) {
+                Ok(_) => anyhow::bail!("empty light initialization was accepted"),
+                Err(failure) => failure,
+            };
+        assert!(failure.error.to_string().contains("distinct"));
+        let failure = match MissingGenerationLightWorker::start(
+            failure.assembled,
+            &streamer,
+            &session,
+            vec![target, target],
+        ) {
+            Ok(_) => anyhow::bail!("duplicate light initialization was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("distinct"));
+        let failure = match MissingGenerationLightWorker::start(
+            failure.assembled,
+            &streamer,
+            &session,
+            vec![saved_pos],
+        ) {
+            Ok(_) => anyhow::bail!("unprepared light initialization was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("incomplete"));
+        let mut light = MissingGenerationLightWorker::start(
+            failure.assembled,
+            &streamer,
+            &session,
+            vec![target],
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let initialized = loop {
+            if let Some(result) = light.try_result(&streamer, &session)? {
+                break result;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "light initialization timed out");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(initialized.is_current(&streamer, &session));
+        let (assembled, initialized_light) = initialized.into_checked_parts(&streamer, &session)?;
+        assert_eq!(
+            assembled.batch().schedule().completed(target),
+            Some(GenerationStage::InitializeLight)
+        );
+        drop(initialized_light);
+        drop(light);
         session.queue_loaded_chunk(saved_pos, chunk_world(saved_pos));
         assert!(assembled.observed.is_current(&streamer, &session));
         assert!(!assembled.is_current(&streamer, &session));

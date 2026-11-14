@@ -8098,7 +8098,11 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 "minecraft:oak_log"
                                     | "minecraft:dark_oak_log"
                                     | "minecraft:birch_log"
-                            ) && tree_generated_log(state)));
+                            ) && tree_generated_log(state))
+                            || (matches!(
+                                state.name.as_str(),
+                                "minecraft:dirt" | "minecraft:rooted_dirt"
+                            ) && state.properties.is_empty()));
                     // Block piles only replace air with one of the verified
                     // vanilla states accepted by set_pile_block.
                     let pile_light_update = self.pile_block_write
@@ -11898,6 +11902,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tree_soil_light_updates_match_java() {
+        check_tracked_light_updates(&[
+            "tree_fresh_dirt",
+            "tree_fresh_rooted_dirt",
+            "log_active_dirt_full",
+            "log_active_rooted_dirt_full",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn fresh_village_pile_light_matches_java() {
         check_tracked_light_updates(&[
             "pile_fresh_snow",
@@ -12119,6 +12134,10 @@ mod tests {
                     "big_dripleaf"
                 } else if mode == "patch_fresh_clay_water" {
                     "water"
+                } else if mode == "tree_fresh_dirt" {
+                    "dirt"
+                } else if mode == "tree_fresh_rooted_dirt" {
+                    "rooted_dirt"
                 } else if mode == "tree_fresh_birch_log" {
                     "birch_log"
                 } else if mode == "tree_fresh_birch_leaf" {
@@ -12156,6 +12175,8 @@ mod tests {
                     ])
                 } else if mode == "patch_fresh_clay_water" {
                     BTreeMap::from([("level".into(), "0".into())])
+                } else if matches!(mode, "tree_fresh_dirt" | "tree_fresh_rooted_dirt") {
+                    BTreeMap::new()
                 } else if mode.ends_with("log") || mode.ends_with("empty") {
                     BTreeMap::from([("axis".into(), "y".into())])
                 } else {
@@ -12251,7 +12272,11 @@ mod tests {
                 .activate(&terrain, active, [center], &registry)
                 .unwrap();
             let is_log = mode.starts_with("log_active_");
-            let mut leaf = state(if mode == "log_active_oak_full" {
+            let mut leaf = state(if mode == "log_active_dirt_full" {
+                "dirt"
+            } else if mode == "log_active_rooted_dirt_full" {
+                "rooted_dirt"
+            } else if mode == "log_active_oak_full" {
                 "oak_log"
             } else if mode == "leaf_active_oak_full" {
                 "oak_leaves"
@@ -12260,15 +12285,18 @@ mod tests {
             } else {
                 "dark_oak_leaves"
             });
-            leaf.properties = if is_log {
-                BTreeMap::from([("axis".into(), "y".into())])
-            } else {
-                BTreeMap::from([
-                    ("distance".into(), "7".into()),
-                    ("persistent".into(), "false".into()),
-                    ("waterlogged".into(), "false".into()),
-                ])
-            };
+            leaf.properties =
+                if matches!(mode, "log_active_dirt_full" | "log_active_rooted_dirt_full") {
+                    BTreeMap::new()
+                } else if is_log {
+                    BTreeMap::from([("axis".into(), "y".into())])
+                } else {
+                    BTreeMap::from([
+                        ("distance".into(), "7".into()),
+                        ("persistent".into(), "false".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ])
+                };
             let previous_world = Arc::clone(&terrain.world);
             let mut draft = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))

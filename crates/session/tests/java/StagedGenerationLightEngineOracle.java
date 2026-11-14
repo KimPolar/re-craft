@@ -253,6 +253,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         w.sparseShadow=skyShadow;
         w.sparseMany=skyMany;
         boolean logActive=args.length>1 && (args[1].equals("log_active_full") || args[1].equals("log_active_oak_full"));
+        logActive |= args.length>1 && (args[1].equals("log_active_dirt_full") || args[1].equals("log_active_rooted_dirt_full"));
         boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || args[1].equals("leaf_active_oak_full") || leafMany || logActive || treeEmptyFull || treeSparse || treeFreshEmpty || pileFreshEmpty);
         boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull || treeEmpty);
         boolean normal=args.length>1 && args[1].equals("normal");
@@ -431,6 +432,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             var before=new JsonArray(); before.add(capture(engine,0)); before.add(capture(engine,1)); stages.add(before);
             var pile=args[1].endsWith("_snow") ? Blocks.SNOW : args[1].endsWith("_hay") ? Blocks.HAY_BLOCK : args[1].endsWith("_ice") ? Blocks.BLUE_ICE : Blocks.JACK_O_LANTERN;
             var state=pileFresh ? pile.defaultBlockState() : (freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence) ? Blocks.BIG_DRIPLEAF.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,net.minecraft.core.Direction.NORTH).setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,freshWaterlogDripleaf) : patchFreshWater ? Blocks.WATER.defaultBlockState() : args[1].equals("tree_fresh_birch_log") ? Blocks.BIRCH_LOG.defaultBlockState() : args[1].equals("tree_fresh_birch_leaf") ? Blocks.BIRCH_LEAVES.defaultBlockState() : args[1].equals("tree_fresh_oak_log") ? Blocks.OAK_LOG.defaultBlockState() : args[1].equals("tree_fresh_oak_leaf") ? Blocks.OAK_LEAVES.defaultBlockState() : (args[1].equals("tree_fresh_log") || treeFreshEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            if(args[1].equals("tree_fresh_dirt"))state=Blocks.DIRT.defaultBlockState();
+            if(args[1].equals("tree_fresh_rooted_dirt"))state=Blocks.ROOTED_DIRT.defaultBlockState();
             var pos=new BlockPos(16,10,8);
             boolean wasEmpty=eastSection.section.hasOnlyAir();
             var old=eastSection.section.setBlockState(0,10,8,state); w.edits.put(pos,state);
@@ -497,6 +500,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(activeEmptyWide?1:leafFull?0:1,0)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
             var state=args[1].contains("birch_leaf") ? Blocks.BIRCH_LEAVES.defaultBlockState() : args[1].contains("birch_log") ? Blocks.BIRCH_LOG.defaultBlockState() : args[1].contains("oak_leaf") || args[1].equals("leaf_active_oak_full") ? Blocks.OAK_LEAVES.defaultBlockState() : args[1].contains("oak_log") || args[1].equals("log_active_oak_full") ? Blocks.OAK_LOG.defaultBlockState() : vineNoSky ? Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,true) : emptyLeaf ? Blocks.DARK_OAK_LEAVES.defaultBlockState() : (logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            if(args[1].equals("log_active_dirt_full"))state=Blocks.DIRT.defaultBlockState();
+            if(args[1].equals("log_active_rooted_dirt_full"))state=Blocks.ROOTED_DIRT.defaultBlockState();
             int[][] positions=skyMany ? new int[][]{{16,10,8},{16,10,9},{17,10,8}} : leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();

@@ -4285,7 +4285,8 @@ impl PreparedExistingGenerator {
         })
     }
 
-    /// Run FEATURES for a mixed captured batch with structures disabled.
+    /// Run FEATURES for a mixed captured batch when its structure references
+    /// are empty or new structure generation is disabled.
     /// A light-dependent feature fails until an appropriate light view exists.
     /// Results remain intermediate and do not authorize saving the world.
     pub fn run_captured_features(
@@ -4320,10 +4321,6 @@ impl PreparedExistingGenerator {
             "decoration belongs to another generation capture"
         );
         ensure!(
-            !self.generate_structures,
-            "captured structure decoration is not prepared"
-        );
-        ensure!(
             light.is_none_or(|light| light.matches_batch(batch)),
             "feature light belongs to another terrain revision"
         );
@@ -4336,6 +4333,25 @@ impl PreparedExistingGenerator {
             batch.schedule.ready(center, GenerationStage::Features),
             "features dependencies are incomplete"
         );
+        let structures_enabled = self.generate_structures;
+        if structures_enabled {
+            let empty = if let Some(generated) = batch.generated_references.get(&center) {
+                generated
+                    .references
+                    .membership()
+                    .values()
+                    .all(BTreeSet::is_empty)
+            } else {
+                let saved = self.restore_saved_structure_references(context.position)?;
+                validate_saved_decoration_references(&saved)?;
+                saved
+                    .references
+                    .membership()
+                    .values()
+                    .all(BTreeSet::is_empty)
+            };
+            ensure!(empty, "captured structure decoration is not prepared");
+        }
         let captured = self.context.inputs().sources().chunks();
         let mut positions = Vec::with_capacity(9);
         for dz in -1i32..=1 {
@@ -4407,16 +4423,33 @@ impl PreparedExistingGenerator {
             Ok(())
         })();
         let result = priming.and_then(|()| {
-            self.with_saved_prepared_decoration(context, |prepared| match light {
-                Some(light) => batch.schedule.run_features_with_visible_light(
-                    &mut batch.terrain,
-                    prepared,
-                    false,
-                    &light.light,
-                ),
-                None => batch
-                    .schedule
-                    .run_features(&mut batch.terrain, prepared, false, None),
+            self.with_saved_prepared_decoration(context, |prepared| {
+                match (structures_enabled, light) {
+                    (true, Some(light)) => batch
+                        .schedule
+                        .run_features_with_structure_plan_and_visible_light(
+                            &mut batch.terrain,
+                            prepared,
+                            &[],
+                            &light.light,
+                        )
+                        .map(|(features, _)| features),
+                    (true, None) => batch
+                        .schedule
+                        .run_features_with_structure_plan(&mut batch.terrain, prepared, &[])
+                        .map(|(features, _)| features),
+                    (false, Some(light)) => batch.schedule.run_features_with_visible_light(
+                        &mut batch.terrain,
+                        prepared,
+                        false,
+                        &light.light,
+                    ),
+                    (false, None) => {
+                        batch
+                            .schedule
+                            .run_features(&mut batch.terrain, prepared, false, None)
+                    }
+                }
             })
         });
         let result = match result {
@@ -12419,6 +12452,108 @@ mod tests {
                 columns,
             )
             .context("light snapshot unavailable")?;
+        let mut captured_biomes = structured.generator.biome_neighborhood()?;
+        for z in 2..=4 {
+            for x in 2..=4 {
+                captured_biomes.insert(Arc::clone(
+                    decoration.biomes.chunk([x, z]).context("biome missing")?,
+                ))?;
+            }
+        }
+        let mut captured_batch = CapturedTerrainBatch {
+            identity: Arc::clone(&structured.identity),
+            schedule: schedule.clone(),
+            biomes: captured_biomes,
+            terrain: terrain.terrain.clone(),
+            sources: terrain
+                .sources
+                .iter()
+                .map(|(pos, source)| (*pos, Some(Arc::clone(source))))
+                .collect(),
+            saved_stages: BTreeMap::new(),
+            generated_references: BTreeMap::new(),
+            feature_entity_sources: ResumedFeatureEntitySources::default(),
+            revision: Arc::new(()),
+        };
+        let captured_context =
+            structured.prepare_captured_decoration(&captured_batch, saved_center)?;
+        let captured_light =
+            structured.bind_captured_initial_feature_light(&captured_batch, light.clone())?;
+        let before = captured_batch.terrain().snapshot();
+        let reference_tag = Tag::Compound(vec![(
+            "minecraft:buried_treasure".into(),
+            Tag::LongArray(vec![((center.z as i64) << 32) | (center.x as u32 as i64)]),
+        )]);
+        let references =
+            native_session::worldgen::structure_references::restore_saved_structure_references(
+                center,
+                Some(&reference_tag),
+                |_| Ok(true),
+            )?;
+        assert!(references.discarded.is_empty());
+        captured_batch.generated_references.insert(
+            center,
+            CapturedGeneratedReferences {
+                original: None,
+                references: references.references,
+            },
+        );
+        let error = structured
+            .run_captured_features_with_initial_light(
+                &mut captured_batch,
+                &captured_context,
+                &captured_light,
+            )
+            .expect_err("a nonempty structure plan must not be skipped");
+        assert!(format!("{error:#}").contains("captured structure decoration is not prepared"));
+        assert!(Arc::ptr_eq(&before, &captured_batch.terrain().snapshot()));
+        assert_eq!(
+            captured_batch.schedule().completed(center),
+            Some(GenerationStage::Terrain)
+        );
+        captured_batch.generated_references.remove(&center);
+        let empty_references =
+            native_session::worldgen::structure_references::restore_saved_structure_references(
+                center,
+                None,
+                |_| Ok(true),
+            )?;
+        captured_batch.generated_references.insert(
+            center,
+            CapturedGeneratedReferences {
+                original: None,
+                references: empty_references.references,
+            },
+        );
+        let before_maps = captured_batch.terrain().generated_heightmap_data(center)?;
+        assert!(
+            structured
+                .run_captured_features(&mut captured_batch, &captured_context)
+                .is_err()
+        );
+        assert_eq!(
+            captured_batch.terrain().generated_heightmap_data(center)?,
+            before_maps
+        );
+        assert!(Arc::ptr_eq(&before, &captured_batch.terrain().snapshot()));
+        assert_eq!(
+            captured_batch.schedule().completed(center),
+            Some(GenerationStage::Terrain)
+        );
+        captured_batch.generated_references.remove(&center);
+        assert_eq!(
+            structured.run_captured_features_with_initial_light(
+                &mut captured_batch,
+                &captured_context,
+                &captured_light,
+            )?,
+            vec![true]
+        );
+        assert!(!captured_light.matches_batch(&captured_batch));
+        assert_eq!(
+            captured_batch.schedule().completed(center),
+            Some(GenerationStage::Features)
+        );
         let light = structured.bind_initial_feature_light(&terrain, light)?;
         assert_eq!(
             structured.run_saved_features_with_initial_light(
@@ -12444,6 +12579,7 @@ mod tests {
         assert!(absent_sidecar.matches_entity_sidecar(None)?);
         assert!(absent_sidecar.document().value.get("entities").is_none());
         let structured_snapshot = terrain.terrain().snapshot();
+        let captured_snapshot = captured_batch.terrain().snapshot();
         for y in structured.lighting.min_y..structured.lighting.min_y + structured.lighting.height {
             for z in 32..80 {
                 for x in 32..80 {
@@ -12451,6 +12587,11 @@ mod tests {
                         structured_snapshot.block(x, y, z),
                         no_structures_snapshot.block(x, y, z),
                         "empty structure plan changed block {x}, {y}, {z}"
+                    );
+                    assert_eq!(
+                        structured_snapshot.block(x, y, z),
+                        captured_snapshot.block(x, y, z),
+                        "captured empty structure plan changed block {x}, {y}, {z}"
                     );
                 }
             }

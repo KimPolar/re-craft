@@ -11319,6 +11319,7 @@ mod tests {
         let spawn_schedule = batch.schedule.clone();
         let mut worker_spawn_document = None;
         for spawn_mobs in [true, false] {
+            let before_spawn = batch.terrain.snapshot();
             let inputs = crate::chunk_stream::MissingGenerationSpawnInputs {
                 spawn_mobs,
                 clocks: clocks.clone(),
@@ -11352,11 +11353,16 @@ mod tests {
                 Err(error) => error,
             };
             assert!(rejected.error.to_string().contains("distinct"));
+            let mut spawn_positions = vec![target, second];
+            if !spawn_mobs {
+                spawn_positions.extend([third, neighbor]);
+                spawn_positions.extend(support);
+            }
             let mut worker = crate::chunk_stream::MissingGenerationSpawnWorker::start(
                 rejected.initialized,
                 &streamer,
                 &worker_session,
-                vec![target, second],
+                spawn_positions.clone(),
                 inputs.clone(),
             )
             .map_err(|failure| failure.error)?;
@@ -11371,7 +11377,7 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             };
-            assert_eq!(spawned.spawns().len(), 2);
+            assert_eq!(spawned.spawns().len(), spawn_positions.len());
             assert_eq!(spawned.spawns()[0].position(), target);
             assert_eq!(spawned.spawns()[1].position(), second);
             assert_eq!(
@@ -11405,6 +11411,134 @@ mod tests {
                     CapturedCompletedSpawn::Empty(_)
                 ));
             }
+            let post_worker_inputs = crate::chunk_stream::MissingGenerationPostprocessingInputs {
+                spawn: inputs.clone(),
+                game_time: 42,
+                next_sub_tick: 9,
+                water_source_conversion: true,
+            };
+            let mut stale_post_inputs = post_worker_inputs.clone();
+            stale_post_inputs.spawn.last_update += 1;
+            let rejected = match crate::chunk_stream::MissingGenerationPostprocessingWorker::start(
+                spawned,
+                &streamer,
+                &worker_session,
+                vec![target],
+                stale_post_inputs,
+            ) {
+                Ok(_) => bail!("stale spawn inputs were accepted for postprocessing"),
+                Err(failure) => failure,
+            };
+            assert!(rejected.error.to_string().contains("stale"));
+            let rejected = match crate::chunk_stream::MissingGenerationPostprocessingWorker::start(
+                rejected.spawned,
+                &streamer,
+                &worker_session,
+                vec![target, target],
+                post_worker_inputs.clone(),
+            ) {
+                Ok(_) => bail!("duplicate postprocessing targets were accepted"),
+                Err(failure) => failure,
+            };
+            assert!(rejected.error.to_string().contains("distinct"));
+            let rejected = match crate::chunk_stream::MissingGenerationPostprocessingWorker::start(
+                rejected.spawned,
+                &streamer,
+                &worker_session,
+                vec![structure_target],
+                post_worker_inputs.clone(),
+            ) {
+                Ok(_) => bail!("an uncaptured postprocessing target was accepted"),
+                Err(failure) => failure,
+            };
+            assert!(rejected.error.to_string().contains("no captured spawn"));
+            let mut post_worker =
+                crate::chunk_stream::MissingGenerationPostprocessingWorker::start(
+                    rejected.spawned,
+                    &streamer,
+                    &worker_session,
+                    vec![target, second],
+                    post_worker_inputs.clone(),
+                )
+                .map_err(|failure| failure.error)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let result = loop {
+                if let Some(result) =
+                    post_worker.try_result(&streamer, &worker_session, &post_worker_inputs)?
+                {
+                    break result;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "postprocessing timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            assert!(
+                post_worker
+                    .try_result(&streamer, &worker_session, &post_worker_inputs)?
+                    .is_none()
+            );
+            let (spawned, completed) = match result {
+                crate::chunk_stream::MissingGenerationPostprocessingResult::NeedsChunk {
+                    spawned,
+                    position,
+                } if spawn_mobs => {
+                    assert_eq!(position, neighbor);
+                    let mut cancelled =
+                        crate::chunk_stream::MissingGenerationPostprocessingWorker::start(
+                            spawned,
+                            &streamer,
+                            &worker_session,
+                            vec![target, second],
+                            post_worker_inputs.clone(),
+                        )
+                        .map_err(|failure| failure.error)?;
+                    cancelled.cancel();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    let spawned = loop {
+                        match cancelled.try_result(&streamer, &worker_session, &post_worker_inputs)? {
+                            Some(crate::chunk_stream::MissingGenerationPostprocessingResult::Cancelled { spawned }) => break spawned,
+                            Some(_) => bail!("cancelled postprocessing returned another outcome"),
+                            None => {}
+                        }
+                        ensure!(
+                            std::time::Instant::now() < deadline,
+                            "postprocessing cancellation timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    };
+                    (spawned, None)
+                }
+                crate::chunk_stream::MissingGenerationPostprocessingResult::Completed(
+                    completed,
+                ) if !spawn_mobs => {
+                    assert_eq!(completed.targets(), &[target, second]);
+                    let mut stale = post_worker_inputs.clone();
+                    stale.next_sub_tick += 1;
+                    assert!(!completed.is_current(&streamer, &worker_session, &stale));
+                    stale = post_worker_inputs.clone();
+                    stale.game_time += 1;
+                    assert!(!completed.is_current(&streamer, &worker_session, &stale));
+                    stale = post_worker_inputs.clone();
+                    stale.water_source_conversion = !stale.water_source_conversion;
+                    assert!(!completed.is_current(&streamer, &worker_session, &stale));
+                    let (spawned, completed) = completed.into_checked_parts(
+                        &streamer,
+                        &worker_session,
+                        &post_worker_inputs,
+                    )?;
+                    (spawned, Some(completed))
+                }
+                crate::chunk_stream::MissingGenerationPostprocessingResult::Failed {
+                    error,
+                    ..
+                } => {
+                    return Err(error.context("postprocessing worker failed"));
+                }
+                _ => bail!("unexpected postprocessing outcome"),
+            };
+            drop(post_worker);
             let (initialized, spawns) =
                 spawned.into_checked_parts(&streamer, &worker_session, &inputs)?;
             let (assembled, next_staged) =
@@ -11415,6 +11549,7 @@ mod tests {
             batch = next_batch;
             restored = next_restored;
             staged = next_staged;
+            assert!(Arc::ptr_eq(&before_spawn, &batch.terrain.snapshot()));
             assert_eq!(
                 batch.schedule.completed(target),
                 Some(GenerationStage::Spawn)
@@ -11436,8 +11571,80 @@ mod tests {
                 post_inputs,
             )?;
             assert!(converted.matches_state(&batch, &staged, post_inputs));
+            if let Some(completed) = completed {
+                let mut baseline = actual.run_captured_mixed_postprocessing(
+                    &batch,
+                    &staged,
+                    converted,
+                    [target, second],
+                    post_inputs,
+                )?;
+                for position in [target, second] {
+                    loop {
+                        match baseline.try_poll(&batch, &staged, post_inputs, position, 64)? {
+                            native_session::worldgen::PostprocessingAttempt::Progress {
+                                complete: true,
+                            } => break,
+                            native_session::worldgen::PostprocessingAttempt::Progress {
+                                complete: false,
+                            } => {}
+                            native_session::worldgen::PostprocessingAttempt::NeedsChunk(
+                                missing,
+                            ) => {
+                                bail!("baseline needs unprepared neighbor {missing:?}")
+                            }
+                        }
+                    }
+                }
+                actual.drain_captured_mixed_postprocessing_light(
+                    &batch,
+                    &staged,
+                    &mut baseline,
+                    post_inputs,
+                )?;
+                let baseline = baseline.finish(&batch, &staged, post_inputs)?;
+                assert_eq!(completed.region().chunks, baseline.region().chunks);
+                assert_eq!(completed.region().edits, baseline.region().edits);
+                assert_eq!(
+                    completed.region().ticks().activated_snapshot(),
+                    baseline.region().ticks().activated_snapshot()
+                );
+                assert_eq!(
+                    completed.region().deferred_chunks().collect::<Vec<_>>(),
+                    baseline.region().deferred_chunks().collect::<Vec<_>>()
+                );
+                for position in [target, second] {
+                    assert_eq!(
+                        completed.region().heightmaps()[&position].to_tag()?,
+                        baseline.region().heightmaps()[&position].to_tag()?
+                    );
+                    assert_eq!(
+                        completed.region().recorded_entity_candidates(position),
+                        baseline.region().recorded_entity_candidates(position)
+                    );
+                }
+                assert_eq!(
+                    completed.region().light_checks,
+                    baseline.region().light_checks
+                );
+                let actual_sections = actual.captured_mixed_postprocessed_sections(
+                    &batch,
+                    &staged,
+                    &completed,
+                    [target, second],
+                    post_inputs,
+                )?;
+                let expected_sections = actual.captured_mixed_postprocessed_sections(
+                    &batch,
+                    &staged,
+                    &baseline,
+                    [target, second],
+                    post_inputs,
+                )?;
+                assert_eq!(actual_sections.sections(), expected_sections.sections());
+            }
             batch.schedule = spawn_schedule.clone();
-            for position in [target, second] {
+            for position in spawn_positions {
                 staged.completed_creature_spawns.remove(&position);
                 staged.completed_empty_spawns.remove(&position);
             }

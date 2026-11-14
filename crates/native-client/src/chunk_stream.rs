@@ -1886,6 +1886,327 @@ impl Drop for MissingGenerationSpawnWorker {
     }
 }
 
+/// Values that affect conversion and postprocessing of spawned chunks. The
+/// caller must sample them from the live session at a tick boundary and supply
+/// the current values again before accepting or publishing a result.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MissingGenerationPostprocessingInputs {
+    pub spawn: MissingGenerationSpawnInputs,
+    pub game_time: i64,
+    pub next_sub_tick: i64,
+    pub water_source_conversion: bool,
+}
+
+impl MissingGenerationPostprocessingInputs {
+    fn captured(&self) -> crate::fresh_generation::existing::CapturedPostprocessingInputs<'_> {
+        crate::fresh_generation::existing::CapturedPostprocessingInputs {
+            spawn_mobs: self.spawn.spawn_mobs,
+            clocks: &self.spawn.clocks,
+            border: Some(self.spawn.border),
+            game_time: self.game_time,
+            next_sub_tick: self.next_sub_tick,
+            water_source_conversion: self.water_source_conversion,
+        }
+    }
+}
+
+/// A private completed pass. Other live state and storage dependencies still
+/// need reconciliation before its chunks can be attached or saved.
+pub(crate) struct PostprocessedMissingGeneration {
+    spawned: SpawnedMissingGeneration,
+    inputs: MissingGenerationPostprocessingInputs,
+    targets: Vec<ChunkPos>,
+    completed: crate::fresh_generation::existing::CapturedMixedPostprocessedRegion,
+}
+
+impl PostprocessedMissingGeneration {
+    pub fn is_current(
+        &self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        inputs: &MissingGenerationPostprocessingInputs,
+    ) -> bool {
+        self.inputs == *inputs
+            && self.spawned.is_current(streamer, session, &inputs.spawn)
+            && self.completed.matches_state(
+                &self.spawned.initialized.state.batch,
+                &self.spawned.initialized.light,
+                inputs.captured(),
+            )
+            && self
+                .targets
+                .iter()
+                .all(|position| self.completed.region().chunks.contains(position))
+    }
+
+    pub fn targets(&self) -> &[ChunkPos] {
+        &self.targets
+    }
+
+    pub fn into_checked_parts(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        inputs: &MissingGenerationPostprocessingInputs,
+    ) -> Result<(
+        SpawnedMissingGeneration,
+        crate::fresh_generation::existing::CapturedMixedPostprocessedRegion,
+    )> {
+        if !self.is_current(streamer, session, inputs) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("captured postprocessing is stale");
+        }
+        Ok((self.spawned, self.completed))
+    }
+}
+
+pub(crate) struct MissingGenerationPostprocessingStartError {
+    pub spawned: SpawnedMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+/// Missing neighbors and failed callbacks leave the original spawn result
+/// available so the caller can expand the inputs or retry from a clean pass.
+pub(crate) enum MissingGenerationPostprocessingResult {
+    Completed(PostprocessedMissingGeneration),
+    Cancelled {
+        spawned: SpawnedMissingGeneration,
+    },
+    NeedsChunk {
+        spawned: SpawnedMissingGeneration,
+        position: ChunkPos,
+    },
+    Failed {
+        spawned: SpawnedMissingGeneration,
+        error: anyhow::Error,
+    },
+}
+
+pub(crate) struct MissingGenerationPostprocessingWorker {
+    observed: MissingGenerationTargets,
+    inputs: MissingGenerationPostprocessingInputs,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<MissingGenerationPostprocessingResult>,
+    finished: bool,
+}
+
+impl MissingGenerationPostprocessingWorker {
+    /// Convert all supplied spawns and process the selected chunks in order.
+    /// A missing neighbor discards the private pass and reports its position.
+    pub fn start(
+        spawned: SpawnedMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        targets: Vec<ChunkPos>,
+        inputs: MissingGenerationPostprocessingInputs,
+    ) -> std::result::Result<Self, MissingGenerationPostprocessingStartError> {
+        let unique: BTreeSet<_> = targets.iter().copied().collect();
+        let available: BTreeSet<_> = spawned
+            .spawns
+            .iter()
+            .map(|spawn| spawn.position())
+            .collect();
+        let error = if !spawned.is_current(streamer, session, &inputs.spawn) {
+            Some("spawn generation is stale")
+        } else if targets.is_empty() || unique.len() != targets.len() {
+            Some("postprocessing requires distinct chunk positions")
+        } else if !unique.is_subset(&available) {
+            Some("postprocessing target has no captured spawn")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(MissingGenerationPostprocessingStartError {
+                spawned,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = spawned.initialized.state.observed.clone();
+        let worker_inputs = inputs.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            spawned,
+            move |mut spawned| {
+                enum Outcome {
+                    Completed(crate::fresh_generation::existing::CapturedMixedPostprocessedRegion),
+                    NeedsChunk(ChunkPos),
+                }
+                let work = (|| -> Result<Outcome> {
+                    use native_session::worldgen::PostprocessingAttempt;
+                    let initialized = &mut spawned.initialized;
+                    let state = &mut initialized.state;
+                    let check = || -> Result<()> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "postprocessing cancelled"
+                        );
+                        anyhow::ensure!(
+                            state.observed.stamp.is_current(),
+                            "terrain assembly is stale"
+                        );
+                        Ok(())
+                    };
+                    check()?;
+                    let captured = worker_inputs.captured();
+                    let converted = state.generator.begin_captured_mixed_postprocessing_region(
+                        &state.batch,
+                        &initialized.light,
+                        spawned
+                            .spawns
+                            .iter()
+                            .map(|spawn| spawn.as_postprocessing_spawn()),
+                        captured,
+                    )?;
+                    check()?;
+                    let mut stage = state.generator.run_captured_mixed_postprocessing(
+                        &state.batch,
+                        &initialized.light,
+                        converted,
+                        targets.iter().copied(),
+                        captured,
+                    )?;
+                    for &position in &targets {
+                        loop {
+                            check()?;
+                            match stage.try_poll(
+                                &state.batch,
+                                &initialized.light,
+                                captured,
+                                position,
+                                256,
+                            )? {
+                                PostprocessingAttempt::Progress { complete: true } => break,
+                                PostprocessingAttempt::Progress { complete: false } => {}
+                                PostprocessingAttempt::NeedsChunk(missing) => {
+                                    return Ok(Outcome::NeedsChunk(missing));
+                                }
+                            }
+                        }
+                    }
+                    check()?;
+                    state.generator.drain_captured_mixed_postprocessing_light(
+                        &state.batch,
+                        &initialized.light,
+                        &mut stage,
+                        captured,
+                    )?;
+                    check()?;
+                    Ok(Outcome::Completed(stage.finish(
+                        &state.batch,
+                        &initialized.light,
+                        captured,
+                    )?))
+                })();
+                let outcome = match work {
+                    Ok(Outcome::Completed(completed)) => {
+                        MissingGenerationPostprocessingResult::Completed(
+                            PostprocessedMissingGeneration {
+                                spawned,
+                                inputs: worker_inputs,
+                                targets,
+                                completed,
+                            },
+                        )
+                    }
+                    Ok(Outcome::NeedsChunk(position)) => {
+                        MissingGenerationPostprocessingResult::NeedsChunk { spawned, position }
+                    }
+                    Err(error) => MissingGenerationPostprocessingResult::Failed { spawned, error },
+                };
+                let _ = sender.send(outcome);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-postprocessing".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(
+            |(spawned, error)| MissingGenerationPostprocessingStartError {
+                spawned,
+                error: anyhow::Error::new(error).context("cannot start postprocessing"),
+            },
+        )?;
+        Ok(Self {
+            observed,
+            inputs,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        inputs: &MissingGenerationPostprocessingInputs,
+    ) -> Result<Option<MissingGenerationPostprocessingResult>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("postprocessing stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.inputs != *inputs || !self.observed.is_current(streamer, session) {
+            crate::generation_staging::discard_async(result);
+            anyhow::bail!("postprocessing became stale");
+        }
+        let current = match &result {
+            MissingGenerationPostprocessingResult::Completed(completed) => {
+                completed.is_current(streamer, session, inputs)
+            }
+            MissingGenerationPostprocessingResult::Cancelled { spawned }
+            | MissingGenerationPostprocessingResult::NeedsChunk { spawned, .. }
+            | MissingGenerationPostprocessingResult::Failed { spawned, .. } => {
+                spawned.is_current(streamer, session, &inputs.spawn)
+            }
+        };
+        if !current {
+            crate::generation_staging::discard_async(result);
+            anyhow::bail!("live generation inputs changed during postprocessing");
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            let spawned = match result {
+                MissingGenerationPostprocessingResult::Completed(completed) => {
+                    let PostprocessedMissingGeneration {
+                        spawned, completed, ..
+                    } = completed;
+                    crate::generation_staging::discard_async(completed);
+                    spawned
+                }
+                MissingGenerationPostprocessingResult::Cancelled { spawned }
+                | MissingGenerationPostprocessingResult::NeedsChunk { spawned, .. }
+                | MissingGenerationPostprocessingResult::Failed { spawned, .. } => spawned,
+            };
+            return Ok(Some(MissingGenerationPostprocessingResult::Cancelled {
+                spawned,
+            }));
+        }
+        Ok(Some(result))
+    }
+}
+
+impl Drop for MissingGenerationPostprocessingWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 /// Build a controlled scheduling observation around real captured generation
 /// data so the worker's ownership and result path can be exercised in tests.
 #[cfg(test)]

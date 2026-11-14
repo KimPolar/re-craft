@@ -2169,6 +2169,9 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if pane_waterlogged(state).is_some() {
         return connected(state, 7.0 / 16.0, 9.0 / 16.0, 1.0);
     }
+    if matches!(id, "raw_iron_block" | "raw_copper_block" | "raw_gold_block") {
+        return state.properties.is_empty().then(|| FULL.to_vec());
+    }
     if matches!(
         id,
         "stone"
@@ -2992,6 +2995,32 @@ pub fn unknown_barrier() -> &'static [Aabb] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn raw_ore_blocks_have_full_shapes_and_validate_properties() {
+        for name in ["raw_iron_block", "raw_copper_block", "raw_gold_block"] {
+            let mut state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            assert_eq!(block_shape(&state), Some(FULL.to_vec()));
+            assert_eq!(block_outline(&state), Some(FULL.to_vec()));
+            assert_eq!(spawn_collision_shape(&state), Some(FULL.to_vec()));
+            for direction in [
+                IVec3::X,
+                IVec3::NEG_X,
+                IVec3::Y,
+                IVec3::NEG_Y,
+                IVec3::Z,
+                IVec3::NEG_Z,
+            ] {
+                assert_eq!(button_support_face(&state, direction), Some(true));
+            }
+            state.properties.insert("invalid".into(), "true".into());
+            assert_eq!(block_shape(&state), None);
+            assert_eq!(block_outline(&state), None);
+        }
+    }
 
     #[test]
     fn ladders_validate_facing_and_use_the_wall_side_shape() {

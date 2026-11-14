@@ -1590,7 +1590,7 @@ impl Renderer {
         items: &[native_session::items::DroppedItem],
         models: &[Option<Arc<HeldModel>>],
         falling: &[native_session::falling_block::FallingBlockVisual],
-        falling_models: &[Option<Arc<HeldModel>>],
+        falling_models: &[Option<Vec<Arc<HeldModel>>>],
         origin: glam::IVec3,
         partial: f32,
     ) -> Result<()> {
@@ -3014,6 +3014,8 @@ mod tests {
                         previous_position: glam::DVec3::new(0.5, 4.0, 0.5),
                         position: glam::DVec3::new(0.5, 3.5, 0.5),
                         kind: native_session::falling_block::FallingKind::Sand,
+                        block_state: None,
+                        start_position: None,
                     }]);
                 let deadline = Instant::now() + Duration::from_secs(45);
                 loop {

@@ -3,6 +3,7 @@
 
 use glam::{DVec3, IVec3};
 use native_world::movement::BoundingBox;
+use std::sync::Arc;
 
 /// Only use this fallback for collision shapes supplied by the native block
 /// registry. Known exceptions such as snow and active fire tags must be
@@ -138,9 +139,10 @@ impl FallingDamage {
 /// retain water, but FallingBlockEntity.fall always clears the carried state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FallingStalactite {
-    block: native_world::loaded::BlockState,
+    block: Arc<native_world::loaded::BlockState>,
     source_waterlogged: bool,
     damage: Option<FallingDamage>,
+    start_position: Option<IVec3>,
 }
 
 impl FallingStalactite {
@@ -168,10 +170,23 @@ impl FallingStalactite {
             .properties
             .insert("waterlogged".into(), "false".into());
         Some(Self {
-            block,
+            block: Arc::new(block),
             source_waterlogged,
             damage,
+            start_position: None,
         })
+    }
+
+    /// Record the original position used by Java's moving-block renderer to
+    /// select weighted blockstate models.
+    pub fn from_source_at(
+        source: &native_world::loaded::BlockState,
+        top_y: i32,
+        position: IVec3,
+    ) -> Option<Self> {
+        let mut body = Self::from_source(source, top_y, position.y)?;
+        body.start_position = Some(position);
+        Some(body)
     }
 
     pub fn block(&self) -> &native_world::loaded::BlockState {
@@ -182,6 +197,12 @@ impl FallingStalactite {
     }
     pub fn damage(&self) -> Option<FallingDamage> {
         self.damage
+    }
+    pub fn shared_block(&self) -> Arc<native_world::loaded::BlockState> {
+        Arc::clone(&self.block)
+    }
+    pub fn start_position(&self) -> Option<IVec3> {
+        self.start_position
     }
 }
 
@@ -207,20 +228,31 @@ impl FallingKind {
 }
 
 /// Immutable visual state for the renderer; positions are absolute world coordinates.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FallingBlockVisual {
     pub previous_position: DVec3,
     pub position: DVec3,
     pub kind: FallingKind,
+    /// The blockstate carried by a non-default falling block.
+    pub block_state: Option<Arc<native_world::loaded::BlockState>>,
+    /// Original block position for Java's weighted model seed.
+    pub start_position: Option<IVec3>,
 }
 
 impl FallingBlockVisual {
     /// Model origin relative to the render origin, preserving precision for far worlds.
     pub fn model_origin(&self, origin: IVec3, partial_tick: f32) -> DVec3 {
         let partial = f64::from(partial_tick);
+        let offset = self.block_state.as_ref().map_or(glam::Vec3::ZERO, |state| {
+            let position = (self.position + DVec3::new(0.0, f64::from(0.98_f32), 0.0))
+                .floor()
+                .as_ivec3();
+            native_world::collision::block_model_offset(&state.name, position)
+        });
         self.previous_position + (self.position - self.previous_position) * partial
             - origin.as_dvec3()
             + DVec3::new(-0.5, 0.0, -0.5)
+            + offset.as_dvec3()
     }
 }
 

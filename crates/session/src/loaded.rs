@@ -19426,12 +19426,27 @@ impl LoadedSession {
                 self.world.chunks.contains_key(&ChunkPos {
                     x: position.x.div_euclid(16),
                     z: position.z.div_euclid(16),
-                })
+                }) && self
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .is_none_or(|block| {
+                        if let Some(stalactite) = &entity.stalactite {
+                            block != stalactite.block()
+                        } else {
+                            block.name != entity.kind.id() || !block.properties.is_empty()
+                        }
+                    })
             })
             .map(|entity| crate::falling_block::FallingBlockVisual {
                 previous_position: entity.previous,
                 position: entity.motion.position,
                 kind: entity.kind,
+                block_state: entity.stalactite.as_ref().map(|body| body.shared_block()),
+                start_position: entity
+                    .stalactite
+                    .as_ref()
+                    .and_then(|body| body.start_position())
+                    .or_else(|| entity.created.as_ref().map(|created| created.origin)),
             })
             .collect::<Vec<_>>()
             .into()
@@ -20400,7 +20415,7 @@ impl LoadedSession {
                 break;
             };
             let Some(body) =
-                crate::falling_block::FallingStalactite::from_source(&block, top_y, absolute.y)
+                crate::falling_block::FallingStalactite::from_source_at(&block, top_y, absolute)
             else {
                 break;
             };
@@ -79857,6 +79872,23 @@ pub(crate) mod tests {
         session.tick = 1;
         session.advance_block_ticks();
         assert!(session.validate_speleothem_updates().is_err());
+        let visuals = session.falling_sand_snapshot();
+        let repeated = session.falling_sand_snapshot();
+        assert_eq!(visuals.len(), session.falling_sand.len());
+        for (index, (visual, again)) in visuals.iter().zip(repeated.iter()).enumerate() {
+            assert_eq!(
+                visual.start_position,
+                Some(absolute - IVec3::Y * index as i32)
+            );
+            assert!(Arc::ptr_eq(
+                visual.block_state.as_ref().unwrap(),
+                again.block_state.as_ref().unwrap()
+            ));
+            assert_eq!(
+                visual.block_state.as_ref().unwrap().properties["waterlogged"],
+                "false"
+            );
+        }
         let mut result = format!("{name} {length} {wet} {}", session.falling_sand.len());
         for (i, entity) in session.falling_sand.iter().enumerate() {
             let body = entity.stalactite.as_ref().unwrap();
@@ -79888,6 +79920,53 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn falling_snapshot_hides_entity_only_for_matching_block_state() {
+        let mut session = session();
+        let relative = IVec3::new(8, 8, 8);
+        let absolute = session.origin + relative;
+        let original = state(
+            "minecraft:pointed_dripstone",
+            &[
+                ("vertical_direction", "down"),
+                ("thickness", "tip"),
+                ("waterlogged", "false"),
+            ],
+        );
+        let body = crate::falling_block::FallingStalactite::from_source_at(
+            &original, absolute.y, absolute,
+        )
+        .unwrap();
+        let motion = crate::falling_block::AirborneMotion::from_block(absolute);
+        session.falling_sand.push(FallingSand {
+            previous: motion.position,
+            motion,
+            fall_distance: 0.0,
+            fall_distance_verified: true,
+            stalactite: Some(body),
+            kind: FallingKind::PointedDripstone,
+            drop_item: true,
+            cancel_drop: false,
+            on_ground: false,
+            source: None,
+            created: None,
+        });
+        let matching = session.intern_block(original.clone());
+        assert!(session.set_with_notify(relative, matching, false));
+        assert!(session.falling_sand_snapshot().is_empty());
+        let mut other = original;
+        other.properties.insert("thickness".into(), "base".into());
+        let other = session.intern_block(other);
+        assert!(session.set_with_notify(relative, other, false));
+        let visuals = session.falling_sand_snapshot();
+        assert_eq!(visuals.len(), 1);
+        assert_eq!(visuals[0].start_position, Some(absolute));
+        assert_eq!(
+            visuals[0].block_state.as_ref().unwrap().properties["thickness"],
+            "tip"
+        );
     }
 
     #[test]

@@ -216,6 +216,10 @@ pub struct GroundItemRenderer {
     has_glint: bool,
 }
 
+#[cfg(test)]
+#[path = "ground_items_gpu_tests.rs"]
+mod gpu_tests;
+
 impl GroundItemRenderer {
     pub fn new(
         device: &wgpu::Device,
@@ -522,7 +526,7 @@ impl GroundItemRenderer {
         items: &[DroppedItem],
         models: &[Option<Arc<HeldModel>>],
         falling: &[native_session::falling_block::FallingBlockVisual],
-        falling_models: &[Option<Arc<HeldModel>>],
+        falling_models: &[Option<Vec<Arc<HeldModel>>>],
         origin: IVec3,
         partial: f32,
     ) -> Result<()> {
@@ -564,25 +568,29 @@ impl GroundItemRenderer {
                 batch,
             );
         }
-        for (block, source) in falling
+        for (block, sources) in falling
             .iter()
             .zip(falling_models)
             .filter_map(|(block, source)| source.as_ref().map(|source| (block, source)))
         {
-            let identity = Arc::as_ptr(source);
-            let index = if let Some(&index) = group_index.get(&identity) {
-                index
-            } else {
-                let gpu = self.load(device, queue, Arc::clone(source));
-                groups.push((gpu, Vec::new()));
-                let index = groups.len() - 1;
-                group_index.insert(identity, index);
-                index
-            };
-            groups[index].1.push(Instance {
-                transform: Mat4::from_translation(block.model_origin(origin, partial).as_vec3())
+            for source in sources {
+                let identity = Arc::as_ptr(source);
+                let index = if let Some(&index) = group_index.get(&identity) {
+                    index
+                } else {
+                    let gpu = self.load(device, queue, Arc::clone(source));
+                    groups.push((gpu, Vec::new()));
+                    let index = groups.len() - 1;
+                    group_index.insert(identity, index);
+                    index
+                };
+                groups[index].1.push(Instance {
+                    transform: Mat4::from_translation(
+                        block.model_origin(origin, partial).as_vec3(),
+                    )
                     .to_cols_array_2d(),
-            });
+                });
+            }
         }
         self.draws.clear();
         let mut all = Vec::new();

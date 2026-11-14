@@ -523,13 +523,24 @@ import java.nio.file.*;
 import com.google.gson.*;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.util.Mth;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Blocks;
 public class FallingRenderOracle {
   public static void main(String[] args) throws Exception {
+    SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var input=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray(); var result=new JsonArray();
     for (var entry:input) { var c=entry.getAsJsonObject(); var a=c.getAsJsonArray("previous"); var b=c.getAsJsonArray("position"); var o=c.getAsJsonArray("origin"); float t=c.get("partial").getAsFloat();
       var pose=new PoseStack();
       pose.translate(Mth.lerp(t,a.get(0).getAsDouble(),b.get(0).getAsDouble())-o.get(0).getAsDouble(),Mth.lerp(t,a.get(1).getAsDouble(),b.get(1).getAsDouble())-o.get(1).getAsDouble(),Mth.lerp(t,a.get(2).getAsDouble(),b.get(2).getAsDouble())-o.get(2).getAsDouble());
-      pose.translate(-0.5,0.0,-0.5); var m=pose.last().pose(); var row=new JsonArray(); row.add(m.m30()); row.add(m.m31()); row.add(m.m32()); result.add(row);
+      pose.translate(-0.5,0.0,-0.5);
+      if (c.get("spike").getAsBoolean()) {
+        var pos=BlockPos.containing(b.get(0).getAsDouble(),b.get(1).getAsDouble()+(double)0.98f,b.get(2).getAsDouble());
+        var offset=Blocks.POINTED_DRIPSTONE.defaultBlockState().getOffset(pos);
+        pose.translate((float)offset.x,(float)offset.y,(float)offset.z);
+      }
+      var m=pose.last().pose(); var row=new JsonArray(); row.add(m.m30()); row.add(m.m31()); row.add(m.m32()); result.add(row);
     }
     Files.writeString(Path.of(args[1]),new Gson().toJson(result));
   }
@@ -555,7 +566,11 @@ public class FallingRenderOracle {
             1.0_f32,
         ),
     ];
-    let input: Vec<_>=cases.iter().map(|(a,b,o,t)| serde_json::json!({"previous":a.to_array(),"position":b.to_array(),"origin":o.to_array(),"partial":t})).collect();
+    let cases: Vec<_> = cases
+        .into_iter()
+        .flat_map(|(a, b, o, t)| [(a, b, o, t, false), (a, b, o, t, true)])
+        .collect();
+    let input: Vec<_>=cases.iter().map(|(a,b,o,t,spike)| serde_json::json!({"previous":a.to_array(),"position":b.to_array(),"origin":o.to_array(),"partial":t,"spike":spike})).collect();
     let inp = temp.path().join("input.json");
     let out = temp.path().join("output.json");
     std::fs::write(&inp, serde_json::to_vec(&input).unwrap()).unwrap();
@@ -572,11 +587,24 @@ public class FallingRenderOracle {
         .arg(inp)
         .arg(&out));
     let expected: Vec<[f32; 3]> = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
-    for (index, (previous_position, position, origin, partial)) in cases.into_iter().enumerate() {
+    for (index, (previous_position, position, origin, partial, spike)) in
+        cases.into_iter().enumerate()
+    {
         let visual = FallingBlockVisual {
             previous_position,
             position,
-            kind: native_session::falling_block::FallingKind::Sand,
+            kind: if spike {
+                native_session::falling_block::FallingKind::PointedDripstone
+            } else {
+                native_session::falling_block::FallingKind::Sand
+            },
+            block_state: spike.then(|| {
+                std::sync::Arc::new(native_world::loaded::BlockState {
+                    name: "minecraft:pointed_dripstone".into(),
+                    properties: std::collections::BTreeMap::new(),
+                })
+            }),
+            start_position: None,
         };
         let actual = visual.model_origin(origin, partial).as_vec3();
         assert!(

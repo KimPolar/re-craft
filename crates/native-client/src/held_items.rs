@@ -4,7 +4,7 @@
 //! their own resolvers. Unsupported definitions remain absent from this cache.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::Cursor,
     sync::{Arc, Mutex, Weak, mpsc},
     thread,
@@ -369,6 +369,58 @@ fn compass_range_branch<'a>(definition: &'a Value, key: &ModelKey) -> Option<&'a
 }
 
 impl Loader {
+    /// Bake blockstate variants on the resource worker for falling blocks.
+    /// Keep alternatives separate so entities with different seeds can share
+    /// the same CPU model and GPU upload.
+    fn load_moving_block_models(
+        &mut self,
+        state: &native_world::loaded::BlockState,
+    ) -> Result<MovingBlockModels> {
+        let baked = geometry::bake_blockstate(&mut self.stack, &state.name, &state.properties)?;
+        let mut groups = Vec::with_capacity(baked.groups.len());
+        for group in baked.groups {
+            let mut variants = Vec::with_capacity(group.len());
+            for weighted in group {
+                let mut quads = Vec::with_capacity(weighted.model.quads.len());
+                for quad in weighted.model.quads {
+                    let texture = self.texture(&quad.texture.sprite)?;
+                    quads.push(TexturedQuad {
+                        vertices: quad.vertices,
+                        normal: quad.direction.normal(),
+                        texture,
+                        tint: [1.0; 3],
+                        layer: 0,
+                    });
+                }
+                let transform = DisplayTransform::parse(None)?;
+                variants.push(Arc::new(HeldModel {
+                    quads,
+                    particle_texture: None,
+                    numeric_item_id: None,
+                    glint: false,
+                    glint_materials: Vec::new(),
+                    right: transform,
+                    left: transform,
+                    first_right: transform,
+                    first_left: transform,
+                    ground: transform,
+                    gui: transform,
+                    gui_side_light: true,
+                    gui_icon: None,
+                    gui_glint_uv: None,
+                    gui_glint_pixels: None,
+                    gui_glint_quads: None,
+                    sprite_layers: Vec::new(),
+                }));
+            }
+            groups.push(variants);
+        }
+        Ok(MovingBlockModels {
+            definition: baked.definition,
+            groups,
+        })
+    }
+
     pub(crate) fn load_plant_particle_sprites(
         &mut self,
     ) -> Result<
@@ -957,6 +1009,149 @@ fn estimated_bytes(model: &HeldModel) -> usize {
             .len()
             .saturating_mul(std::mem::size_of::<SpriteLayer>()),
     )
+}
+
+struct MovingBlockModels {
+    definition: native_resources::blockstates::BlockstateDefinition,
+    groups: Vec<Vec<Arc<HeldModel>>>,
+}
+
+impl MovingBlockModels {
+    fn select(&self, start: glam::IVec3) -> Option<Vec<Arc<HeldModel>>> {
+        let seed = native_resources::blockstates::positional_seed(start.x, start.y, start.z);
+        let indices = self.definition.select_indices(seed).ok()?;
+        self.groups
+            .iter()
+            .zip(indices)
+            .map(|(group, index)| group.get(index).cloned())
+            .collect()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.groups.iter().flatten().fold(0usize, |total, model| {
+            total.saturating_add(estimated_bytes(model))
+        })
+    }
+}
+
+enum MovingBlockEntry {
+    Pending,
+    Missing,
+    Ready {
+        models: MovingBlockModels,
+        bytes: usize,
+    },
+}
+
+/// Bounded cache indexed by block state, not entity position. Each baked
+/// alternative is shared across every entity that selects it.
+pub(crate) struct MovingBlockCache {
+    request: mpsc::SyncSender<native_world::loaded::BlockState>,
+    response: mpsc::Receiver<(native_world::loaded::BlockState, Option<MovingBlockModels>)>,
+    entries: BTreeMap<native_world::loaded::BlockState, MovingBlockEntry>,
+    order: VecDeque<native_world::loaded::BlockState>,
+    active: BTreeSet<native_world::loaded::BlockState>,
+    previous_active: BTreeSet<native_world::loaded::BlockState>,
+    bytes: usize,
+}
+
+impl MovingBlockCache {
+    pub(crate) fn new(loader: Arc<Mutex<Loader>>) -> Self {
+        let (request, incoming) = mpsc::sync_channel::<native_world::loaded::BlockState>(32);
+        let (outgoing, response) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(state) = incoming.recv() {
+                let models = loader.lock().ok().and_then(|mut loader| {
+                    match loader.load_moving_block_models(&state) {
+                        Ok(models) => Some(models),
+                        Err(error) => {
+                            eprintln!("Cannot load falling block {}: {error:#}", state.name);
+                            None
+                        }
+                    }
+                });
+                if outgoing.send((state, models)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            request,
+            response,
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            active: BTreeSet::new(),
+            previous_active: BTreeSet::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn begin_frame(&mut self) {
+        std::mem::swap(&mut self.active, &mut self.previous_active);
+        self.active.clear();
+        for (state, result) in self.response.try_iter() {
+            if let Some(entry) = self.entries.get_mut(&state) {
+                if let MovingBlockEntry::Ready { bytes, .. } = entry {
+                    self.bytes = self.bytes.saturating_sub(*bytes);
+                }
+                *entry = match result {
+                    Some(models) => {
+                        let bytes = models.estimated_bytes();
+                        self.bytes = self.bytes.saturating_add(bytes);
+                        MovingBlockEntry::Ready { models, bytes }
+                    }
+                    None => MovingBlockEntry::Missing,
+                };
+            }
+        }
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.order.len() > MAX_CACHED_MODELS
+            || (self.bytes > MAX_CACHED_BYTES && self.order.len() > 1)
+        {
+            let oldest = self
+                .order
+                .iter()
+                .position(|key| !self.active.contains(key) && !self.previous_active.contains(key));
+            let hard_limit = self.order.len() > MAX_ACTIVE_MODELS
+                || (self.bytes > MAX_ACTIVE_BYTES && self.order.len() > 1);
+            let Some(index) = oldest.or_else(|| hard_limit.then_some(0)) else {
+                break;
+            };
+            let Some(oldest) = self.order.remove(index) else {
+                break;
+            };
+            if let Some(MovingBlockEntry::Ready { bytes, .. }) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    pub(crate) fn get(
+        &mut self,
+        state: &native_world::loaded::BlockState,
+        start: glam::IVec3,
+    ) -> Option<Vec<Arc<HeldModel>>> {
+        if let Some(entry) = self.entries.get(state) {
+            if !self.active.contains(state) {
+                self.active.insert(state.clone());
+            }
+            return match entry {
+                MovingBlockEntry::Ready { models, .. } => models.select(start),
+                MovingBlockEntry::Pending | MovingBlockEntry::Missing => None,
+            };
+        }
+        if self.request.try_send(state.clone()).is_ok() {
+            self.active.insert(state.clone());
+            self.entries
+                .insert(state.clone(), MovingBlockEntry::Pending);
+            self.order.push_back(state.clone());
+            self.trim();
+        }
+        None
+    }
 }
 
 pub struct ItemModelCache {
@@ -2420,6 +2615,221 @@ public class PaletteOracle {
                 glint_uv: None,
             }],
         })
+    }
+
+    #[test]
+    fn moving_block_cache_shares_weighted_models_across_positions() {
+        use native_resources::blockstates::{BlockstateDefinition, ModelChoice};
+        let choice = |name: &str, weight| ModelChoice {
+            model: ResourceId::parse(name).unwrap(),
+            x_rotation: 0,
+            y_rotation: 0,
+            uv_lock: false,
+            weight,
+        };
+        let first = test_model();
+        let second = test_model();
+        let overlay = test_model();
+        let definition = BlockstateDefinition {
+            multipart: true,
+            groups: vec![
+                vec![
+                    choice("minecraft:block/first", 1),
+                    choice("minecraft:block/second", 3),
+                ],
+                vec![choice("minecraft:block/overlay", 1)],
+            ],
+        };
+        let models = MovingBlockModels {
+            definition: definition.clone(),
+            groups: vec![
+                vec![Arc::clone(&first), Arc::clone(&second)],
+                vec![Arc::clone(&overlay)],
+            ],
+        };
+        let (request, requests) = mpsc::sync_channel(8);
+        let (results, response) = mpsc::channel();
+        let mut cache = MovingBlockCache {
+            request,
+            response,
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            active: BTreeSet::new(),
+            previous_active: BTreeSet::new(),
+            bytes: 0,
+        };
+        let state = native_world::loaded::BlockState {
+            name: "minecraft:pointed_dripstone".into(),
+            properties: BTreeMap::from([("thickness".into(), "tip".into())]),
+        };
+        cache.begin_frame();
+        for x in 0..40 {
+            assert!(cache.get(&state, glam::IVec3::new(x, 14, 8)).is_none());
+        }
+        assert_eq!(requests.try_iter().count(), 1);
+        results.send((state.clone(), Some(models))).unwrap();
+        cache.begin_frame();
+        let mut seen = BTreeSet::new();
+        for x in 0..40 {
+            let pos = glam::IVec3::new(x, 14, 8);
+            let expected = definition
+                .select_indices(native_resources::blockstates::positional_seed(
+                    pos.x, pos.y, pos.z,
+                ))
+                .unwrap();
+            let selected = cache.get(&state, pos).unwrap();
+            assert_eq!(selected.len(), 2);
+            assert!(Arc::ptr_eq(
+                &selected[0],
+                if expected[0] == 0 { &first } else { &second }
+            ));
+            assert!(Arc::ptr_eq(&selected[1], &overlay));
+            seen.insert(expected[0]);
+        }
+        assert_eq!(seen, BTreeSet::from([0, 1]));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn moving_block_models_follow_resource_pack_variants() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut vanilla = open_loader(&game, &[]);
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for direction in ["up", "down"] {
+                for thickness in ["tip", "tip_merge", "frustum", "middle", "base"] {
+                    let state = native_world::loaded::BlockState {
+                        name: name.into(),
+                        properties: BTreeMap::from([
+                            ("vertical_direction".into(), direction.into()),
+                            ("thickness".into(), thickness.into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]),
+                    };
+                    let models = vanilla.load_moving_block_models(&state).unwrap();
+                    let expected = geometry::bake_blockstate(
+                        &mut vanilla.stack,
+                        &state.name,
+                        &state.properties,
+                    )
+                    .unwrap();
+                    let indices = expected
+                        .definition
+                        .select_indices(native_resources::blockstates::positional_seed(8, 14, 8))
+                        .unwrap();
+                    let selected = models.select(glam::IVec3::new(8, 14, 8)).unwrap();
+                    assert_eq!(
+                        selected.len(),
+                        expected.groups.len(),
+                        "{name} {direction} {thickness}"
+                    );
+                    for ((actual, group), index) in
+                        selected.iter().zip(&expected.groups).zip(indices)
+                    {
+                        let quads = &group[index].model.quads;
+                        assert_eq!(
+                            actual.quads.len(),
+                            quads.len(),
+                            "{name} {direction} {thickness}"
+                        );
+                        for (actual, expected) in actual.quads.iter().zip(quads) {
+                            assert_eq!(
+                                actual.vertices, expected.vertices,
+                                "{name} {direction} {thickness}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let pack = tempfile::tempdir().unwrap();
+        let base = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(base.join("blockstates")).unwrap();
+        std::fs::create_dir_all(base.join("models/block")).unwrap();
+        std::fs::create_dir_all(base.join("textures/block")).unwrap();
+        std::fs::write(
+            base.join("blockstates/pointed_dripstone.json"),
+            br#"{
+          "variants": {
+            "thickness=tip,vertical_direction=down": [
+              {"model":"minecraft:block/test_red","weight":1},
+              {"model":"minecraft:block/test_blue","weight":3}
+            ],
+            "thickness=base,vertical_direction=down": {"model":"minecraft:block/test_green","x":180}
+          }
+        }"#,
+        )
+        .unwrap();
+        for (name, color) in [
+            ("red", [255, 0, 0, 255]),
+            ("blue", [0, 0, 255, 255]),
+            ("green", [0, 255, 0, 255]),
+        ] {
+            std::fs::write(base.join(format!("models/block/test_{name}.json")),
+                format!(r#"{{"parent":"minecraft:block/cube_all","textures":{{"all":"minecraft:block/test_{name}"}}}}"#)).unwrap();
+            RgbaImage::from_pixel(16, 16, image::Rgba(color))
+                .save(base.join(format!("textures/block/test_{name}.png")))
+                .unwrap();
+        }
+        let mut loader = open_loader(&game, &[pack.path().to_path_buf()]);
+        let mut state = native_world::loaded::BlockState {
+            name: "minecraft:pointed_dripstone".into(),
+            properties: BTreeMap::from([
+                ("vertical_direction".into(), "down".into()),
+                ("thickness".into(), "tip".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        let models = loader.load_moving_block_models(&state).unwrap();
+        let mut colors = BTreeSet::new();
+        for x in 0..40 {
+            let selected = models.select(glam::IVec3::new(x, 14, 8)).unwrap();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].quads.len(), 6);
+            colors.insert(selected[0].quads[0].texture.get_pixel(0, 0).0);
+        }
+        assert_eq!(colors, BTreeSet::from([[255, 0, 0, 255], [0, 0, 255, 255]]));
+        state.properties.insert("thickness".into(), "base".into());
+        let base_model = loader.load_moving_block_models(&state).unwrap();
+        let chosen = base_model.select(glam::IVec3::ZERO).unwrap();
+        assert_eq!(
+            chosen[0].quads[0].texture.get_pixel(0, 0).0,
+            [0, 255, 0, 255]
+        );
+        let expected =
+            geometry::bake_blockstate(&mut loader.stack, &state.name, &state.properties).unwrap();
+        assert_eq!(
+            chosen[0].quads[0].vertices,
+            expected.groups[0][0].model.quads[0].vertices
+        );
+        let mut cache = MovingBlockCache::new(Arc::new(Mutex::new(open_loader(
+            &game,
+            &[pack.path().to_path_buf()],
+        ))));
+        let start = glam::IVec3::new(16, 14, -5);
+        cache.begin_frame();
+        assert!(cache.get(&state, start).is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let selected = loop {
+            cache.begin_frame();
+            if let Some(models) = cache.get(&state, start) {
+                break models;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "moving block worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_eq!(
+            selected[0].quads[0].texture.get_pixel(0, 0).0,
+            [0, 255, 0, 255]
+        );
+        let reused = cache.get(&state, start).unwrap();
+        assert!(Arc::ptr_eq(&selected[0], &reused[0]));
     }
 
     #[test]

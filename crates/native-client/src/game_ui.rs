@@ -171,6 +171,7 @@ pub struct GameUi {
     tooltip_attack_base: Option<[f64; 2]>,
     skin: Arc<crate::player_skin::PlayerSkin>,
     held_models: ItemModelCache,
+    moving_block_models: crate::held_items::MovingBlockCache,
     consume_particles: crate::consume_particles::ParticleSystem,
     plant_sprites: Option<
         std::collections::BTreeMap<
@@ -341,6 +342,8 @@ impl GameUi {
                 }
             });
         let mut held_models = ItemModelCache::new(Arc::clone(&assets.item_models));
+        let moving_block_models =
+            crate::held_items::MovingBlockCache::new(Arc::clone(&assets.item_models));
         // Falling blocks can appear immediately after a world starts. Request
         // their models on the existing worker before the first entity spawns.
         let _ = held_models.get("minecraft:sand");
@@ -356,6 +359,7 @@ impl GameUi {
             assets,
             skin,
             held_models,
+            moving_block_models,
             consume_particles: crate::consume_particles::ParticleSystem::default(),
             plant_sprites: None,
             plant_sprite_result,
@@ -2929,10 +2933,22 @@ impl GameUi {
             .iter()
             .map(|item| self.held_models.get_dropped_item(item))
             .collect::<Vec<_>>();
+        self.moving_block_models.begin_frame();
         let falling_models = snapshot
             .falling_blocks
             .iter()
-            .map(|block| self.held_models.get(block.kind.id()))
+            .map(|block| {
+                if let Some(state) = &block.block_state {
+                    let start = block
+                        .start_position
+                        .unwrap_or_else(|| block.position.floor().as_ivec3());
+                    self.moving_block_models.get(state, start)
+                } else {
+                    self.held_models
+                        .get(block.kind.id())
+                        .map(|model| vec![model])
+                }
+            })
             .collect::<Vec<_>>();
         renderer.update_dropped_items(
             &snapshot.dropped_items,

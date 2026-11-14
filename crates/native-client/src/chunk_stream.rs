@@ -1471,6 +1471,192 @@ impl Drop for MissingGenerationLightWorker {
     }
 }
 
+/// Apply light operations in the caller's order, checking cancellation and
+/// source identity between chunks. A failed pass must be discarded.
+pub(crate) fn propagate_captured_light_sequence(
+    generator: &crate::fresh_generation::existing::PreparedExistingGenerator,
+    batch: &mut crate::fresh_generation::existing::CapturedTerrainBatch,
+    light: &mut crate::fresh_generation::existing::CapturedStagedLight,
+    positions: &[ChunkPos],
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    for &position in positions {
+        check()?;
+        generator.propagate_captured_light(batch, light, position)?;
+    }
+    check()
+}
+
+/// Propagated light is still isolated and cannot yet be attached or saved.
+pub(crate) struct PropagatedMissingGenerationLight {
+    initialized: InitializedMissingGenerationLight,
+    positions: Vec<ChunkPos>,
+}
+
+impl PropagatedMissingGenerationLight {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.initialized.is_current(streamer, session)
+    }
+
+    pub fn positions(&self) -> &[ChunkPos] {
+        &self.positions
+    }
+
+    pub fn into_checked_light(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<InitializedMissingGenerationLight> {
+        if !self.is_current(streamer, session) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("propagated generation light is stale");
+        }
+        Ok(self.initialized)
+    }
+}
+
+pub(crate) struct MissingGenerationPropagationStartError {
+    pub initialized: InitializedMissingGenerationLight,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationPropagationWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<PropagatedMissingGenerationLight>>,
+    finished: bool,
+}
+
+impl MissingGenerationPropagationWorker {
+    /// Propagate in the supplied order after all required neighbors are initialized.
+    /// The isolated state is discarded if a running pass fails or is cancelled.
+    pub fn start(
+        initialized: InitializedMissingGenerationLight,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        positions: Vec<ChunkPos>,
+    ) -> std::result::Result<Self, MissingGenerationPropagationStartError> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let unique: BTreeSet<_> = positions.iter().copied().collect();
+        let error = if !initialized.is_current(streamer, session) {
+            Some("initialized generation light is stale")
+        } else if positions.is_empty() || unique.len() != positions.len() {
+            Some("light propagation requires distinct chunk positions")
+        } else if positions.iter().any(|&pos| {
+            !initialized
+                .state
+                .batch
+                .schedule()
+                .ready(pos, GenerationStage::Light)
+        }) {
+            Some("light propagation dependencies are incomplete")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(MissingGenerationPropagationStartError {
+                initialized,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = initialized.state.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            initialized,
+            move |mut initialized| {
+                let work = (|| -> Result<PropagatedMissingGenerationLight> {
+                    let state = &mut initialized.state;
+                    let check = || -> Result<()> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "light propagation cancelled"
+                        );
+                        anyhow::ensure!(
+                            state.observed.stamp.is_current(),
+                            "terrain assembly is stale"
+                        );
+                        Ok(())
+                    };
+                    propagate_captured_light_sequence(
+                        &state.generator,
+                        &mut state.batch,
+                        &mut initialized.light,
+                        &positions,
+                        check,
+                    )?;
+                    Ok(PropagatedMissingGenerationLight {
+                        initialized,
+                        positions,
+                    })
+                })();
+                let _ = sender.send(work);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-light-propagation".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(
+            |(initialized, error)| MissingGenerationPropagationStartError {
+                initialized,
+                error: anyhow::Error::new(error).context("cannot start light propagation"),
+            },
+        )?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<PropagatedMissingGenerationLight>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("light propagation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(light) = result {
+                crate::generation_staging::discard_async(light);
+            }
+            anyhow::bail!("light propagation was cancelled or became stale");
+        }
+        let propagated = result?;
+        if !propagated.is_current(streamer, session) {
+            crate::generation_staging::discard_async(propagated);
+            anyhow::bail!("live generation inputs changed during light propagation");
+        }
+        Ok(Some(propagated))
+    }
+}
+
+impl Drop for MissingGenerationPropagationWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 impl MissingGenerationTargets {
     pub fn targets(&self) -> &[ChunkPos] {
         &self.targets
@@ -3471,7 +3657,39 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         };
         assert!(initialized.is_current(&streamer, &session));
-        let (assembled, initialized_light) = initialized.into_checked_parts(&streamer, &session)?;
+        let failure = match MissingGenerationPropagationWorker::start(
+            initialized,
+            &streamer,
+            &session,
+            Vec::new(),
+        ) {
+            Ok(_) => anyhow::bail!("empty light propagation was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("distinct"));
+        let failure = match MissingGenerationPropagationWorker::start(
+            failure.initialized,
+            &streamer,
+            &session,
+            vec![target, target],
+        ) {
+            Ok(_) => anyhow::bail!("duplicate light propagation was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("distinct"));
+        let failure = match MissingGenerationPropagationWorker::start(
+            failure.initialized,
+            &streamer,
+            &session,
+            vec![target],
+        ) {
+            Ok(_) => anyhow::bail!("light propagation without initialized neighbors was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("incomplete"));
+        let (assembled, initialized_light) = failure
+            .initialized
+            .into_checked_parts(&streamer, &session)?;
         assert_eq!(
             assembled.batch().schedule().completed(target),
             Some(GenerationStage::InitializeLight)

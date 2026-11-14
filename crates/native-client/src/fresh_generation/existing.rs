@@ -8925,10 +8925,33 @@ mod tests {
                 )
                 .is_err()
         );
-        actual.propagate_captured_light(&mut batch, &mut staged, second)?;
-        actual.propagate_captured_light(&mut batch, &mut staged, third)?;
-        actual.propagate_captured_light(&mut batch, &mut staged, neighbor)?;
-        actual.propagate_captured_light(&mut batch, &mut staged, structure_target)?;
+        let before = batch.schedule().completed(second);
+        assert!(
+            crate::chunk_stream::propagate_captured_light_sequence(
+                &actual,
+                &mut batch,
+                &mut staged,
+                &[second],
+                || anyhow::bail!("cancelled")
+            )
+            .is_err()
+        );
+        assert_eq!(batch.schedule().completed(second), before);
+        let (mut actual, mut batch, mut staged) = std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> Result<_> {
+                    crate::chunk_stream::propagate_captured_light_sequence(
+                        &actual,
+                        &mut batch,
+                        &mut staged,
+                        &[second, third, neighbor, structure_target],
+                        || Ok(()),
+                    )?;
+                    Ok((actual, batch, staged))
+                })
+                .join()
+                .expect("light worker panicked")
+        })?;
         let visible = actual.propagate_captured_light(&mut batch, &mut staged, target)?;
         assert!(visible.raw_brightness(marker, 0).is_some());
         assert!(staged.activated.contains(&target));

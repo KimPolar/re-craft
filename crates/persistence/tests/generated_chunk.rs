@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 use native_core::postprocessing::PostProcessing;
 use native_persistence::{
     generated_chunk::{
-        FullChunkComponents, SpawnChunkComponents, append_proto_entity_records,
-        assemble_entity_chunk, assemble_full_chunk, assemble_full_chunk_with_postprocessing,
-        assemble_spawn_chunk,
+        FullChunkComponents, SpawnChunkComponents, append_entity_chunk_records,
+        append_proto_entity_records, assemble_entity_chunk, assemble_full_chunk,
+        assemble_full_chunk_with_postprocessing, assemble_spawn_chunk,
     },
     generated_section::encode_generated_sections,
     generated_ticks::{encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks},
@@ -234,6 +234,51 @@ fn proto_entity_append_preserves_existing_records_and_empty_storage() {
         .is_err()
     );
     assert!(append_proto_entity_records(None, &[Tag::Int(1)]).is_err());
+}
+
+#[test]
+fn existing_entity_chunk_append_preserves_fields_and_rejects_duplicate_identities() {
+    let position = ChunkPos { x: -1, z: 2 };
+    let entity = |uuid: [i32; 4]| {
+        Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+        ])
+    };
+    let passenger = entity([5, 6, 7, 8]);
+    let mut parent = entity([1, 2, 3, 4]);
+    let Tag::Compound(fields) = &mut parent else {
+        unreachable!()
+    };
+    fields.push((
+        "Passengers".into(),
+        Tag::List {
+            element_type: TagType::Compound,
+            values: vec![passenger.clone()],
+        },
+    ));
+    let mut source = assemble_entity_chunk(position, &[parent.clone()]).unwrap();
+    let Tag::Compound(fields) = &mut source.value else {
+        unreachable!()
+    };
+    fields.push(("example:unknown".into(), Tag::Int(91)));
+    let saved = source.clone();
+    let added = entity([9, 10, 11, 12]);
+    let draft = append_entity_chunk_records(position, &source, &[added.clone()]).unwrap();
+    assert_eq!(draft.value.get("example:unknown"), Some(&Tag::Int(91)));
+    assert!(
+        matches!(draft.value.get("Entities"), Some(Tag::List { values, .. }) if values == &vec![parent, added])
+    );
+    assert_eq!(source, saved);
+    assert_eq!(
+        append_entity_chunk_records(position, &source, &[]).unwrap(),
+        source
+    );
+    assert!(append_entity_chunk_records(position, &source, &[passenger]).is_err());
+    assert!(append_entity_chunk_records(ChunkPos { x: 0, z: 0 }, &source, &[]).is_err());
+    assert!(append_entity_chunk_records(position, &source, &[Tag::Int(1)]).is_err());
+    let malformed = Tag::Compound(vec![("UUID".into(), Tag::IntArray(vec![1, 2]))]);
+    assert!(append_entity_chunk_records(position, &source, &[malformed]).is_err());
 }
 
 #[test]

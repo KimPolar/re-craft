@@ -1041,6 +1041,7 @@ impl CapturedMixedSaveCandidate {
 
 pub(crate) struct CapturedMixedFullDraft {
     source_nbt: Option<Vec<u8>>,
+    source_entities_nbt: Option<Vec<u8>>,
     chunk: NamedTag,
     entity_chunk: NamedTag,
 }
@@ -1054,6 +1055,15 @@ impl CapturedMixedFullDraft {
     }
     pub fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
         match (&self.source_nbt, source) {
+            (None, None) => Ok(true),
+            (Some(expected), Some(actual)) => {
+                Ok(*expected == native_persistence::nbt::write(actual)?)
+            }
+            _ => Ok(false),
+        }
+    }
+    pub fn matches_entity_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        match (&self.source_entities_nbt, source) {
             (None, None) => Ok(true),
             (Some(expected), Some(actual)) => {
                 Ok(*expected == native_persistence::nbt::write(actual)?)
@@ -1454,8 +1464,25 @@ fn captured_spawn_entity_candidates(
     feature_coverage: bool,
     structure_sources_present: bool,
 ) -> Result<Option<Arc<Vec<Tag>>>> {
-    if entity_sidecar.is_some() || !feature_coverage || structure_sources_present {
+    if !feature_coverage || structure_sources_present {
         return Ok(None);
+    }
+    if let Some(sidecar) = entity_sidecar {
+        let (Some(Tag::Int(x)), Some(Tag::Int(z))) = (
+            unique_root_field(document, "xPos")?,
+            unique_root_field(document, "zPos")?,
+        ) else {
+            bail!("spawn chunk position is missing")
+        };
+        native_persistence::generated_chunk::append_entity_chunk_records(
+            native_world::loaded::ChunkPos { x: *x, z: *z },
+            sidecar,
+            &[],
+        )?;
+        if matches!(unique_root_field(sidecar, "Entities")?, Some(Tag::List { values, .. }) if !values.is_empty())
+        {
+            return Ok(None);
+        }
     }
     let original = unique_root_field(document, "entities")?;
     let entities = native_persistence::generated_chunk::append_proto_entity_records(original, &[])?;
@@ -3402,7 +3429,7 @@ impl PreparedExistingGenerator {
                 .structures
                 .get(&position)
                 .context("structure data missing")?;
-            let (chunk, entity_chunk) = assemble_captured_mixed_full_chunk(
+            let (chunk, generated_entities) = assemble_captured_mixed_full_chunk(
                 position,
                 self.lighting.min_y,
                 self.lighting.height,
@@ -3411,6 +3438,34 @@ impl PreparedExistingGenerator {
                 structures.as_ref(),
                 parts,
             )?;
+            let sidecar = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                })
+                .context("entity source was not captured")?
+                .entities
+                .as_ref()
+                .map(|source| source.document.as_ref());
+            let entity_chunk = if let Some(sidecar) = sidecar {
+                ensure!(
+                    !matches!(unique_root_field(sidecar, "Entities")?, Some(Tag::List { values, .. }) if !values.is_empty()),
+                    "nonempty entity sidecar requires live reconciliation"
+                );
+                let Some(Tag::List { values, .. }) = generated_entities.value.get("Entities")
+                else {
+                    bail!("generated entity records are missing")
+                };
+                native_persistence::generated_chunk::append_entity_chunk_records(
+                    position, sidecar, values,
+                )?
+            } else {
+                generated_entities
+            };
             chunks.insert(
                 position,
                 CapturedMixedFullDraft {
@@ -3418,6 +3473,7 @@ impl PreparedExistingGenerator {
                         .as_deref()
                         .map(native_persistence::nbt::write)
                         .transpose()?,
+                    source_entities_nbt: sidecar.map(native_persistence::nbt::write).transpose()?,
                     chunk,
                     entity_chunk,
                 },
@@ -3520,9 +3576,13 @@ impl PreparedExistingGenerator {
                 draft.matches_source(terrain)?,
                 "captured terrain source differs"
             );
+            let entity_source = source
+                .entities
+                .as_ref()
+                .map(|chunk| chunk.document.as_ref());
             ensure!(
-                source.entities.is_none(),
-                "existing entity sidecars require reconciliation"
+                draft.matches_entity_source(entity_source)?,
+                "captured entity source differs"
             );
             let (poi_source, poi) = match &source.poi {
                 Some(source) => (
@@ -3549,10 +3609,11 @@ impl PreparedExistingGenerator {
             chunks.push(CapturedGeneratedChunk {
                 position: key,
                 source_terrain: terrain,
-                source_entities: None,
+                source_entities: entity_source,
                 source_poi: poi_source,
                 terrain: &draft.chunk,
-                entities: (!values.is_empty()).then_some(&draft.entity_chunk),
+                entities: (entity_source.is_some() || !values.is_empty())
+                    .then_some(&draft.entity_chunk),
                 poi,
                 region_timestamp_seconds,
             });
@@ -9807,6 +9868,32 @@ mod tests {
                     z: second.z,
                 },
             )?);
+        let mut existing_entity_document =
+            native_persistence::generated_chunk::assemble_entity_chunk(second, &[])?;
+        let Tag::Compound(fields) = &mut existing_entity_document.value else {
+            unreachable!()
+        };
+        fields.push(("example:entity_root".into(), Tag::Int(87)));
+        let entity_bytes = native_persistence::nbt::write(&existing_entity_document)?;
+        let entity_sectors = (entity_bytes.len() + 5).div_ceil(4096);
+        let mut entity_region = vec![0; 8192 + entity_sectors * 4096];
+        let entity_header = usize::try_from((second.x + second.z * 32) * 4)?;
+        entity_region[entity_header..entity_header + 4]
+            .copy_from_slice(&((2u32 << 8) | entity_sectors as u32).to_be_bytes());
+        entity_region[8192..8196]
+            .copy_from_slice(&u32::try_from(entity_bytes.len() + 1)?.to_be_bytes());
+        entity_region[8196] = 3;
+        entity_region[8197..8197 + entity_bytes.len()].copy_from_slice(&entity_bytes);
+        let entity_dir = root.join("dimensions/minecraft/overworld/entities");
+        std::fs::create_dir_all(&entity_dir)?;
+        std::fs::write(entity_dir.join("r.0.0.mca"), entity_region)?;
+        let existing_entity_source = Arc::new(native_persistence::world::SavedEntityChunk {
+            position: native_persistence::world::ChunkPos {
+                x: second.x,
+                z: second.z,
+            },
+            document: Arc::new(existing_entity_document),
+        });
         // Keep earlier protochunks far outside the test generation schedule.
         // Their original NBT must be captured without assuming biome data exists.
         let early_positions = [
@@ -10074,7 +10161,10 @@ mod tests {
             second,
             native_session::loaded::SavedPoiData::Present(Arc::clone(&existing_poi_source)),
         )?;
-        live.set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
+        live.set_initial_entity_chunk(
+            second,
+            native_session::loaded::SavedEntityData::Present(Arc::clone(&existing_entity_source)),
+        )?;
         live.set_initial_poi_chunk(third, native_session::loaded::SavedPoiData::Missing)?;
         live.set_initial_entity_chunk(third, native_session::loaded::SavedEntityData::Empty)?;
         let guard = actual.capture_live_inputs(&live, &restored)?;
@@ -10152,8 +10242,10 @@ mod tests {
             second,
             native_session::loaded::SavedPoiData::Present(Arc::clone(&existing_poi_source)),
         )?;
-        early_live
-            .set_initial_entity_chunk(second, native_session::loaded::SavedEntityData::Empty)?;
+        early_live.set_initial_entity_chunk(
+            second,
+            native_session::loaded::SavedEntityData::Present(Arc::clone(&existing_entity_source)),
+        )?;
         let early_guard = early_generator.capture_live_inputs(&early_live, &early_restored)?;
         early_generator.verify_live_inputs(&early_live, &early_guard)?;
         early_live.queue_missing_chunk(native_world::loaded::ChunkPos { x: 1000, z: 0 });
@@ -10851,8 +10943,14 @@ mod tests {
                 native_session::loaded::SavedPoiData::Missing
             };
             worker_session.set_initial_poi_chunk(pos, poi)?;
-            worker_session
-                .set_initial_entity_chunk(pos, native_session::loaded::SavedEntityData::Empty)?;
+            let entities = if pos == second {
+                native_session::loaded::SavedEntityData::Present(Arc::clone(
+                    &existing_entity_source,
+                ))
+            } else {
+                native_session::loaded::SavedEntityData::Empty
+            };
+            worker_session.set_initial_entity_chunk(pos, entities)?;
         }
         let (streamer, initialized) = crate::chunk_stream::light_worker_test_fixture(
             actual,
@@ -11457,7 +11555,10 @@ mod tests {
         )?;
         assert!(saved_spawn.matches_state(&batch, &staged, true, &clocks, None));
         assert!(saved_spawn.matches_source(Some(&saved))?);
-        assert!(saved_spawn.entity_sidecar_source().is_none());
+        assert_eq!(
+            saved_spawn.entity_sidecar_source(),
+            Some(existing_entity_source.document.as_ref())
+        );
         assert!(saved_spawn.has_entity_free_feature_coverage());
         let saved_proof = actual.convert_captured_planned_heightmaps(
             &batch,
@@ -11839,6 +11940,11 @@ mod tests {
         assert_eq!(save_candidate.chunk_count(), 2);
         let full_new = &full_drafts.chunks()[&target];
         let full_saved = &full_drafts.chunks()[&second];
+        assert!(full_saved.matches_entity_source(Some(&existing_entity_source.document))?);
+        assert_eq!(
+            full_saved.entity_chunk().value.get("example:entity_root"),
+            Some(&Tag::Int(87))
+        );
         assert!(full_new.matches_source(None)?);
         assert!(full_saved.matches_source(Some(&saved))?);
         assert!(!full_saved.matches_source(None)?);
@@ -12024,7 +12130,10 @@ mod tests {
         assert!(early_spawn.matches_state(&batch, &staged, false));
         assert!(!saved_spawn.matches_source(None)?);
         assert!(new_spawn.entity_sidecar_source().is_none());
-        assert!(saved_spawn.entity_sidecar_source().is_none());
+        assert_eq!(
+            saved_spawn.entity_sidecar_source(),
+            Some(existing_entity_source.document.as_ref())
+        );
         assert!(new_spawn.has_entity_free_feature_coverage());
         assert!(saved_spawn.has_entity_free_feature_coverage());
         let empty_new_entities = captured_generated_entities_are_empty(
@@ -12205,7 +12314,10 @@ mod tests {
         assert!(saved_draft.matches_state(&batch, &staged));
         assert!(saved_draft.matches_source(&saved)?);
         assert!(!saved_draft.matches_source(draft.document())?);
-        assert!(saved_draft.entity_sidecar_source().is_none());
+        assert_eq!(
+            saved_draft.entity_sidecar_source(),
+            Some(existing_entity_source.document.as_ref())
+        );
         assert!(saved_draft.has_entity_free_feature_coverage());
         assert_eq!(
             saved_draft.document().value.get("Status"),
@@ -12865,8 +12977,34 @@ mod tests {
         };
         let records = captured_spawn_entity_candidates(&document, None, true, false)?.unwrap();
         assert_eq!(records.as_slice(), &[pig]);
+        assert!(captured_spawn_entity_candidates(&document, Some(&sidecar), true, false).is_err());
+        let positioned = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("xPos".into(), Tag::Int(1)),
+                ("zPos".into(), Tag::Int(2)),
+                (
+                    "entities".into(),
+                    document.value.get("entities").unwrap().clone(),
+                ),
+            ]),
+        };
+        let position = native_world::loaded::ChunkPos { x: 1, z: 2 };
+        let empty_sidecar =
+            native_persistence::generated_chunk::assemble_entity_chunk(position, &[])?;
+        assert_eq!(
+            captured_spawn_entity_candidates(&positioned, Some(&empty_sidecar), true, false)?
+                .unwrap()
+                .len(),
+            1
+        );
+        let nonempty_sidecar = native_persistence::generated_chunk::assemble_entity_chunk(
+            position,
+            &[Tag::Compound(vec![])],
+        )?;
         assert!(
-            captured_spawn_entity_candidates(&document, Some(&sidecar), true, false)?.is_none()
+            captured_spawn_entity_candidates(&positioned, Some(&nonempty_sidecar), true, false)?
+                .is_none()
         );
         assert!(captured_spawn_entity_candidates(&document, None, false, false)?.is_none());
         assert!(captured_spawn_entity_candidates(&document, None, true, true)?.is_none());

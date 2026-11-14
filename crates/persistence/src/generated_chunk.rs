@@ -75,6 +75,41 @@ pub fn assemble_entity_chunk(position: ChunkPos, records: &[Tag]) -> Result<Name
     Ok(document)
 }
 
+/// Append generation records to a captured entity-region document while
+/// retaining its original root fields and entity order. This isolated draft
+/// does not prove global UUID uniqueness or authorize a world save.
+pub fn append_entity_chunk_records(
+    position: ChunkPos,
+    source: &NamedTag,
+    records: &[Tag],
+) -> Result<NamedTag> {
+    let expected = crate::world::ChunkPos {
+        x: position.x,
+        z: position.z,
+    };
+    crate::world::decode_entity_chunk(source.clone(), expected)?;
+    let combined = append_proto_entity_records(source.value.get("Entities"), records)?;
+    let mut document = source.clone();
+    if let Some(combined) = combined {
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        if let Some((_, value)) = fields.iter_mut().find(|(name, _)| name.matches("Entities")) {
+            *value = combined;
+        } else {
+            fields.push(("Entities".into(), combined));
+        }
+    }
+    crate::world::decode_entity_chunk(document.clone(), expected)?;
+    crate::save::collect_fresh_entity_identities(&document, &mut BTreeSet::new())?;
+    let bytes = nbt::write(&document)?;
+    ensure!(
+        bytes.len() <= nbt::MAX_NBT_BYTES,
+        "entity chunk exceeds NBT limit"
+    );
+    Ok(document)
+}
+
 /// Append recorded generation-time entities to a captured protochunk list.
 /// Existing opaque compounds retain their order and absent/empty storage is
 /// unchanged when there are no additions. This is not a completeness or save

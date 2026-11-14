@@ -396,8 +396,10 @@ public class RegionWriteOracle {
                 var root = NbtIo.read((DataInput)in);
                 if (!Arrays.equals(root.getIntArray("Position").orElseThrow(), new int[]{1, 0}) ||
                     root.getIntOr("future_entity_root", 0) != 73 ||
+                    root.getListOrEmpty("Entities").size() != 2 ||
                     !root.getListOrEmpty("Entities").getCompoundOrEmpty(0).getStringOr("id", "").equals("minecraft:pig") ||
-                    root.getListOrEmpty("Entities").getCompoundOrEmpty(0).getIntOr("future_pig", 0) != 42)
+                    root.getListOrEmpty("Entities").getCompoundOrEmpty(0).getIntOr("future_pig", 0) != 42 ||
+                    !root.getListOrEmpty("Entities").getCompoundOrEmpty(1).getStringOr("id", "").equals("minecraft:sheep"))
                     throw new AssertionError("captured entity differs");
             }
             var ops = net.minecraft.core.RegistryAccess.fromRegistryOfRegistries(net.minecraft.core.registries.BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
@@ -842,6 +844,15 @@ fn java_reads_captured_proto_replacement_and_new_chunk() {
             .read_chunk(1, 0)
             .unwrap()
             .unwrap();
+    let merged_entities = native_persistence::generated_chunk::append_entity_chunk_records(
+        native_world::loaded::ChunkPos { x: 1, z: 0 },
+        &entities,
+        &[Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:sheep".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+        ])],
+    )
+    .unwrap();
     let poi = RegionReader::open(&world.join("dimensions/minecraft/overworld/poi/r.0.0.mca"))
         .unwrap()
         .read_chunk(1, 0)
@@ -858,7 +869,7 @@ fn java_reads_captured_proto_replacement_and_new_chunk() {
                 source_entities: Some(&entities),
                 source_poi: Some(&poi),
                 terrain: &saved,
-                entities: Some(&entities),
+                entities: Some(&merged_entities),
                 poi: Some(&poi),
                 region_timestamp_seconds: 10,
             },

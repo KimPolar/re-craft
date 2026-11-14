@@ -2600,7 +2600,7 @@ fn validate_poi_preservation(
 
 /// Explicit UUIDs are checked across the loaded entities of one dimension.
 /// Missing UUIDs are left to Java's entity decoder and are not proof of identity.
-fn collect_fresh_entity_identities(
+pub(crate) fn collect_fresh_entity_identities(
     document: &nbt::NamedTag,
     seen: &mut BTreeSet<[i32; 4]>,
 ) -> Result<()> {

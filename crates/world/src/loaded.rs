@@ -40,6 +40,7 @@ pub enum ChunkImportError {
     PositionMismatch,
     UnknownBlockState,
     UnknownBiome,
+    StaleChunkSource,
     StaleBlockEdit,
 }
 
@@ -51,6 +52,7 @@ impl std::fmt::Display for ChunkImportError {
             Self::PositionMismatch => "chunk position does not match its key",
             Self::UnknownBlockState => "chunk contains an unknown block-state ID",
             Self::UnknownBiome => "chunk contains an unknown biome ID",
+            Self::StaleChunkSource => "saved chunk source changed since loading",
             Self::StaleBlockEdit => "source chunk conflicts with a pending block edit",
         })
     }
@@ -198,6 +200,9 @@ pub struct World {
     pub saved_fluid_ticks: BTreeMap<ChunkPos, Vec<SavedFluidTick>>,
     pub saved_block_ticks: BTreeMap<ChunkPos, Vec<SavedBlockTick>>,
     pub saved_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
+    // Full original NBT fingerprints, shared by render snapshots. They remain
+    // available while a dirty chunk is parked outside the active window.
+    saved_chunk_sources: Arc<BTreeMap<ChunkPos, [u8; 32]>>,
     /// Session changes visible to snapshots; the saved source remains unchanged
     /// so a later draft can check it for concurrent edits.
     pub live_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
@@ -205,6 +210,22 @@ pub struct World {
 }
 
 impl World {
+    /// Associate a saved chunk with the exact NBT document used to load it.
+    pub fn remember_saved_chunk_source(&mut self, pos: ChunkPos, fingerprint: [u8; 32]) {
+        Arc::make_mut(&mut self.saved_chunk_sources).insert(pos, fingerprint);
+    }
+
+    pub fn saved_chunk_source(&self, pos: ChunkPos) -> Option<[u8; 32]> {
+        self.saved_chunk_sources.get(&pos).copied()
+    }
+
+    /// Forget clean, evicted chunks; dirty parked chunks retain their source.
+    pub fn forget_saved_chunk_source(&mut self, pos: ChunkPos) {
+        if self.saved_chunk_sources.contains_key(&pos) {
+            Arc::make_mut(&mut self.saved_chunk_sources).remove(&pos);
+        }
+    }
+
     pub fn visible_block_entities(&self, pos: &ChunkPos) -> Option<&SavedBlockEntities> {
         self.live_block_entities
             .get(pos)
@@ -312,6 +333,11 @@ impl World {
             return Ok(false);
         }
         let pending_edits: Vec<_> = self.block_edits_in_chunk(pos).cloned().collect();
+        if let Some(expected) = self.saved_chunk_source(pos)
+            && source.saved_chunk_source(pos) != Some(expected)
+        {
+            return Err(ChunkImportError::StaleChunkSource);
+        }
         for edit in &pending_edits {
             let section_y = i8::try_from(edit.position.y.div_euclid(16))
                 .map_err(|_| ChunkImportError::StaleBlockEdit)?;
@@ -407,6 +433,11 @@ impl World {
             }),
         );
         self.missing_chunks.remove(&pos);
+        if let Some(fingerprint) = source.saved_chunk_source(pos) {
+            self.remember_saved_chunk_source(pos, fingerprint);
+        } else {
+            self.forget_saved_chunk_source(pos);
+        }
         if let Some(ticks) = source.saved_fluid_ticks.get(&pos) {
             self.saved_fluid_ticks.insert(pos, ticks.clone());
         } else {
@@ -722,6 +753,7 @@ mod tests {
                 )]),
             }),
         );
+        source.remember_saved_chunk_source(pos, [7; 32]);
         let mut dest = World::new("minecraft:overworld");
         let dest_air = dest.intern_state(BlockState {
             name: "minecraft:air".into(),
@@ -730,6 +762,7 @@ mod tests {
         dest.intern_biome("minecraft:plains".into());
         dest.missing_chunks.insert(pos);
         assert!(dest.import_chunk(&source, pos).unwrap());
+        assert_eq!(dest.saved_chunk_source(pos), Some([7; 32]));
         assert!(dest.chunks[&pos].block_light_correct);
         assert_eq!(
             dest.saved_block_entities.get(&pos),
@@ -774,6 +807,13 @@ mod tests {
         assert!(!dest.chunks.contains_key(&bad_pos));
 
         dest.chunks.remove(&pos);
+        let mut changed_source = source.clone();
+        changed_source.remember_saved_chunk_source(pos, [8; 32]);
+        assert_eq!(
+            dest.import_chunk(&changed_source, pos),
+            Err(ChunkImportError::StaleChunkSource)
+        );
+        assert_eq!(dest.saved_chunk_source(pos), Some([7; 32]));
         dest.saved_fluid_ticks.insert(
             pos,
             vec![SavedFluidTick {

@@ -1174,6 +1174,7 @@ fn prepare_existing_world(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
+        session.require_saved_chunk_sources()?;
         let mut new_player_uuid = None;
         if let Some(seed) = world_seed {
             match reader.random_sequences() {

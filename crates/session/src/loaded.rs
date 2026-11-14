@@ -909,6 +909,7 @@ pub struct LoadedSession {
     original_light_chunks: BTreeMap<ChunkPos, Arc<native_world::loaded::Chunk>>,
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
+    require_saved_chunk_sources: bool,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     placed_chests: BTreeSet<(i32, i32, i32)>,
@@ -5010,6 +5011,17 @@ impl LoadedSession {
             &native_persistence::palette::BlockState,
         ) -> anyhow::Result<(bool, bool)>,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        if self.require_saved_chunk_sources {
+            use anyhow::Context;
+            let expected = self
+                .world
+                .saved_chunk_source(position)
+                .context("saved terrain source was not captured")?;
+            anyhow::ensure!(
+                native_persistence::nbt::fingerprint(original)? == expected,
+                "saved terrain source changed since loading"
+            );
+        }
         anyhow::ensure!(
             self.dirty_chunk_positions().contains(&position),
             "chunk has no recorded changes"
@@ -5726,6 +5738,17 @@ impl LoadedSession {
             .copied()
             .chain(self.chest_dirty_chunks.iter().copied())
             .collect()
+    }
+
+    /// Require original saved terrain identities before drafting changed chunks.
+    /// Generated sessions may opt in only after loading their published world.
+    pub fn require_saved_chunk_sources(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0,
+            "terrain source tracking must start before the first tick"
+        );
+        self.require_saved_chunk_sources = true;
+        Ok(())
     }
 
     fn mark_tick_chunk_dirty(&mut self, x: i32, z: i32) {
@@ -7619,6 +7642,7 @@ impl LoadedSession {
             original_light_chunks: BTreeMap::new(),
             snapshot,
             unsupported_states,
+            require_saved_chunk_sources: false,
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
             placed_chests: BTreeSet::new(),
@@ -12195,6 +12219,7 @@ impl LoadedSession {
                         self.parked_chunks.insert(pos, chunk);
                         respawn_changed = true;
                     } else {
+                        world.forget_saved_chunk_source(pos);
                         self.registered_sculk_chunks.remove(&pos);
                         let sensors: Vec<_> = self
                             .sculk_listeners
@@ -12278,6 +12303,7 @@ impl LoadedSession {
             .collect();
         for pos in unused {
             self.parked_chunks.remove(&pos);
+            Arc::make_mut(&mut self.world).forget_saved_chunk_source(pos);
             self.registered_sculk_chunks.remove(&pos);
             let sensors: Vec<_> = self
                 .sculk_listeners
@@ -29904,6 +29930,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn saved_chunk_source_follows_streaming_and_dirty_parking() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let remote = ChunkPos {
+            x: home.x + 10,
+            z: home.z,
+        };
+        Arc::make_mut(&mut session.world).remember_saved_chunk_source(home, [9; 32]);
+        let original = (*session.world).clone();
+        session.dirty_chunks.insert(home);
+        session.queue_chunk_window(remote, 0);
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&home));
+        assert_eq!(session.world.saved_chunk_source(home), Some([9; 32]));
+
+        session.queue_chunk_window(home, 0);
+        session.apply_streaming();
+        assert!(session.world.chunks.contains_key(&home));
+        assert_eq!(session.world.saved_chunk_source(home), Some([9; 32]));
+        session.dirty_chunks.remove(&home);
+        session.queue_chunk_window(remote, 0);
+        session.apply_streaming();
+        assert!(!session.parked_chunks.contains_key(&home));
+        assert_eq!(session.world.saved_chunk_source(home), None);
+
+        session.queue_chunk_window(home, 0);
+        session.queue_loaded_chunk(home, original);
+        session.apply_streaming();
+        assert!(session.world.chunks.contains_key(&home));
+        assert_eq!(session.world.saved_chunk_source(home), Some([9; 32]));
+    }
+
+    #[test]
     fn generation_terrain_guard_checks_live_inputs_and_pending_updates() {
         let (mut source, origin, player) = fixture();
         let bounds = BuildBounds {
@@ -42626,6 +42685,54 @@ pub(crate) mod tests {
                 ),
             ]),
         };
+        session.require_saved_chunk_sources().unwrap();
+        let missing_without_lighting = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                neighbor,
+                &source,
+                &test_heightmap_tags(),
+                |_| Ok((true, false)),
+            )
+            .unwrap_err();
+        assert!(
+            missing_without_lighting
+                .to_string()
+                .contains("source was not captured")
+        );
+        let missing = session
+            .draft_dirty_chunk_with_lighting(neighbor, &source, &test_heightmap_tags(), |_| {
+                Ok((true, false))
+            })
+            .unwrap_err();
+        assert!(missing.to_string().contains("source was not captured"));
+        Arc::make_mut(&mut session.world).remember_saved_chunk_source(
+            neighbor,
+            native_persistence::nbt::fingerprint(&source).unwrap(),
+        );
+        let mut changed = source.clone();
+        let Tag::Compound(fields) = &mut changed.value else {
+            unreachable!()
+        };
+        fields.push(("unrecognized_field".into(), Tag::Int(42)));
+        let changed_without_lighting = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                neighbor,
+                &changed,
+                &test_heightmap_tags(),
+                |_| Ok((true, false)),
+            )
+            .unwrap_err();
+        assert!(
+            changed_without_lighting
+                .to_string()
+                .contains("changed since loading")
+        );
+        let changed_error = session
+            .draft_dirty_chunk_with_lighting(neighbor, &changed, &test_heightmap_tags(), |_| {
+                Ok((true, false))
+            })
+            .unwrap_err();
+        assert!(changed_error.to_string().contains("changed since loading"));
         let draft = session
             .draft_dirty_chunk_with_lighting(neighbor, &source, &test_heightmap_tags(), |_| {
                 anyhow::bail!("light-only chunk must not rebuild heightmaps")

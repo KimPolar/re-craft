@@ -619,6 +619,9 @@ impl ChunkArea {
                     sections,
                 }),
             );
+            if let Ok(fingerprint) = crate::nbt::fingerprint(&chunk.document) {
+                world.remember_saved_chunk_source(position, fingerprint);
+            }
             let ticks = saved_fluid_ticks(&chunk.document.value, position);
             if !ticks.is_empty() {
                 world.saved_fluid_ticks.insert(position, ticks);
@@ -4280,6 +4283,19 @@ mod tests {
         let runtime = area
             .materialize(&DimensionId::parse("example:custom").unwrap())
             .unwrap();
+        assert_eq!(
+            runtime.saved_chunk_source(native_world::loaded::ChunkPos { x: -1, z: -1 }),
+            Some(crate::nbt::fingerprint(&root).unwrap())
+        );
+        let mut changed_source = root.clone();
+        let Tag::Compound(fields) = &mut changed_source.value else {
+            unreachable!()
+        };
+        fields.push(("another_unknown_field".into(), Tag::Int(1)));
+        assert_ne!(
+            runtime.saved_chunk_source(native_world::loaded::ChunkPos { x: -1, z: -1 }),
+            Some(crate::nbt::fingerprint(&changed_source).unwrap())
+        );
         let state = runtime.block(-1, -64, -1).unwrap();
         assert_eq!(state.name, "example:unfamiliar");
         assert_eq!(

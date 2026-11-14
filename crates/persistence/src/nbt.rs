@@ -206,6 +206,13 @@ pub fn write(root: &NamedTag) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Fingerprint the complete decoded document, including unknown fields, for
+/// comparison with the source used by a running session.
+pub fn fingerprint(root: &NamedTag) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(write(root)?).into())
+}
+
 struct Parser<'a> {
     bytes: &'a [u8],
     position: usize,

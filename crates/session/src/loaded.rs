@@ -203,6 +203,37 @@ pub struct GenerationTerrainStageDraft {
     stage: GenerationTerrainStage,
 }
 
+/// Live work that prevents taking a stable intermediate terrain snapshot.
+/// Callers may retry after the relevant tick or streamed chunk is applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationTerrainPending {
+    ReadyShape(ChunkPos),
+    ShapeDependencyStreaming(ChunkPos),
+    Chunk(ChunkPos),
+}
+
+impl std::fmt::Display for GenerationTerrainPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadyShape(position) => {
+                write!(f, "a queued shape update is ready at {position:?}")
+            }
+            Self::ShapeDependencyStreaming(position) => {
+                write!(
+                    f,
+                    "a queued shape dependency has pending streaming at {position:?}"
+                )
+            }
+            Self::Chunk(position) => write!(
+                f,
+                "generation terrain has pending streaming or shape changes at {position:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GenerationTerrainPending {}
+
 impl GenerationTerrainStageDraft {
     pub fn validate(self) -> anyhow::Result<GenerationTerrainStage> {
         self.validate_checked(|| Ok(()))
@@ -6393,10 +6424,9 @@ impl LoadedSession {
         {
             return Ok(None);
         }
-        anyhow::ensure!(
-            self.ready_shape_update_chunks().is_empty(),
-            "a queued shape update is ready before generation"
-        );
+        if let Some(position) = self.ready_shape_update_chunks().into_iter().next() {
+            return Err(GenerationTerrainPending::ReadyShape(position).into());
+        }
         Ok(Some(GenerationDeferredShapes {
             stairs: self.pending_stair_updates.clone(),
             fences: self.pending_fence_updates.clone(),
@@ -6483,15 +6513,15 @@ impl LoadedSession {
                     && deferred.lichen == self.pending_lichen_updates,
                 "queued shape updates changed during generation"
             );
-            anyhow::ensure!(
-                self.ready_shape_update_chunks().is_empty(),
-                "a queued shape update became ready during generation"
-            );
-            anyhow::ensure!(
-                self.generation_shape_positions()
-                    .all(|position| !pending.contains(&position)),
-                "a queued shape dependency has pending streaming"
-            );
+            if let Some(position) = self.ready_shape_update_chunks().into_iter().next() {
+                return Err(GenerationTerrainPending::ReadyShape(position).into());
+            }
+            if let Some(position) = self
+                .generation_shape_positions()
+                .find(|position| pending.contains(position))
+            {
+                return Err(GenerationTerrainPending::ShapeDependencyStreaming(position).into());
+            }
         } else {
             pending.extend(self.generation_shape_positions());
         }
@@ -6535,10 +6565,9 @@ impl LoadedSession {
                 !chunks.contains_key(&position),
                 "duplicate generation terrain input"
             );
-            anyhow::ensure!(
-                !pending.contains(&position),
-                "generation terrain has pending streaming or shape changes at {position:?}"
-            );
+            if pending.contains(&position) {
+                return Err(GenerationTerrainPending::Chunk(position).into());
+            }
             let live = self.generation_terrain_chunk(position).chunk;
             let edits = self.block_edits.get(&position).cloned().unwrap_or_default();
             let saved_source = self.world.saved_chunk_source(position);
@@ -31446,6 +31475,81 @@ pub(crate) mod tests {
         )
         .status = Some("minecraft:full".into());
         assert!(session.verify_generation_terrain_stage(&stage).is_err());
+    }
+
+    #[test]
+    fn staged_generation_terrain_identifies_pending_work_for_retry() {
+        let (mut source, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut chunk = source.chunks[&home].as_ref().clone();
+        chunk.position = neighbor;
+        source.chunks.insert(neighbor, Arc::new(chunk));
+        let source = Arc::new(source);
+        let mut session = LoadedSession::new(
+            source.as_ref().clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.queue_loaded_chunk(neighbor, source.as_ref().clone());
+        let error = session
+            .capture_generation_terrain_stage_draft(Arc::clone(&source), [neighbor])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<GenerationTerrainPending>(),
+            Some(&GenerationTerrainPending::Chunk(neighbor))
+        );
+        session.incoming.clear();
+
+        let fence = BlockPosition {
+            x: origin.x + 15,
+            y: 2,
+            z: origin.z,
+        };
+        let other = BlockPosition {
+            x: origin.x + 16,
+            ..fence
+        };
+        session
+            .pending_fence_updates
+            .insert(neighbor, BTreeSet::from([(fence, other)]));
+        let error = session
+            .capture_generation_terrain_stage_draft(Arc::clone(&source), [home])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<GenerationTerrainPending>(),
+            Some(&GenerationTerrainPending::ReadyShape(home))
+        );
+
+        Arc::make_mut(&mut session.world).chunks.remove(&neighbor);
+        session.queue_loaded_chunk(neighbor, source.as_ref().clone());
+        let error = session
+            .capture_generation_terrain_stage_draft(Arc::clone(&source), [home])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<GenerationTerrainPending>(),
+            Some(&GenerationTerrainPending::ShapeDependencyStreaming(
+                neighbor
+            ))
+        );
+        session.incoming.clear();
+        session
+            .capture_generation_terrain_stage(Arc::clone(&source), [home])
+            .unwrap();
     }
 
     #[test]

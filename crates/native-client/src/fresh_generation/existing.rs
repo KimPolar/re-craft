@@ -91,7 +91,6 @@ impl KnownEntityIds {
 struct ResumedFarmEnvironment<'a> {
     biome: &'a ResourceId,
     moon: Option<&'a native_resources::moon_phase::Environment>,
-    clocks: &'a BTreeMap<ResourceId, i64>,
     structures: Option<BTreeSet<ResourceId>>,
     resolve_structures: &'a mut dyn FnMut() -> Result<BTreeSet<ResourceId>>,
 }
@@ -111,8 +110,8 @@ impl native_resources::animal_variants::SpawnVariantEnvironment for ResumedFarmE
             .has_biome_layer
             .then(|| format!("{}:{}", self.biome.namespace, self.biome.path));
         Ok(moon
-            .sample(biome.as_deref(), |id| self.clocks.get(id).copied())
-            .context("moon phase or world clock unavailable")?
+            .sample_static(biome.as_deref())
+            .context("static moon phase environment unavailable")?
             .index() as u8)
     }
     fn structures_with_piece(&mut self) -> Result<&BTreeSet<ResourceId>> {
@@ -4695,14 +4694,13 @@ impl PreparedExistingGenerator {
         let probability_biome = biomes.noise_biome_at_block(x, y, z)?.clone();
         if self.creature_environment.is_none() {
             let categories = self.resources.vanilla_entity_category_registry()?;
-            let environment = native_resources::creature_timeline::CreatureSpawnEnvironment::from_definition_with_registry(&mut self.resources, &self.dimension_definition, &categories)?;
+            let environment = native_resources::creature_timeline::CreatureSpawnEnvironment::from_static_definition_with_registry(&self.dimension_definition, &categories)?;
             self.creature_environment = Some((environment, categories));
         }
         let (environment, categories) = self
             .creature_environment
             .as_ref()
             .expect("creature environment initialized");
-        let layers = environment.sample_layers(|id| clocks.get(id).copied())?;
         let spawn = native_resources::mob_spawns::load_biome_spawn_attributes(
             &mut self.resources,
             &spawn_biome,
@@ -4719,7 +4717,7 @@ impl PreparedExistingGenerator {
             environment.dimension_attributes(),
             &spawn,
             &probability,
-            &layers,
+            &[],
             |id| categories.is_misc(id),
         )?;
         let planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
@@ -5473,7 +5471,6 @@ impl PreparedExistingGenerator {
         );
         self.finalize_creature(
             plan,
-            clocks,
             border,
             &context.biomes,
             CreatureStructureContext::Resumed(world),
@@ -5498,7 +5495,6 @@ impl PreparedExistingGenerator {
         self.validate_captured_spawn(batch, light, plan.inner.position)?;
         self.finalize_creature(
             &mut plan.inner,
-            clocks,
             border,
             &batch.biomes,
             CreatureStructureContext::Captured(batch),
@@ -5508,7 +5504,6 @@ impl PreparedExistingGenerator {
     fn finalize_creature(
         &mut self,
         plan: &mut ResumedCreaturePlan,
-        clocks: &BTreeMap<ResourceId, i64>,
         border: native_session::respawn::RespawnBorder,
         biomes: &native_session::worldgen::BiomeNeighborhood,
         structures: CreatureStructureContext<'_>,
@@ -5561,10 +5556,12 @@ impl PreparedExistingGenerator {
                 .expect("farm variants initialized");
             let needs_moon = variants.uses_moon_conditions();
             if needs_moon && self.farm_moon.is_none() {
-                self.farm_moon = Some(native_resources::moon_phase::Environment::from_definition(
-                    &mut self.resources,
-                    &self.dimension_definition,
-                )?);
+                self.farm_moon = Some(
+                    native_resources::moon_phase::Environment::from_static_definition(
+                        &mut self.resources,
+                        &self.dimension_definition,
+                    )?,
+                );
             }
         }
         let probe = plan.probe.as_mut().context("creature probe missing")?;
@@ -5622,7 +5619,6 @@ impl PreparedExistingGenerator {
                     let mut environment = ResumedFarmEnvironment {
                         biome,
                         moon: moon.as_ref(),
-                        clocks,
                         structures: None,
                         resolve_structures: &mut resolve_structures,
                     };
@@ -11457,6 +11453,7 @@ mod tests {
         let probability_biome = batch.biomes.noise_biome_at_block(x, y, z)?.clone();
         let (environment, categories) = actual.creature_environment.as_ref().unwrap();
         let layers = environment.sample_layers(|id| clocks.get(id).copied())?;
+        assert!(layers.is_empty());
         let spawn = native_resources::mob_spawns::load_biome_spawn_attributes(
             &mut actual.resources,
             &spawn_biome,
@@ -17210,7 +17207,6 @@ mod tests {
             let mut environment = ResumedFarmEnvironment {
                 biome: &biome,
                 moon: None,
-                clocks: &clocks,
                 structures: None,
                 resolve_structures: &mut resolve,
             };

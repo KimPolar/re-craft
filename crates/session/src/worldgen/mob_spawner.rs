@@ -12,10 +12,7 @@ use native_resources::{
 };
 use native_world::loaded::ChunkPos;
 use native_world::movement::BoundingBox;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
 use super::{
     FreshTerrainBatch, GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
@@ -104,10 +101,7 @@ pub struct GeneratedSheepSpawner {
     pose: Option<GeneratedCreaturePose>,
     construction: Option<FreshCreatureConstruction>,
     farm_variants: [Option<Arc<FarmAnimalSpawnVariants>>; 3],
-    farm_moon: Option<(
-        Arc<native_resources::moon_phase::Environment>,
-        Arc<BTreeMap<native_resources::packs::ResourceId, i64>>,
-    )>,
+    farm_moon: Option<Arc<native_resources::moon_phase::Environment>>,
     additions: Vec<super::GeneratedEntityAddition>,
     #[cfg(test)]
     rule_light: Option<(
@@ -123,52 +117,26 @@ impl GeneratedSheepSpawner {
         provider: &mut impl native_resources::packs::ResourceProvider,
         center: ChunkPos,
         environment: &native_resources::creature_timeline::CreatureSpawnEnvironment,
-        clock_ticks: impl FnMut(&native_resources::packs::ResourceId) -> Option<i64>,
         registry: &native_resources::entity_category::EntityCategoryRegistry,
         inputs: SheepSpawnInputs<'_>,
     ) -> Result<Self> {
-        Self::from_timed_environment(
-            batch,
-            provider,
-            center,
-            environment,
-            clock_ticks,
-            |id| registry.is_misc(id),
-            inputs,
-        )
-    }
-
-    /// Load the dimension's already-resolved timeline definitions using the
-    /// supplied world clock values before starting this spawn operation.
-    pub fn from_timed_environment(
-        batch: &FreshTerrainBatch,
-        provider: &mut impl native_resources::packs::ResourceProvider,
-        center: ChunkPos,
-        environment: &native_resources::creature_timeline::CreatureSpawnEnvironment,
-        clock_ticks: impl FnMut(&native_resources::packs::ResourceId) -> Option<i64>,
-        entity_is_misc: impl FnMut(&native_resources::packs::ResourceId) -> Option<bool>,
-        inputs: SheepSpawnInputs<'_>,
-    ) -> Result<Self> {
-        let later_layers = environment.sample_layers(clock_ticks)?;
         Self::from_environment(
             batch,
             provider,
             center,
             environment.dimension_attributes(),
-            &later_layers,
-            entity_is_misc,
+            |id| registry.is_misc(id),
             inputs,
         )
     }
 
     /// Resolve the biome-dependent attributes before creating the spawn job.
-    /// The caller supplies dimension and already-sampled later layers.
+    /// World generation uses static dimension and biome layers only.
     pub fn from_environment(
         batch: &FreshTerrainBatch,
         provider: &mut impl native_resources::packs::ResourceProvider,
         center: ChunkPos,
         dimension_attributes: &serde_json::Value,
-        later_layers: &[serde_json::Value],
         entity_is_misc: impl FnMut(&native_resources::packs::ResourceId) -> Option<bool>,
         inputs: SheepSpawnInputs<'_>,
     ) -> Result<Self> {
@@ -176,7 +144,7 @@ impl GeneratedSheepSpawner {
             provider,
             center,
             dimension_attributes,
-            later_layers,
+            &[],
             entity_is_misc,
         )?;
         Self::new(batch, center, settings.probability, settings.spawns, inputs)
@@ -270,11 +238,10 @@ impl GeneratedSheepSpawner {
         Ok(())
     }
 
-    /// Use the same immutable dimension environment and clocks as generation.
+    /// Use the static dimension and biome environment for world generation.
     pub fn set_farm_moon_environment(
         &mut self,
         moon: Arc<native_resources::moon_phase::Environment>,
-        clocks: Arc<BTreeMap<native_resources::packs::ResourceId, i64>>,
     ) -> Result<()> {
         ensure!(
             matches!(self.stage, Stage::Begin),
@@ -284,7 +251,7 @@ impl GeneratedSheepSpawner {
             self.farm_moon.is_none(),
             "farm moon environment is already set"
         );
-        self.farm_moon = Some((moon, clocks));
+        self.farm_moon = Some(moon);
         Ok(())
     }
 
@@ -412,9 +379,7 @@ impl GeneratedSheepSpawner {
                         &mut self.group,
                         construction.uuid,
                         construction.chicken_egg_time,
-                        self.farm_moon
-                            .as_ref()
-                            .map(|(moon, clocks)| (moon.as_ref(), clocks.as_ref())),
+                        self.farm_moon.as_deref(),
                     )?
                 } else {
                     probe.prepare_fresh_sheep(

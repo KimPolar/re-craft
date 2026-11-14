@@ -4532,21 +4532,20 @@ fn generation_step(
                     };
                     Ok(hut
                         .moon
-                        .sample(biome.as_deref(), |id| hut.clocks.get(id).copied())
-                        .context("moon phase environment or world clock unavailable")?
+                        .sample_static(biome.as_deref())
+                        .context("static moon phase environment unavailable")?
                         .index() as u8)
                 },
                 &mut minecart_uuid,
             )
         } else {
-            batch.step_with_hut_clocks(
+            batch.step_with_hut_static_environment(
                 provider,
                 classify,
                 resolve,
                 &hut.variants,
                 &hut.conditions,
                 &hut.moon,
-                &hut.clocks,
             )
         }
     } else {

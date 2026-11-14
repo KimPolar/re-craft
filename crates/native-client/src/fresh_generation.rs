@@ -445,7 +445,7 @@ impl InitialClockCommandData {
 }
 
 /// All inputs for world-generation creatures, resolved from the same active
-/// pack stack and world clock state used by the generation batch.
+/// pack stack used by the generation batch.
 pub struct PreparedCreatureSpawning {
     environment: native_resources::creature_timeline::CreatureSpawnEnvironment,
     categories: native_resources::entity_category::EntityCategoryRegistry,
@@ -455,7 +455,6 @@ pub struct PreparedCreatureSpawning {
     biome_tags: native_resources::worldgen_region_random::SheepBiomeTags,
     variants: [Arc<native_resources::animal_variants::FarmAnimalSpawnVariants>; 3],
     border: native_session::respawn::RespawnBorder,
-    clocks: Arc<BTreeMap<ResourceId, i64>>,
     moon: Option<Arc<native_resources::moon_phase::Environment>>,
     has_ceiling: bool,
 }
@@ -467,7 +466,6 @@ impl PreparedCreatureSpawning {
         resources: &mut ResourceStack,
         definition: &Value,
         border: native_session::respawn::RespawnBorder,
-        clocks: BTreeMap<ResourceId, i64>,
     ) -> Result<Self> {
         use anyhow::Context;
         use native_resources::animal_variants::{FarmAnimal, FarmAnimalSpawnVariants};
@@ -486,12 +484,10 @@ impl PreparedCreatureSpawning {
             .context("dimension has_ceiling is missing or invalid")?;
         let categories = resources.vanilla_entity_category_registry()?;
         let environment =
-            native_resources::creature_timeline::CreatureSpawnEnvironment::from_definition_with_registry(
-                resources,
+            native_resources::creature_timeline::CreatureSpawnEnvironment::from_static_definition_with_registry(
                 definition,
                 &categories,
             )?;
-        environment.sample_layers(|id| clocks.get(id).copied())?;
         let blocks = resources.vanilla_block_ids()?;
         let prevent_inside =
             native_resources::mob_spawns::load_prevent_mob_spawning_inside(resources, &blocks)?;
@@ -518,8 +514,10 @@ impl PreparedCreatureSpawning {
             .iter()
             .any(|variant| variant.uses_moon_conditions())
             .then(|| {
-                native_resources::moon_phase::Environment::from_definition(resources, definition)
-                    .map(Arc::new)
+                native_resources::moon_phase::Environment::from_static_definition(
+                    resources, definition,
+                )
+                .map(Arc::new)
             })
             .transpose()?;
         Ok(Self {
@@ -531,7 +529,6 @@ impl PreparedCreatureSpawning {
             biome_tags,
             variants,
             border,
-            clocks: Arc::new(clocks),
             moon,
             has_ceiling,
         })
@@ -557,7 +554,6 @@ impl PreparedCreatureSpawning {
             resources,
             pos,
             &self.environment,
-            |id| self.clocks.get(id).copied(),
             &self.categories,
             inputs,
         )?;
@@ -565,7 +561,7 @@ impl PreparedCreatureSpawning {
             driver.enable_farm_animal(Arc::clone(variants))?;
         }
         if let Some(moon) = &self.moon {
-            driver.set_farm_moon_environment(Arc::clone(moon), Arc::clone(&self.clocks))?;
+            driver.set_farm_moon_environment(Arc::clone(moon))?;
         }
         Ok(driver)
     }
@@ -595,7 +591,7 @@ pub(crate) fn structured_initial_context(
         .map(|id| (id, 0))
         .collect();
     let clocks = Arc::new(InitialWorldClocks {
-        ticks: ticks.clone(),
+        ticks,
         advance_time,
         spawn_mobs,
         command_data: InitialClockCommandData::load(resources, &lighting, &definition),
@@ -613,7 +609,6 @@ pub(crate) fn structured_initial_context(
             resources,
             &definition,
             border,
-            ticks,
         )?)
     } else {
         None
@@ -652,7 +647,7 @@ impl PreparedFreshGeneration {
         advance_time: bool,
     ) -> Result<PreparedInitialWorld> {
         let initial_clocks = Arc::new(InitialWorldClocks {
-            ticks: clocks.clone(),
+            ticks: clocks,
             advance_time,
             spawn_mobs,
             command_data: InitialClockCommandData::load(
@@ -677,7 +672,6 @@ impl PreparedFreshGeneration {
                 &mut self.resources,
                 &self.dimension_definition,
                 border,
-                clocks,
             )?)
         } else {
             None
@@ -1027,11 +1021,6 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let mut resources = ResourceStack::open(&game)?;
-        let clocks: BTreeMap<ResourceId, i64> =
-            native_resources::world_clock::registered_clocks(&mut resources)?
-                .into_iter()
-                .map(|id| (id, 0_i64))
-                .collect();
         for (dimension, ceiling) in [
             ("minecraft:overworld", false),
             ("minecraft:the_nether", true),
@@ -1047,12 +1036,7 @@ mod tests {
                 min_z: -29_999_984.0,
                 max_z: 29_999_984.0,
             };
-            let inputs = PreparedCreatureSpawning::load(
-                &mut resources,
-                &definition,
-                border,
-                clocks.clone(),
-            )?;
+            let inputs = PreparedCreatureSpawning::load(&mut resources, &definition, border)?;
             assert_eq!(inputs.has_ceiling, ceiling);
             assert!(!inputs.prevent_inside.is_empty());
             assert_eq!(
@@ -1312,8 +1296,7 @@ mod tests {
             creatures.environment.dimension_attributes()["minecraft:gameplay/creature_world_gen_spawn_probability"],
             json!(0.31)
         );
-        assert_eq!(creatures.environment.sample_layers(|_| Some(0))?.len(), 1);
-        assert!(creatures.environment.sample_layers(|_| None).is_err());
+        assert!(creatures.environment.sample_layers(|_| None)?.is_empty());
         let initial = &inputs.initial_clocks;
         assert_eq!(
             initial

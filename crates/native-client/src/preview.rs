@@ -3497,10 +3497,6 @@ mod tests {
                             "minecraft:normal",
                             "minecraft:overworld",
                         )?;
-                    let clocks = native_resources::world_clock::registered_clocks(&mut resources)?
-                        .into_iter()
-                        .map(|id| (id, 0))
-                        .collect();
                     let border = native_session::respawn::RespawnBorder {
                         min_x: -100.0,
                         max_x: 100.0,
@@ -3511,7 +3507,6 @@ mod tests {
                         &mut resources,
                         &definition,
                         border,
-                        clocks,
                     )?;
                     Ok((resources, classify, resolve, spawn))
                 })

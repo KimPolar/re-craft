@@ -66,10 +66,7 @@ struct FarmAnimalEnvironment<'a> {
     batch: &'a FreshTerrainBatch,
     position: [i32; 3],
     biome: &'a ResourceId,
-    moon: Option<(
-        &'a native_resources::moon_phase::Environment,
-        &'a BTreeMap<ResourceId, i64>,
-    )>,
+    moon: Option<&'a native_resources::moon_phase::Environment>,
     structures: Option<BTreeSet<ResourceId>>,
 }
 
@@ -79,13 +76,13 @@ impl native_resources::animal_variants::SpawnVariantEnvironment for FarmAnimalEn
     }
 
     fn moon_phase(&mut self) -> Result<u8> {
-        let (moon, clocks) = self.moon.context("moon phase environment unavailable")?;
+        let moon = self.moon.context("moon phase environment unavailable")?;
         let biome = moon
             .has_biome_layer
             .then(|| format!("{}:{}", self.biome.namespace, self.biome.path));
         Ok(moon
-            .sample(biome.as_deref(), |id| clocks.get(id).copied())
-            .context("moon phase environment or world clock unavailable")?
+            .sample_static(biome.as_deref())
+            .context("static moon phase environment unavailable")?
             .index() as u8)
     }
 
@@ -1675,10 +1672,7 @@ impl FreshTerrainBatch {
         random: &mut native_resources::worldgen_region_random::RegionRandom,
         group: &mut native_resources::worldgen_region_random::AnimalGroupData,
         has_follow_range_bonus: bool,
-        moon: Option<(
-            &native_resources::moon_phase::Environment,
-            &BTreeMap<ResourceId, i64>,
-        )>,
+        moon: Option<&native_resources::moon_phase::Environment>,
     ) -> Result<native_resources::animal_variants::FarmAnimalInitialization> {
         ensure!(
             self.is_complete(),
@@ -4993,9 +4987,8 @@ impl FreshTerrainBatch {
         )
     }
 
-    /// Evaluate moon phase at the actual spawn position using the active
-    /// dimension, biome attributes, timelines and world-clock state supplied
-    /// by the caller. The callback runs only for moon-dependent selectors.
+    /// Evaluate the world's static moon phase at the actual spawn position.
+    /// The callback runs only for moon-dependent selectors.
     /// Missing inputs must return an error, rather than a guessed phase.
     pub fn step_with_hut_environment(
         &mut self,
@@ -5014,10 +5007,9 @@ impl FreshTerrainBatch {
         self.step_inner(provider, classify, resolve, Some(&mut runner), None)
     }
 
-    /// Evaluate the active moon-phase environment against a snapshot of the
-    /// actual world clocks and the generated biome at each cat spawn position.
+    /// Evaluate the static dimension and biome layers at each cat spawn position.
     #[allow(clippy::too_many_arguments)]
-    pub fn step_with_hut_clocks(
+    pub fn step_with_hut_static_environment(
         &mut self,
         provider: &mut impl ResourceProvider,
         classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
@@ -5025,7 +5017,6 @@ impl FreshTerrainBatch {
         variants: &native_resources::cat_variants::CatSpawnVariants,
         conditions: &native_resources::cat_variants::CatWorldConditions,
         moon: &native_resources::moon_phase::Environment,
-        clocks: &BTreeMap<ResourceId, i64>,
     ) -> Result<Option<(ChunkPos, GenerationStage)>> {
         self.step_with_hut_environment(
             provider,
@@ -5041,8 +5032,8 @@ impl FreshTerrainBatch {
                     None
                 };
                 let phase = moon
-                    .sample(biome.as_deref(), |id| clocks.get(id).copied())
-                    .context("moon phase environment or world clock unavailable")?;
+                    .sample_static(biome.as_deref())
+                    .context("static moon phase environment unavailable")?;
                 Ok(phase.index() as u8)
             },
         )

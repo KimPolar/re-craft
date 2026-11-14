@@ -635,10 +635,7 @@ impl GeneratedCreatureProbe {
         group: &mut native_resources::worldgen_region_random::AnimalGroupData,
         uuid: [i32; 4],
         chicken_egg_time: Option<i32>,
-        moon: Option<(
-            &native_resources::moon_phase::Environment,
-            &std::collections::BTreeMap<native_resources::packs::ResourceId, i64>,
-        )>,
+        moon: Option<&native_resources::moon_phase::Environment>,
     ) -> Result<super::GeneratedEntityAddition> {
         self.prepare_farm_animal_with(
             planner,
@@ -656,7 +653,7 @@ impl GeneratedCreatureProbe {
     }
 
     /// Prepare a farm animal against a caller-verified saved-world context.
-    /// The environment must resolve the actual biome, clock and structures.
+    /// The environment must resolve the actual biome, static moon and structures.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_farm_animal_in_environment(
         &mut self,

@@ -222,6 +222,33 @@ impl Environment {
         provider: &mut impl ResourceProvider,
         definition: &Value,
     ) -> Result<Self> {
+        let mut environment = Self::from_static_definition(provider, definition)?;
+        for timeline in
+            crate::fluid_environment::dimension_timelines_from_definition(provider, definition)?
+        {
+            let tracks = timeline
+                .get("tracks")
+                .and_then(Value::as_object)
+                .context("invalid timeline tracks")?;
+            let mut found = false;
+            for (name, value) in tracks {
+                let id = ResourceId::parse(name)?;
+                if id.namespace == "minecraft" && id.path == "visual/moon_phase" {
+                    ensure!(!found, "duplicate moon phase track");
+                    found = true;
+                    environment.tracks.push(Track::parse(&timeline, value)?);
+                }
+            }
+        }
+        Ok(environment)
+    }
+
+    /// WorldGenRegion's attributes contain dimension and biome layers only;
+    /// referenced timelines are not sampled or loaded for this context.
+    pub fn from_static_definition(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+    ) -> Result<Self> {
         ensure!(definition.is_object(), "dimension type must be an object");
         let base = moon_attribute(definition.get("attributes"))?
             .map(layer)
@@ -253,24 +280,16 @@ impl Environment {
                 Some(layer_value),
             );
         }
-        for timeline in
-            crate::fluid_environment::dimension_timelines_from_definition(provider, definition)?
-        {
-            let tracks = timeline
-                .get("tracks")
-                .and_then(Value::as_object)
-                .context("invalid timeline tracks")?;
-            let mut found = false;
-            for (name, value) in tracks {
-                let id = ResourceId::parse(name)?;
-                if id.namespace == "minecraft" && id.path == "visual/moon_phase" {
-                    ensure!(!found, "duplicate moon phase track");
-                    found = true;
-                    environment.tracks.push(Track::parse(&timeline, value)?);
-                }
-            }
-        }
         Ok(environment)
+    }
+
+    /// Resolve only the layers present in a world-generation region.
+    pub fn sample_static(&self, biome: Option<&str>) -> Option<Phase> {
+        let mut value = self.base;
+        if self.has_biome_layer {
+            value = self.biomes.get(biome?)?.as_ref()?.unwrap_or(value);
+        }
+        Some(value)
     }
 
     pub fn sample(
@@ -278,10 +297,7 @@ impl Environment {
         biome: Option<&str>,
         mut clock: impl FnMut(&ResourceId) -> Option<i64>,
     ) -> Option<Phase> {
-        let mut value = self.base;
-        if self.has_biome_layer {
-            value = self.biomes.get(biome?)?.as_ref()?.unwrap_or(value);
-        }
+        let mut value = self.sample_static(biome)?;
         for track in &self.tracks {
             value = track.sample(&mut clock)?;
         }
@@ -359,6 +375,14 @@ mod tests {
         assert_eq!(environment.sample(Some("example:unknown"), |_| None), None);
         let environment = Environment::load(&mut Data { timeline: true }, "example:world").unwrap();
         assert_eq!(
+            environment.sample_static(Some("example:plains")),
+            Some(Phase::ThirdQuarter)
+        );
+        assert_eq!(
+            environment.sample_static(Some("example:desert")),
+            Some(Phase::NewMoon)
+        );
+        assert_eq!(
             environment.sample(Some("example:plains"), |_| Some(0)),
             Some(Phase::FullMoon)
         );
@@ -371,6 +395,20 @@ mod tests {
             Some(Phase::NewMoon)
         );
         assert_eq!(environment.sample(Some("example:plains"), |_| None), None);
+
+        let definition =
+            json!({"attributes":{"visual/moon_phase":"new_moon"}, "timelines":["example:missing"]});
+        let static_environment =
+            Environment::from_static_definition(&mut Data { timeline: true }, &definition).unwrap();
+        assert_eq!(
+            static_environment.sample_static(Some("example:plains")),
+            Some(Phase::ThirdQuarter)
+        );
+        assert_eq!(
+            static_environment.sample_static(Some("example:desert")),
+            Some(Phase::NewMoon)
+        );
+        assert!(Environment::from_definition(&mut Data { timeline: true }, &definition).is_err());
     }
 
     #[test]

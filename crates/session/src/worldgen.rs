@@ -5901,20 +5901,24 @@ mod tests {
                     .is_err()
             );
             assert_eq!(random.next_long(), original.next_long());
-            for (ticks, expected) in [(0, "minecraft:moon"), (10, "minecraft:temperate")] {
-                let clocks = BTreeMap::from([(ResourceId::parse("example:clock").unwrap(), ticks)]);
-                let actual = batch
-                    .initialize_farm_animal_with_moon(
-                        position,
-                        &conditional,
-                        &mut random,
-                        &mut group,
-                        false,
-                        Some((&moon, &clocks)),
-                    )
-                    .unwrap();
-                assert_eq!(actual.variant, Some(ResourceId::parse(expected).unwrap()));
-            }
+            assert_eq!(
+                moon.sample(None, |_| Some(0)),
+                Some(native_resources::moon_phase::Phase::FullMoon)
+            );
+            let actual = batch
+                .initialize_farm_animal_with_moon(
+                    position,
+                    &conditional,
+                    &mut random,
+                    &mut group,
+                    false,
+                    Some(&moon),
+                )
+                .unwrap();
+            assert_eq!(
+                actual.variant,
+                Some(ResourceId::parse("minecraft:temperate").unwrap())
+            );
             let saved = || GeneratedEntityAddition {
                 block_position: position,
                 record: GeneratedEntityRecord::Saved(native_persistence::nbt::Tag::Compound(vec![
@@ -6273,11 +6277,13 @@ mod tests {
                 self.base.list_data(folder)
             }
         }
+        let mut static_attributes = attributes.clone();
+        static_attributes["gameplay/creature_world_gen_spawn_probability"] = json!(probability);
         let mut timed = TimedData {
             base: &mut data,
-            dimension: json!({"attributes":attributes,"timelines":["example:test"]}),
+            dimension: json!({"attributes":static_attributes,"timelines":["example:test"]}),
             timeline: json!({"clock":"example:clock","period_ticks":20,"tracks":{
-                "gameplay/creature_world_gen_spawn_probability":{"keyframes":[{"ticks":0,"value":probability}]}
+                "gameplay/creature_world_gen_spawn_probability":{"keyframes":[{"ticks":0,"value":0.0}]}
             }}),
         };
         let categories = resources.vanilla_entity_category_registry().unwrap();
@@ -6288,24 +6294,12 @@ mod tests {
                 &categories,
             )
             .unwrap();
-        assert!(
-            GeneratedSheepSpawner::from_verified_environment(
-                &batch,
-                &mut timed,
-                center,
-                &environment,
-                |_| None,
-                &categories,
-                inputs,
-            )
-            .is_err()
-        );
+        assert!(environment.sample_layers(|_| None).is_err());
         let mut driver = GeneratedSheepSpawner::from_verified_environment(
             &batch,
             &mut timed,
             center,
             &environment,
-            |_| Some(7),
             &categories,
             inputs,
         )
@@ -9204,14 +9198,13 @@ mod tests {
                 }
             }
         }
-        for (fail_mob, native_conditions, predicate, phase, fail_clock, expected_variant) in [
-            (false, false, "structure", 0, false, "example:structure_cat"),
-            (true, false, "structure", 0, false, "example:structure_cat"),
-            (false, true, "structure", 0, false, "example:structure_cat"),
-            (false, true, "biome", 0, false, "example:structure_cat"),
-            (false, true, "moon", 0, false, "example:structure_cat"),
-            (false, true, "moon", 4, false, "minecraft:black"),
-            (false, true, "moon", 0, true, "minecraft:black"),
+        for (fail_mob, native_conditions, predicate, phase, expected_variant) in [
+            (false, false, "structure", 0, "example:structure_cat"),
+            (true, false, "structure", 0, "example:structure_cat"),
+            (false, true, "structure", 0, "example:structure_cat"),
+            (false, true, "biome", 0, "example:structure_cat"),
+            (false, true, "moon", 0, "example:structure_cat"),
+            (false, true, "moon", 4, "minecraft:black"),
         ] {
             let mut data = HutData { predicate };
             let mut config = definition();
@@ -9315,18 +9308,17 @@ mod tests {
             let conditions = variants.prepare_world_conditions(&mut data).unwrap();
             let moon = native_resources::moon_phase::Environment {
                 base: native_resources::moon_phase::Phase::FullMoon,
-                biomes: BTreeMap::from([("minecraft:plains".into(), Some(Some(native_resources::moon_phase::Phase::ThirdQuarter)))]),
+                biomes: BTreeMap::from([("minecraft:plains".into(), Some(Some(if phase == 4 { native_resources::moon_phase::Phase::NewMoon } else { native_resources::moon_phase::Phase::FullMoon })))]),
                 has_biome_layer: true,
-                tracks: vec![native_resources::moon_phase::Track::parse(&json!({"clock":"example:clock", "period_ticks":20}), &json!({"keyframes":[{"ticks":0,"value":"full_moon"},{"ticks":10,"value":"new_moon"}]})).unwrap()],
+                tracks: vec![native_resources::moon_phase::Track::parse(&json!({"clock":"example:clock", "period_ticks":20}), &json!({"keyframes":[{"ticks":0,"value":"new_moon"},{"ticks":10,"value":"full_moon"}]})).unwrap()],
             };
-            let clocks = if fail_clock {
-                BTreeMap::new()
-            } else {
-                BTreeMap::from([(
-                    ResourceId::parse("example:clock").unwrap(),
-                    if phase == 4 { 10 } else { 0 },
-                )])
-            };
+            if predicate == "moon" {
+                let ticks = if phase == 4 { 10 } else { 0 };
+                assert_ne!(
+                    moon.sample_static(Some("minecraft:plains")),
+                    moon.sample(Some("minecraft:plains"), |_| Some(ticks))
+                );
+            }
             let mut construct = |mob| {
                 ensure!(!fail_mob, "injected mob initialization failure");
                 let (id, seed) = match mob {
@@ -9369,14 +9361,13 @@ mod tests {
                     })
                 };
                 let result = if native_conditions && predicate == "moon" {
-                    batch.step_with_hut_clocks(
+                    batch.step_with_hut_static_environment(
                         &mut data,
                         &mut classify,
                         &mut resolve,
                         &variants,
                         &conditions,
                         &moon,
-                        &clocks,
                     )
                 } else if native_conditions {
                     batch.step_with_native_hut_support(
@@ -9401,15 +9392,10 @@ mod tests {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(error) => {
+                        assert!(fail_mob, "unexpected generation failure: {error:#}");
                         assert!(
-                            fail_mob || fail_clock,
-                            "unexpected generation failure: {error:#}"
+                            format!("{error:#}").contains("injected mob initialization failure")
                         );
-                        assert!(format!("{error:#}").contains(if fail_mob {
-                            "injected mob initialization failure"
-                        } else {
-                            "moon phase environment or world clock unavailable"
-                        }));
                         assert!(Arc::ptr_eq(&previous.unwrap(), &batch.snapshot().unwrap()));
                         assert!(batch.structure_starts(target).is_none());
                         saw_failure = true;
@@ -9417,7 +9403,7 @@ mod tests {
                     }
                 }
             }
-            if fail_mob || fail_clock {
+            if fail_mob {
                 assert!(saw_failure);
                 continue;
             }

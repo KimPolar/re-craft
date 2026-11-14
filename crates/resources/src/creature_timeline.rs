@@ -19,6 +19,43 @@ pub struct CreatureSpawnEnvironment {
 }
 
 impl CreatureSpawnEnvironment {
+    /// WorldGenRegion uses only static dimension and biome layers. In
+    /// particular, its creature settings must not read timeline clocks.
+    pub fn from_static_definition_with_registry(
+        definition: &Value,
+        registry: &crate::entity_category::EntityCategoryRegistry,
+    ) -> Result<Self> {
+        Self::from_static_definition(definition, |id| registry.is_misc(id))
+    }
+
+    pub fn from_static_definition(
+        definition: &Value,
+        mut entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
+    ) -> Result<Self> {
+        let object = definition
+            .as_object()
+            .context("dimension type must be an object")?;
+        let dimension_attributes = object
+            .get("attributes")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        ensure!(
+            dimension_attributes.is_object(),
+            "dimension attributes must be an object"
+        );
+        resolve_creature_spawns(
+            &dimension_attributes,
+            &json!({}),
+            &json!({}),
+            &[],
+            &mut entity_is_misc,
+        )?;
+        Ok(Self {
+            dimension_attributes,
+            tracks: Vec::new(),
+        })
+    }
+
     /// Decode against categories read from the verified client registration.
     pub fn load_with_registry(
         provider: &mut impl ResourceProvider,
@@ -58,24 +95,7 @@ impl CreatureSpawnEnvironment {
         definition: &Value,
         mut entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
     ) -> Result<Self> {
-        let object = definition
-            .as_object()
-            .context("dimension type must be an object")?;
-        let dimension_attributes = object
-            .get("attributes")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        ensure!(
-            dimension_attributes.is_object(),
-            "dimension attributes must be an object"
-        );
-        resolve_creature_spawns(
-            &dimension_attributes,
-            &json!({}),
-            &json!({}),
-            &[],
-            &mut entity_is_misc,
-        )?;
+        let mut environment = Self::from_static_definition(definition, &mut entity_is_misc)?;
         let mut tracks = Vec::new();
         for timeline in dimension_timelines_from_definition(provider, definition)? {
             let values = timeline
@@ -97,10 +117,8 @@ impl CreatureSpawnEnvironment {
                 tracks.push(Track::parse(&timeline, value, kind, &mut entity_is_misc)?);
             }
         }
-        Ok(Self {
-            dimension_attributes,
-            tracks,
-        })
+        environment.tracks = tracks;
+        Ok(environment)
     }
 
     pub fn dimension_attributes(&self) -> &Value {
@@ -380,5 +398,50 @@ impl Easing {
                 sample(y, t)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoTimeline;
+
+    impl ResourceProvider for NoTimeline {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn worldgen_creature_settings_do_not_load_or_sample_timelines() {
+        let definition = json!({
+            "attributes": {"gameplay/creature_world_gen_spawn_probability": 0.35},
+            "timelines": ["example:missing"]
+        });
+        let environment = CreatureSpawnEnvironment::from_static_definition(&definition, |_| None)
+            .expect("static worldgen layers must not require timeline resources");
+        assert!(environment.sample_layers(|_| None).unwrap().is_empty());
+        let settings = resolve_creature_spawns(
+            environment.dimension_attributes(),
+            &json!({}),
+            &json!({}),
+            &[],
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(settings.probability, 0.35_f32);
+        assert!(
+            CreatureSpawnEnvironment::from_definition(&mut NoTimeline, &definition, |_| None)
+                .is_err()
+        );
     }
 }

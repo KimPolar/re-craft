@@ -45,6 +45,29 @@ fn same_optional_nbt(
     }
 }
 
+/// Section palettes may be encoded differently after a Java save. Compare the
+/// remaining fields without silently discarding unknown chunk metadata.
+fn chunk_metadata(value: &native_persistence::nbt::Tag) -> Option<native_persistence::nbt::Tag> {
+    use native_persistence::nbt::Tag;
+    match value {
+        Tag::Compound(entries) => Some(Tag::Compound(
+            entries
+                .iter()
+                .filter(|(name, _)| !name.matches("sections"))
+                .cloned()
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+fn same_chunk_metadata(a: &native_persistence::nbt::Tag, b: &native_persistence::nbt::Tag) -> bool {
+    match (chunk_metadata(a), chunk_metadata(b)) {
+        (Some(a), Some(b)) => same_nbt(&a, &b),
+        _ => false,
+    }
+}
+
 #[test]
 fn nbt_comparison_ignores_only_compound_key_order() {
     use native_persistence::nbt::{Tag, TagType};
@@ -89,6 +112,17 @@ fn nbt_comparison_ignores_only_compound_key_order() {
     assert!(same_optional_nbt(None, None));
     assert!(!same_optional_nbt(Some(&a), None));
     assert!(same_optional_nbt(Some(&a), Some(&reversed)));
+    let with_sections = Tag::Compound(vec![
+        ("sections".into(), Tag::Int(1)),
+        ("future_field".into(), Tag::Long(42)),
+    ]);
+    let reencoded_sections = Tag::Compound(vec![
+        ("sections".into(), Tag::Int(2)),
+        ("future_field".into(), Tag::Long(42)),
+    ]);
+    let lost_field = Tag::Compound(vec![("sections".into(), Tag::Int(2))]);
+    assert!(same_chunk_metadata(&with_sections, &reencoded_sections));
+    assert!(!same_chunk_metadata(&with_sections, &lost_field));
 }
 
 /// Enumerate actual region entries instead of assuming the requested chunks
@@ -685,6 +719,16 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             .read_chunk(position.x, position.z)?
             .with_context(|| format!("rewritten chunk {position:?} missing"))?;
         assert_eq!(before.status, after.status, "chunk {position:?}");
+        assert_eq!(
+            before.document.name, after.document.name,
+            "chunk {position:?} NBT name"
+        );
+        assert!(
+            same_chunk_metadata(&before.document.value, &after.document.value),
+            "chunk {position:?} metadata differs between staging and Java round-trip: {:?} / {:?}",
+            chunk_metadata(&before.document.value),
+            chunk_metadata(&after.document.value)
+        );
         for key in [
             "DataVersion",
             "xPos",

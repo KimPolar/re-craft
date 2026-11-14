@@ -21255,6 +21255,7 @@ impl LoadedSession {
                 air,
             };
             let mut item_path_proof = CreatedItemPathProof::new(world, origin, bounds);
+            let item_contacts_clear = std::cell::Cell::new(false);
             let rain = RainView {
                 raining: self.global_rain(),
                 origin,
@@ -21317,7 +21318,13 @@ impl LoadedSession {
                 |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
                 |pos| rain.at(pos),
                 |item_bounds, actual, requested| {
-                    fluid_view.bubble_contacts(item_bounds, actual, requested)
+                    let clear = fluid_view.known_no_item_contacts(item_bounds, actual, requested);
+                    item_contacts_clear.set(clear);
+                    if clear {
+                        Some(Vec::new())
+                    } else {
+                        fluid_view.bubble_contacts(item_bounds, actual, requested)
+                    }
                 },
                 |contact| {
                     self.unresolved_bubble_tick = true;
@@ -21333,7 +21340,11 @@ impl LoadedSession {
                     }
                 },
                 |item_bounds, actual, requested| {
-                    fluid_view.cactus_contacts(item_bounds, actual, requested)
+                    if item_contacts_clear.get() {
+                        Some(0)
+                    } else {
+                        fluid_view.cactus_contacts(item_bounds, actual, requested)
+                    }
                 },
             );
             self.tick_experience_orbs(false);
@@ -23324,6 +23335,7 @@ impl LoadedSession {
             air,
         };
         let mut item_path_proof = CreatedItemPathProof::new(world, origin, bounds);
+        let item_contacts_clear = std::cell::Cell::new(false);
         let rain = RainView {
             raining: self.global_rain(),
             origin,
@@ -23390,7 +23402,13 @@ impl LoadedSession {
             |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
             |pos| rain.at(pos),
             |item_bounds, actual, requested| {
-                fluid_view.bubble_contacts(item_bounds, actual, requested)
+                let clear = fluid_view.known_no_item_contacts(item_bounds, actual, requested);
+                item_contacts_clear.set(clear);
+                if clear {
+                    Some(Vec::new())
+                } else {
+                    fluid_view.bubble_contacts(item_bounds, actual, requested)
+                }
             },
             |contact| {
                 self.unresolved_bubble_tick = true;
@@ -23406,7 +23424,11 @@ impl LoadedSession {
                 }
             },
             |item_bounds, actual, requested| {
-                fluid_view.cactus_contacts(item_bounds, actual, requested)
+                if item_contacts_clear.get() {
+                    Some(0)
+                } else {
+                    fluid_view.cactus_contacts(item_bounds, actual, requested)
+                }
             },
         );
         update_recipe_unlocks(&mut self.inventory, &before_pickup, self.recipes.as_deref());
@@ -25964,6 +25986,61 @@ struct FluidView<'a> {
 }
 
 impl FluidView<'_> {
+    /// A shared fast path for the two item callbacks. Returning false falls
+    /// back to their separate traversals, including all unknown-cell handling.
+    fn known_no_item_contacts(&self, bounds: BoundingBox, actual: DVec3, requested: DVec3) -> bool {
+        let inset = DVec3::splat(f64::from(1.0e-5_f32));
+        if !bounds.min.is_finite()
+            || !bounds.max.is_finite()
+            || !(bounds.min + inset).cmple(bounds.max - inset).all()
+            || !actual.is_finite()
+            || !requested.is_finite()
+        {
+            return false;
+        }
+        let area = bounds.expanded_towards(actual);
+        if !area.min.is_finite()
+            || !area.max.is_finite()
+            || !area.min.cmple(area.max).all()
+            || area.min.min_element() < f64::from(i32::MIN)
+            || area.max.max_element() > f64::from(i32::MAX)
+        {
+            return false;
+        }
+        let low = area.min.floor().as_ivec3();
+        let high = area.max.floor().as_ivec3();
+        let count = (i64::from(high.x) - i64::from(low.x) + 1)
+            .checked_mul(i64::from(high.y) - i64::from(low.y) + 1)
+            .and_then(|n| n.checked_mul(i64::from(high.z) - i64::from(low.z) + 1));
+        if !count.is_some_and(|count| (1..=4096).contains(&count)) {
+            return false;
+        }
+        for x in low.x..=high.x {
+            for y in low.y..=high.y {
+                for z in low.z..=high.z {
+                    let Cell::State(id) = cell(
+                        self.world,
+                        self.origin,
+                        self.bounds,
+                        IVec3::new(x, y, z),
+                        self.air,
+                    ) else {
+                        return false;
+                    };
+                    if self.world.state(id).is_none_or(|state| {
+                        matches!(
+                            state.name.as_str(),
+                            "minecraft:bubble_column" | "minecraft:cactus"
+                        )
+                    }) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn cactus_contacts(
         &self,
         bounds: BoundingBox,
@@ -62000,6 +62077,57 @@ pub(crate) mod tests {
         assert!(session.take_consume_sounds().is_empty());
         assert_eq!(session.vitals.exhaustion, 0.0);
         assert_eq!(session.player_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn item_contact_fast_path_only_accepts_known_clear_regions() {
+        let bounds = BoundingBox {
+            min: DVec3::new(8.25, 5.0, 8.25),
+            max: DVec3::new(8.5, 5.25, 8.5),
+        };
+        for name in [
+            "minecraft:air",
+            "minecraft:cactus",
+            "minecraft:bubble_column",
+        ] {
+            let mut test = session();
+            let block = match name {
+                "minecraft:cactus" => state(name, &[("age", "0")]),
+                "minecraft:bubble_column" => state(name, &[("drag", "false")]),
+                _ => state(name, &[]),
+            };
+            let id = test.intern_block(block);
+            if name != "minecraft:air" {
+                assert!(test.set(IVec3::new(8, 5, 8), id));
+            }
+            let view = FluidView {
+                world: &test.world,
+                shapes: &test.shapes,
+                fluids: &test.fluids,
+                origin: test.origin,
+                bounds: test.bounds,
+                air: test.states[0],
+            };
+            let clear = view.known_no_item_contacts(bounds, DVec3::ZERO, DVec3::ZERO);
+            assert_eq!(clear, name == "minecraft:air", "{name}");
+            if clear {
+                assert!(
+                    view.bubble_contacts(bounds, DVec3::ZERO, DVec3::ZERO)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    view.cactus_contacts(bounds, DVec3::ZERO, DVec3::ZERO),
+                    Some(0)
+                );
+            }
+            assert!(!view.known_no_item_contacts(bounds, DVec3::splat(f64::NAN), DVec3::ZERO));
+            let missing = BoundingBox {
+                min: DVec3::new(-1.5, 5.0, 8.0),
+                max: DVec3::new(-1.25, 5.25, 8.25),
+            };
+            assert!(!view.known_no_item_contacts(missing, DVec3::ZERO, DVec3::ZERO));
+        }
     }
 
     #[test]

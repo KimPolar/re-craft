@@ -45,6 +45,7 @@ enum StateSchema {
     PotentSulfur,
     SulfurSpike,
     Liquid,
+    BubbleColumn,
     Axis,
     DoublePlant,
     BerryBush,
@@ -357,6 +358,7 @@ impl StateSchema {
             Self::Lit => ("lit", "false"),
             Self::PotentSulfur => ("potent_sulfur_state", "dry"),
             Self::Liquid => ("level", "0"),
+            Self::BubbleColumn => ("drag", "true"),
             Self::Axis => ("axis", "y"),
             Self::HangingRoots => ("waterlogged", "false"),
             Self::DoublePlant => ("half", "lower"),
@@ -385,6 +387,9 @@ impl StateSchema {
                 Some(value.to_owned())
             }
             Self::Waterlogged if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
+            Self::BubbleColumn if name == "drag" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
             Self::CopperBulb
@@ -1113,6 +1118,9 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/GrassBlock"
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
+                "net/minecraft/world/level/block/BubbleColumnBlock" => {
+                    Some(StateSchema::BubbleColumn)
+                }
                 "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
                 "net/minecraft/world/level/block/CopperBulbBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperBulbBlock" => {
@@ -1355,6 +1363,7 @@ impl GeneratedBlockRegistry {
                 | StateSchema::PressurePlate
                 | StateSchema::WeightedPressurePlate
                 | StateSchema::Liquid
+                | StateSchema::BubbleColumn
                 | StateSchema::PotentSulfur
                 | StateSchema::SulfurSpike
         ) {
@@ -1768,6 +1777,35 @@ mod tests {
         assert_eq!(registry.has_block_entity("minecraft:unimplemented"), None);
         assert!(!registry.is_canonical_state("minecraft:unimplemented", &BTreeMap::new()));
         assert!(!registry.is_registered("example:unknown"));
+    }
+
+    #[test]
+    fn bubble_column_registry_requires_a_single_boolean_drag_property() {
+        let id = "minecraft:bubble_column";
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([(id.into(), StateSchema::BubbleColumn)]),
+            block_entities: BTreeMap::new(),
+        };
+        assert_eq!(
+            StateSchema::BubbleColumn.default_properties()["drag"],
+            "true"
+        );
+        for value in ["true", "false"] {
+            assert!(
+                registry.is_canonical_state(id, &BTreeMap::from([("drag".into(), value.into())]))
+            );
+        }
+        assert!(!registry.is_canonical_state(id, &BTreeMap::new()));
+        assert!(
+            !registry.is_canonical_state(id, &BTreeMap::from([("drag".into(), "invalid".into())]))
+        );
+        assert!(!registry.is_canonical_state(
+            id,
+            &BTreeMap::from([
+                ("drag".into(), "true".into()),
+                ("extra".into(), "true".into()),
+            ])
+        ));
     }
 
     #[test]

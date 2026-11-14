@@ -172,6 +172,10 @@ fn generated_block_defaults_match_java() {
         .arg(&cp)
         .arg(&source));
     let mut cases = vec![
+        serde_json::json!("minecraft:bubble_column"),
+        serde_json::json!({"id":"minecraft:bubble_column","properties":{"drag":"true"}}),
+        serde_json::json!({"id":"minecraft:bubble_column","properties":{"drag":"false"}}),
+        serde_json::json!({"id":"minecraft:bubble_column","properties":{"drag":"invalid"}}),
         serde_json::json!("minecraft:potent_sulfur"),
         serde_json::json!({"id":"minecraft:potent_sulfur","properties":{"potent_sulfur_state":"invalid"}}),
         serde_json::json!("minecraft:sulfur_spike"),

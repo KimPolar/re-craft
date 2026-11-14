@@ -70,6 +70,14 @@ fn fixture() -> (World, ChunkPos) {
             ]),
         ),
         ("spawner", BTreeMap::new()),
+        (
+            "bubble_column",
+            BTreeMap::from([("drag".into(), "true".into())]),
+        ),
+        (
+            "bubble_column",
+            BTreeMap::from([("drag".into(), "false".into())]),
+        ),
     ] {
         states.push(world.intern_state(BlockState {
             name: format!("minecraft:{name}"),

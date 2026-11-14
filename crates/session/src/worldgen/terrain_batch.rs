@@ -11,7 +11,7 @@ use native_resources::{
     structure_decoration::StructureDecorationSchedule,
 };
 use native_world::generation_light::VisibleLightSnapshot;
-use native_world::loaded::{BlockState, ChunkPos, World};
+use native_world::loaded::{BlockState, BlockStateId, ChunkPos, World};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -274,11 +274,28 @@ fn replay_postprocessing_edits(
     current: &Arc<World>,
     processed: &World,
     edits: &[native_world::loaded::BlockPosition],
-) -> Result<Arc<World>> {
+    history: &[(BlockStateId, BlockStateId)],
+) -> Result<(Arc<World>, Vec<(BlockStateId, BlockStateId)>)> {
+    ensure!(
+        edits.len() == history.len(),
+        "postprocessing block history differs"
+    );
     if edits.is_empty() {
-        return Ok(Arc::clone(current));
+        return Ok((Arc::clone(current), Vec::new()));
     }
     let mut world = (**current).clone();
+    let mut remapped = Vec::with_capacity(history.len());
+    for &(before, after) in history {
+        let before = processed
+            .state(before)
+            .context("original postprocessing block state is missing")?
+            .clone();
+        let after = processed
+            .state(after)
+            .context("replacement postprocessing block state is missing")?
+            .clone();
+        remapped.push((world.intern_state(before), world.intern_state(after)));
+    }
     for pos in edits {
         let state = processed
             .block(pos.x, pos.y, pos.z)
@@ -290,7 +307,7 @@ fn replay_postprocessing_edits(
             .set_block_id(pos.x, pos.y, pos.z, id)
             .map_err(|error| anyhow::anyhow!("cannot rebase postprocessed block: {error}"))?;
     }
-    Ok(Arc::new(world))
+    Ok((Arc::new(world), remapped))
 }
 
 /// Group components from one completed pass; this does not authorize a save.
@@ -3657,9 +3674,15 @@ impl FreshTerrainBatch {
                 .all(|pos| checkpoint.sky_sources.get(pos) == engine.fresh.sky_sources.get(pos)),
             "existing generation lighting changed during expansion"
         );
-        let rebased = replay_postprocessing_edits(&current, &processed.world, &processed.edits)?;
+        let (rebased, history) = replay_postprocessing_edits(
+            &current,
+            &processed.world,
+            &processed.edits,
+            &processed.edit_states,
+        )?;
         processed.source = current;
         processed.world = rebased;
+        processed.edit_states = history;
         processed.sealed_world = Arc::clone(&processed.world);
         processed.batch_revision = Some(self.schedule.revision());
         Ok(())
@@ -8205,17 +8228,45 @@ mod expansion_checkpoint_tests {
         assert_eq!(chest, air, "fixture must use conflicting forked state IDs");
         processed.set_block_id(0, 0, 0, chest).unwrap();
         let current = Arc::new(expanded.clone());
-        let unchanged = replay_postprocessing_edits(&current, &processed, &[]).unwrap();
+        let (unchanged, history) =
+            replay_postprocessing_edits(&current, &processed, &[], &[]).unwrap();
         assert!(Arc::ptr_eq(&current, &unchanged));
+        assert!(history.is_empty());
         let at = native_world::loaded::BlockPosition { x: 0, y: 0, z: 0 };
-        let rebased = replay_postprocessing_edits(&current, &processed, &[at]).unwrap();
+        let (rebased, history) = replay_postprocessing_edits(
+            &current,
+            &processed,
+            &[at, at, at],
+            &[(stone, chest), (chest, stone), (stone, chest)],
+        )
+        .unwrap();
         assert_eq!(rebased.block(0, 0, 0).unwrap().name, "minecraft:chest");
+        let names: Vec<_> = history
+            .iter()
+            .map(|&(before, after)| {
+                (
+                    rebased.state(before).unwrap().name.as_str(),
+                    rebased.state(after).unwrap().name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("minecraft:stone", "minecraft:chest"),
+                ("minecraft:chest", "minecraft:stone"),
+                ("minecraft:stone", "minecraft:chest"),
+            ]
+        );
+        assert_ne!(history[0].1, chest, "conflicting IDs must be remapped");
+        assert!(replay_postprocessing_edits(&current, &processed, &[at], &[]).is_err());
         assert_eq!(current.block(0, 0, 0).unwrap().name, "minecraft:stone");
         assert!(
             replay_postprocessing_edits(
                 &current,
                 &processed,
-                &[native_world::loaded::BlockPosition { x: 999, y: 0, z: 0 }]
+                &[native_world::loaded::BlockPosition { x: 999, y: 0, z: 0 }],
+                &[(stone, chest)],
             )
             .is_err()
         );

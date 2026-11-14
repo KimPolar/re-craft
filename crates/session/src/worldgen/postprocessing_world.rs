@@ -242,7 +242,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) source: Arc<World>,
     pub(super) sealed_world: Arc<World>,
     pub(super) sealed_edits: Vec<BlockPosition>,
-    edit_states: Vec<(BlockStateId, BlockStateId)>,
+    pub(super) edit_states: Vec<(BlockStateId, BlockStateId)>,
     pub(super) sealed_checks: Vec<BlockPosition>,
     pub(super) sealed_chunks: BTreeSet<ChunkPos>,
     pub(super) batch_revision: Option<u64>,
@@ -336,9 +336,10 @@ impl PostprocessedGeneratedRegion {
             });
         }
         for (coords, state) in latest {
+            let actual = self.world.block(coords[0], coords[1], coords[2]);
             ensure!(
-                self.world.block(coords[0], coords[1], coords[2]) == Some(state),
-                "postprocessing block history result differs"
+                actual == Some(state),
+                "postprocessing block history result differs at {coords:?}: expected {state:?}, found {actual:?}"
             );
         }
         Ok(changes)

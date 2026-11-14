@@ -323,7 +323,33 @@ pub struct PartialSessionPoiSaveDraft {
 pub struct FrozenPartialSave {
     session: Box<LoadedSession>,
     paused_commands: VecDeque<PlayerCommand>,
+    streaming: DeferredSaveStreaming,
     positions: BTreeSet<native_persistence::world::ChunkPos>,
+}
+
+struct DeferredSaveStreaming {
+    window: Option<(ChunkPos, u32)>,
+    respawn_window: Option<Option<(ChunkPos, u32)>>,
+    incoming: VecDeque<IncomingChunk>,
+}
+
+impl DeferredSaveStreaming {
+    fn take(session: &mut LoadedSession) -> Self {
+        Self {
+            window: session.pending_window.take(),
+            respawn_window: session.pending_respawn_window.take(),
+            incoming: std::mem::take(&mut session.incoming),
+        }
+    }
+
+    fn restore(self, session: &mut LoadedSession) {
+        debug_assert!(session.pending_window.is_none());
+        debug_assert!(session.pending_respawn_window.is_none());
+        debug_assert!(session.incoming.is_empty());
+        session.pending_window = self.window;
+        session.pending_respawn_window = self.respawn_window;
+        session.incoming = self.incoming;
+    }
 }
 
 impl FrozenPartialSave {
@@ -346,11 +372,13 @@ impl FrozenPartialSave {
             .is_some_and(|session| stamp.belongs_to_session(session))
     }
 
-    /// Restore the exact queued controls if the save is cancelled or fails.
+    /// Restore queued controls and streamed results if the save is cancelled
+    /// or fails. Stale read stamps are still checked on the following tick.
     pub fn resume(self) -> LoadedSession {
         debug_assert!(self.session.commands.is_empty());
         let mut session = *self.session;
         session.commands = self.paused_commands;
+        self.streaming.restore(&mut session);
         session
     }
 }
@@ -4324,20 +4352,22 @@ impl LoadedSession {
 
     /// Freeze a tick-boundary session while collecting partial save inputs.
     /// Queued screen-release controls are set aside without being applied;
-    /// cancelling restores them in their original order. Gameplay commands and
-    /// pending chunk attachments must reach a tick before freezing.
+    /// cancelling restores them in their original order. Stamped chunk results
+    /// are deferred to the next tick; unstamped results and gameplay commands
+    /// must reach a tick before freezing.
     pub fn freeze_partial_save(mut self) -> Result<FrozenPartialSave, FreezePartialSaveError> {
         let validate = || -> anyhow::Result<()> {
-            anyhow::ensure!(
-                self.saved_world_session.is_some(),
-                "loaded session has no bound world lock"
-            );
+            let session = self
+                .saved_world_session
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loaded session has no bound world lock"))?;
             anyhow::ensure!(!self.advancing_tick, "a simulation tick is in progress");
             anyhow::ensure!(
-                self.incoming.is_empty()
-                    && self.pending_window.is_none()
-                    && self.pending_respawn_window.is_none(),
-                "streaming updates have not reached the session"
+                self.incoming.iter().all(|result| result
+                    .stamp
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.belongs_to_session(session))),
+                "streamed results need a matching world stamp before saving"
             );
             let mut keys = self.gameplay_keys.clone();
             let mut commands = self.commands.clone();
@@ -4362,10 +4392,12 @@ impl LoadedSession {
             });
         }
         let paused_commands = std::mem::take(&mut self.commands);
+        let streaming = DeferredSaveStreaming::take(&mut self);
         let positions = match self.partial_save_source_positions() {
             Ok(positions) => positions,
             Err(error) => {
                 self.commands = paused_commands;
+                streaming.restore(&mut self);
                 return Err(FreezePartialSaveError {
                     session: Box::new(self),
                     error,
@@ -4375,6 +4407,7 @@ impl LoadedSession {
         Ok(FrozenPartialSave {
             session: Box::new(self),
             paused_commands,
+            streaming,
             positions,
         })
     }
@@ -30338,7 +30371,7 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_partial_save_freeze_preserves_session_and_queued_actions() {
-        let (_directory, _reader, mut session) = locked_session_for_save();
+        let (_directory, reader, mut session) = locked_session_for_save();
         session.submit_command(PlayerCommand::Place);
         session.submit_command(PlayerCommand::ClearGameplayKeys);
         session.submit_command(PlayerCommand::StopUse);
@@ -30354,21 +30387,131 @@ pub(crate) mod tests {
 
         session.commands.clear();
         session.submit_command(PlayerCommand::StopBreak);
+        let home = session.player_chunk().unwrap();
+        session.queue_chunk_window(home, 1);
+        session.queue_streamed_chunk(
+            home,
+            None,
+            None,
+            None,
+            None,
+            Some(reader.session_guard().unwrap().read_stamp().unwrap()),
+        );
         session.uncoordinated_falling_lifecycle = true;
         let (mut session, error) = session.freeze_partial_save().err().unwrap().into_parts();
         assert!(error.to_string().contains("falling-block lifecycle"));
+        assert_eq!(session.pending_window, Some((home, 1)));
+        assert_eq!(session.incoming.len(), 1);
         assert!(matches!(
             session.commands.front(),
             Some(PlayerCommand::StopBreak)
         ));
         session.uncoordinated_falling_lifecycle = false;
-        session.queue_chunk_window(session.player_chunk().unwrap(), 1);
+        session.incoming.clear();
+        session.queue_streamed_chunk(home, None, None, None, None, None);
         let (session, error) = session.freeze_partial_save().err().unwrap().into_parts();
-        assert!(error.to_string().contains("streaming updates"));
+        assert!(error.to_string().contains("matching world stamp"));
+        assert_eq!(session.pending_window, Some((home, 1)));
+        assert_eq!(session.incoming.len(), 1);
         assert!(matches!(
             session.commands.front(),
             Some(PlayerCommand::StopBreak)
         ));
+    }
+
+    #[test]
+    fn frozen_save_defers_streamed_chunks_to_the_next_tick() {
+        let (_directory, reader, mut session) = locked_session_for_save();
+        let guard = reader.session_guard().unwrap();
+        let home = session.player_chunk().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut incoming = session.world.as_ref().clone();
+        let mut chunk = incoming.chunks[&home].as_ref().clone();
+        chunk.position = neighbor;
+        incoming.chunks.insert(neighbor, Arc::new(chunk));
+        session.queue_chunk_window(home, 1);
+        session.queue_respawn_window(Some((neighbor, 0)));
+        session.queue_streamed_chunk(
+            neighbor,
+            Some(incoming),
+            Some(SavedEntityData::Empty),
+            Some(SavedPoiData::Missing),
+            None,
+            Some(guard.read_stamp().unwrap()),
+        );
+        session.submit_command(PlayerCommand::StopUse);
+        let before = session.snapshot();
+        let frozen = session.freeze_partial_save().unwrap();
+        assert!(Arc::ptr_eq(&before, &frozen.session().snapshot()));
+        assert!(frozen.session().incoming.is_empty());
+        assert!(frozen.session().pending_window.is_none());
+        assert!(frozen.session().pending_respawn_window.is_none());
+        let mut session = frozen.resume();
+        assert_eq!(session.pending_window, Some((home, 1)));
+        assert_eq!(session.pending_respawn_window, Some(Some((neighbor, 0))));
+        assert_eq!(session.incoming.len(), 1);
+        assert_eq!(session.snapshot().tick, before.tick);
+        session.update(TICK);
+        assert!(session.world.chunks.contains_key(&neighbor));
+        assert!(matches!(
+            session.saved_entity_chunk(neighbor),
+            Some(SavedEntityData::Empty)
+        ));
+        assert!(session.incoming.is_empty());
+    }
+
+    #[test]
+    fn deferred_stream_result_is_rechecked_after_a_writer() {
+        let (_directory, reader, mut session) = locked_session_for_save();
+        let guard = reader.session_guard().unwrap();
+        let home = session.player_chunk().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut incoming = session.world.as_ref().clone();
+        let mut chunk = incoming.chunks[&home].as_ref().clone();
+        chunk.position = neighbor;
+        incoming.chunks.insert(neighbor, Arc::new(chunk));
+        session.queue_chunk_window(home, 1);
+        session.queue_streamed_chunk(
+            neighbor,
+            Some(incoming),
+            Some(SavedEntityData::Empty),
+            Some(SavedPoiData::Missing),
+            None,
+            Some(guard.read_stamp().unwrap()),
+        );
+        let frozen = session.freeze_partial_save().unwrap();
+        drop(guard.acquire_write().unwrap());
+        let mut session = frozen.resume();
+        session.update(TICK);
+        assert!(!session.world.chunks.contains_key(&neighbor));
+        assert_eq!(
+            session.take_stale_streamed_chunks(),
+            BTreeSet::from([neighbor])
+        );
+    }
+
+    #[test]
+    fn frozen_save_rejects_a_stream_result_from_another_world() {
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        let (_other_directory, other_reader, _other_session) = locked_session_for_save();
+        let home = session.player_chunk().unwrap();
+        session.queue_streamed_chunk(
+            home,
+            None,
+            None,
+            None,
+            None,
+            Some(other_reader.session_guard().unwrap().read_stamp().unwrap()),
+        );
+        let (session, error) = session.freeze_partial_save().err().unwrap().into_parts();
+        assert!(error.to_string().contains("matching world stamp"));
+        assert_eq!(session.incoming.len(), 1);
     }
 
     #[test]
@@ -59746,6 +59889,19 @@ pub(crate) mod tests {
                 .unwrap()
                 .to_string()
                 .contains("another world session")
+        );
+        let queued = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        session.queue_chunk_window(home, 1);
+        session.queue_streamed_chunk(
+            queued,
+            None,
+            None,
+            None,
+            None,
+            Some(world_lock.read_stamp().unwrap()),
         );
         let frozen = session.freeze_partial_save().unwrap();
         assert_eq!(frozen.source_positions(), &positions);

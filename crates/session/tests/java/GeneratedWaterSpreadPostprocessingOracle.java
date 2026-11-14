@@ -162,6 +162,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lava_dry_neighbors")){
             scenarios.clear();scenarios.addAll(List.of("lava_dry_slab_bottom","lava_dry_slab_top","lava_dry_stair","lava_dry_fence","lava_dry_ladder","lava_dry_lichen","lava_dry_leaves","lava_dry_slab_bottom_target","lava_dry_slab_top_target","lava_dry_stair_target","lava_dry_fence_target","lava_dry_ladder_target","lava_dry_lichen_target","lava_dry_leaves_target"));
         }
+        if(args.length>0 && args[0].equals("lava_falling")){
+            scenarios.clear();for(var block:List.of("sand","red_sand","gravel")){scenarios.add("lava_down_"+block);scenarios.add("lava_drain_"+block);}scenarios.add("lava_drain_sand_all");
+        }
         if(args.length>0 && args[0].equals("down_containers")){
             scenarios.clear();
             for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
@@ -231,15 +234,24 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             }
             if(scenario.startsWith("lava_down_") || scenario.startsWith("lava_sides_") || scenario.startsWith("lava_rise_") || scenario.startsWith("lava_convert_")){
                 blocks.put(pos,Blocks.LAVA.defaultBlockState());
-                if(scenario.startsWith("lava_down_"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                if(scenario.startsWith("lava_down_")){
+                    blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                    var falling=switch(scenario.substring("lava_down_".length())){case "sand" -> Blocks.SAND;case "red_sand" -> Blocks.RED_SAND;case "gravel" -> Blocks.GRAVEL;default -> null;};
+                    if(falling!=null)blocks.put(pos.below().east(),falling.defaultBlockState());
+                }
                 else if(scenario.startsWith("lava_sides_"))for(var p:List.of(pos.north(),pos.south(),pos.west(),pos.east()))blocks.put(p,Blocks.AIR.defaultBlockState());
                 else {blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,4));blocks.put(pos.west(),Blocks.LAVA.defaultBlockState());}
                 if(scenario.startsWith("lava_convert_"))blocks.put(pos.north(),Blocks.LAVA.defaultBlockState());
                 if(scenario.equals("lava_convert_on_water"))blocks.put(pos.east(),Blocks.WATER.defaultBlockState());
                 attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,scenario.endsWith("_fast")).build()).build();
             }
-            if(scenario.startsWith("lava_drain_"))
-                blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,Integer.parseInt(scenario.substring("lava_drain_".length()))));
+            if(scenario.startsWith("lava_drain_")){
+                var suffix=scenario.substring("lava_drain_".length());
+                var falling=switch(suffix){case "sand", "sand_all" -> Blocks.SAND;case "red_sand" -> Blocks.RED_SAND;case "gravel" -> Blocks.GRAVEL;default -> null;};
+                blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,falling==null?Integer.parseInt(suffix):4));
+                if(suffix.equals("sand_all"))for(var p:List.of(pos.west(),pos.east(),pos.north(),pos.south(),pos.below(),pos.above()))blocks.put(p,falling.defaultBlockState());
+                else if(falling!=null)blocks.put(pos.above(),falling.defaultBlockState());
+            }
             if(scenario.startsWith("dry_lichen_")) {
                 var target=(scenario.equals("dry_lichen_down") || scenario.equals("dry_lichen_support"))?pos.below():pos.east();
                 blocks.put(target,Blocks.GLOW_LICHEN.defaultBlockState().setValue(MultifaceBlock.getFaceProperty(Direction.EAST),true));

@@ -2251,6 +2251,7 @@ impl GeneratedBlockView<'_> {
             || ladder_state(state).is_some()
             || super::ore::valid_lichen(state)
             || leaf_distance(state).ok().flatten().is_some()
+            || matches!(supported_postprocessing_block(state), Ok(DryBlock::Falling))
     }
 
     fn tick_generated_lava(
@@ -2758,7 +2759,6 @@ impl GeneratedBlockView<'_> {
     }
 
     /// A flowing lava block with no incoming fluid disappears before spreading.
-    /// Only inert neighbors can be updated here without additional callbacks.
     fn remove_exhausted_lava(
         &mut self,
         pos: [i32; 3],
@@ -2777,7 +2777,10 @@ impl GeneratedBlockView<'_> {
             let neighbor = [pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2]];
             let state = self.read(neighbor)?;
             ensure!(
-                matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain)),
+                matches!(
+                    supported_postprocessing_block(&state),
+                    Ok(DryBlock::Plain | DryBlock::Falling)
+                ),
                 "exhausted lava requires unsupported neighbor callbacks"
             );
         }
@@ -2813,14 +2816,30 @@ impl GeneratedBlockView<'_> {
             nonempty >= 2,
             "lava removal requires light section allocation update"
         );
-        self.write_postprocessed_state(
-            pos,
-            &old,
-            &BlockState {
-                name: "minecraft:air".into(),
-                properties: BTreeMap::new(),
-            },
-        )
+        let air = BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        };
+        self.write_postprocessed_state(pos, &old, &air)?;
+        let target = glam::IVec3::from_array(pos);
+        for delta in [
+            glam::IVec3::NEG_X,
+            glam::IVec3::X,
+            glam::IVec3::NEG_Z,
+            glam::IVec3::Z,
+            glam::IVec3::NEG_Y,
+            glam::IVec3::Y,
+        ] {
+            let neighbor = target + delta;
+            let state = self.read(neighbor.to_array())?;
+            if matches!(
+                supported_postprocessing_block(&state),
+                Ok(DryBlock::Falling)
+            ) {
+                self.update_lava_shape_neighbor(neighbor, &state, target, &air, 511)?;
+            }
+        }
+        Ok(())
     }
 
     fn fluid_incomplete_error(
@@ -8732,8 +8751,14 @@ mod tests {
                 }
                 if case.starts_with("lava_down_") {
                     world.set_block_id(origin_x, 7, 8, air).unwrap();
-                    if case == "lava_down_sand" {
-                        world.set_block_id(origin_x + 1, 7, 8, sand).unwrap();
+                    if let Some(name) = case.strip_prefix("lava_down_")
+                        && matches!(name, "sand" | "red_sand" | "gravel")
+                    {
+                        let falling = world.intern_state(BlockState {
+                            name: format!("minecraft:{name}"),
+                            properties: BTreeMap::new(),
+                        });
+                        world.set_block_id(origin_x + 1, 7, 8, falling).unwrap();
                     }
                 } else if case.starts_with("lava_sides_") {
                     for [x, y, z] in [[8, 8, 7], [8, 8, 9], [7, 8, 8], [9, 8, 8]] {
@@ -8758,11 +8783,16 @@ mod tests {
                     world.set_block_id(origin_x - 1, 7, 8, lava).unwrap();
                 }
                 if case == "water_touch_lava_unsupported" {
-                    world.set_block_id(origin_x + 2, 7, 8, sand).unwrap();
+                    let unsupported = world.intern_state(BlockState {
+                        name: "example:unsupported".into(),
+                        properties: BTreeMap::new(),
+                    });
+                    world.set_block_id(origin_x + 2, 7, 8, unsupported).unwrap();
                 }
             }
             case if case.starts_with("lava_drain_") => {
-                let level = if case == "lava_drain_sand" {
+                let material = case.strip_prefix("lava_drain_").unwrap();
+                let level = if matches!(material, "sand" | "red_sand" | "gravel" | "sand_all") {
                     4
                 } else {
                     case.strip_prefix("lava_drain_")
@@ -8775,8 +8805,32 @@ mod tests {
                     properties: BTreeMap::from([("level".into(), level.to_string())]),
                 });
                 world.set_block_id(origin_x, 8, 8, lava).unwrap();
-                if case == "lava_drain_sand" {
-                    world.set_block_id(origin_x, 9, 8, sand).unwrap();
+                if matches!(material, "sand" | "red_sand" | "gravel" | "sand_all") {
+                    let falling = world.intern_state(BlockState {
+                        name: format!(
+                            "minecraft:{}",
+                            if material == "sand_all" {
+                                "sand"
+                            } else {
+                                material
+                            }
+                        ),
+                        properties: BTreeMap::new(),
+                    });
+                    if material == "sand_all" {
+                        for [x, y, z] in [
+                            [7, 8, 8],
+                            [9, 8, 8],
+                            [8, 8, 7],
+                            [8, 8, 9],
+                            [8, 7, 8],
+                            [8, 9, 8],
+                        ] {
+                            world.set_block_id(x, y, z, falling).unwrap();
+                        }
+                    } else {
+                        world.set_block_id(origin_x, 9, 8, falling).unwrap();
+                    }
                 }
             }
             "dry_lichen_on" | "dry_lichen_off" | "dry_lichen_down" | "dry_lichen_support" => {
@@ -9706,7 +9760,6 @@ mod tests {
             "lava_down_unknown"
                 | "lava_down_tagged"
                 | "lava_down_empty_tagged"
-                | "lava_down_sand"
                 | "lava_rise_no_random"
                 | "water_touch_lava_unsupported"
         ) {
@@ -9715,15 +9768,6 @@ mod tests {
             assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
             assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
             assert_eq!(stage.world.block(8, 7, 8), source.block(8, 7, 8));
-            assert!(stage.edits.is_empty());
-            return vec![format!("{error:#}")];
-        }
-        if case == "lava_drain_sand" {
-            let before_ticks = stage.region.ticks.activated_snapshot();
-            let error = stage.try_poll(chunk, 1).unwrap_err();
-            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
-            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
-            assert_eq!(stage.world.block(8, 9, 8), source.block(8, 9, 8));
             assert!(stage.edits.is_empty());
             return vec![format!("{error:#}")];
         }
@@ -11519,9 +11563,6 @@ mod tests {
                     .any(|line| line.starts_with("fluid ") || line.starts_with("block "))
             );
         }
-        assert!(
-            water_spread_trace("lava_drain_sand")[0].contains("unsupported neighbor callbacks")
-        );
     }
 
     #[test]
@@ -11565,7 +11606,6 @@ mod tests {
         assert!(water_spread_trace("lava_down_unknown")[0].contains("settings unavailable"));
         assert!(water_spread_trace("lava_down_tagged")[0].contains("water fluid tag"));
         assert!(water_spread_trace("lava_down_empty_tagged")[0].contains("water fluid tag"));
-        assert!(water_spread_trace("lava_down_sand")[0].contains("unsupported neighbor callbacks"));
         assert!(
             water_spread_trace("lava_rise_no_random")[0].contains("shared level random stream")
         );
@@ -11592,6 +11632,49 @@ mod tests {
         .into_iter()
         .flat_map(water_spread_trace)
         .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_lava_schedules_falling_neighbors() {
+        for block in ["sand", "red_sand", "gravel"] {
+            for (case, position) in [
+                (format!("lava_down_{block}"), "9,7,8"),
+                (format!("lava_drain_{block}"), "8,9,8"),
+            ] {
+                let trace = water_spread_trace(&case);
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == &format!("block minecraft:{block} {position} 2")),
+                    "{case}: {trace:?}"
+                );
+            }
+        }
+        let trace = water_spread_trace("lava_drain_sand_all");
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|line| line.starts_with("block minecraft:sand "))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_lava_falling_neighbors_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_falling"],
+        );
+        let mut expected = ["sand", "red_sand", "gravel"]
+            .into_iter()
+            .flat_map(|block| [format!("lava_down_{block}"), format!("lava_drain_{block}")])
+            .flat_map(|case| water_spread_trace(&case))
+            .collect::<Vec<_>>();
+        expected.extend(water_spread_trace("lava_drain_sand_all"));
         assert_eq!(actual, expected);
     }
 

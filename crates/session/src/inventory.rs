@@ -349,6 +349,98 @@ pub(crate) fn item_enchantments(item: &ItemStack) -> anyhow::Result<Vec<(Resourc
     Ok(result)
 }
 
+/// Java iterates enchantments in a holder-identity hash map, so NBT order is
+/// not a reliable execution order. Accept multiple effects only when every
+/// possible order produces the same intermediate values and uniform RNG state.
+/// The callback may consume uniform random values but must leave the cached
+/// Gaussian untouched.
+fn resolve_enchantment_effect_order(
+    enchantments: &[(ResourceId, u32)],
+    value: f32,
+    random: &LegacyRandom,
+    mut apply: impl FnMut(&ResourceId, u32, f32, &mut LegacyRandom) -> anyhow::Result<(f32, bool)>,
+) -> anyhow::Result<(f32, LegacyRandom)> {
+    use anyhow::ensure;
+
+    #[derive(Clone)]
+    struct EffectState {
+        value: f32,
+        random: LegacyRandom,
+    }
+
+    impl EffectState {
+        fn same_as(&self, other: &Self) -> bool {
+            self.value.to_bits() == other.value.to_bits()
+                && self.random.state() == other.random.state()
+        }
+    }
+
+    let initial = EffectState {
+        value,
+        random: random.clone(),
+    };
+    let mut active = Vec::new();
+    let mut first = None;
+    for (id, level) in enchantments {
+        let mut candidate = initial.clone();
+        let (value, has_effect) = apply(id, *level, candidate.value, &mut candidate.random)?;
+        candidate.value = value;
+        if has_effect {
+            active.push((id, *level));
+            first = Some(candidate);
+        } else {
+            ensure!(
+                candidate.same_as(&initial),
+                "inactive enchantment changed state"
+            );
+        }
+    }
+    if active.is_empty() {
+        return Ok((initial.value, initial.random));
+    }
+    if active.len() == 1 {
+        let result = first.expect("an active effect was evaluated");
+        return Ok((result.value, result.random));
+    }
+
+    // Bound work for data packs with arbitrarily many enchantments. The usual
+    // zero- and one-effect cases above never allocate the subset table.
+    const MAX_ACTIVE_EFFECTS: usize = 10;
+    ensure!(
+        active.len() <= MAX_ACTIVE_EFFECTS,
+        "too many enchantments to verify their iteration order"
+    );
+    let count = 1_usize << active.len();
+    let mut states = vec![None; count];
+    states[0] = Some(initial);
+    for mask in 0..count {
+        let state = states[mask]
+            .clone()
+            .expect("each enchantment subset is reachable");
+        for (index, (id, level)) in active.iter().enumerate() {
+            let bit = 1_usize << index;
+            if mask & bit != 0 {
+                continue;
+            }
+            let mut candidate = state.clone();
+            let (value, has_effect) = apply(id, *level, candidate.value, &mut candidate.random)?;
+            ensure!(has_effect, "enchantment effect changed during evaluation");
+            candidate.value = value;
+            let next = &mut states[mask | bit];
+            if let Some(previous) = next {
+                ensure!(
+                    previous.same_as(&candidate),
+                    "enchantment effects depend on unknown Java iteration order"
+                );
+            } else {
+                *next = Some(candidate);
+            }
+        }
+    }
+    let result = states.pop().flatten().expect("all effects were evaluated");
+    Ok((result.value, result.random))
+}
+
 fn quick_craft_amount(carried: &ItemStack, slots: usize, button: ClickButton) -> u32 {
     match button {
         ClickButton::Primary => ((carried.count as f32 / slots as f32).floor()) as u32,
@@ -530,6 +622,50 @@ impl Default for PlayerInventory {
 }
 
 impl PlayerInventory {
+    fn apply_enchantment_damage(
+        &self,
+        item: &ItemStack,
+        value: f32,
+        random: &LegacyRandom,
+    ) -> anyhow::Result<(f32, LegacyRandom)> {
+        use anyhow::Context;
+
+        let enchantments = item_enchantments(item)?;
+        if enchantments.is_empty() {
+            return Ok((value, random.clone()));
+        }
+        let registry = self
+            .enchantments
+            .as_ref()
+            .context("active enchantment registry is unavailable")?;
+        // A data pack can make a single effect consume up to a million draws.
+        // Do not multiply that work across every ordering on the game thread.
+        // The existing single-effect path keeps its original limits.
+        const MAX_ORDER_CHECK_DRAWS: usize = 65_536;
+        let mut draws = 0_usize;
+        let mut first_effect = None::<ResourceId>;
+        let mut multiple_effects = false;
+        resolve_enchantment_effect_order(&enchantments, value, random, |id, level, value, rng| {
+            let (value, affected) =
+                registry.apply_item_damage(id, level, item.id(), value, &mut || {
+                    draws = draws.saturating_add(1);
+                    rng.next_float()
+                })?;
+            if affected {
+                if let Some(first) = &first_effect {
+                    multiple_effects |= first != id;
+                } else {
+                    first_effect = Some(id.clone());
+                }
+            }
+            anyhow::ensure!(
+                !multiple_effects || draws <= MAX_ORDER_CHECK_DRAWS,
+                "too many random draws to verify enchantment iteration order"
+            );
+            Ok((value, affected))
+        })
+    }
+
     /// Apply a location effect's durability change to one equipped stack.
     /// Inventory and RNG are committed together after all components resolve.
     pub(crate) fn change_equipped_item_damage(
@@ -539,7 +675,7 @@ impl PlayerInventory {
         infinite_materials: bool,
         random: &mut LegacyRandom,
     ) -> anyhow::Result<bool> {
-        use anyhow::{Context, ensure};
+        use anyhow::ensure;
         ensure!(
             matches!(slot, PlayerSlot::Armor(0..=3) | PlayerSlot::Offhand)
                 || matches!(slot, PlayerSlot::Storage(index) if index == self.selected),
@@ -585,24 +721,9 @@ impl PlayerInventory {
         let mut next_random = random.clone();
         let mut change = amount;
         if change > 0 {
-            let mut adjusted = change as f32;
-            let mut effect_count = 0;
-            for (id, level) in item_enchantments(item)? {
-                let registry = self
-                    .enchantments
-                    .as_ref()
-                    .context("active enchantment registry is unavailable")?;
-                let (value, affected) =
-                    registry.apply_item_damage(&id, level, item.id(), adjusted, &mut || {
-                        next_random.next_float()
-                    })?;
-                effect_count += usize::from(affected);
-                ensure!(
-                    effect_count <= 1,
-                    "multiple durability enchantment order is unsupported"
-                );
-                adjusted = value;
-            }
+            let (adjusted, resolved_random) =
+                self.apply_enchantment_damage(item, change as f32, &next_random)?;
+            next_random = resolved_random;
             change = adjusted as i32;
         }
         if change == 0 {
@@ -745,24 +866,9 @@ impl PlayerInventory {
                 Some(Tag::Int(value)) if *value >= 0 => (*value).min(maximum),
                 _ => anyhow::bail!("invalid equipment damage"),
             };
-            let mut damage = points as f32;
-            let mut effect_count = 0;
-            for (id, level) in item_enchantments(item)? {
-                let registry = next
-                    .enchantments
-                    .as_ref()
-                    .context("active enchantment registry is unavailable")?;
-                let (value, affected) =
-                    registry.apply_item_damage(&id, level, item.id(), damage, &mut || {
-                        next_random.next_float()
-                    })?;
-                effect_count += usize::from(affected);
-                ensure!(
-                    effect_count <= 1,
-                    "multiple durability enchantment order is unsupported"
-                );
-                damage = value;
-            }
+            let (damage, resolved_random) =
+                next.apply_enchantment_damage(item, points as f32, &next_random)?;
+            next_random = resolved_random;
             let points = damage as i32;
             if points == 0 {
                 continue;
@@ -825,19 +931,16 @@ impl PlayerInventory {
             .and_then(Option::as_mut)
             .context("repair candidate disappeared")?;
             let damage = repair_damage(item)?.context("repair candidate has no damage")?;
-            let mut repair = amount as f32;
-            let mut has_repair_effect = false;
-            for (id, level) in item_enchantments(item)? {
-                // Java applies every repair effect on the chosen item.
-                if let Some(next_value) = registry.apply_repair_with_xp(&id, level, repair)? {
-                    ensure!(
-                        !has_repair_effect,
-                        "multiple enchantment repair-effect order is not supported"
-                    );
-                    has_repair_effect = true;
-                    repair = next_value;
-                }
-            }
+            let enchantments = item_enchantments(item)?;
+            let (repair, _) = resolve_enchantment_effect_order(
+                &enchantments,
+                amount as f32,
+                random,
+                |id, level, value, _| {
+                    let next = registry.apply_repair_with_xp(id, level, value)?;
+                    Ok((next.unwrap_or(value), next.is_some()))
+                },
+            )?;
             let possible = (repair as i32).max(0);
             let restored = possible.min(damage);
             let Tag::Compound(components) = &mut item.components else {
@@ -1647,33 +1750,10 @@ impl PlayerInventory {
         if item.count != 1 || !ordinary_return_supported(item) {
             return false;
         }
-        let Ok(enchantments) = item_enchantments(item) else {
+        let Ok((damage, next_random)) = self.apply_enchantment_damage(item, amount as f32, random)
+        else {
             return false;
         };
-        let mut next_random = random.clone();
-        let mut damage = amount as f32;
-        let mut effect_count = 0;
-        for (id, level) in enchantments {
-            let Some(registry) = &self.enchantments else {
-                return false;
-            };
-            let Ok((next, has_effect)) =
-                registry.apply_item_damage(&id, level, item.id(), damage, &mut || {
-                    next_random.next_float()
-                })
-            else {
-                return false;
-            };
-            if has_effect {
-                effect_count += 1;
-            }
-            // The Java enchantment map determines the order of multiple
-            // independently effective enchantments; it is not NBT order.
-            if effect_count > 1 {
-                return false;
-            }
-            damage = next;
-        }
         let amount = damage as i32;
         *random = next_random;
         if amount == 0 {
@@ -5912,6 +5992,420 @@ mod tests {
                     Some(&Tag::Int(20))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn enchantment_effect_order_checks_rounding_and_random_consumption() {
+        let ids = ["example:first", "example:second"].map(|id| (ResourceId::parse(id).unwrap(), 1));
+        let random = LegacyRandom::new(17);
+        let additive = |id: &ResourceId, _: u32, value: f32, _: &mut LegacyRandom| {
+            Ok((value + if id.path == "first" { 1.0 } else { 2.0 }, true))
+        };
+        let (value, next) = resolve_enchantment_effect_order(&ids, 4.0, &random, additive).unwrap();
+        assert_eq!(value, 7.0);
+        assert_eq!(next.state(), random.state());
+
+        // Floating-point addition is not associative at this magnitude.
+        assert!(resolve_enchantment_effect_order(&ids, 16_777_216.0, &random, additive).is_err());
+        let changed_random = |id: &ResourceId,
+                              _: u32,
+                              value: f32,
+                              rng: &mut LegacyRandom|
+         -> anyhow::Result<(f32, bool)> {
+            if id.path == "first" {
+                Ok((value + 1.0, true))
+            } else {
+                for _ in 0..value as u32 {
+                    rng.next_float();
+                }
+                Ok((value, true))
+            }
+        };
+        assert!(resolve_enchantment_effect_order(&ids, 1.0, &random, changed_random).is_err());
+        assert_eq!(random.state(), LegacyRandom::new(17).state());
+    }
+
+    #[test]
+    fn commuting_data_pack_effects_work_for_tools_armor_and_xp_repair() {
+        use native_resources::packs::ResourceProvider;
+
+        struct Source {
+            non_commuting: bool,
+        }
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                if folder == "enchantment" {
+                    ["minecraft:efficiency", "minecraft:unbreaking"]
+                        .into_iter()
+                        .map(ResourceId::parse)
+                        .collect()
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                let value = if path.ends_with("/efficiency.json") {
+                    1
+                } else if path.ends_with("/unbreaking.json") {
+                    2
+                } else {
+                    return Ok(None);
+                };
+                let effect = if self.non_commuting && value == 2 {
+                    serde_json::json!({"type": "minecraft:multiply", "factor": 2})
+                } else {
+                    serde_json::json!({"type": "minecraft:add", "value": value})
+                };
+                Ok(Some(serde_json::to_vec(&serde_json::json!({
+                    "slots": ["any"],
+                    "effects": {
+                        "minecraft:item_damage": [{"effect": effect}],
+                        "minecraft:repair_with_xp": [{"effect": effect}]
+                    }
+                }))?))
+            }
+        }
+
+        let registry = Arc::new(
+            OxygenEnchantments::load(&mut Source {
+                non_commuting: false,
+            })
+            .unwrap(),
+        );
+        let item = |name: &str, damage| {
+            ItemStack::new(
+                name.into(),
+                1,
+                1,
+                Tag::Compound(vec![
+                    ("minecraft:damage".into(), Tag::Int(damage)),
+                    (
+                        "minecraft:enchantments".into(),
+                        Tag::Compound(vec![
+                            ("minecraft:efficiency".into(), Tag::Int(1)),
+                            ("minecraft:unbreaking".into(), Tag::Int(1)),
+                        ]),
+                    ),
+                ]),
+            )
+            .unwrap()
+        };
+        let damage = |inventory: &PlayerInventory, slot| {
+            inventory
+                .slot(slot)
+                .unwrap()
+                .components()
+                .get("minecraft:damage")
+                .and_then(Tag::as_java_int)
+                .unwrap_or(0)
+        };
+
+        let mut inventory = PlayerInventory::default();
+        inventory.set_enchantments(Arc::clone(&registry));
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(item("minecraft:iron_pickaxe", 0)),
+        );
+        let mut random = LegacyRandom::new(3);
+        assert!(inventory.damage_selected_tool(1, &mut random));
+        assert_eq!(damage(&inventory, PlayerSlot::Storage(0)), 4);
+        assert_eq!(random.state(), LegacyRandom::new(3).state());
+
+        inventory.set_slot(PlayerSlot::Armor(3), Some(item("minecraft:iron_boots", 0)));
+        inventory
+            .damage_equipped_armor(4.0, "minecraft:cactus", &mut random, Some(&registry), None)
+            .unwrap();
+        assert_eq!(damage(&inventory, PlayerSlot::Armor(3)), 4);
+        inventory
+            .change_equipped_item_damage(PlayerSlot::Armor(3), 1, false, &mut random)
+            .unwrap();
+        assert_eq!(damage(&inventory, PlayerSlot::Armor(3)), 8);
+        assert_eq!(random.state(), LegacyRandom::new(3).state());
+
+        // Keep one repairable slot so both candidate entries point to it.
+        inventory.set_slot(PlayerSlot::Armor(3), None);
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(item("minecraft:iron_pickaxe", 20)),
+        );
+        let mut expected_random = random.clone();
+        expected_random.next_int_bound(2).unwrap();
+        let (remaining, repaired) = inventory.repair_with_experience(7, &mut random).unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(damage(&repaired.unwrap(), PlayerSlot::Storage(0)), 10);
+        assert_eq!(random.state(), expected_random.state());
+        assert_eq!(damage(&inventory, PlayerSlot::Storage(0)), 20);
+
+        let ambiguous = Arc::new(
+            OxygenEnchantments::load(&mut Source {
+                non_commuting: true,
+            })
+            .unwrap(),
+        );
+        inventory.set_enchantments(Arc::clone(&ambiguous));
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(item("minecraft:iron_pickaxe", 0)),
+        );
+        inventory.set_slot(PlayerSlot::Armor(3), Some(item("minecraft:iron_boots", 0)));
+        let before = inventory.clone();
+        let old_random = random.state();
+        assert!(!inventory.damage_selected_tool(1, &mut random));
+        assert!(
+            inventory
+                .damage_equipped_armor(4.0, "minecraft:cactus", &mut random, Some(&ambiguous), None)
+                .is_err()
+        );
+        assert!(
+            inventory
+                .change_equipped_item_damage(PlayerSlot::Armor(3), 1, false, &mut random)
+                .is_err()
+        );
+        assert_eq!(inventory, before);
+        assert_eq!(random.state(), old_random);
+    }
+
+    #[test]
+    fn multiple_random_enchantments_have_a_bounded_order_check() {
+        use native_resources::packs::ResourceProvider;
+
+        struct Source;
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                if folder == "enchantment" {
+                    ["example:first", "example:second"]
+                        .into_iter()
+                        .map(ResourceId::parse)
+                        .collect()
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.starts_with("data/example/enchantment/").then(|| {
+                    br#"{"slots":["any"],"effects":{"minecraft:item_damage":[{"effect":{"type":"minecraft:remove_binomial","chance":0}}]}}"#.to_vec()
+                }))
+            }
+        }
+        let mut inventory = PlayerInventory::default();
+        inventory.set_enchantments(Arc::new(OxygenEnchantments::load(&mut Source).unwrap()));
+        let item = |names: &[&str]| {
+            ItemStack::new(
+                "minecraft:iron_pickaxe".into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(
+                        names
+                            .iter()
+                            .map(|name| ((*name).into(), Tag::Int(1)))
+                            .collect(),
+                    ),
+                )]),
+            )
+            .unwrap()
+        };
+        let random = LegacyRandom::new(31);
+        let mut expected = random.clone();
+        for _ in 0..65_537 {
+            expected.next_float();
+        }
+        let (damage, single_random) = inventory
+            .apply_enchantment_damage(&item(&["example:first"]), 65_537.0, &random)
+            .unwrap();
+        assert_eq!(damage, 65_537.0);
+        assert_eq!(single_random.state(), expected.state());
+        assert!(
+            inventory
+                .apply_enchantment_damage(
+                    &item(&["example:first", "example:second"]),
+                    20_000.0,
+                    &random,
+                )
+                .is_err()
+        );
+        assert_eq!(random.state(), LegacyRandom::new(31).state());
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn multiple_enchantment_effects_match_java_when_order_independent() {
+        use native_resources::packs::ResourceProvider;
+        use serde_json::{Value, json};
+        use std::{path::PathBuf, process::Command};
+
+        struct Source([Value; 2]);
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                if folder == "enchantment" {
+                    ["example:first", "example:second"]
+                        .into_iter()
+                        .map(ResourceId::parse)
+                        .collect()
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                let index = if path.ends_with("/first.json") {
+                    0
+                } else if path.ends_with("/second.json") {
+                    1
+                } else {
+                    return Ok(None);
+                };
+                let mut effects = serde_json::Map::new();
+                for kind in ["item_damage", "repair_with_xp"] {
+                    if let Some(effect) = self.0[index].get(kind) {
+                        effects.insert(format!("minecraft:{kind}"), json!([{"effect": effect}]));
+                    }
+                }
+                Ok(Some(serde_json::to_vec(&json!({
+                    "slots": ["any"], "effects": effects
+                }))?))
+            }
+        }
+
+        let add = |n| json!({"type": "minecraft:add", "value": n});
+        let multiply = |n| json!({"type": "minecraft:multiply", "factor": n});
+        let binomial = || json!({"type": "minecraft:remove_binomial", "chance": 0.5});
+        let specifications = [
+            [
+                json!({"item_damage": add(1), "repair_with_xp": add(1)}),
+                json!({"item_damage": add(2), "repair_with_xp": add(2)}),
+            ],
+            [
+                json!({"item_damage": multiply(2), "repair_with_xp": multiply(2)}),
+                json!({"item_damage": multiply(3), "repair_with_xp": multiply(3)}),
+            ],
+            [
+                json!({"item_damage": binomial()}),
+                json!({"item_damage": binomial()}),
+            ],
+            [
+                json!({"item_damage": binomial()}),
+                json!({"item_damage": multiply(1)}),
+            ],
+        ];
+        let ids = ["example:first", "example:second"].map(|id| (ResourceId::parse(id).unwrap(), 1));
+        let mut cases = Vec::new();
+        let mut expected = Vec::new();
+        for specification in specifications {
+            let registry =
+                Arc::new(OxygenEnchantments::load(&mut Source(specification.clone())).unwrap());
+            let mut inventory = PlayerInventory::default();
+            inventory.set_enchantments(Arc::clone(&registry));
+            let item = ItemStack::new(
+                "minecraft:iron_pickaxe".into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![
+                        ("example:first".into(), Tag::Int(1)),
+                        ("example:second".into(), Tag::Int(1)),
+                    ]),
+                )]),
+            )
+            .unwrap();
+            for amount in [1, 3, 7, 20, 64] {
+                for seed in [0, 1, 7, 19, 123, 999, -1, -42] {
+                    let random = LegacyRandom::new(seed);
+                    let (damage, mut damage_random) = inventory
+                        .apply_enchantment_damage(&item, amount as f32, &random)
+                        .unwrap();
+                    let (repair, mut repair_random) = resolve_enchantment_effect_order(
+                        &ids,
+                        amount as f32,
+                        &random,
+                        |id, level, value, _| {
+                            let next = registry.apply_repair_with_xp(id, level, value)?;
+                            Ok((next.unwrap_or(value), next.is_some()))
+                        },
+                    )
+                    .unwrap();
+                    cases.push(json!({
+                        "first": specification[0], "second": specification[1],
+                        "amount": amount, "seed": seed,
+                    }));
+                    expected.push(json!({
+                        "damage": damage as i32, "damage_next": damage_random.next_int(),
+                        "repair": (repair as i32).max(0), "repair_next": repair_random.next_int(),
+                    }));
+                }
+            }
+        }
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("MultipleEnchantmentEffectsOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/MultipleEnchantmentEffectsOracle.java"),
+        )
+        .unwrap();
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source)
+                .output()
+                .unwrap(),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("MultipleEnchantmentEffectsOracle")
+                .arg(&input)
+                .arg(&output)
+                .output()
+                .unwrap(),
+        ] {
+            assert!(
+                command.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&command.stdout),
+                String::from_utf8_lossy(&command.stderr)
+            );
+        }
+        let actual: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(actual.len(), cases.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(actual, expected, "case {index}: {}", cases[index]);
         }
     }
 

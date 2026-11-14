@@ -58,7 +58,7 @@ public class GeneratedInertPostprocessingOracle {
         var level=(FakeLevel)unsafe.allocateInstance(FakeLevel.class);
         var chunk=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
-        var names=new ArrayList<>(List.of("stone","sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","dripstone_block",
+        var names=new ArrayList<>(List.of("stone","sulfur","cinnabar","magma_block","granite","diorite","andesite","tuff","calcite","dripstone_block",
             "cobblestone","mossy_cobblestone","dirt","coarse_dirt","rooted_dirt","moss_block","clay","bedrock",
             "netherrack","soul_soil","end_stone","blackstone","obsidian","crying_obsidian","coal_ore","iron_ore",
             "copper_ore","gold_ore","lapis_ore","diamond_ore","emerald_ore","deepslate_coal_ore",

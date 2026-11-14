@@ -1433,6 +1433,7 @@ fn inert_generated_full_cube(name: &str) -> bool {
         "minecraft:stone"
             | "minecraft:sulfur"
             | "minecraft:cinnabar"
+            | "minecraft:magma_block"
             | "minecraft:granite"
             | "minecraft:diorite"
             | "minecraft:andesite"
@@ -6249,6 +6250,7 @@ mod tests {
             "stone",
             "sulfur",
             "cinnabar",
+            "magma_block",
             "granite",
             "diorite",
             "andesite",
@@ -6560,7 +6562,7 @@ mod tests {
 
     #[test]
     fn inert_natural_cubes_complete_postprocessing_without_side_effects() {
-        assert_eq!(inert_cube_postprocessing_trace().len(), 465);
+        assert_eq!(inert_cube_postprocessing_trace().len(), 468);
         for unsupported in [
             "minecraft:oak_log",
             "minecraft:oak_slab",

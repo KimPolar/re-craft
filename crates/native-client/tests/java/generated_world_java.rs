@@ -270,22 +270,28 @@ fn new_player_round_trips_through_java_player() -> Result<()> {
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_spawn_chunk_round_trips_through_java() -> Result<()> {
-    generated_world_round_trips_through_java(-1)
+    generated_world_round_trips_through_java(-1, false)
 }
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_seed_one_round_trips_through_java() -> Result<()> {
-    generated_world_round_trips_through_java(1)
+    generated_world_round_trips_through_java(1, false)
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK; currently fails on unsettled live light"]
+fn generated_world_seed_one_captures_live_inputs_for_missing_shape_chunk() -> Result<()> {
+    generated_world_round_trips_through_java(1, true)
 }
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_seed_42_round_trips_through_java() -> Result<()> {
-    generated_world_round_trips_through_java(42)
+    generated_world_round_trips_through_java(42, false)
 }
 
-fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
+fn generated_world_round_trips_through_java(seed: i64, check_live_inputs: bool) -> Result<()> {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -783,10 +789,14 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     if seed == 1 {
         use native_session::{GameSession, PlayerCommand, SystemMessageKind};
 
+        let staged_world_path = stage.path().to_path_buf();
         let stream_reader = native_persistence::world::WorldReader::open_for_session(
-            stage.path(),
+            &staged_world_path,
             dimension.clone(),
         )?;
+        let stream_guard = stream_reader
+            .session_guard()
+            .context("streaming world lock missing")?;
         let mut streamer = crate::chunk_stream::ChunkStreamer::start(
             stream_reader,
             defaults.clone(),
@@ -888,7 +898,7 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
             session.pending_fence_update_chunks().collect::<Vec<_>>(),
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
+        let generation_targets = loop {
             streamer.service(session)?;
             let required_missing: Vec<_> = session
                 .required_shape_update_chunks()
@@ -905,7 +915,14 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
                     eprintln!(
                         "Missing shape dependencies prioritized for generation: {required_missing:?}"
                     );
-                    break;
+                    let first = streamer
+                        .missing_generation_targets(session, 1)
+                        .context("single generation target missing")?;
+                    ensure!(
+                        first.targets() == [required_missing[0]],
+                        "first generation target does not match the deferred update"
+                    );
+                    break first;
                 }
             }
             ensure!(
@@ -919,6 +936,76 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
                 "generation target streaming errors: {errors:?}"
             );
             std::thread::sleep(Duration::from_millis(10));
+        };
+        if check_live_inputs {
+            let generation_reader = native_persistence::world::WorldReader::open_with_session(
+                &staged_world_path,
+                dimension.clone(),
+                stream_guard,
+            )?;
+            let mut capture = crate::chunk_stream::MissingGenerationCaptureWorker::start(
+                generation_targets,
+                &streamer,
+                session,
+                generation_reader,
+            )?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let captured = loop {
+                if let Some(result) = capture.try_result(&streamer, session)? {
+                    break result;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "generation capture timed out"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let mut prepare = crate::chunk_stream::MissingGenerationPrepareWorker::start(
+                captured,
+                &streamer,
+                session,
+                game.clone(),
+            )
+            .map_err(|failure| failure.error)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let prepared = loop {
+                if let Some(result) = prepare.try_result(&streamer, session)? {
+                    break result;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "generation preparation timed out"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let (_, generator, restored, observed) =
+                prepared.into_checked_parts(&streamer, session)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let live_inputs = loop {
+                match generator.capture_live_inputs_with_deferred_shapes(session, &restored) {
+                    Ok(inputs) => break inputs,
+                    Err(error)
+                        if error.to_string().contains("sky lighting is not settled")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        streamer.service(session)?;
+                        session.update(Duration::from_millis(50));
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Dirty chunks during generation: {:?}",
+                            session.dirty_chunk_positions()
+                        );
+                        return Err(error.context("cannot bind seed 1 live generation inputs"));
+                    }
+                }
+            };
+            ensure!(
+                observed.is_current(&streamer, session),
+                "seed 1 generation observation changed while lighting settled"
+            );
+            generator.verify_live_inputs(session, &live_inputs)?;
         }
         match session.draft_new_player_state() {
             Ok(draft) => {

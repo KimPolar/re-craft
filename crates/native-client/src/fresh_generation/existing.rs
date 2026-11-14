@@ -1456,8 +1456,8 @@ fn captured_generated_entities_are_empty(
     Ok(true)
 }
 
-/// Retain candidates only when the captured protochunk covers known generated
-/// sources. A caller must still recheck live entities and all save inputs.
+/// Retain captured sidecar and protochunk records as candidates. They do not
+/// establish which entities are loaded or authorize a live-world save.
 fn captured_spawn_entity_candidates(
     document: &NamedTag,
     entity_sidecar: Option<&NamedTag>,
@@ -1467,23 +1467,6 @@ fn captured_spawn_entity_candidates(
     if !feature_coverage || structure_sources_present {
         return Ok(None);
     }
-    if let Some(sidecar) = entity_sidecar {
-        let (Some(Tag::Int(x)), Some(Tag::Int(z))) = (
-            unique_root_field(document, "xPos")?,
-            unique_root_field(document, "zPos")?,
-        ) else {
-            bail!("spawn chunk position is missing")
-        };
-        native_persistence::generated_chunk::append_entity_chunk_records(
-            native_world::loaded::ChunkPos { x: *x, z: *z },
-            sidecar,
-            &[],
-        )?;
-        if matches!(unique_root_field(sidecar, "Entities")?, Some(Tag::List { values, .. }) if !values.is_empty())
-        {
-            return Ok(None);
-        }
-    }
     let original = unique_root_field(document, "entities")?;
     let entities = native_persistence::generated_chunk::append_proto_entity_records(original, &[])?;
     let records = match entities {
@@ -1491,7 +1474,48 @@ fn captured_spawn_entity_candidates(
         Some(Tag::List { values, .. }) => values,
         _ => unreachable!("entity list was validated"),
     };
+    if let Some(sidecar) = entity_sidecar {
+        let (Some(Tag::Int(x)), Some(Tag::Int(z))) = (
+            unique_root_field(document, "xPos")?,
+            unique_root_field(document, "zPos")?,
+        ) else {
+            bail!("spawn chunk position is missing")
+        };
+        let combined = native_persistence::generated_chunk::append_entity_chunk_records(
+            native_world::loaded::ChunkPos { x: *x, z: *z },
+            sidecar,
+            &records,
+        )?;
+        let values = match unique_root_field(&combined, "Entities")? {
+            Some(Tag::List { values, .. }) => values.clone(),
+            None => Vec::new(),
+            _ => unreachable!("entity list was validated"),
+        };
+        return Ok(Some(Arc::new(values)));
+    }
     Ok(Some(Arc::new(records)))
+}
+
+/// Restore the captured sidecar prefix exactly once when assembling a draft.
+fn merge_captured_entity_candidates(
+    position: native_world::loaded::ChunkPos,
+    sidecar: &NamedTag,
+    candidates: &[Tag],
+) -> Result<NamedTag> {
+    let existing = match unique_root_field(sidecar, "Entities")? {
+        Some(Tag::List { values, .. }) => values.as_slice(),
+        None => &[],
+        _ => bail!("captured entity records are invalid"),
+    };
+    ensure!(
+        candidates.starts_with(existing),
+        "captured entity candidates differ from their sidecar"
+    );
+    native_persistence::generated_chunk::append_entity_chunk_records(
+        position,
+        sidecar,
+        &candidates[existing.len()..],
+    )
 }
 
 impl CapturedPostprocessedRegion {
@@ -3452,17 +3476,11 @@ impl PreparedExistingGenerator {
                 .as_ref()
                 .map(|source| source.document.as_ref());
             let entity_chunk = if let Some(sidecar) = sidecar {
-                ensure!(
-                    !matches!(unique_root_field(sidecar, "Entities")?, Some(Tag::List { values, .. }) if !values.is_empty()),
-                    "nonempty entity sidecar requires live reconciliation"
-                );
                 let Some(Tag::List { values, .. }) = generated_entities.value.get("Entities")
                 else {
                     bail!("generated entity records are missing")
                 };
-                native_persistence::generated_chunk::append_entity_chunk_records(
-                    position, sidecar, values,
-                )?
+                merge_captured_entity_candidates(position, sidecar, values)?
             } else {
                 generated_entities
             };
@@ -9693,6 +9711,11 @@ mod tests {
                 ])
             })
             .collect();
+        let proto_entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![55, 66, 77, 88])),
+            ("example:proto_field".into(), Tag::Int(89)),
+        ]);
         let saved = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![
@@ -9701,6 +9724,13 @@ mod tests {
                 ("zPos".into(), Tag::Int(second.z)),
                 ("Status".into(), Tag::String("minecraft:biomes".into())),
                 ("example:root".into(), Tag::Int(73)),
+                (
+                    "entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![proto_entity.clone()],
+                    },
+                ),
                 (
                     "UpgradeData".into(),
                     Tag::Compound(vec![
@@ -9868,8 +9898,16 @@ mod tests {
                     z: second.z,
                 },
             )?);
+        let existing_entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![11, 22, 33, 44])),
+            ("example:entity_field".into(), Tag::Int(88)),
+        ]);
         let mut existing_entity_document =
-            native_persistence::generated_chunk::assemble_entity_chunk(second, &[])?;
+            native_persistence::generated_chunk::assemble_entity_chunk(
+                second,
+                &[existing_entity.clone()],
+            )?;
         let Tag::Compound(fields) = &mut existing_entity_document.value else {
             unreachable!()
         };
@@ -11665,11 +11703,9 @@ mod tests {
                 .iter()
                 .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into())))
         );
-        assert!(
-            region.entity_candidates[&second]
-                .as_ref()
-                .is_some_and(|records| records.is_empty())
-        );
+        assert!(region.entity_candidates[&second].as_ref().is_some_and(
+            |records| records.as_slice() == [existing_entity.clone(), proto_entity.clone()]
+        ));
         let before_pass = batch.terrain.snapshot();
         let mut pass =
             actual.run_captured_mixed_postprocessing(&batch, &staged, region, [target], inputs)?;
@@ -11852,12 +11888,9 @@ mod tests {
                     .iter()
                     .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into()))))
         );
-        assert!(
-            chunks[&second]
-                .entity_records
-                .as_ref()
-                .is_some_and(|records| records.is_empty())
-        );
+        assert!(chunks[&second].entity_records.as_ref().is_some_and(
+            |records| records.as_slice() == [existing_entity.clone(), proto_entity.clone()]
+        ));
         let original_parts = &chunks[&target];
         let unknown_entities = native_session::worldgen::PostprocessedChunkComponents {
             sections: original_parts.sections.clone(),
@@ -11944,6 +11977,9 @@ mod tests {
         assert_eq!(
             full_saved.entity_chunk().value.get("example:entity_root"),
             Some(&Tag::Int(87))
+        );
+        assert!(
+            matches!(full_saved.entity_chunk().value.get("Entities"), Some(Tag::List { values, .. }) if values == &[existing_entity.clone(), proto_entity.clone()])
         );
         assert!(full_new.matches_source(None)?);
         assert!(full_saved.matches_source(Some(&saved))?);
@@ -12922,14 +12958,14 @@ mod tests {
             String::from_utf8_lossy(&checked.stdout),
             String::from_utf8_lossy(&checked.stderr)
         );
-        let entity_input = oracle.path().join("captured-full-entities.nbt");
-        std::fs::write(
-            &entity_input,
-            native_persistence::nbt::write(full_new.entity_chunk())?,
-        )?;
         for (name, draft) in [("new", full_new), ("saved", full_saved)] {
             let chunk_input = oracle.path().join(format!("captured-{name}-full.nbt"));
+            let entity_input = oracle.path().join(format!("captured-{name}-entities.nbt"));
             std::fs::write(&chunk_input, native_persistence::nbt::write(draft.chunk())?)?;
+            std::fs::write(
+                &entity_input,
+                native_persistence::nbt::write(draft.entity_chunk())?,
+            )?;
             let mut command = std::process::Command::new(java.join("java.exe"));
             command
                 .arg("-cp")
@@ -12938,10 +12974,8 @@ mod tests {
                 .arg(&chunk_input)
                 .arg(lighting.min_y.to_string())
                 .arg(lighting.height.to_string())
-                .arg("status:full");
-            if name == "new" {
-                command.arg(&entity_input);
-            }
+                .arg("status:full")
+                .arg(&entity_input);
             let checked = command.output()?;
             ensure!(
                 checked.status.success(),
@@ -13002,9 +13036,19 @@ mod tests {
             position,
             &[Tag::Compound(vec![])],
         )?;
-        assert!(
+        let candidates =
             captured_spawn_entity_candidates(&positioned, Some(&nonempty_sidecar), true, false)?
-                .is_none()
+                .context("sidecar candidates missing")?;
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], Tag::Compound(vec![]));
+        assert_eq!(candidates[1], records[0]);
+        let merged = merge_captured_entity_candidates(position, &nonempty_sidecar, &candidates)?;
+        assert!(
+            matches!(merged.value.get("Entities"), Some(Tag::List { values, .. }) if values == candidates.as_ref())
+        );
+        assert!(
+            merge_captured_entity_candidates(position, &nonempty_sidecar, &candidates[1..])
+                .is_err()
         );
         assert!(captured_spawn_entity_candidates(&document, None, false, false)?.is_none());
         assert!(captured_spawn_entity_candidates(&document, None, true, true)?.is_none());

@@ -72,6 +72,35 @@ pub fn draft_created(
         ),
         "unsupported falling block"
     );
+    draft_created_body(uuid, Tag::String(block.into()), None, state)
+}
+
+/// Prepare the exact carried state and tip damage for a newly created
+/// stalactite. The caller must coordinate source removal and entity effects.
+pub fn draft_created_stalactite(
+    uuid: [i32; 4],
+    body: &crate::falling_block::FallingStalactite,
+    state: FallingSaveState,
+) -> Result<CreatedFallingBlockDraft> {
+    let block = body.block();
+    let properties = block
+        .properties
+        .iter()
+        .map(|(name, value)| (name.as_str().into(), Tag::String(value.as_str().into())))
+        .collect();
+    let block_tag = Tag::Compound(vec![
+        ("id".into(), Tag::String(block.name.as_str().into())),
+        ("properties".into(), Tag::Compound(properties)),
+    ]);
+    draft_created_body(uuid, block_tag, body.damage(), state)
+}
+
+fn draft_created_body(
+    uuid: [i32; 4],
+    block: Tag,
+    damage: Option<crate::falling_block::FallingDamage>,
+    state: FallingSaveState,
+) -> Result<CreatedFallingBlockDraft> {
     ensure!(
         state.position.is_finite()
             && state.position.x.abs() <= 30_000_512.0
@@ -111,13 +140,19 @@ pub fn draft_created(
             ("PortalCooldown".into(), Tag::Int(0)),
             ("OnGround".into(), Tag::Byte(i8::from(state.on_ground))),
             ("NoGravity".into(), Tag::Byte(i8::from(state.no_gravity))),
-            ("BlockState".into(), Tag::String(block.into())),
+            ("BlockState".into(), block),
             ("Time".into(), Tag::Int(state.time)),
             ("DropItem".into(), Tag::Byte(i8::from(state.drop_item))),
             ("CancelDrop".into(), Tag::Byte(i8::from(state.cancel_drop))),
-            ("HurtEntities".into(), Tag::Byte(0)),
-            ("FallHurtAmount".into(), Tag::Float(0.0)),
-            ("FallHurtMax".into(), Tag::Int(40)),
+            ("HurtEntities".into(), Tag::Byte(i8::from(damage.is_some()))),
+            (
+                "FallHurtAmount".into(),
+                Tag::Float(damage.map_or(0.0, |damage| damage.per_distance)),
+            ),
+            (
+                "FallHurtMax".into(),
+                Tag::Int(damage.map_or(40, |damage| damage.maximum)),
+            ),
         ]),
     };
     ensure!(
@@ -1011,6 +1046,182 @@ mod tests {
                 },
             ),
         ])
+    }
+
+    #[test]
+    fn created_stalactite_preserves_state_and_tip_damage() {
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for thickness in ["tip", "tip_merge", "frustum", "middle", "base"] {
+                for wet in [false, true] {
+                    let block = BlockState {
+                        name: name.into(),
+                        properties: BTreeMap::from([
+                            ("vertical_direction".into(), "down".into()),
+                            ("thickness".into(), thickness.into()),
+                            ("waterlogged".into(), wet.to_string()),
+                        ]),
+                    };
+                    let body = crate::falling_block::FallingStalactite::from_source(&block, 20, 14)
+                        .unwrap();
+                    assert_eq!(body.source_waterlogged(), wet);
+                    let tip = matches!(thickness, "tip" | "tip_merge");
+                    assert_eq!(
+                        body.damage().map(|damage| damage.per_distance),
+                        tip.then_some(7.0)
+                    );
+                    let draft = draft_created_stalactite(
+                        [1, 2, 3, 4],
+                        &body,
+                        FallingSaveState {
+                            position: DVec3::new(8.5, 14.0, 8.5),
+                            velocity: DVec3::ZERO,
+                            fall_distance: 0.0,
+                            on_ground: false,
+                            no_gravity: false,
+                            time: 0,
+                            drop_item: true,
+                            cancel_drop: false,
+                        },
+                    )
+                    .unwrap();
+                    let saved = read(&draft.document().value).unwrap().unwrap();
+                    assert_eq!(saved.block.name, name);
+                    assert_eq!(saved.block.properties["waterlogged"], "false");
+                    assert_eq!(saved.block.properties["vertical_direction"], "down");
+                    assert_eq!(saved.block.properties["thickness"], thickness);
+                    assert_eq!(saved.hurt_entities, Some(tip));
+                    assert_eq!(saved.fall_damage.per_distance, if tip { 7.0 } else { 0.0 });
+                    assert_eq!(saved.fall_damage.maximum, 40);
+                    // Preparing an entity is not authorization to save it into a world.
+                    assert!(!saved.block_uses_default);
+                }
+            }
+        }
+        let upward = BlockState {
+            name: "minecraft:pointed_dripstone".into(),
+            properties: BTreeMap::from([
+                ("vertical_direction".into(), "up".into()),
+                ("thickness".into(), "tip".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        assert!(crate::falling_block::FallingStalactite::from_source(&upward, 20, 14).is_none());
+        let mut invalid = upward;
+        invalid
+            .properties
+            .insert("vertical_direction".into(), "down".into());
+        invalid
+            .properties
+            .insert("thickness".into(), "invalid".into());
+        assert!(crate::falling_block::FallingStalactite::from_source(&invalid, 20, 14).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn created_stalactites_round_trip_with_java_codec() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(metadata["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let source = temp.path().join("SavedStalactiteOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SavedStalactiteOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("SavedStalactiteOracle")
+            .arg(temp.path())
+            .arg("generate"));
+        let mut index = 0;
+        for name in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+            for thickness in ["tip", "tip_merge", "frustum", "middle", "base"] {
+                let java_document = native_persistence::nbt::read(
+                    &std::fs::read(temp.path().join(format!("java-{index}.nbt"))).unwrap(),
+                )
+                .unwrap();
+                let java_saved = read(&java_document.value).unwrap().unwrap();
+                let block = BlockState {
+                    name: name.into(),
+                    properties: BTreeMap::from([
+                        ("vertical_direction".into(), "down".into()),
+                        ("thickness".into(), thickness.into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                };
+                assert_eq!(java_saved.block, block, "case {index}");
+                let body =
+                    crate::falling_block::FallingStalactite::from_source(&block, 20, 14).unwrap();
+                assert_eq!(java_saved.hurt_entities, Some(body.damage().is_some()));
+                assert_eq!(
+                    java_saved.fall_damage.per_distance,
+                    body.damage().map_or(0.0, |damage| damage.per_distance)
+                );
+                assert_eq!(java_saved.fall_damage.maximum, 40);
+                let draft = draft_created_stalactite(
+                    [1, 2, 3, 4],
+                    &body,
+                    FallingSaveState {
+                        position: DVec3::new(8.5, 14.0, 8.5),
+                        velocity: DVec3::ZERO,
+                        fall_distance: 0.0,
+                        on_ground: false,
+                        no_gravity: false,
+                        time: 0,
+                        drop_item: true,
+                        cancel_drop: false,
+                    },
+                )
+                .unwrap();
+                std::fs::write(
+                    temp.path().join(format!("rust-{index}.nbt")),
+                    native_persistence::nbt::write(draft.document()).unwrap(),
+                )
+                .unwrap();
+                index += 1;
+            }
+        }
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("SavedStalactiteOracle")
+            .arg(temp.path())
+            .arg("verify"));
     }
 
     #[test]

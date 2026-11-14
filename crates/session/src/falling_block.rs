@@ -132,6 +132,57 @@ impl FallingDamage {
     }
 }
 
+/// Block state carried by one falling stalactite segment. The source cell may
+/// retain water, but FallingBlockEntity.fall always clears the carried state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FallingStalactite {
+    block: native_world::loaded::BlockState,
+    source_waterlogged: bool,
+    damage: Option<FallingDamage>,
+}
+
+impl FallingStalactite {
+    pub fn from_source(
+        source: &native_world::loaded::BlockState,
+        top_y: i32,
+        segment_y: i32,
+    ) -> Option<Self> {
+        native_world::collision::positioned_speleothem_shape(source, IVec3::ZERO)?;
+        if source.properties.get("vertical_direction")?.as_str() != "down" || segment_y > top_y {
+            return None;
+        }
+        let source_waterlogged = source.properties.get("waterlogged")? == "true";
+        let tip = matches!(
+            source.properties.get("thickness")?.as_str(),
+            "tip" | "tip_merge"
+        );
+        let damage = if tip {
+            Some(FallingDamage::stalactite(top_y, segment_y)?)
+        } else {
+            None
+        };
+        let mut block = source.clone();
+        block
+            .properties
+            .insert("waterlogged".into(), "false".into());
+        Some(Self {
+            block,
+            source_waterlogged,
+            damage,
+        })
+    }
+
+    pub fn block(&self) -> &native_world::loaded::BlockState {
+        &self.block
+    }
+    pub fn source_waterlogged(&self) -> bool {
+        self.source_waterlogged
+    }
+    pub fn damage(&self) -> Option<FallingDamage> {
+        self.damage
+    }
+}
+
 impl FallingKind {
     pub fn id(self) -> &'static str {
         match self {

@@ -202,15 +202,23 @@ impl SavedStructurePlan {
     }
 }
 
-fn ensure_structure_sources_in_output(
-    sources: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
-    mut contains: impl FnMut(native_world::loaded::ChunkPos) -> bool,
-) -> Result<()> {
-    ensure!(
-        sources.into_iter().all(&mut contains),
-        "postprocessed output omits an updated structure source"
-    );
-    Ok(())
+fn partition_structure_sources(
+    drafts: BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+    mut postprocessed: impl FnMut(native_world::loaded::ChunkPos) -> bool,
+) -> (
+    BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+    BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+) {
+    let mut included = BTreeMap::new();
+    let mut external = BTreeMap::new();
+    for (position, draft) in drafts {
+        if postprocessed(position) {
+            included.insert(position, draft);
+        } else {
+            external.insert(position, draft);
+        }
+    }
+    (included, external)
 }
 
 /// Decoration inputs from one captured biome neighborhood and pack snapshot.
@@ -784,7 +792,8 @@ impl CapturedPostprocessedSections {
     }
 }
 
-/// Components tied to the same completed pass. Entity sidecars remain unknown.
+/// Components tied to the same completed pass. External source updates must be
+/// committed with the chunks; entity sidecars and other save checks remain unknown.
 pub(crate) struct CapturedPostprocessedComponents {
     result_identity: Arc<()>,
     chunks: BTreeMap<
@@ -792,20 +801,27 @@ pub(crate) struct CapturedPostprocessedComponents {
         native_session::worldgen::PostprocessedChunkComponents,
     >,
     structures: BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
+    external_structure_sources: BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
 }
 
 impl CapturedPostprocessedComponents {
-    pub fn chunks(
+    /// Every returned component must be committed in one transaction after
+    /// revalidating source data, live state, packs and entity/POI sidecars.
+    pub fn outputs(
         &self,
-    ) -> &BTreeMap<
-        native_world::loaded::ChunkPos,
-        native_session::worldgen::PostprocessedChunkComponents,
-    > {
-        &self.chunks
-    }
-
-    pub fn structures(&self) -> &BTreeMap<native_world::loaded::ChunkPos, Option<Tag>> {
-        &self.structures
+    ) -> (
+        &BTreeMap<
+            native_world::loaded::ChunkPos,
+            native_session::worldgen::PostprocessedChunkComponents,
+        >,
+        &BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
+        &BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+    ) {
+        (
+            &self.chunks,
+            &self.structures,
+            &self.external_structure_sources,
+        )
     }
 
     pub fn matches_state(
@@ -2379,10 +2395,10 @@ impl PreparedExistingGenerator {
                 ),
             "captured postprocessing inputs changed"
         );
-        ensure_structure_sources_in_output(
-            batch.treasure_starts.keys().map(|(_, source)| *source),
-            |source| sections.sections.contains_key(&source),
-        )?;
+        let (mut updated_sources, external_structure_sources) =
+            partition_structure_sources(self.draft_captured_structure_sources(batch)?, |source| {
+                sections.sections.contains_key(&source)
+            });
         let assets = self
             .terrain_assets
             .as_ref()
@@ -2408,16 +2424,8 @@ impl PreparedExistingGenerator {
                 proof.matches_source(source.as_deref())?,
                 "postprocessing source differs"
             );
-            let mut document = if batch
-                .treasure_starts
-                .keys()
-                .any(|(_, source)| *source == pos)
-            {
-                self.draft_captured_structure_starts(
-                    batch,
-                    native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
-                )?
-                .document
+            let mut document = if let Some(draft) = updated_sources.remove(&pos) {
+                draft.document
             } else {
                 source.as_deref().cloned().unwrap_or_else(|| NamedTag {
                     name: "".into(),
@@ -2451,10 +2459,15 @@ impl PreparedExistingGenerator {
                 },
             );
         }
+        ensure!(
+            updated_sources.is_empty(),
+            "postprocessed structure source is missing"
+        );
         Ok(CapturedPostprocessedComponents {
             result_identity: Arc::clone(&completed.identity),
             chunks,
             structures,
+            external_structure_sources,
         })
     }
 
@@ -3607,6 +3620,30 @@ impl PreparedExistingGenerator {
             "structure belongs to another generation capture"
         );
         self.draft_saved_treasure_starts(&batch.treasure_starts, position)
+    }
+
+    fn draft_captured_structure_sources(
+        &self,
+        batch: &CapturedTerrainBatch,
+    ) -> Result<BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "structure belongs to another generation capture"
+        );
+        let mut drafts = BTreeMap::new();
+        for (_, position) in batch.treasure_starts.keys() {
+            if !drafts.contains_key(position) {
+                let saved_pos = native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                };
+                drafts.insert(
+                    *position,
+                    self.draft_saved_treasure_starts(&batch.treasure_starts, saved_pos)?,
+                );
+            }
+        }
+        Ok(drafts)
     }
 
     fn draft_saved_treasure_starts(
@@ -9694,18 +9731,44 @@ mod tests {
     }
 
     #[test]
-    fn postprocessed_output_requires_every_changed_structure_source() {
+    fn postprocessed_output_retains_external_structure_sources() -> Result<()> {
         use native_world::loaded::ChunkPos;
 
         let first = ChunkPos { x: -1, z: 2 };
         let second = ChunkPos { x: 3, z: -4 };
-        let output = BTreeSet::from([first]);
-        let error =
-            ensure_structure_sources_in_output([first, second], |pos| output.contains(&pos))
-                .expect_err("a changed structure source must not be omitted");
-        assert!(format!("{error:#}").contains("omits an updated structure source"));
-        ensure_structure_sources_in_output([first], |pos| output.contains(&pos)).unwrap();
-        ensure_structure_sources_in_output([], |_| false).unwrap();
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("original".into(), Tag::Int(42))]),
+        };
+        let changed = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("changed".into(), Tag::Int(7))]),
+        };
+        let make_draft = || -> Result<ResumedStructureDraft> {
+            Ok(ResumedStructureDraft {
+                source_nbt: native_persistence::nbt::write(&source)?,
+                document: changed.clone(),
+            })
+        };
+        let drafts = BTreeMap::from([(first, make_draft()?), (second, make_draft()?)]);
+        let (mut included, external) = partition_structure_sources(drafts, |pos| pos == first);
+        assert_eq!(included.keys().copied().collect::<Vec<_>>(), [first]);
+        assert_eq!(external.keys().copied().collect::<Vec<_>>(), [second]);
+        assert_eq!(included.remove(&first).unwrap().document(), &changed);
+        assert!(included.is_empty());
+        let components = CapturedPostprocessedComponents {
+            result_identity: Arc::new(()),
+            chunks: BTreeMap::new(),
+            structures: BTreeMap::from([(first, Some(Tag::Int(1)))]),
+            external_structure_sources: external,
+        };
+        let (chunks, structures, pending) = components.outputs();
+        assert!(chunks.is_empty());
+        assert_eq!(structures.get(&first), Some(&Some(Tag::Int(1))));
+        assert_eq!(pending[&second].document(), &changed);
+        assert!(pending[&second].matches_source(&source)?);
+        assert!(!pending[&second].matches_source(&changed)?);
+        Ok(())
     }
 
     #[test]
@@ -12961,6 +13024,10 @@ mod tests {
         let captured_draft = restored.draft_captured_structure_starts(&captured, saved_center)?;
         assert_eq!(captured_draft.document(), draft.document());
         assert!(captured_draft.matches_source(&treasure.source)?);
+        let captured_sources = restored.draft_captured_structure_sources(&captured)?;
+        assert_eq!(captured_sources.len(), 1);
+        assert_eq!(captured_sources[&center].document(), draft.document());
+        assert!(captured_sources[&center].matches_source(&treasure.source)?);
         assert_eq!(
             captured.treasure_starts[&key].placement.bounds,
             treasure.placement.bounds

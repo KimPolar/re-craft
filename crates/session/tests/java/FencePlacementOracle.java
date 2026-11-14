@@ -51,7 +51,7 @@ public class FencePlacementOracle {
         var result = new JsonArray();
         for (var fence : fences) for (var fluid : List.of("air", "water", "flowing"))
             for (var direction : List.of(Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST))
-                for (var neighbor : List.of("air", "stone", "oak_planks", "oak_fence", "nether_brick_fence", "oak_fence_gate", "oak_leaves", "barrier", "pumpkin")) {
+                for (var neighbor : List.of("air", "stone", "sulfur", "cinnabar", "calcite", "smooth_basalt", "amethyst_block", "budding_amethyst", "oak_planks", "oak_fence", "nether_brick_fence", "oak_fence_gate", "oak_leaves", "barrier", "pumpkin")) {
                     var id = BuiltInRegistries.BLOCK.getKey(fence.value());
                     var other = BuiltInRegistries.BLOCK.getValue(Identifier.withDefaultNamespace(neighbor)).defaultBlockState();
                     world.states = new HashMap<>();

@@ -1803,6 +1803,19 @@ pub(crate) fn fence_connection(
     if except {
         return Ok(false);
     }
+    if neighbor.properties.is_empty()
+        && matches!(
+            neighbor.name.as_str(),
+            "minecraft:sulfur"
+                | "minecraft:cinnabar"
+                | "minecraft:calcite"
+                | "minecraft:smooth_basalt"
+                | "minecraft:amethyst_block"
+                | "minecraft:budding_amethyst"
+        )
+    {
+        return Ok(true);
+    }
     let face = glam::IVec3::new(-direction[0], -direction[1], -direction[2]);
     native_world::collision::button_support_face(neighbor, face)
         .with_context(|| format!("unsupported fence neighbor support: {}", neighbor.name))

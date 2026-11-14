@@ -564,7 +564,9 @@ mod tests {
             data["container_events"].as_array().unwrap(),
         );
         let landings = data["landing"].as_array().unwrap();
+        let falling_landings = data["falling_landing"].as_array().unwrap();
         assert_eq!(landings.len(), 200);
+        assert_eq!(falling_landings.len(), landings.len());
         for (index, row) in landings.iter().enumerate() {
             let ground = row["ground"].as_bool().unwrap();
             let water = row["water"].as_bool().unwrap();
@@ -598,6 +600,15 @@ mod tests {
                 "legacy"
             };
             assert_eq!(row["affected"], expected_affected, "landing {index}: {row}");
+            let falling = &falling_landings[index];
+            for field in ["event", "fall_on", "fall_bits", "affected"] {
+                assert_eq!(
+                    falling[field], row[field],
+                    "falling landing {index}: {field}"
+                );
+            }
+            assert_eq!(falling["source"].as_bool().unwrap(), emitted, "{falling}");
+            assert_eq!(falling["position"].as_bool().unwrap(), emitted, "{falling}");
         }
         let rows = data["movement"].as_array().unwrap();
         assert_eq!(rows.len(), 1024);

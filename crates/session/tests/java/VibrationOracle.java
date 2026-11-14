@@ -78,6 +78,13 @@ public class VibrationOracle {
         @Override public void gameEvent(Holder<GameEvent> event) { testWorld.movementEvent=event==GameEvent.SWIM ? "swim" : "other"; }
         void applyFall(double vertical, boolean grounded, BlockState block) { super.checkFallDamage(vertical,grounded,block,BlockPos.ZERO); }
     }
+    static class FallingSource extends net.minecraft.world.entity.item.FallingBlockEntity {
+        World testWorld; boolean water;
+        FallingSource() { super(null, null); }
+        @Override public net.minecraft.world.level.Level level() { return testWorld; }
+        @Override public boolean isInWater() { return water; }
+        void applyFall(double vertical, boolean grounded, BlockState block) { super.checkFallDamage(vertical,grounded,block,BlockPos.ZERO); }
+    }
     static class ProbeBlock extends Block {
         boolean landed;
         ProbeBlock() { super(net.minecraft.world.level.block.state.BlockBehaviour.Properties.of().setId(net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.BLOCK,net.minecraft.resources.Identifier.parse("test:fall_probe")))); }
@@ -305,6 +312,15 @@ public class VibrationOracle {
             mover.applyFall(vertical,ground,probeState);
             var row=new JsonObject();row.addProperty("water",water);row.addProperty("ground",ground);row.addProperty("support",support);row.addProperty("initial",distance);row.addProperty("vertical",vertical);row.addProperty("fall_bits",Double.doubleToRawLongBits(mover.fallDistance));row.addProperty("event",world.movementEvent);row.addProperty("fall_on",probe.landed);row.addProperty("affected",world.affectedState==null ? "none" : world.affectedState==world.movementState ? "support" : "legacy");fallRows.add(row);
         }
+        var fallingRows=new JsonArray();
+        var falling=(FallingSource)unsafe.allocateInstance(FallingSource.class);falling.testWorld=world;positionField.set(falling,Vec3.ZERO);
+        for(boolean water:new boolean[]{false,true}) for(boolean ground:new boolean[]{false,true}) for(boolean support:new boolean[]{false,true})
+        for(double distance:new double[]{0,0.01,0.5,3,100000000}) for(double vertical:new double[]{-3.141592653589793,-0.2,-1e-12,0,0.2}) {
+            falling.water=water;falling.fallDistance=distance;falling.mainSupportingBlockPos=support ? Optional.of(BlockPos.ZERO) : Optional.empty();
+            world.movementState=Blocks.STONE.defaultBlockState();world.movementEvent="none";world.affectedState=null;world.eventSource=null;world.eventPosition=null;probe.landed=false;
+            falling.applyFall(vertical,ground,probeState);
+            var row=new JsonObject();row.addProperty("event",world.movementEvent);row.addProperty("fall_on",probe.landed);row.addProperty("fall_bits",Double.doubleToRawLongBits(falling.fallDistance));row.addProperty("affected",world.affectedState==null ? "none" : world.affectedState==world.movementState ? "support" : "legacy");row.addProperty("source",world.eventSource==falling);row.addProperty("position",Vec3.ZERO.equals(world.eventPosition));fallingRows.add(row);
+        }
         world.movementState=null;
         var player=(ProbePlayer)unsafe.allocateInstance(ProbePlayer.class);var placeContext=(ProbePlacement)unsafe.allocateInstance(ProbePlacement.class);var placeItem=(ProbeItem)unsafe.allocateInstance(ProbeItem.class);
         net.minecraft.world.item.Items.STONE.builtInRegistryHolder().bindComponents(net.minecraft.core.component.DataComponentMap.builder().set(net.minecraft.core.component.DataComponents.MAX_STACK_SIZE,64).build());
@@ -346,6 +362,7 @@ public class VibrationOracle {
         }
         world.captureActions=false;
         var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);result.add("sensor_step",sensorStep);result.add("movement",movementRows);result.add("landing",fallRows);result.add("block_events",blockEvents);result.add("block_actions",actions);result.add("container_events",containerEvents);
+        result.add("falling_landing",fallingRows);
         Files.writeString(Path.of(args[0]), result.toString());
         var registryLookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
         var sensorNbt=new net.minecraft.nbt.CompoundTag();

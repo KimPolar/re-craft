@@ -19383,6 +19383,70 @@ impl LoadedSession {
                 );
                 entity.fall_distance_verified = safe;
                 if safe {
+                    let landing_distance = crate::fall::accumulate_distance(
+                        entity.fall_distance,
+                        collision.actual.y,
+                        false,
+                    );
+                    if !self.sculk_listeners.is_empty()
+                        && crate::fall::emits_landing(landing_distance, collision.on_ground)
+                    {
+                        let position = entity.motion.position - self.origin.as_dvec3();
+                        let support = crate::movement::supporting_box(
+                            position,
+                            f64::from(0.98_f32) / 2.0,
+                            collision.actual,
+                            false,
+                            |p| match cell(&self.world, self.origin, self.bounds, p, self.states[0])
+                            {
+                                Cell::State(id) => {
+                                    shape_at_relative(&self.world, &self.shapes, id, self.origin, p)
+                                        .unwrap_or_else(|| unknown_barrier())
+                                }
+                                Cell::Missing => unknown_barrier(),
+                            },
+                        );
+                        let legacy = crate::movement::legacy_on_block(position, support, |p| {
+                            match cell(&self.world, self.origin, self.bounds, p, self.states[0]) {
+                                Cell::State(id) => self.world.state(id).is_some_and(|state| {
+                                    state.name.ends_with("_wall")
+                                        || state.name.ends_with("_fence")
+                                        || state.name.ends_with("_fence_gate")
+                                }),
+                                Cell::Missing => false,
+                            }
+                        });
+                        let affected = match cell(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            support.unwrap_or(legacy),
+                            self.states[0],
+                        ) {
+                            Cell::State(id) => self.world.state(id).map(|state| state.name.clone()),
+                            Cell::Missing => None,
+                        };
+                        if let Some(affected) = affected {
+                            let uuid = entity
+                                .created
+                                .as_ref()
+                                .and_then(|created| created.uuid)
+                                .or_else(|| {
+                                    entity.source.as_ref().and_then(|source| {
+                                        crate::saved_item::optional_uuid(source, "UUID")
+                                            .ok()
+                                            .flatten()
+                                    })
+                                });
+                            self.dispatch_vibration(
+                                "minecraft:hit_ground",
+                                entity.motion.position,
+                                uuid,
+                                Some(crate::vibration::VibrationSource::default()),
+                                Some(&affected),
+                            );
+                        }
+                    }
                     entity.fall_distance = crate::falling_block::fall_distance_after_move(
                         entity.fall_distance,
                         collision.actual.y,
@@ -44635,6 +44699,93 @@ pub(crate) mod tests {
             );
             if let Some((_, event)) = selected {
                 assert_eq!(event.event, "minecraft:hit_ground");
+            }
+        }
+    }
+
+    #[test]
+    fn falling_block_landing_emits_vibration_with_entity_and_support() {
+        struct Packs(bool);
+        impl native_resources::packs::ResourceProvider for Packs {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    if self.0 && path.ends_with("dampens_vibrations.json") {
+                        br#"{"values":["minecraft:stone"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    },
+                ])
+            }
+        }
+        for (dampens, listening, height, distance, expected) in [
+            (false, true, 1.1, 0.0, true),
+            (false, true, 1.0, 0.0, false),
+            (false, true, 1.1, 2.0, true),
+            (true, true, 1.1, 2.0, false),
+            (false, false, 1.1, 2.0, false),
+            (false, true, 3.0, 2.0, false),
+        ] {
+            let (mut session, sensor) =
+                splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+            let registry = BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:stone".into(),
+                "minecraft:sculk_sensor".into(),
+            ]);
+            let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+                &mut Packs(dampens),
+                &registry,
+            )
+            .unwrap();
+            let events = native_resources::game_event_tags::GameEventTags::new(
+                if listening {
+                    BTreeSet::from(["minecraft:hit_ground".into()])
+                } else {
+                    BTreeSet::new()
+                },
+                BTreeSet::new(),
+            );
+            session.set_vibration_tags(Arc::new(events), Arc::new(blocks));
+            let position = session.origin.as_dvec3() + DVec3::new(6.5, height, 6.5);
+            let uuid = [1, 2, 3, 4];
+            let mut created = CreatedFallingSand::new(position.floor().as_ivec3(), position);
+            created.uuid = Some(uuid);
+            session.falling_sand.push(FallingSand {
+                previous: position,
+                fall_distance: distance,
+                fall_distance_verified: true,
+                motion: crate::falling_block::AirborneMotion {
+                    position,
+                    velocity: DVec3::new(0.0, -0.2, 0.0),
+                    age: 0,
+                    no_gravity: true,
+                },
+                kind: FallingKind::Sand,
+                drop_item: false,
+                cancel_drop: true,
+                on_ground: false,
+                source: None,
+                created: Some(created),
+            });
+            session.advance_falling_sand();
+            let event = session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending();
+            assert_eq!(
+                event.is_some(),
+                expected,
+                "{dampens} {listening} {height} {distance}"
+            );
+            if let Some((_, event)) = event {
+                assert_eq!(event.event, "minecraft:hit_ground");
+                assert_eq!(event.source, Some(uuid));
+                assert_eq!(
+                    event.position,
+                    session.origin.as_dvec3() + DVec3::new(6.5, 1.0, 6.5)
+                );
             }
         }
     }

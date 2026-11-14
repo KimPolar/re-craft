@@ -96,6 +96,11 @@ struct ResumedFarmEnvironment<'a> {
     resolve_structures: &'a mut dyn FnMut() -> Result<BTreeSet<ResourceId>>,
 }
 
+enum CreatureStructureContext<'a> {
+    Resumed(&'a ResumedTerrainWorld),
+    Captured(&'a CapturedTerrainBatch),
+}
+
 impl native_resources::animal_variants::SpawnVariantEnvironment for ResumedFarmEnvironment<'_> {
     fn biome(&self) -> Result<&ResourceId> {
         Ok(self.biome)
@@ -3677,19 +3682,54 @@ impl PreparedExistingGenerator {
         world: &ResumedTerrainWorld,
         position: [i32; 3],
     ) -> Result<BTreeSet<ResourceId>> {
-        use native_session::worldgen::saved_structure_starts::RestoredStructureStart;
         let target = native_persistence::world::ChunkPos {
             x: position[0].div_euclid(16),
             z: position[2].div_euclid(16),
         };
         let references = self.restore_saved_structure_references(target)?;
         validate_saved_decoration_references(&references)?;
+        self.creature_structures_at(&references.references, &world.treasure_starts, position)
+    }
+
+    fn captured_structures_at(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        position: [i32; 3],
+    ) -> Result<BTreeSet<ResourceId>> {
+        let target = native_world::loaded::ChunkPos {
+            x: position[0].div_euclid(16),
+            z: position[2].div_euclid(16),
+        };
+        if let Some(generated) = batch.generated_references.get(&target) {
+            self.creature_structures_at(&generated.references, &batch.treasure_starts, position)
+        } else {
+            let saved = native_persistence::world::ChunkPos {
+                x: target.x,
+                z: target.z,
+            };
+            ensure!(
+                matches!(batch.sources.get(&saved), Some(Some(_))),
+                "structure references missing"
+            );
+            let references = self.restore_saved_structure_references(saved)?;
+            validate_saved_decoration_references(&references)?;
+            self.creature_structures_at(&references.references, &batch.treasure_starts, position)
+        }
+    }
+
+    fn creature_structures_at(
+        &mut self,
+        references: &native_session::worldgen::structure_references::OrderedStructureReferences,
+        treasure_starts: &BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+        position: [i32; 3],
+    ) -> Result<BTreeSet<ResourceId>> {
+        use native_session::worldgen::saved_structure_starts::RestoredStructureStart;
         let mut loaded = BTreeMap::new();
         let mut matches = BTreeSet::new();
         let contains = |bounds: native_core::beardifier::BoundingBox| {
             (0..3).all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&position[axis]))
         };
-        for (id, sources) in references.references.membership() {
+        for (id, sources) in references.membership() {
             for &packed in sources {
                 let bits = packed as u64;
                 let source = native_world::loaded::ChunkPos {
@@ -3709,7 +3749,7 @@ impl PreparedExistingGenerator {
                     .and_then(|chunk| chunk.terrain.as_ref())
                     .context("structure source missing")?;
                 let key = (id.clone(), source);
-                if let Some(treasure) = world.treasure_starts.get(&key) {
+                if let Some(treasure) = treasure_starts.get(&key) {
                     ensure!(
                         Arc::ptr_eq(&treasure.source, &captured.document),
                         "structure source differs"
@@ -3758,12 +3798,54 @@ impl PreparedExistingGenerator {
         );
         self.validate_resumed_spawn(world, schedule, light, plan.position)?;
         ensure!(
-            plan.border == Some(border) && plan.finalizable,
-            "creature is not ready for finalization"
-        );
-        ensure!(
             context.position.x == plan.position.x && context.position.z == plan.position.z,
             "creature biome context differs"
+        );
+        self.finalize_creature(
+            plan,
+            clocks,
+            border,
+            &context.biomes,
+            CreatureStructureContext::Resumed(world),
+        )
+    }
+
+    /// Finalize a mixed-terrain creature into its private spawn plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_captured_creature(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        plan: &mut CapturedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+    ) -> Result<()> {
+        ensure!(
+            plan.matches_state(batch, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.validate_captured_spawn(batch, light, plan.inner.position)?;
+        self.finalize_creature(
+            &mut plan.inner,
+            clocks,
+            border,
+            &batch.biomes,
+            CreatureStructureContext::Captured(batch),
+        )
+    }
+
+    fn finalize_creature(
+        &mut self,
+        plan: &mut ResumedCreaturePlan,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+        biomes: &native_session::worldgen::BiomeNeighborhood,
+        structures: CreatureStructureContext<'_>,
+    ) -> Result<()> {
+        ensure!(
+            plan.border == Some(border) && plan.finalizable,
+            "creature is not ready for finalization"
         );
         let construction = plan.constructed.context("constructed creature missing")?;
         let pose = plan.pose.context("creature pose missing")?;
@@ -3818,9 +3900,7 @@ impl PreparedExistingGenerator {
         let probe = plan.probe.as_mut().context("creature probe missing")?;
         let addition = match attempt.entity.path.as_str() {
             "sheep" => {
-                let biome = context
-                    .biomes
-                    .biome_at_block(position[0], position[1], position[2])?;
+                let biome = biomes.biome_at_block(position[0], position[1], position[2])?;
                 let tags = &self
                     .mob_placement_assets
                     .as_ref()
@@ -3849,15 +3929,20 @@ impl PreparedExistingGenerator {
             )?,
             "pig" | "cow" | "chicken" => {
                 let index = farm.expect("farm species identified").0;
-                let biome = context
-                    .biomes
-                    .biome_at_block(position[0], position[1], position[2])?;
+                let biome = biomes.biome_at_block(position[0], position[1], position[2])?;
                 let variants = self.farm_variants[index]
                     .take()
                     .expect("farm variants initialized");
                 let moon = self.farm_moon.take();
                 let result = {
-                    let mut resolve_structures = || self.resumed_structures_at(world, position);
+                    let mut resolve_structures = || match &structures {
+                        CreatureStructureContext::Resumed(world) => {
+                            self.resumed_structures_at(world, position)
+                        }
+                        CreatureStructureContext::Captured(batch) => {
+                            self.captured_structures_at(batch, position)
+                        }
+                    };
                     let mut environment = ResumedFarmEnvironment {
                         biome,
                         moon: moon.as_ref(),
@@ -9401,7 +9486,7 @@ mod tests {
             forced.spawns,
         )?;
         let mut constructed = false;
-        for _ in 0..512 {
+        for sequence in 0..512 {
             match animal.advance(&batch, &staged, true, &clocks)? {
                 native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished => break,
                 native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Pending => continue,
@@ -9422,7 +9507,7 @@ mod tests {
                 ResumedCreatureCheck::NeedsConstruction(_) => {}
             }
             let construction = native_session::worldgen::FreshCreatureConstruction {
-                uuid: [42, 43, 44, 45],
+                uuid: [42, 43, 44, sequence],
                 chicken_egg_time: None,
             };
             let invalid = native_session::worldgen::FreshCreatureConstruction {
@@ -9534,6 +9619,7 @@ mod tests {
                 ResumedCreatureInstance::Rejected => {
                     assert!(animal.inner.probe.is_none());
                     assert!(animal.inner.constructed.is_none());
+                    continue;
                 }
                 ResumedCreatureInstance::NeedsFinalization(actual_pose) => {
                     assert_eq!(actual_pose, pose);
@@ -9551,6 +9637,51 @@ mod tests {
                 }
             }
             assert!(pose.geometry.position.iter().all(|v| v.is_finite()));
+            assert!(
+                actual
+                    .finalize_captured_creature(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &wrong_clocks,
+                        changed_border,
+                    )
+                    .is_err()
+            );
+            assert!(animal.inner.additions.is_empty());
+            actual.finalize_captured_creature(
+                &batch,
+                &staged,
+                &mut animal,
+                true,
+                &clocks,
+                changed_border,
+            )?;
+            assert_eq!(animal.inner.additions.len(), 1);
+            let native_session::worldgen::GeneratedEntityRecord::Saved(record) =
+                &animal.inner.additions[0].record
+            else {
+                bail!("finalized creature record missing")
+            };
+            assert_eq!(record.get("id"), Some(&Tag::String("minecraft:pig".into())));
+            assert_eq!(
+                record.get("UUID"),
+                Some(&Tag::IntArray(construction.uuid.to_vec()))
+            );
+            assert!(animal.inner.probe.is_none());
+            assert!(
+                actual
+                    .finalize_captured_creature(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &clocks,
+                        changed_border,
+                    )
+                    .is_err()
+            );
             constructed = true;
             break;
         }
@@ -13541,6 +13672,11 @@ mod tests {
                 references: references.references,
             },
         );
+        assert!(
+            structured
+                .captured_structures_at(&captured_batch, [48, 0, 48])
+                .is_err()
+        );
         let error = structured
             .run_captured_features_with_initial_light(
                 &mut captured_batch,
@@ -13567,6 +13703,11 @@ mod tests {
                 original: None,
                 references: empty_references.references,
             },
+        );
+        assert!(
+            structured
+                .captured_structures_at(&captured_batch, [48, 0, 48])?
+                .is_empty()
         );
         let before_maps = captured_batch.terrain().generated_heightmap_data(center)?;
         assert!(
@@ -14014,6 +14155,15 @@ mod tests {
             restored
                 .resumed_structures_at(&terrain, treasure_point)?
                 .contains(&treasure_id)
+        );
+        assert_eq!(
+            restored.captured_structures_at(&captured, treasure_point)?,
+            restored.resumed_structures_at(&terrain, treasure_point)?
+        );
+        assert!(
+            restored
+                .captured_structures_at(&captured, [1_000_000, 0, 1_000_000])
+                .is_err()
         );
         {
             use native_resources::animal_variants::SpawnVariantEnvironment;

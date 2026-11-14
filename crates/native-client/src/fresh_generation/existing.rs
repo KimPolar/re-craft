@@ -3217,16 +3217,53 @@ impl PreparedExistingGenerator {
         border: native_session::respawn::RespawnBorder,
         budget: usize,
     ) -> Result<ResumedCreatureCheck> {
-        use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
-        use native_session::worldgen::{
-            GeneratedCreatureCollisionProgress, GeneratedCreatureProbeProgress,
-            GeneratedCreatureRuleProgress,
-        };
         ensure!(
             plan.matches_state(world, light, spawn_mobs, clocks),
             "creature plan is stale"
         );
         self.validate_resumed_spawn(world, schedule, light, plan.position)?;
+        self.check_creature_candidate(&world.terrain, &light.engine, plan, border, budget)
+    }
+
+    /// Test a mixed-terrain candidate without creating or publishing an entity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_captured_creature_candidate(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        plan: &mut CapturedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+        budget: usize,
+    ) -> Result<ResumedCreatureCheck> {
+        ensure!(
+            plan.matches_state(batch, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.validate_captured_spawn(batch, light, plan.inner.position)?;
+        self.check_creature_candidate(
+            &batch.terrain,
+            &light.engine,
+            &mut plan.inner,
+            border,
+            budget,
+        )
+    }
+
+    fn check_creature_candidate(
+        &mut self,
+        terrain: &native_session::worldgen::CarvedTerrainWorld,
+        engine: &native_session::worldgen::StagedGenerationLightEngine,
+        plan: &mut ResumedCreaturePlan,
+        border: native_session::respawn::RespawnBorder,
+        budget: usize,
+    ) -> Result<ResumedCreatureCheck> {
+        use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
+        use native_session::worldgen::{
+            GeneratedCreatureCollisionProgress, GeneratedCreatureProbeProgress,
+            GeneratedCreatureRuleProgress,
+        };
         ensure!(border.is_valid(), "invalid mob spawn border");
         ensure!(
             plan.border.is_none_or(|before| before == border),
@@ -3283,11 +3320,7 @@ impl PreparedExistingGenerator {
             .context("terrain registry is missing")?
             .blocks;
         if plan.rule_light.is_none() {
-            plan.rule_light = Some(light.engine.snapshot(
-                &world.terrain,
-                [plan.position],
-                registry,
-            )?);
+            plan.rule_light = Some(engine.snapshot(terrain, [plan.position], registry)?);
         }
         let visible = plan
             .rule_light
@@ -3303,7 +3336,7 @@ impl PreparedExistingGenerator {
             .and_then(Value::as_bool)
             .context("dimension has_ceiling is missing")?;
         let mut view = native_session::worldgen::GeneratedMobPlacementView::from_captured_terrain(
-            &world.terrain,
+            terrain,
             visible,
             registry,
             ambient,
@@ -9189,8 +9222,98 @@ mod tests {
             native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_)
         ));
         assert_eq!(pending.advance(&batch, &staged, true, &clocks)?, attempt);
+        let excluded = native_session::respawn::RespawnBorder {
+            min_x: 1000.0,
+            max_x: 1001.0,
+            min_z: 1000.0,
+            max_z: 1001.0,
+        };
+        assert!(
+            actual
+                .check_captured_creature_candidate(
+                    &batch,
+                    &staged,
+                    &mut pending,
+                    true,
+                    &wrong_clocks,
+                    excluded,
+                    64,
+                )
+                .is_err()
+        );
+        assert_eq!(pending.advance(&batch, &staged, true, &clocks)?, attempt);
+        assert_eq!(
+            actual.check_captured_creature_candidate(
+                &batch,
+                &staged,
+                &mut pending,
+                true,
+                &clocks,
+                excluded,
+                0,
+            )?,
+            ResumedCreatureCheck::Pending
+        );
+        assert_eq!(pending.advance(&batch, &staged, true, &clocks)?, attempt);
+        let changed_border = native_session::respawn::RespawnBorder {
+            min_x: -1000.0,
+            max_x: 1000.0,
+            min_z: -1000.0,
+            max_z: 1000.0,
+        };
+        assert!(
+            actual
+                .check_captured_creature_candidate(
+                    &batch,
+                    &staged,
+                    &mut pending,
+                    true,
+                    &clocks,
+                    changed_border,
+                    64,
+                )
+                .is_err()
+        );
+        let mut rejected = false;
+        for _ in 0..16 {
+            match actual.check_captured_creature_candidate(
+                &batch,
+                &staged,
+                &mut pending,
+                true,
+                &clocks,
+                excluded,
+                64,
+            )? {
+                ResumedCreatureCheck::Pending => {}
+                ResumedCreatureCheck::Rejected => {
+                    rejected = true;
+                    break;
+                }
+                ResumedCreatureCheck::NeedsConstruction(_) => {
+                    bail!("out-of-border creature was accepted")
+                }
+            }
+        }
+        assert!(
+            rejected,
+            "excluded captured candidate did not finish placement"
+        );
         let light_revision = Arc::clone(&staged.light_revision);
         staged.light_revision = Arc::new(());
+        assert!(
+            actual
+                .check_captured_creature_candidate(
+                    &batch,
+                    &staged,
+                    &mut pending,
+                    true,
+                    &clocks,
+                    excluded,
+                    64,
+                )
+                .is_err()
+        );
         assert!(
             captured_plan
                 .advance(&batch, &staged, true, &clocks)

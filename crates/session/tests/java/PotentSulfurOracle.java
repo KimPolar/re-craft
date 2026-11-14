@@ -26,6 +26,9 @@ public class PotentSulfurOracle {
         var empty=(LevelReader)java.lang.reflect.Proxy.newProxyInstance(LevelReader.class.getClassLoader(),new Class[]{LevelReader.class},(o,m,a)->{throw new AssertionError("unexpected survival query "+m);});
         int index=0;
         for(var state:Blocks.POTENT_SULFUR.getStateDefinition().getPossibleStates()) {
+            if(!state.getFluidState().isEmpty()
+                    || !Block.isShapeFullBlock(state.getCollisionShape(net.minecraft.world.level.EmptyBlockGetter.INSTANCE,BlockPos.ZERO)))
+                throw new AssertionError("unexpected potent sulfur fluid or collision: "+state);
             for(var direction:Direction.values())
                 if(!Block.isShapeFullBlock(state.getFaceOcclusionShape(direction)))
                     throw new AssertionError("potent sulfur face is not full: "+state+" "+direction);

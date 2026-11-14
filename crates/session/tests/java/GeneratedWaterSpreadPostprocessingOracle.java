@@ -140,6 +140,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("dry_lichen")){scenarios.clear();scenarios.addAll(List.of("dry_lichen_on","dry_lichen_off","dry_lichen_down","dry_lichen_support"));}
         if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone"));}
         if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack"));}
+        if(args.length>0 && args[0].equals("potent_sulfur_barrier")){scenarios.clear();scenarios.add("barrier_potent_sulfur_wet");}
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
             if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
@@ -296,7 +297,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 else {blocks.put(pos,Blocks.OAK_FENCE.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true).setValue(FenceBlock.EAST,true));blocks.put(pos.east(),Blocks.AIR.defaultBlockState());blocks.put(pos.below(),snowy);}
             }
             if(scenario.startsWith("barrier_")) {
-                var barrier=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+scenario.substring("barrier_".length()))).defaultBlockState();
+                var barrier=scenario.equals("barrier_potent_sulfur_wet")
+                    ? Blocks.POTENT_SULFUR.defaultBlockState().setValue(PotentSulfurBlock.STATE,net.minecraft.world.level.block.state.properties.PotentSulfurState.WET)
+                    : BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+scenario.substring("barrier_".length()))).defaultBlockState();
                 for(var p:List.of(pos.below(),pos.north(),pos.south(),pos.west()))blocks.put(p,barrier);
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
             }

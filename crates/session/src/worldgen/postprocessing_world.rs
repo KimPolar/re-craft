@@ -2022,7 +2022,10 @@ impl GeneratedBlockView<'_> {
                 .flatten()
                 .map_or(Cell::Unknown, Cell::Fluid);
         }
-        if inert_generated_pillar(state) || snowy_fluid_barrier(state) {
+        if inert_generated_pillar(state)
+            || snowy_fluid_barrier(state)
+            || super::generated_potent_sulfur::is_valid_state(state)
+        {
             return Cell::Solid;
         }
         if !state.properties.is_empty() {
@@ -2310,7 +2313,16 @@ impl GeneratedBlockView<'_> {
         };
         match self.fluid_cell(pos) {
             Cell::Air => Cell::Air,
-            Cell::Solid => Cell::Solid,
+            Cell::Solid => {
+                if self
+                    .read(pos.to_array())
+                    .is_ok_and(|state| super::generated_potent_sulfur::is_valid_state(&state))
+                {
+                    Cell::Unknown
+                } else {
+                    Cell::Solid
+                }
+            }
             cell @ (Cell::Slab {
                 waterlogged: false, ..
             }
@@ -3231,6 +3243,10 @@ impl GeneratedBlockView<'_> {
             let p = target + glam::IVec3::from_array(d);
             let state = self.read(p.to_array())?;
             ensure!(
+                !super::generated_potent_sulfur::is_valid_state(&state),
+                "water change needs potent sulfur neighbor callbacks"
+            );
+            ensure!(
                 matches!(
                     self.fluid_cell(p),
                     Cell::Air
@@ -3481,6 +3497,10 @@ impl GeneratedBlockView<'_> {
                 pos[2].wrapping_add(d[2]),
             ];
             let state = self.read(neighbor)?;
+            ensure!(
+                !super::generated_potent_sulfur::is_valid_state(&state),
+                "water shape update needs potent sulfur neighbor callbacks"
+            );
             let cell = self.fluid_cell(glam::IVec3::from_array(neighbor));
             ensure!(
                 matches!(
@@ -9216,6 +9236,14 @@ mod tests {
                 world.set_block_id(8, 8, 7, spike).unwrap();
                 world.set_block_id(9, 8, 8, air).unwrap();
             }
+            "potent_sulfur_neighbor_guard" => {
+                let sulfur = world.intern_state(BlockState {
+                    name: "minecraft:potent_sulfur".into(),
+                    properties: BTreeMap::from([("potent_sulfur_state".into(), "wet".into())]),
+                });
+                world.set_block_id(9, 8, 8, air).unwrap();
+                world.set_block_id(10, 8, 8, sulfur).unwrap();
+            }
             "marked_speleothem_sulfur"
             | "marked_speleothem_dripstone"
             | "marked_speleothem_sulfur_stack" => {
@@ -9239,6 +9267,7 @@ mod tests {
             }
             "barrier_sulfur"
             | "barrier_cinnabar"
+            | "barrier_potent_sulfur_wet"
             | "barrier_oak_planks"
             | "barrier_deepslate_bricks"
             | "barrier_light_blue_concrete"
@@ -9246,8 +9275,16 @@ mod tests {
             | "barrier_blue_ice" => {
                 let name = case.strip_prefix("barrier_").unwrap();
                 let barrier = world.intern_state(BlockState {
-                    name: format!("minecraft:{name}"),
-                    properties: BTreeMap::new(),
+                    name: if name == "potent_sulfur_wet" {
+                        "minecraft:potent_sulfur".into()
+                    } else {
+                        format!("minecraft:{name}")
+                    },
+                    properties: if name == "potent_sulfur_wet" {
+                        BTreeMap::from([("potent_sulfur_state".into(), "wet".into())])
+                    } else {
+                        BTreeMap::new()
+                    },
                 });
                 for [x, y, z] in [[8, 7, 8], [8, 8, 7], [8, 8, 9], [7, 8, 8]] {
                     world.set_block_id(x, y, z, barrier).unwrap();
@@ -9811,6 +9848,7 @@ mod tests {
             "stone",
             "sulfur",
             "cinnabar",
+            "potent_sulfur",
             "sand",
             "dirt",
             "chest",
@@ -10013,6 +10051,16 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if case == "potent_sulfur_neighbor_guard" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert!(format!("{error:#}").contains("potent sulfur neighbor callbacks"));
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(9, 8, 8), source.block(9, 8, 8));
+            assert_eq!(stage.world.block(10, 8, 8), source.block(10, 8, 8));
+            assert!(stage.edits.is_empty());
+            return vec!["rolled back".into()];
+        }
         if case == "marked_lichen_lose_last" {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let error = stage.try_poll(chunk, 1).unwrap_err();
@@ -11954,6 +12002,25 @@ mod tests {
         let mut expected = water_spread_trace("barrier_sulfur");
         expected.extend(water_spread_trace("barrier_cinnabar"));
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn potent_sulfur_barrier_matches_java_water_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["potent_sulfur_barrier"],
+        );
+        assert_eq!(actual, water_spread_trace("barrier_potent_sulfur_wet"));
+    }
+
+    #[test]
+    fn potent_sulfur_neighbor_callbacks_roll_back() {
+        assert_eq!(
+            water_spread_trace("potent_sulfur_neighbor_guard"),
+            ["rolled back"]
+        );
     }
 
     #[test]

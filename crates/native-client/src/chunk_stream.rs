@@ -1657,6 +1657,235 @@ impl Drop for MissingGenerationPropagationWorker {
     }
 }
 
+/// Spawn inputs captured at a simulation boundary. The caller must supply
+/// the current values again before accepting or publishing a worker result.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MissingGenerationSpawnInputs {
+    pub spawn_mobs: bool,
+    pub clocks: BTreeMap<native_resources::packs::ResourceId, i64>,
+    pub border: native_session::respawn::RespawnBorder,
+    pub last_update: i64,
+}
+
+impl MissingGenerationSpawnInputs {
+    fn captured(&self) -> crate::fresh_generation::existing::CapturedCreatureSpawnInputs<'_> {
+        crate::fresh_generation::existing::CapturedCreatureSpawnInputs {
+            spawn_mobs: self.spawn_mobs,
+            clocks: &self.clocks,
+            border: self.border,
+            last_update: self.last_update,
+        }
+    }
+}
+
+/// Spawn-complete drafts remain isolated until all later generation stages,
+/// entity identities, live state and save dependencies have been validated.
+pub(crate) struct SpawnedMissingGeneration {
+    initialized: InitializedMissingGenerationLight,
+    inputs: MissingGenerationSpawnInputs,
+    spawns: Vec<crate::fresh_generation::existing::CapturedCompletedSpawn>,
+}
+
+impl SpawnedMissingGeneration {
+    pub fn is_current(
+        &self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        inputs: &MissingGenerationSpawnInputs,
+    ) -> bool {
+        self.inputs == *inputs
+            && self.initialized.is_current(streamer, session)
+            && self.spawns.iter().all(|spawn| {
+                spawn.matches_state(
+                    &self.initialized.state.batch,
+                    &self.initialized.light,
+                    inputs.captured(),
+                )
+            })
+    }
+
+    pub fn spawns(&self) -> &[crate::fresh_generation::existing::CapturedCompletedSpawn] {
+        &self.spawns
+    }
+
+    pub fn into_checked_parts(
+        self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        inputs: &MissingGenerationSpawnInputs,
+    ) -> Result<(
+        InitializedMissingGenerationLight,
+        Vec<crate::fresh_generation::existing::CapturedCompletedSpawn>,
+    )> {
+        if !self.is_current(streamer, session, inputs) {
+            crate::generation_staging::discard_async(self);
+            anyhow::bail!("captured spawn generation is stale");
+        }
+        Ok((self.initialized, self.spawns))
+    }
+}
+
+pub(crate) struct MissingGenerationSpawnStartError {
+    pub initialized: InitializedMissingGenerationLight,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationSpawnWorker {
+    observed: MissingGenerationTargets,
+    inputs: MissingGenerationSpawnInputs,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<SpawnedMissingGeneration>>,
+    finished: bool,
+}
+
+impl MissingGenerationSpawnWorker {
+    /// Generate creatures in the caller's chunk order without blocking the
+    /// simulation thread. Failed or cancelled running batches are discarded.
+    pub fn start(
+        initialized: InitializedMissingGenerationLight,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        positions: Vec<ChunkPos>,
+        inputs: MissingGenerationSpawnInputs,
+    ) -> std::result::Result<Self, MissingGenerationSpawnStartError> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let unique: BTreeSet<_> = positions.iter().copied().collect();
+        let error = if !initialized.is_current(streamer, session) {
+            Some("initialized generation light is stale")
+        } else if !inputs.border.is_valid() {
+            Some("invalid mob spawn border")
+        } else if positions.is_empty() || unique.len() != positions.len() {
+            Some("spawn generation requires distinct chunk positions")
+        } else if positions.iter().any(|&pos| {
+            !initialized
+                .state
+                .batch
+                .schedule()
+                .ready(pos, GenerationStage::Spawn)
+        }) {
+            Some("spawn generation dependencies are incomplete")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(MissingGenerationSpawnStartError {
+                initialized,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = initialized.state.observed.clone();
+        let worker_inputs = inputs.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            initialized,
+            move |mut initialized| {
+                let work = (|| -> Result<SpawnedMissingGeneration> {
+                    let stamp = initialized.state.observed.stamp.clone();
+                    let mut check = || -> Result<()> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "spawn generation cancelled"
+                        );
+                        anyhow::ensure!(stamp.is_current(), "terrain assembly is stale");
+                        Ok(())
+                    };
+                    let mut construct = |id: &native_resources::packs::ResourceId| {
+                        Ok(
+                            native_session::worldgen::FreshCreatureRandom::from_entropy(id)?
+                                .construction,
+                        )
+                    };
+                    let mut used_uuids = BTreeSet::new();
+                    let mut spawns = Vec::with_capacity(positions.len());
+                    for position in positions {
+                        spawns.push(initialized.state.generator.complete_captured_spawn(
+                            &mut initialized.state.batch,
+                            &mut initialized.light,
+                            position,
+                            worker_inputs.captured(),
+                            &mut used_uuids,
+                            &mut construct,
+                            &mut check,
+                        )?);
+                    }
+                    check()?;
+                    Ok(SpawnedMissingGeneration {
+                        initialized,
+                        inputs: worker_inputs,
+                        spawns,
+                    })
+                })();
+                let _ = sender.send(work);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-spawn".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(initialized, error)| MissingGenerationSpawnStartError {
+            initialized,
+            error: anyhow::Error::new(error).context("cannot start spawn generation"),
+        })?;
+        Ok(Self {
+            observed,
+            inputs,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        inputs: &MissingGenerationSpawnInputs,
+    ) -> Result<Option<SpawnedMissingGeneration>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("spawn generation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire)
+            || self.inputs != *inputs
+            || !self.observed.is_current(streamer, session)
+        {
+            if let Ok(spawned) = result {
+                crate::generation_staging::discard_async(spawned);
+            }
+            anyhow::bail!("spawn generation was cancelled or became stale");
+        }
+        let spawned = result?;
+        if !spawned.is_current(streamer, session, inputs) {
+            crate::generation_staging::discard_async(spawned);
+            anyhow::bail!("live generation inputs changed during creature spawning");
+        }
+        Ok(Some(spawned))
+    }
+}
+
+impl Drop for MissingGenerationSpawnWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 /// Build a controlled scheduling observation around real captured generation
 /// data so the worker's ownership and result path can be exercised in tests.
 #[cfg(test)]

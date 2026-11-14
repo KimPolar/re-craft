@@ -94,21 +94,56 @@ public class GeneratedWorldJavaOracle {
         return a == null ? b == null : b != null && Arrays.equals(a.getData(), b.getData());
     }
 
+    private static HolderLookup.Provider entityRegistry() {
+        var registry = VanillaRegistries.createWorldLookup();
+        entityAccess = new RegistryAccess.ImmutableRegistryAccess(java.util.List.of(
+                copyRegistry(registry, Registries.PIG_VARIANT),
+                copyRegistry(registry, Registries.COW_VARIANT),
+                copyRegistry(registry, Registries.CHICKEN_VARIANT),
+                copyRegistry(registry, Registries.PIG_SOUND_VARIANT),
+                copyRegistry(registry, Registries.COW_SOUND_VARIANT),
+                copyRegistry(registry, Registries.CHICKEN_SOUND_VARIANT),
+                copyRegistry(registry, Registries.ZOMBIE_NAUTILUS_VARIANT)));
+        return registry;
+    }
+
+    private static void verifyEntityRoundTrip(CompoundTag entity, HolderLookup.Provider registry,
+            TestEntityLevel level, String location) {
+        var id = Identifier.parse(entity.getStringOr("id", ""));
+        if (!BuiltInRegistries.ENTITY_TYPE.containsKey(id) || entity.read("Pos", Vec3.CODEC).isEmpty())
+            throw new AssertionError("unreadable entity " + id + " in " + location);
+        var problems = new ProblemReporter.Collector();
+        var loaded = EntityType.loadEntityRecursive(TagValueInput.create(problems, registry, entity),
+                level, EntitySpawnReason.LOAD, EntityProcessor.NOP);
+        if (loaded == null) throw new AssertionError("cannot load entity " + id + " in " + location);
+        var output = TagValueOutput.createWithContext(problems, registry);
+        if (!loaded.save(output) || !problems.isEmpty())
+            throw new AssertionError("cannot save entity " + id + " in " + location + ": " + problems.getReport());
+        var rewritten = output.buildResult();
+        if (!entity.equals(rewritten))
+            throw new AssertionError("entity " + id + " changed on Java load/save in " + location + ": " + entity + " != " + rewritten);
+    }
+
+    private static int verifyProtoEntities(Path input) throws Exception {
+        var registry = entityRegistry();
+        var level = entityLevel();
+        var document = NbtIo.read(input);
+        var entities = document.getListOrEmpty("entities");
+        if (entities.isEmpty()) throw new AssertionError("spawned entities missing");
+        for (var item : entities) {
+            if (!(item instanceof CompoundTag entity)) throw new AssertionError("invalid proto entity");
+            verifyEntityRoundTrip(entity, registry, level, input.toString());
+        }
+        return entities.size();
+    }
+
     private static int verifySidecars(Path world, String kind, Path list) throws Exception {
         var positions = Files.readAllLines(list);
         var directory = world.resolve("dimensions/minecraft/overworld/" + kind);
         var poiOps = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY)
                 .createSerializationContext(NbtOps.INSTANCE);
         int entityCount = 0;
-        var entityRegistry = VanillaRegistries.createWorldLookup();
-        entityAccess = new RegistryAccess.ImmutableRegistryAccess(java.util.List.of(
-                copyRegistry(entityRegistry, Registries.PIG_VARIANT),
-                copyRegistry(entityRegistry, Registries.COW_VARIANT),
-                copyRegistry(entityRegistry, Registries.CHICKEN_VARIANT),
-                copyRegistry(entityRegistry, Registries.PIG_SOUND_VARIANT),
-                copyRegistry(entityRegistry, Registries.COW_SOUND_VARIANT),
-                copyRegistry(entityRegistry, Registries.CHICKEN_SOUND_VARIANT),
-                copyRegistry(entityRegistry, Registries.ZOMBIE_NAUTILUS_VARIANT)));
+        var entityRegistry = entityRegistry();
         var entityLevel = kind.equals("entities") ? entityLevel() : null;
         for (var position : positions) {
             var coordinates = position.split(" ");
@@ -127,19 +162,7 @@ public class GeneratedWorldJavaOracle {
                         throw new AssertionError("entity position differs: " + pos);
                     for (var item : original.getListOrEmpty("Entities")) {
                         if (!(item instanceof CompoundTag entity)) throw new AssertionError("invalid entity: " + pos);
-                        var id = Identifier.parse(entity.getStringOr("id", ""));
-                        if (!BuiltInRegistries.ENTITY_TYPE.containsKey(id) || entity.read("Pos", Vec3.CODEC).isEmpty())
-                            throw new AssertionError("unreadable entity " + id + " in " + pos);
-                        var problems = new ProblemReporter.Collector();
-                        var loaded = EntityType.loadEntityRecursive(TagValueInput.create(problems, entityRegistry, entity),
-                                entityLevel, EntitySpawnReason.LOAD, EntityProcessor.NOP);
-                        if (loaded == null) throw new AssertionError("cannot load entity " + id + " in " + pos);
-                        var output = TagValueOutput.createWithContext(problems, entityRegistry);
-                        if (!loaded.save(output) || !problems.isEmpty())
-                            throw new AssertionError("cannot save entity " + id + " in " + pos + ": " + problems.getReport());
-                        var rewritten = output.buildResult();
-                        if (!entity.equals(rewritten))
-                            throw new AssertionError("entity " + id + " changed on Java load/save in " + pos + ": " + entity + " != " + rewritten);
+                        verifyEntityRoundTrip(entity, entityRegistry, entityLevel, pos.toString());
                         entityCount++;
                     }
                 } else {
@@ -161,6 +184,10 @@ public class GeneratedWorldJavaOracle {
         var out = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        if (args[0].equals("--proto-entities")) {
+            out.println("PROTO_ENTITIES_OK " + verifyProtoEntities(Path.of(args[1])));
+            return;
+        }
         if (args[0].equals("--player")) {
             verifyPlayerRoundTrip(NbtIo.read(Path.of(args[1])));
             out.println("PLAYER_OK");

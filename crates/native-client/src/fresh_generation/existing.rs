@@ -708,6 +708,63 @@ pub(crate) enum CapturedPostprocessingSpawn<'a> {
     Planned(&'a CapturedPlannedSpawn),
 }
 
+/// A completed, still private spawn stage for a captured terrain revision.
+pub(crate) enum CapturedCompletedSpawn {
+    Empty(CapturedEmptySpawnDraft),
+    Planned(CapturedPlannedSpawn),
+}
+
+impl CapturedCompletedSpawn {
+    pub fn position(&self) -> native_world::loaded::ChunkPos {
+        match self {
+            Self::Empty(spawn) => spawn.position,
+            Self::Planned(spawn) => spawn.position,
+        }
+    }
+
+    pub fn document(&self) -> &NamedTag {
+        match self {
+            Self::Empty(spawn) => spawn.document(),
+            Self::Planned(spawn) => spawn.document(),
+        }
+    }
+
+    pub fn as_postprocessing_spawn(&self) -> CapturedPostprocessingSpawn<'_> {
+        match self {
+            Self::Empty(spawn) => CapturedPostprocessingSpawn::Empty(spawn),
+            Self::Planned(spawn) => CapturedPostprocessingSpawn::Planned(spawn),
+        }
+    }
+
+    pub fn matches_state(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedCreatureSpawnInputs<'_>,
+    ) -> bool {
+        match self {
+            Self::Empty(spawn) => spawn.matches_state(batch, light, inputs.spawn_mobs),
+            Self::Planned(spawn) => spawn.matches_state(
+                batch,
+                light,
+                inputs.spawn_mobs,
+                inputs.clocks,
+                spawn.border.map(|_| inputs.border),
+            ),
+        }
+    }
+}
+
+/// The caller must capture these values from the live session and revalidate
+/// them before using an isolated result.
+#[derive(Clone, Copy)]
+pub(crate) struct CapturedCreatureSpawnInputs<'a> {
+    pub spawn_mobs: bool,
+    pub clocks: &'a BTreeMap<ResourceId, i64>,
+    pub border: native_session::respawn::RespawnBorder,
+    pub last_update: i64,
+}
+
 impl CapturedPostprocessingSpawn<'_> {
     fn position(&self) -> native_world::loaded::ChunkPos {
         match self {
@@ -4497,6 +4554,125 @@ impl PreparedExistingGenerator {
                 clocks,
             )?,
         })
+    }
+
+    /// Complete one captured spawn stage without publishing its entities.
+    /// `used_uuids` also covers earlier chunks in this generation pass. A
+    /// caller must still check identities outside the captured generation area.
+    /// On error, discard the batch and light: a draft failure or cancellation
+    /// can occur after the spawn stage has been recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_captured_spawn(
+        &mut self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedStagedLight,
+        position: native_world::loaded::ChunkPos,
+        inputs: CapturedCreatureSpawnInputs<'_>,
+        used_uuids: &mut BTreeSet<[i32; 4]>,
+        construct: &mut impl FnMut(
+            &ResourceId,
+        )
+            -> Result<native_session::worldgen::FreshCreatureConstruction>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<CapturedCompletedSpawn> {
+        use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
+
+        check()?;
+        ensure!(inputs.border.is_valid(), "invalid mob spawn border");
+        let disabled = self
+            .generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")?;
+        if !inputs.spawn_mobs || disabled {
+            self.complete_captured_spawn_without_mobs(batch, light, position, inputs.spawn_mobs)?;
+            let spawn = self.draft_captured_empty_spawn(
+                batch,
+                light,
+                native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                },
+                inputs.spawn_mobs,
+                inputs.last_update,
+            )?;
+            check()?;
+            return Ok(CapturedCompletedSpawn::Empty(spawn));
+        }
+
+        let mut plan = self.plan_captured_creatures(batch, light, position, true, inputs.clocks)?;
+        loop {
+            check()?;
+            let attempt = match plan.advance(batch, light, true, inputs.clocks)? {
+                CreatureSpawnProgress::Pending => continue,
+                CreatureSpawnProgress::Finished => break,
+                CreatureSpawnProgress::Attempt(attempt) => attempt,
+            };
+            loop {
+                check()?;
+                match self.check_captured_creature_candidate(
+                    batch,
+                    light,
+                    &mut plan,
+                    true,
+                    inputs.clocks,
+                    inputs.border,
+                    64,
+                )? {
+                    ResumedCreatureCheck::Pending => continue,
+                    ResumedCreatureCheck::Rejected => break,
+                    ResumedCreatureCheck::NeedsConstruction(_) => {
+                        let construction = construct(&attempt.entity)?;
+                        ensure!(
+                            used_uuids.insert(construction.uuid),
+                            "duplicate generated creature UUID across spawn chunks"
+                        );
+                        self.construct_captured_creature(
+                            batch,
+                            light,
+                            &mut plan,
+                            true,
+                            inputs.clocks,
+                            inputs.border,
+                            construction,
+                        )?;
+                        check()?;
+                        if let ResumedCreatureInstance::NeedsFinalization(_) = self
+                            .check_captured_creature_instance(
+                                batch,
+                                light,
+                                &mut plan,
+                                true,
+                                inputs.clocks,
+                                inputs.border,
+                            )?
+                        {
+                            self.finalize_captured_creature(
+                                batch,
+                                light,
+                                &mut plan,
+                                true,
+                                inputs.clocks,
+                                inputs.border,
+                            )?;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        check()?;
+        let border = plan.inner.border;
+        let spawn = self.finish_captured_creatures(
+            batch,
+            light,
+            &plan,
+            true,
+            inputs.clocks,
+            border,
+            inputs.last_update,
+        )?;
+        check()?;
+        Ok(CapturedCompletedSpawn::Planned(spawn))
     }
 
     fn build_creature_plan(
@@ -9725,6 +9901,10 @@ mod tests {
             "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8},
                 {"type":"minecraft:block_predicate_filter", "predicate":{"type":"minecraft:not", "predicate":{"type":"minecraft:would_survive", "state":"minecraft:brown_mushroom"}}}]
         }]]);
+        plains["attributes"]["minecraft:gameplay/creature_world_gen_spawn_probability"] =
+            json!(0.95);
+        plains["attributes"]["minecraft:gameplay/natural_mob_spawns"]["argument"]["spawns_by_category"]
+            ["creature"] = json!([{"type":"minecraft:pig","weight":1,"count":4}]);
         std::fs::write(&biome_file, serde_json::to_vec(&plains)?)?;
         let level = NamedTag {
             name: "".into(),
@@ -11124,7 +11304,7 @@ mod tests {
         assert_eq!(propagated.positions(), order);
         let initialized = propagated.into_checked_light(&streamer, &worker_session)?;
         let (assembled, mut staged) = initialized.into_checked_parts(&streamer, &worker_session)?;
-        let (mut batch, mut actual, _restored, _evaluator, _observed, _live) =
+        let (mut batch, mut actual, mut restored, _evaluator, _observed, _live) =
             assembled.into_checked_parts(&streamer, &worker_session)?;
         drop(worker);
         drop(streamer);
@@ -11140,6 +11320,134 @@ mod tests {
                 .into_iter()
                 .map(|id| (id, 0))
                 .collect();
+        let spawn_schedule = batch.schedule.clone();
+        let mut worker_spawn_document = None;
+        for spawn_mobs in [true, false] {
+            let inputs = crate::chunk_stream::MissingGenerationSpawnInputs {
+                spawn_mobs,
+                clocks: clocks.clone(),
+                border: native_session::respawn::RespawnBorder {
+                    min_x: -1000.0,
+                    max_x: 1000.0,
+                    min_z: -1000.0,
+                    max_z: 1000.0,
+                },
+                last_update: 42,
+            };
+            let (streamer, initialized) = crate::chunk_stream::light_worker_test_fixture(
+                actual,
+                batch,
+                restored,
+                staged,
+                &worker_session,
+                reader
+                    .session_guard()
+                    .context("world session lock missing")?,
+                target,
+            )?;
+            let rejected = match crate::chunk_stream::MissingGenerationSpawnWorker::start(
+                initialized,
+                &streamer,
+                &worker_session,
+                vec![target, target],
+                inputs.clone(),
+            ) {
+                Ok(_) => bail!("duplicate spawn positions were accepted"),
+                Err(error) => error,
+            };
+            assert!(rejected.error.to_string().contains("distinct"));
+            let mut worker = crate::chunk_stream::MissingGenerationSpawnWorker::start(
+                rejected.initialized,
+                &streamer,
+                &worker_session,
+                vec![target, second],
+                inputs.clone(),
+            )
+            .map_err(|failure| failure.error)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let spawned = loop {
+                if let Some(result) = worker.try_result(&streamer, &worker_session, &inputs)? {
+                    break result;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "spawn generation timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            assert_eq!(spawned.spawns().len(), 2);
+            assert_eq!(spawned.spawns()[0].position(), target);
+            assert_eq!(spawned.spawns()[1].position(), second);
+            assert_eq!(
+                spawned.spawns()[0].document().value.get("Status"),
+                Some(&Tag::String("minecraft:spawn".into()))
+            );
+            assert_eq!(
+                spawned.spawns()[1].document().value.get("example:root"),
+                Some(&Tag::Int(73))
+            );
+            let mut stale = inputs.clone();
+            stale.last_update += 1;
+            assert!(!spawned.is_current(&streamer, &worker_session, &stale));
+            if spawn_mobs {
+                assert!(matches!(
+                    spawned.spawns()[0],
+                    CapturedCompletedSpawn::Planned(_)
+                ));
+                let Some(Tag::List { values, .. }) =
+                    spawned.spawns()[0].document().value.get("entities")
+                else {
+                    bail!("worker did not generate any creatures")
+                };
+                assert!(values.iter().any(|value| {
+                    value.get("id") == Some(&Tag::String("minecraft:pig".into()))
+                }));
+                worker_spawn_document = Some(spawned.spawns()[0].document().clone());
+            } else {
+                assert!(matches!(
+                    spawned.spawns()[0],
+                    CapturedCompletedSpawn::Empty(_)
+                ));
+            }
+            let (initialized, spawns) =
+                spawned.into_checked_parts(&streamer, &worker_session, &inputs)?;
+            let (assembled, next_staged) =
+                initialized.into_checked_parts(&streamer, &worker_session)?;
+            let (next_batch, next_actual, next_restored, _, _, _) =
+                assembled.into_checked_parts(&streamer, &worker_session)?;
+            actual = next_actual;
+            batch = next_batch;
+            restored = next_restored;
+            staged = next_staged;
+            assert_eq!(
+                batch.schedule.completed(target),
+                Some(GenerationStage::Spawn)
+            );
+            let post_inputs = CapturedPostprocessingInputs {
+                spawn_mobs,
+                clocks: &clocks,
+                border: Some(inputs.border),
+                game_time: 42,
+                next_sub_tick: 9,
+                water_source_conversion: true,
+            };
+            let converted = actual.begin_captured_mixed_postprocessing_region(
+                &batch,
+                &staged,
+                spawns
+                    .iter()
+                    .map(CapturedCompletedSpawn::as_postprocessing_spawn),
+                post_inputs,
+            )?;
+            assert!(converted.matches_state(&batch, &staged, post_inputs));
+            batch.schedule = spawn_schedule.clone();
+            for position in [target, second] {
+                staged.completed_creature_spawns.remove(&position);
+                staged.completed_empty_spawns.remove(&position);
+            }
+            drop(worker);
+            drop(streamer);
+        }
         let mut captured_plan =
             actual.plan_captured_creatures(&batch, &staged, target, true, &clocks)?;
         let x = target.x * 16;
@@ -12900,12 +13208,18 @@ mod tests {
             &structure_oracle,
             include_str!("../../../session/tests/java/SavedStructureReferencesOracle.java"),
         )?;
+        let entity_oracle = oracle.path().join("GeneratedWorldJavaOracle.java");
+        std::fs::write(
+            &entity_oracle,
+            include_str!("../../tests/java/GeneratedWorldJavaOracle.java"),
+        )?;
         let compiled = std::process::Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg(&source)
             .arg(&heightmap_oracle)
             .arg(&structure_oracle)
+            .arg(&entity_oracle)
             .output()?;
         ensure!(
             compiled.status.success(),
@@ -13038,26 +13352,51 @@ mod tests {
                 String::from_utf8_lossy(&checked.stderr)
             );
         }
-        let animal_input = oracle.path().join("captured-planned-animal.nbt");
-        std::fs::write(
-            &animal_input,
-            native_persistence::nbt::write(spawn.document())?,
-        )?;
-        let checked = std::process::Command::new(java.join("java.exe"))
-            .arg("-cp")
-            .arg(&classpath)
-            .arg("ResumedLightOracle")
-            .arg(&animal_input)
-            .arg(lighting.min_y.to_string())
-            .arg(lighting.height.to_string())
-            .arg("entities:pig")
-            .output()?;
-        ensure!(
-            checked.status.success(),
-            "Java captured animal validation failed: {}\n{}",
-            String::from_utf8_lossy(&checked.stdout),
-            String::from_utf8_lossy(&checked.stderr)
-        );
+        for (name, document) in [
+            ("planned", spawn.document()),
+            (
+                "worker",
+                worker_spawn_document
+                    .as_ref()
+                    .context("spawn worker document missing")?,
+            ),
+        ] {
+            let animal_input = oracle.path().join(format!("captured-{name}-animal.nbt"));
+            std::fs::write(&animal_input, native_persistence::nbt::write(document)?)?;
+            let checked = std::process::Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("ResumedLightOracle")
+                .arg(&animal_input)
+                .arg(lighting.min_y.to_string())
+                .arg(lighting.height.to_string())
+                .arg("entities:pig")
+                .output()?;
+            ensure!(
+                checked.status.success(),
+                "Java captured {name} animal validation failed: {}\n{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            );
+            if name == "worker" {
+                let checked = std::process::Command::new(java.join("java.exe"))
+                    .arg("-cp")
+                    .arg(&classpath)
+                    .arg("GeneratedWorldJavaOracle")
+                    .arg("--proto-entities")
+                    .arg(&animal_input)
+                    .output()?;
+                ensure!(
+                    checked.status.success()
+                        && String::from_utf8_lossy(&checked.stdout)
+                            .lines()
+                            .any(|line| line.starts_with("PROTO_ENTITIES_OK ")),
+                    "Java spawn worker entity round trip failed: {}\n{}",
+                    String::from_utf8_lossy(&checked.stdout),
+                    String::from_utf8_lossy(&checked.stderr)
+                );
+            }
+        }
         for (name, draft) in [("new", full_new), ("saved", full_saved)] {
             let chunk_input = oracle.path().join(format!("captured-{name}-full.nbt"));
             let entity_input = oracle.path().join(format!("captured-{name}-entities.nbt"));
@@ -13089,6 +13428,58 @@ mod tests {
                 .propagate_captured_light(&mut batch, &mut staged, target)
                 .is_err()
         );
+        batch.schedule = spawn_schedule;
+        for position in [target, second] {
+            staged.completed_creature_spawns.remove(&position);
+            staged.completed_empty_spawns.remove(&position);
+        }
+        let (streamer, initialized) = crate::chunk_stream::light_worker_test_fixture(
+            actual,
+            batch,
+            restored,
+            staged,
+            &worker_session,
+            reader
+                .session_guard()
+                .context("world session lock missing")?,
+            target,
+        )?;
+        let inputs = crate::chunk_stream::MissingGenerationSpawnInputs {
+            spawn_mobs: true,
+            clocks,
+            border: native_session::respawn::RespawnBorder {
+                min_x: -1000.0,
+                max_x: 1000.0,
+                min_z: -1000.0,
+                max_z: 1000.0,
+            },
+            last_update: 42,
+        };
+        let mut worker = crate::chunk_stream::MissingGenerationSpawnWorker::start(
+            initialized,
+            &streamer,
+            &worker_session,
+            vec![target],
+            inputs.clone(),
+        )
+        .map_err(|failure| failure.error)?;
+        worker.cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            match worker.try_result(&streamer, &worker_session, &inputs) {
+                Ok(None) => {}
+                Ok(Some(_)) => bail!("cancelled spawn generation was accepted"),
+                Err(error) => {
+                    assert!(error.to_string().contains("cancelled"));
+                    break;
+                }
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "spawn cancellation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         Ok(())
     }
 

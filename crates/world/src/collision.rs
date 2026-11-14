@@ -1376,6 +1376,80 @@ fn potent_sulfur_state(state: &BlockState) -> bool {
         )
 }
 
+/// The two vanilla speleothems use a horizontal, position-dependent offset.
+/// Their finite set of boxes is shared so collision and ray queries need no
+/// allocation. Other dynamic blocks remain unsupported here.
+pub fn positioned_speleothem_shape(state: &BlockState, pos: IVec3) -> Option<&'static [Aabb]> {
+    use std::sync::OnceLock;
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:sulfur_spike" | "minecraft:pointed_dripstone"
+    ) || state.properties.len() != 3
+        || !matches!(
+            state.properties.get("waterlogged").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    let direction = state.properties.get("vertical_direction")?.as_str();
+    if !matches!(direction, "up" | "down") {
+        return None;
+    }
+    let kind = match state.properties.get("thickness")?.as_str() {
+        "tip" if direction == "up" => 0,
+        "tip" => 1,
+        "tip_merge" => 2,
+        "frustum" => 3,
+        "middle" => 4,
+        "base" => 5,
+        _ => return None,
+    };
+    let seed =
+        i64::from(pos.x.wrapping_mul(3_129_871)) ^ i64::from(pos.z).wrapping_mul(116_129_781);
+    let seed = seed
+        .wrapping_mul(seed)
+        .wrapping_mul(42_317_861)
+        .wrapping_add(seed.wrapping_mul(11))
+        >> 16;
+    let x = (seed & 15) as usize;
+    let z = ((seed >> 8) & 15) as usize;
+    static SHAPES: OnceLock<[[Aabb; 256]; 6]> = OnceLock::new();
+    let shapes = SHAPES.get_or_init(|| {
+        std::array::from_fn(|kind| {
+            let (min, max, bottom, top) = match kind {
+                0 => (5.0, 11.0, 0.0, 11.0),
+                1 => (5.0, 11.0, 5.0, 16.0),
+                2 => (5.0, 11.0, 0.0, 16.0),
+                3 => (4.0, 12.0, 0.0, 16.0),
+                4 => (3.0, 13.0, 0.0, 16.0),
+                5 => (2.0, 14.0, 0.0, 16.0),
+                _ => unreachable!(),
+            };
+            std::array::from_fn(|index| {
+                let offset = |value: usize| {
+                    ((f64::from(value as f32 / 15.0) - 0.5) * 0.5).clamp(-0.125, 0.125)
+                };
+                let dx = offset(index & 15);
+                let dz = offset(index >> 4);
+                Aabb {
+                    min: Vec3::new(
+                        (min / 16.0 + dx) as f32,
+                        bottom / 16.0,
+                        (min / 16.0 + dz) as f32,
+                    ),
+                    max: Vec3::new(
+                        (max / 16.0 + dx) as f32,
+                        top / 16.0,
+                        (max / 16.0 + dz) as f32,
+                    ),
+                }
+            })
+        })
+    });
+    Some(std::slice::from_ref(&shapes[kind][x | (z << 4)]))
+}
+
 fn crop_outline_height(state: &BlockState) -> Option<f32> {
     let (max, step) = match state.name.as_str() {
         "minecraft:wheat" => (7, 2),

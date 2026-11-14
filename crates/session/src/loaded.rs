@@ -7214,7 +7214,15 @@ impl LoadedSession {
             .states()
             .map(|(_, state)| FluidState::from_block(state).ok().flatten())
             .collect();
-        let unsupported_states = shapes.iter().filter(|shape| shape.is_none()).count();
+        let unsupported_states = world
+            .states()
+            .zip(&shapes)
+            .filter(|((_, state), shape)| {
+                shape.is_none()
+                    && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
+                        .is_none()
+            })
+            .count();
         // A world snapshot can retain metadata for chunks that are not yet
         // resident. Their ticks must wait for streaming, or they will be
         // enqueued a second time when that chunk is imported.
@@ -8483,7 +8491,11 @@ impl LoadedSession {
         anyhow::ensure!(imported, "initial spawn chunk is already loaded");
         for (_, state) in self.world.states().skip(old_count) {
             let shape = block_shape(state);
-            self.unsupported_states += usize::from(shape.is_none());
+            self.unsupported_states += usize::from(
+                shape.is_none()
+                    && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
+                        .is_none(),
+            );
             self.stair_octants
                 .push(stair_octants(state, shape.as_deref()));
             self.shapes.push(shape);
@@ -12267,7 +12279,14 @@ impl LoadedSession {
                             respawn_changed = true;
                             for (_, state) in self.world.states().skip(old_count) {
                                 let shape = block_shape(state);
-                                self.unsupported_states += usize::from(shape.is_none());
+                                self.unsupported_states += usize::from(
+                                    shape.is_none()
+                                        && native_world::collision::positioned_speleothem_shape(
+                                            state,
+                                            IVec3::ZERO,
+                                        )
+                                        .is_none(),
+                                );
                                 self.stair_octants
                                     .push(stair_octants(state, shape.as_deref()));
                                 self.shapes.push(shape);
@@ -12575,7 +12594,15 @@ impl LoadedSession {
     }
 
     pub fn unsupported_outlines(&self) -> usize {
-        self.outlines.iter().filter(|shape| shape.is_none()).count()
+        self.world
+            .states()
+            .zip(&self.outlines)
+            .filter(|((_, state), shape)| {
+                shape.is_none()
+                    && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
+                        .is_none()
+            })
+            .count()
     }
 
     fn movement_below(&self) -> IVec3 {
@@ -13953,9 +13980,7 @@ impl LoadedSession {
             ) {
                 Cell::Missing => None,
                 Cell::State(id) => Some(
-                    self.outlines
-                        .get(id.0 as usize)
-                        .and_then(Option::as_deref)
+                    shape_at_relative(&self.world, &self.outlines, id, self.origin, relative)
                         .unwrap_or_else(|| unknown_barrier()),
                 ),
             },
@@ -14181,11 +14206,9 @@ impl LoadedSession {
                 ) else {
                     return None;
                 };
-                let outline = self
-                    .outlines
-                    .get(id.0 as usize)
-                    .and_then(Option::as_deref)
-                    .unwrap_or_else(|| unknown_barrier());
+                let outline =
+                    shape_at_relative(&self.world, &self.outlines, id, self.origin, relative)
+                        .unwrap_or_else(|| unknown_barrier());
                 let fluid = self.fluids.get(id.0 as usize).copied().flatten();
                 if let Some(fluid) = fluid.filter(|fluid| fluid.source) {
                     let above = add(relative, IVec3::Y).and_then(|p| {
@@ -19217,9 +19240,7 @@ impl LoadedSession {
         let state = self.world.state(id)?;
         let fire = self.falling_fire_tag.as_ref()?;
         crate::falling_block::known_falling_free(state, fire.contains(&state.name)).or_else(|| {
-            self.shapes
-                .get(id.0 as usize)
-                .and_then(Option::as_deref)
+            shape_at_relative(&self.world, &self.shapes, id, self.origin, relative)
                 .filter(|shape| crate::falling_block::known_collision_support(shape))
                 .map(|_| false)
         })
@@ -19263,11 +19284,14 @@ impl LoadedSession {
                                 complete = false;
                                 break 'check;
                             };
-                            if self
-                                .shapes
-                                .get(id.0 as usize)
-                                .and_then(Option::as_deref)
-                                .is_none()
+                            if shape_at_relative(
+                                &self.world,
+                                &self.shapes,
+                                id,
+                                self.origin,
+                                IVec3::new(x, y, z),
+                            )
+                            .is_none()
                                 || (self.fluids.get(id.0 as usize).copied().flatten().is_some()
                                     && self.ordinary_fluid(id).is_none()
                                     && !self
@@ -19307,9 +19331,7 @@ impl LoadedSession {
                     local.position = position - origin.as_dvec3();
                     crate::movement::resolve_box(local.bounds(), movement, false, 0.0, |p| {
                         match cell(world, origin, bounds, p, air) {
-                            Cell::State(id) => shapes
-                                .get(id.0 as usize)
-                                .and_then(Option::as_deref)
+                            Cell::State(id) => shape_at_relative(world, shapes, id, origin, p)
                                 .unwrap_or_else(|| unknown_barrier()),
                             Cell::Missing => unknown_barrier(),
                         }
@@ -20745,7 +20767,11 @@ impl LoadedSession {
         if self.world.state_count() != old_count {
             let state = self.world.state(id).expect("new state is interned");
             let shape = block_shape(state);
-            self.unsupported_states += usize::from(shape.is_none());
+            self.unsupported_states += usize::from(
+                shape.is_none()
+                    && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
+                        .is_none(),
+            );
             self.stair_octants
                 .push(stair_octants(state, shape.as_deref()));
             self.shapes.push(shape);
@@ -21273,9 +21299,7 @@ impl LoadedSession {
                 &mut self.inventory,
                 |pos| match cell(world, origin, bounds, pos, air) {
                     Cell::Missing => unknown_barrier(),
-                    Cell::State(id) => shapes
-                        .get(id.0 as usize)
-                        .and_then(Option::as_deref)
+                    Cell::State(id) => shape_at_relative(world, shapes, id, origin, pos)
                         .unwrap_or_else(|| unknown_barrier()),
                 },
                 |pos| match cell(world, origin, bounds, pos, air) {
@@ -21413,11 +21437,14 @@ impl LoadedSession {
                                     self.states[0],
                                 ) {
                                     Cell::Missing => unknown_barrier(),
-                                    Cell::State(id) => self
-                                        .shapes
-                                        .get(id.0 as usize)
-                                        .and_then(Option::as_deref)
-                                        .unwrap_or_else(|| unknown_barrier()),
+                                    Cell::State(id) => shape_at_relative(
+                                        &self.world,
+                                        &self.shapes,
+                                        id,
+                                        self.origin,
+                                        pos,
+                                    )
+                                    .unwrap_or_else(|| unknown_barrier()),
                                 },
                             );
                             if grounded {
@@ -22305,11 +22332,10 @@ impl LoadedSession {
             self.states[0],
         ) {
             Cell::Missing => unknown_barrier(),
-            Cell::State(id) => self
-                .shapes
-                .get(id.0 as usize)
-                .and_then(Option::as_deref)
-                .unwrap_or_else(|| unknown_barrier()),
+            Cell::State(id) => {
+                shape_at_relative(&self.world, &self.shapes, id, self.origin, cell_pos)
+                    .unwrap_or_else(|| unknown_barrier())
+            }
         };
         self.swimming = if self.flight.flying {
             false
@@ -23255,11 +23281,10 @@ impl LoadedSession {
             self.states[0],
         ) {
             Cell::Missing => unknown_barrier(),
-            Cell::State(id) => self
-                .shapes
-                .get(id.0 as usize)
-                .and_then(Option::as_deref)
-                .unwrap_or_else(|| unknown_barrier()),
+            Cell::State(id) => {
+                shape_at_relative(&self.world, &self.shapes, id, self.origin, cell_pos)
+                    .unwrap_or_else(|| unknown_barrier())
+            }
         };
         let fits_standing =
             crate::movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
@@ -23360,9 +23385,7 @@ impl LoadedSession {
             &mut self.inventory,
             |pos| match cell(world, origin, bounds, pos, air) {
                 Cell::Missing => unknown_barrier(),
-                Cell::State(id) => shapes
-                    .get(id.0 as usize)
-                    .and_then(Option::as_deref)
+                Cell::State(id) => shape_at_relative(world, shapes, id, origin, pos)
                     .unwrap_or_else(|| unknown_barrier()),
             },
             |pos| match cell(world, origin, bounds, pos, air) {
@@ -23526,9 +23549,7 @@ impl LoadedSession {
             &mut self.score,
             |pos| match cell(world, origin, bounds, pos, air) {
                 Cell::Missing => unknown_barrier(),
-                Cell::State(id) => shapes
-                    .get(id.0 as usize)
-                    .and_then(Option::as_deref)
+                Cell::State(id) => shape_at_relative(world, shapes, id, origin, pos)
                     .unwrap_or_else(|| unknown_barrier()),
             },
             |pos| match cell(world, origin, bounds, pos, air) {
@@ -24315,10 +24336,7 @@ fn spawn_blocks_clear(
                     if edge_count == 2 && state.name != "minecraft:moving_piston" {
                         return Ok(false);
                     }
-                    let normal = session
-                        .shapes
-                        .get(id.0 as usize)
-                        .and_then(Option::as_deref)
+                    let normal = shape_at_absolute(&session.world, &session.shapes, id, pos)
                         .context("spawn collision shape is unavailable")?;
                     if edge_count == 1
                         && !normal.iter().any(|shape| {
@@ -24433,11 +24451,7 @@ impl crate::world_spawn::SharedSpawnWorld for LoadedColumnSpawnView<'_> {
     fn full_top_face(&mut self, pos: IVec3) -> anyhow::Result<bool> {
         use anyhow::Context;
         let id = self.state_id(pos)?;
-        let shapes = self
-            .session
-            .shapes
-            .get(id.0 as usize)
-            .and_then(Option::as_deref)
+        let shapes = shape_at_absolute(&self.session.world, &self.session.shapes, id, pos)
             .context("spawn block collision shape is unavailable")?;
         if shapes.is_empty() {
             return Ok(false);
@@ -24568,10 +24582,7 @@ impl<'a> LoadedDismountView<'a> {
 
     fn shape_at(&self, pos: IVec3) -> anyhow::Result<&[Aabb]> {
         let id = self.state_id(pos)?;
-        self.session
-            .shapes
-            .get(id.0 as usize)
-            .and_then(Option::as_deref)
+        shape_at_absolute(&self.session.world, &self.session.shapes, id, pos)
             .ok_or_else(|| anyhow::anyhow!("unsupported respawn collision shape at {pos:?}"))
     }
 
@@ -25161,6 +25172,32 @@ fn climbable_at(
         }
     }
     None
+}
+
+/// Resolve static cached shapes first and use absolute coordinates for the
+/// small number of position-dependent vanilla shapes.
+fn shape_at_absolute<'a>(
+    world: &World,
+    shapes: &'a [Option<Vec<Aabb>>],
+    id: BlockStateId,
+    position: IVec3,
+) -> Option<&'a [Aabb]> {
+    shapes
+        .get(id.0 as usize)
+        .and_then(Option::as_deref)
+        .or_else(|| {
+            native_world::collision::positioned_speleothem_shape(world.state(id)?, position)
+        })
+}
+
+fn shape_at_relative<'a>(
+    world: &World,
+    shapes: &'a [Option<Vec<Aabb>>],
+    id: BlockStateId,
+    origin: IVec3,
+    relative: IVec3,
+) -> Option<&'a [Aabb]> {
+    shape_at_absolute(world, shapes, id, add(origin, relative)?)
 }
 
 fn cell(
@@ -26223,7 +26260,7 @@ impl FluidView<'_> {
             else {
                 return None;
             };
-            let shape = self.shapes.get(id.0 as usize)?.as_deref()?;
+            let shape = shape_at_relative(self.world, self.shapes, id, self.origin, above)?;
             let fluid = *self.fluids.get(id.0 as usize)?;
             let surface = bubble_surface_state(self.world.state(id)?, shape, fluid)?;
             result.push(crate::bubble_column::EntityContact {
@@ -26246,10 +26283,7 @@ impl FluidView<'_> {
                     .world
                     .state(id)
                     .is_some_and(|state| state.name.ends_with("_sign"));
-                let blocks_flow = self
-                    .shapes
-                    .get(id.0 as usize)
-                    .and_then(Option::as_deref)
+                let blocks_flow = shape_at_relative(self.world, self.shapes, id, self.origin, pos)
                     .is_none_or(|shape| !shape.is_empty());
                 if sign || blocks_flow {
                     fluid::Cell::Solid
@@ -26274,10 +26308,7 @@ impl FluidView<'_> {
                 {
                     return false;
                 }
-                let shape = self
-                    .shapes
-                    .get(id.0 as usize)
-                    .and_then(Option::as_deref)
+                let shape = shape_at_relative(self.world, self.shapes, id, self.origin, pos)
                     .unwrap_or_else(|| unknown_barrier());
                 covers_full_face(shape, direction)
             }
@@ -26359,9 +26390,7 @@ fn move_player(
     crate::movement::resolve_player(position, movement, on_ground, PLAYER_HEIGHT, |cell_pos| {
         match cell(world, origin, bounds, cell_pos, air) {
             Cell::Missing => unknown_barrier(),
-            Cell::State(id) => shapes
-                .get(id.0 as usize)
-                .and_then(Option::as_deref)
+            Cell::State(id) => shape_at_relative(world, shapes, id, origin, cell_pos)
                 .unwrap_or_else(|| unknown_barrier()),
         }
     })
@@ -78701,6 +78730,73 @@ pub(crate) mod tests {
             2.0
         ));
         assert!((position.x - (8.0 + 6.0 / 16.0 - PLAYER_HALF_WIDTH)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn positioned_speleothem_affects_movement_and_targeting_at_absolute_coordinates() {
+        let (mut world, origin, mut player) = fixture();
+        let block = state(
+            "minecraft:sulfur_spike",
+            &[
+                ("thickness", "tip"),
+                ("vertical_direction", "up"),
+                ("waterlogged", "false"),
+            ],
+        );
+        let spike = world.intern_state(block.clone());
+        let relative = IVec3::new(9, 2, 8);
+        let absolute = origin + relative;
+        world
+            .set_block_id(absolute.x, absolute.y, absolute.z, spike)
+            .unwrap();
+        player.position = Vec3::new(8.0, 1.0, 8.5);
+        player.yaw = std::f32::consts::FRAC_PI_2;
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert_eq!(session.unsupported_states(), 0);
+        assert_eq!(session.unsupported_outlines(), 0);
+        let expected =
+            native_world::collision::positioned_speleothem_shape(&block, absolute).unwrap()[0];
+        let hit = session.ray_hit_with_range(3.0).unwrap();
+        assert_eq!(hit.position, relative);
+        assert_eq!(hit.face, IVec3::NEG_X);
+        assert!(
+            (hit.location.x - f64::from(relative.x) - f64::from(expected.min.x)).abs() < 1.0e-6
+        );
+        session.player.position.z = 7.9;
+        assert!(session.ray_hit_with_range(3.0).is_none());
+
+        let mut position = Vec3::new(8.0, 2.0, 8.5);
+        assert!(move_axis(
+            &session.world,
+            &session.shapes,
+            origin,
+            session.bounds,
+            session.states[0],
+            &mut position,
+            0,
+            2.0
+        ));
+        assert!((position.x - (9.0 + expected.min.x - PLAYER_HALF_WIDTH)).abs() < 0.0001);
+        let mut clear = Vec3::new(8.0, 2.0, 7.8);
+        assert!(!move_axis(
+            &session.world,
+            &session.shapes,
+            origin,
+            session.bounds,
+            session.states[0],
+            &mut clear,
+            0,
+            2.0
+        ));
     }
 
     #[test]

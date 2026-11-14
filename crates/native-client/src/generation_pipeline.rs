@@ -640,6 +640,10 @@ mod tests {
                 let crate::PreparedWorld::Play(reopened) = prepared else {
                     anyhow::bail!("staged world did not reopen as a play session");
                 };
+                if seed == -1 {
+                    assert_eq!(reopened.session.unsupported_states(), 0);
+                    assert_eq!(reopened.session.unsupported_outlines(), 0);
+                }
                 use native_session::GameSession;
                 let before = world.initial.session.snapshot();
                 let after = reopened.session.snapshot();
@@ -654,8 +658,17 @@ mod tests {
                     .context("reopened terrain is missing")?;
                 assert!(!reopened_world.chunks.is_empty());
                 for (_, state) in reopened_world.states() {
-                    let collision = native_world::collision::block_shape(state).is_none();
-                    let outline = native_world::collision::block_outline(state).is_none();
+                    let positioned = || {
+                        native_world::collision::positioned_speleothem_shape(
+                            state,
+                            glam::IVec3::ZERO,
+                        )
+                        .is_some()
+                    };
+                    let collision =
+                        native_world::collision::block_shape(state).is_none() && !positioned();
+                    let outline =
+                        native_world::collision::block_outline(state).is_none() && !positioned();
                     if collision || outline {
                         eprintln!(
                             "unsupported shape: collision={collision} outline={outline} {state:?}"

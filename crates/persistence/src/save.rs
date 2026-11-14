@@ -1398,6 +1398,9 @@ struct PlannedGenerationDependency {
     kind: RegionKind,
     position: crate::world::ChunkPos,
     source_nbt: Option<Vec<u8>>,
+    /// Known source UUIDs or a deferred validation error. Replaced entries
+    /// must not fail merely because their original identities were invalid.
+    entity_identities: Option<std::result::Result<Vec<[i32; 4]>, String>>,
 }
 
 struct PlannedGenerationPacks {
@@ -1432,6 +1435,8 @@ impl PlannedGenerationDependency {
                 }
             }
         }
+        let entity_identities =
+            source.and_then(|document| capture_dependency_entity_identities(kind, document));
         let source_nbt = source.map(nbt::write).transpose()?;
         ensure!(
             source_nbt
@@ -1444,6 +1449,7 @@ impl PlannedGenerationDependency {
             kind,
             position,
             source_nbt,
+            entity_identities,
         })
     }
 }
@@ -2669,6 +2675,55 @@ fn collect_entity_identities(list: Option<&Tag>, seen: &mut BTreeSet<[i32; 4]>) 
     Ok(())
 }
 
+fn capture_dependency_entity_identities(
+    kind: RegionKind,
+    document: &nbt::NamedTag,
+) -> Option<std::result::Result<Vec<[i32; 4]>, String>> {
+    let list = match kind {
+        RegionKind::Blocks => {
+            if matches!(document.value.get("Status"), Some(Tag::String(status)) if status.matches("minecraft:full"))
+            {
+                return None;
+            }
+            let Tag::Compound(fields) = &document.value else {
+                return Some(Err("captured protochunk root is invalid".into()));
+            };
+            let mut lists = fields.iter().filter(|(name, _)| name.matches("entities"));
+            let first = lists.next().map(|(_, value)| value);
+            if lists.next().is_some() {
+                return Some(Err("duplicate protochunk entities field".into()));
+            }
+            first
+        }
+        RegionKind::Entities => document.value.get("Entities"),
+        RegionKind::Poi => None,
+    }?;
+    let mut seen = BTreeSet::new();
+    Some(
+        collect_entity_identities(Some(list), &mut seen)
+            .map(|()| seen.into_iter().collect())
+            .map_err(|error| format!("{error:#}")),
+    )
+}
+
+fn merge_captured_entity_identities(
+    dependency: &PlannedGenerationDependency,
+    seen: &mut BTreeSet<[i32; 4]>,
+) -> Result<()> {
+    if let Some(identities) = &dependency.entity_identities {
+        let identities = identities
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        for &uuid in identities {
+            ensure!(
+                seen.insert(uuid),
+                "duplicate generated entity UUID {uuid:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Check explicit UUIDs in staged entity documents and unchanged sidecars and
 /// protochunks included in the same capture. Other chunks and live entities
 /// are not covered by this check.
@@ -2694,34 +2749,16 @@ fn validate_known_generation_entity_identities<'a>(
             && entry.kind == RegionKind::Blocks
             && !replaced_terrain.contains(&entry.position)
     }) {
-        if let Some(source) = &dependency.source_nbt {
-            let document = nbt::read(source)?;
-            if matches!(document.value.get("Status"), Some(Tag::String(status)) if status.matches("minecraft:full"))
-            {
-                continue;
-            }
-            let Tag::Compound(fields) = &document.value else {
-                anyhow::bail!("captured protochunk root is invalid")
-            };
-            let mut lists = fields.iter().filter(|(name, _)| name.matches("entities"));
-            let list = lists.next().map(|(_, value)| value);
-            ensure!(
-                lists.next().is_none(),
-                "duplicate protochunk entities field"
-            );
-            collect_entity_identities(list, &mut seen)
-                .context("captured protochunk entity identities conflict")?;
-        }
+        merge_captured_entity_identities(dependency, &mut seen)
+            .context("captured protochunk entity identities conflict")?;
     }
     for dependency in dependencies.iter().filter(|entry| {
         &entry.dimension == dimension
             && entry.kind == RegionKind::Entities
             && !replaced.contains(&entry.position)
     }) {
-        if let Some(source) = &dependency.source_nbt {
-            collect_fresh_entity_identities(&nbt::read(source)?, &mut seen)
-                .context("captured entity identities conflict")?;
-        }
+        merge_captured_entity_identities(dependency, &mut seen)
+            .context("captured entity identities conflict")?;
     }
     for entry in planned {
         if let Some(document) = &entry.replacement {
@@ -10077,6 +10114,154 @@ mod tests {
             ],
         )?;
         writer.write_plan(valid, |_, _| Ok(()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn captured_entity_identity_cache_keeps_snapshot_and_deferred_errors() -> Result<()> {
+        let dimension = DimensionId::parse("overworld")?;
+        let position = ChunkPos { x: 0, z: 0 };
+        let entity =
+            |uuid| Tag::Compound(vec![("UUID".into(), Tag::IntArray(vec![0, 0, 0, uuid]))]);
+        let mut proto = editable_chunk(0);
+        *unique_treasure_field_mut(&mut proto.value, "Status")? =
+            Tag::String("minecraft:biomes".into());
+        let Tag::Compound(fields) = &mut proto.value else {
+            unreachable!()
+        };
+        fields.push((
+            "entities".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity(1)],
+            },
+        ));
+        let captured = PlannedGenerationDependency::capture(
+            dimension.clone(),
+            RegionKind::Blocks,
+            position,
+            Some(&proto),
+        )?;
+        let Tag::Compound(fields) = &mut proto.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("entities"))
+            .unwrap()
+            .1 = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![entity(2)],
+        };
+        let planned_entity = |uuid| -> Result<PlannedEntityChunk> {
+            Ok(PlannedEntityChunk {
+                dimension: dimension.clone(),
+                position: ChunkPos { x: 1, z: 0 },
+                source_nbt: None,
+                replacement: Some(nbt::write(&entity_chunk(1, vec![entity(uuid)]))?),
+                region_timestamp_seconds: 0,
+            })
+        };
+        assert!(
+            validate_known_generation_entity_identities(
+                &dimension,
+                std::slice::from_ref(&captured),
+                std::iter::empty(),
+                &[planned_entity(1)?]
+            )
+            .is_err()
+        );
+        validate_known_generation_entity_identities(
+            &dimension,
+            std::slice::from_ref(&captured),
+            std::iter::empty(),
+            &[planned_entity(2)?],
+        )?;
+
+        let Tag::Compound(fields) = &mut proto.value else {
+            unreachable!()
+        };
+        fields.push(("entities".into(), Tag::Int(7)));
+        let ambiguous = PlannedGenerationDependency::capture(
+            dimension.clone(),
+            RegionKind::Blocks,
+            position,
+            Some(&proto),
+        )?;
+        assert!(
+            validate_known_generation_entity_identities(
+                &dimension,
+                std::slice::from_ref(&ambiguous),
+                std::iter::empty(),
+                std::iter::empty()
+            )
+            .is_err()
+        );
+        let replacement = PlannedGeneratedChunk {
+            dimension: dimension.clone(),
+            position,
+            source_nbt: None,
+            captured: true,
+            document: nbt::write(&editable_chunk(0))?,
+            region_timestamp_seconds: 0,
+        };
+        validate_known_generation_entity_identities(
+            &dimension,
+            &[ambiguous],
+            &[replacement],
+            std::iter::empty(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual captured-entity identity scan performance measurement"]
+    fn captured_entity_identity_scan_performance() -> Result<()> {
+        let dimension = DimensionId::parse("overworld")?;
+        let mut dependencies = Vec::new();
+        for x in 0..256 {
+            let mut document = editable_chunk(x);
+            if x % 2 == 0 {
+                *unique_treasure_field_mut(&mut document.value, "Status")? =
+                    Tag::String("minecraft:biomes".into());
+            }
+            let Tag::Compound(fields) = &mut document.value else {
+                unreachable!()
+            };
+            fields.push(("example:payload".into(), Tag::ByteArray(vec![0; 32 * 1024])));
+            if x % 2 == 0 {
+                fields.push((
+                    "entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![(
+                            "UUID".into(),
+                            Tag::IntArray(vec![0, 0, 0, x]),
+                        )])],
+                    },
+                ));
+            }
+            dependencies.push(PlannedGenerationDependency::capture(
+                dimension.clone(),
+                RegionKind::Blocks,
+                ChunkPos { x, z: 0 },
+                Some(&document),
+            )?);
+        }
+        let iterations = 25;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            validate_known_generation_entity_identities(
+                &dimension,
+                std::hint::black_box(&dependencies),
+                std::iter::empty::<&PlannedGeneratedChunk>(),
+                std::iter::empty::<&PlannedEntityChunk>(),
+            )?;
+        }
+        eprintln!(
+            "captured identity scan: {iterations} iterations, 256 chunks, 32 KiB payload each: {:?}",
+            start.elapsed()
+        );
         Ok(())
     }
 

@@ -1758,6 +1758,14 @@ pub(crate) enum ResumedCreatureInstance {
     NeedsFinalization(native_session::worldgen::GeneratedCreaturePose),
 }
 
+fn supports_generated_creature(id: &ResourceId) -> bool {
+    id.namespace == "minecraft"
+        && matches!(
+            id.path.as_str(),
+            "sheep" | "horse" | "donkey" | "pig" | "cow" | "chicken" | "turtle"
+        )
+}
+
 pub(crate) struct ResumedPlannedSpawn {
     lit: ResumedLitDraft,
     clocks: BTreeMap<ResourceId, i64>,
@@ -4774,11 +4782,7 @@ impl PreparedExistingGenerator {
             bail!("no creature candidate is pending")
         };
         ensure!(
-            attempt.entity.namespace == "minecraft"
-                && matches!(
-                    attempt.entity.path.as_str(),
-                    "sheep" | "horse" | "donkey" | "pig" | "cow" | "chicken" | "turtle"
-                ),
+            supports_generated_creature(&attempt.entity),
             "unsupported generated creature {}:{}",
             attempt.entity.namespace,
             attempt.entity.path
@@ -4957,11 +4961,7 @@ impl PreparedExistingGenerator {
             bail!("creature candidate is missing")
         };
         ensure!(
-            attempt.entity.namespace == "minecraft"
-                && matches!(
-                    attempt.entity.path.as_str(),
-                    "sheep" | "horse" | "donkey" | "pig" | "cow" | "chicken"
-                ),
+            supports_generated_creature(&attempt.entity),
             "creature finalization is not supported"
         );
         if attempt.entity.path == "chicken" {
@@ -9195,6 +9195,98 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn every_supported_creature_can_pass_the_construction_gate() -> Result<()> {
+        use native_resources::{
+            density::WorldgenRandom,
+            mob_spawns::{CreatureSpawnLayer, CreatureSpawns},
+            worldgen_mob_geometry::CreatureSpawnGeometry,
+            worldgen_mob_spawner::{ChunkCreatureSpawner, CreatureSpawnProgress},
+            worldgen_region_random::RegionRandom,
+        };
+        let border = native_session::respawn::RespawnBorder {
+            min_x: -100.0,
+            max_x: 100.0,
+            min_z: -100.0,
+            max_z: 100.0,
+        };
+        for species in [
+            "sheep", "horse", "donkey", "pig", "cow", "chicken", "turtle",
+        ] {
+            let id = ResourceId::parse(&format!("minecraft:{species}"))?;
+            assert!(supports_generated_creature(&id));
+            let construction =
+                native_session::worldgen::FreshCreatureRandom::from_seed(&id, 42)?.construction;
+            let attributes = json!({"gameplay/natural_mob_spawns":{
+                "spawns_by_category":{"creature":[{"type":format!("minecraft:{species}"),"weight":1,"count":1}]},
+                "spawn_costs":{}
+            }});
+            let mut spawns = CreatureSpawns::default();
+            spawns
+                .apply(CreatureSpawnLayer::from_attributes(&attributes, |_| Some(false))?.unwrap());
+            let mut planner = ChunkCreatureSpawner::new(42, 0, 0, true, 0.999_999_9, spawns)?;
+            let attempt = loop {
+                match planner.next(1)? {
+                    CreatureSpawnProgress::Pending => continue,
+                    CreatureSpawnProgress::Attempt(attempt) => break attempt,
+                    CreatureSpawnProgress::Finished => {
+                        anyhow::bail!("fixture produced no creature")
+                    }
+                }
+            };
+            assert_eq!(attempt.entity, id);
+            let mut plan = ResumedCreaturePlan {
+                identity: Arc::new(()),
+                revision: Arc::new(()),
+                light_revision: Arc::new(()),
+                position: native_world::loaded::ChunkPos { x: 0, z: 0 },
+                clocks: BTreeMap::new(),
+                planner,
+                finished: false,
+                probe: None,
+                construction: Some(CreatureSpawnGeometry {
+                    position: [0.5, 1.0, 0.5],
+                    min: [0.0, 1.0, 0.0],
+                    max: [1.0, 2.0, 1.0],
+                }),
+                border: Some(border),
+                rule_light: None,
+                random: RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0),
+                group_id: None,
+                sheep_group: Default::default(),
+                horse_group: Default::default(),
+                donkey_group: Default::default(),
+                constructed: None,
+                pose: None,
+                instance_passed: false,
+                finalizable: false,
+                additions: Vec::new(),
+                used_uuids: BTreeSet::new(),
+            };
+            PreparedExistingGenerator::validate_creature_construction(
+                &mut plan,
+                border,
+                construction,
+            )?;
+            plan.used_uuids.insert(construction.uuid);
+            assert!(
+                PreparedExistingGenerator::validate_creature_construction(
+                    &mut plan,
+                    border,
+                    construction
+                )
+                .is_err()
+            );
+        }
+        assert!(!supports_generated_creature(&ResourceId::parse(
+            "example:turtle"
+        )?));
+        assert!(!supports_generated_creature(&ResourceId::parse(
+            "minecraft:unknown"
+        )?));
+        Ok(())
+    }
 
     #[test]
     fn generated_structure_references_preserve_saved_structure_fields() -> Result<()> {

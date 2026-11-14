@@ -19143,7 +19143,8 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
-                    self.unresolved_bubble_tick = true;
+                    // No callback ran: keep the original tick and retry when
+                    // the chunk becomes available, as for other block ticks.
                     self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
@@ -75946,6 +75947,48 @@ pub(crate) mod tests {
 
         let drafted = session.draft_block_ticks(home).unwrap();
         assert_eq!(drafted, source_ticks);
+    }
+
+    #[test]
+    fn unloaded_bubble_tick_is_preserved_until_its_chunk_returns() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let relative = IVec3::new(8, 5, 8);
+        let position = (session.origin + relative).to_array();
+        let tick = SavedBlockTick {
+            block: "minecraft:water".into(),
+            position,
+            delay: 0,
+            priority: -1,
+        };
+        Arc::make_mut(&mut session.world)
+            .saved_block_ticks
+            .insert(home, vec![tick.clone()]);
+        session.enqueue_saved_bubble(std::slice::from_ref(&tick));
+        let chunk = Arc::make_mut(&mut session.world)
+            .chunks
+            .remove(&home)
+            .unwrap();
+
+        session.advance_block_ticks();
+        assert!(!session.unresolved_bubble_tick);
+        assert_eq!(session.bubble_deferred.len(), 1);
+        assert_eq!(session.bubble_pending.len(), 1);
+        assert_eq!(session.draft_block_ticks(home).unwrap(), vec![tick.clone()]);
+
+        session.tick = 3;
+        session.advance_block_ticks();
+        let mut overdue = tick;
+        overdue.delay = -3;
+        assert_eq!(session.draft_block_ticks(home).unwrap(), vec![overdue]);
+
+        Arc::make_mut(&mut session.world).chunks.insert(home, chunk);
+        session.revision = session.revision.wrapping_add(1);
+        session.advance_block_ticks();
+        assert!(!session.unresolved_bubble_tick);
+        assert!(session.bubble_deferred.is_empty());
+        assert!(session.bubble_pending.is_empty());
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
     }
 
     #[test]

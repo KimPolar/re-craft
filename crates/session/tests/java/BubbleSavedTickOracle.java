@@ -23,6 +23,13 @@ public class BubbleSavedTickOracle {
         var chunk = new LevelChunkTicks<Block>(ticks);
         chunk.unpack(100L);
         if(!chunk.pack(100L).equals(ticks)) throw new AssertionError("unpack/pack changed tick order or data: "+chunk.pack(100L));
+        var overdue = chunk.pack(125L);
+        for (int i=0;i<ticks.size();i++) {
+            var tick=overdue.get(i);
+            if(tick.delay()!=ticks.get(i).delay()-25 || tick.type()!=ticks.get(i).type() || !tick.pos().equals(ticks.get(i).pos()) || tick.priority()!=ticks.get(i).priority()) throw new AssertionError("overdue tick changed: "+tick);
+            var decoded=codec.parse(NbtOps.INSTANCE,codec.encodeStart(NbtOps.INSTANCE,tick).getOrThrow()).getOrThrow();
+            if(!decoded.equals(tick)) throw new AssertionError("overdue tick did not survive NBT: "+decoded);
+        }
         if(chunk.poll().type()!=Blocks.SAND || chunk.poll().type()!=Blocks.BUBBLE_COLUMN || chunk.poll().type()!=Blocks.WATER) throw new AssertionError("unexpected execution order");
         var remaining=ticks.get(0);
         if(chunk.hasScheduledTick(remaining.pos(),Blocks.WATER)) throw new AssertionError("duplicate still present in uniqueness set after poll");

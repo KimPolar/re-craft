@@ -482,6 +482,16 @@ pub(crate) struct MissingGenerationBiomeStartError {
     pub error: anyhow::Error,
 }
 
+impl MissingGenerationBiomeStartError {
+    /// A transient input can be retried at a later tick with the returned
+    /// capture, provided that capture is still current.
+    pub fn pending(&self) -> Option<native_session::loaded::GenerationTerrainPending> {
+        self.error
+            .downcast_ref::<native_session::loaded::GenerationTerrainPending>()
+            .copied()
+    }
+}
+
 pub(crate) struct MissingGenerationBiomeWorker {
     observed: MissingGenerationTargets,
     cancelled: Arc<AtomicBool>,
@@ -725,8 +735,9 @@ pub(crate) struct MissingGenerationTerrainWorker {
 }
 
 impl MissingGenerationTerrainWorker {
-    /// For multiple structure keys the caller must supply the corresponding
-    /// Java iteration order. Single-key and empty sets have a unique order.
+    /// For multiple structure keys, infer an order only when all possible
+    /// orders have identical terrain contributions. Otherwise the caller
+    /// must supply the corresponding Java iteration order.
     pub fn start(
         biomed: BiomedMissingGeneration,
         streamer: &ChunkStreamer,
@@ -815,6 +826,7 @@ impl MissingGenerationTerrainWorker {
                             remaining += 1;
                             continue;
                         }
+                        let inferred_order;
                         let order = if let Some(order) = structure_orders.get(&position) {
                             let actual: BTreeSet<_> = order.iter().cloned().collect();
                             let expected: BTreeSet<_> = keys.iter().cloned().collect();
@@ -823,14 +835,19 @@ impl MissingGenerationTerrainWorker {
                                 "structure order does not cover references exactly"
                             );
                             order.as_slice()
-                        } else {
-                            anyhow::ensure!(
-                                keys.len() <= 1,
-                                "Java structure order is required for terrain {},{}",
-                                position.x,
-                                position.z
-                            );
+                        } else if keys.len() <= 1 {
                             keys.as_slice()
+                        } else {
+                            inferred_order = state
+                                .generator
+                                .unambiguous_captured_terrain_order(&state.work, position)?
+                                .with_context(|| {
+                                    format!(
+                                        "Java structure order is required for terrain {},{}",
+                                        position.x, position.z
+                                    )
+                                })?;
+                            inferred_order.as_slice()
                         };
                         if resume {
                             state.generator.run_captured_saved_terrain(
@@ -3481,9 +3498,9 @@ mod tests {
             .generator
             .capture_live_inputs(&session, &prepared.terrain)?;
         prepared.generator.verify_live_inputs(&session, &live)?;
-        let capture_again = || -> Result<CapturedMissingGeneration> {
+        let capture_again = |session: &LoadedSession| -> Result<CapturedMissingGeneration> {
             let targets = streamer
-                .missing_generation_targets(&session, 1)
+                .missing_generation_targets(session, 1)
                 .context("targets missing")?;
             let reader = WorldReader::open_with_session(
                 world.path(),
@@ -3491,17 +3508,17 @@ mod tests {
                 guard.clone(),
             )?;
             let mut worker =
-                MissingGenerationCaptureWorker::start(targets, &streamer, &session, reader)?;
+                MissingGenerationCaptureWorker::start(targets, &streamer, session, reader)?;
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                if let Some(result) = worker.try_result(&streamer, &session)? {
+                if let Some(result) = worker.try_result(&streamer, session)? {
                     return Ok(result);
                 }
                 anyhow::ensure!(Instant::now() < deadline, "generation capture timed out");
                 thread::sleep(Duration::from_millis(2));
             }
         };
-        let captured = capture_again()?;
+        let captured = capture_again(&session)?;
         let mut prepare_biomes =
             MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
                 .map_err(|failure| failure.error)?;
@@ -3513,8 +3530,32 @@ mod tests {
             anyhow::ensure!(Instant::now() < deadline, "biome preparation timed out");
             thread::sleep(Duration::from_millis(2));
         };
+        let waiting_neighbor = prepared_biomes
+            .schedule
+            .requirements()
+            .find_map(|(pos, stage)| {
+                (stage >= GenerationStage::Biomes
+                    && pos != target
+                    && !streamer.missing.contains(&pos))
+                .then_some(pos)
+            })
+            .context("no pending-input fixture position")?;
+        session.queue_entity_chunk(waiting_neighbor, SavedEntityData::Empty);
+        let failure =
+            match MissingGenerationBiomeWorker::start(prepared_biomes, &streamer, &session) {
+                Ok(_) => anyhow::bail!("pending streamed input was accepted"),
+                Err(failure) => failure,
+            };
+        assert_eq!(
+            failure.pending(),
+            Some(native_session::loaded::GenerationTerrainPending::Chunk(
+                waiting_neighbor
+            ))
+        );
+        session.update(Duration::from_millis(50));
+        assert!(failure.prepared.is_current(&streamer, &session));
         let mut biome_worker =
-            MissingGenerationBiomeWorker::start(prepared_biomes, &streamer, &session)
+            MissingGenerationBiomeWorker::start(failure.prepared, &streamer, &session)
                 .map_err(|failure| failure.error)?;
         let deadline = Instant::now() + Duration::from_secs(120);
         let biomed = loop {
@@ -3629,7 +3670,7 @@ mod tests {
                 })
                 .is_some()
         );
-        let captured = capture_again()?;
+        let captured = capture_again(&session)?;
         let mut prepare_cancelled_biomes =
             MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
                 .map_err(|failure| failure.error)?;
@@ -3667,7 +3708,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
-        let captured = capture_again()?;
+        let captured = capture_again(&session)?;
         let mut cancelled =
             MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
                 .map_err(|failure| failure.error)?;
@@ -3688,7 +3729,7 @@ mod tests {
             anyhow::ensure!(Instant::now() < deadline, "cancelled preparation timed out");
             thread::sleep(Duration::from_millis(2));
         }
-        let captured = capture_again()?;
+        let captured = capture_again(&session)?;
         let mut prepare_cancelled_terrain =
             MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
                 .map_err(|failure| failure.error)?;
@@ -3739,8 +3780,8 @@ mod tests {
         // Keep the selected missing target unchanged while another staged
         // neighbor acquires pending streaming. Both workers must reject their
         // results based on the live terrain guard, not just target selection.
-        let stale_capture = capture_again()?;
-        let captured_for_stale_biomes = capture_again()?;
+        let stale_capture = capture_again(&session)?;
+        let captured_for_stale_biomes = capture_again(&session)?;
         let mut prepare_stale_biomes = MissingGenerationPrepareWorker::start(
             captured_for_stale_biomes,
             &streamer,
@@ -3766,7 +3807,7 @@ mod tests {
                 .then_some(pos)
             })
             .context("no independent staged neighbor")?;
-        let captured_for_stale_terrain = capture_again()?;
+        let captured_for_stale_terrain = capture_again(&session)?;
         let mut prepare_stale_terrain = MissingGenerationPrepareWorker::start(
             captured_for_stale_terrain,
             &streamer,

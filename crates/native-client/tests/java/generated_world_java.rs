@@ -293,6 +293,12 @@ fn generated_world_seed_one_stages_dirty_terrain() -> Result<()> {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
+fn generated_world_seed_one_runs_missing_chunk_generation_workers() -> Result<()> {
+    generated_world_round_trips_through_java(1, GenerationCheck::GenerationWorkers)
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK; generates a temporary world"]
 fn generated_world_seed_42_round_trips_through_java() -> Result<()> {
     generated_world_round_trips_through_java(42, GenerationCheck::RoundTrip)
 }
@@ -302,6 +308,55 @@ enum GenerationCheck {
     RoundTrip,
     LiveInputs,
     StagedTerrain,
+    GenerationWorkers,
+}
+
+fn prepare_missing_generation(
+    targets: crate::chunk_stream::MissingGenerationTargets,
+    streamer: &crate::chunk_stream::ChunkStreamer,
+    session: &native_session::loaded::LoadedSession,
+    world_path: &std::path::Path,
+    dimension: &native_persistence::world::DimensionId,
+    guard: &native_persistence::save::WorldSessionGuard,
+    game: &std::path::Path,
+) -> Result<crate::chunk_stream::PreparedMissingGeneration> {
+    let reader = native_persistence::world::WorldReader::open_with_session(
+        world_path,
+        dimension.clone(),
+        guard.clone(),
+    )?;
+    let mut capture = crate::chunk_stream::MissingGenerationCaptureWorker::start(
+        targets, streamer, session, reader,
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let captured = loop {
+        if let Some(result) = capture.try_result(streamer, session)? {
+            break result;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "generation capture timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let mut prepare = crate::chunk_stream::MissingGenerationPrepareWorker::start(
+        captured,
+        streamer,
+        session,
+        game.to_path_buf(),
+    )
+    .map_err(|failure| failure.error)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(result) = prepare.try_result(streamer, session)? {
+            return Ok(result);
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "generation preparation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -> Result<()> {
@@ -951,46 +1006,208 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
             std::thread::sleep(Duration::from_millis(10));
         };
         if check != GenerationCheck::RoundTrip {
-            let generation_reader = native_persistence::world::WorldReader::open_with_session(
-                &staged_world_path,
-                dimension.clone(),
-                stream_guard,
-            )?;
-            let mut capture = crate::chunk_stream::MissingGenerationCaptureWorker::start(
+            let prepared = prepare_missing_generation(
                 generation_targets,
                 &streamer,
                 session,
-                generation_reader,
+                &staged_world_path,
+                &dimension,
+                &stream_guard,
+                &game,
             )?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
-            let captured = loop {
-                if let Some(result) = capture.try_result(&streamer, session)? {
-                    break result;
-                }
+            if check == GenerationCheck::GenerationWorkers {
+                use native_session::worldgen::schedule::GenerationStage;
+
                 ensure!(
-                    std::time::Instant::now() < deadline,
-                    "generation capture timed out"
+                    !session.dirty_chunk_positions().is_empty(),
+                    "seed 1 fixture has no live dirty chunks"
                 );
-                std::thread::sleep(Duration::from_millis(2));
-            };
-            let mut prepare = crate::chunk_stream::MissingGenerationPrepareWorker::start(
-                captured,
-                &streamer,
-                session,
-                game.clone(),
-            )
-            .map_err(|failure| failure.error)?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
-            let prepared = loop {
-                if let Some(result) = prepare.try_result(&streamer, session)? {
-                    break result;
-                }
+                let mut prepared = prepared;
+                let mut target = *prepared
+                    .targets()
+                    .first()
+                    .context("missing target absent")?;
+                let retry_deadline = std::time::Instant::now() + Duration::from_secs(120);
+                let mut biomes = loop {
+                    match crate::chunk_stream::MissingGenerationBiomeWorker::start(
+                        prepared, &streamer, session,
+                    ) {
+                        Ok(worker) => break worker,
+                        Err(failure) => {
+                            let Some(pending) = failure.pending() else {
+                                return Err(failure.error.context("cannot start biome generation"));
+                            };
+                            eprintln!("Waiting for live generation input: {pending}");
+                            prepared = failure.prepared;
+                            ensure!(
+                                std::time::Instant::now() < retry_deadline,
+                                "pending terrain input did not settle"
+                            );
+                            session.update(Duration::from_millis(50));
+                            let errors = session.take_stream_errors();
+                            ensure!(errors.is_empty(), "streaming retry errors: {errors:?}");
+                            streamer.service(session)?;
+                            if !prepared.is_current(&streamer, session) {
+                                crate::generation_staging::discard_async(prepared);
+                                let targets = loop {
+                                    if let Some(targets) =
+                                        streamer.missing_generation_targets(session, 1)
+                                        && !targets.targets().is_empty()
+                                    {
+                                        break targets;
+                                    }
+                                    ensure!(
+                                        std::time::Instant::now() < retry_deadline,
+                                        "generation target retry timed out"
+                                    );
+                                    session.update(Duration::from_millis(50));
+                                    let errors = session.take_stream_errors();
+                                    ensure!(
+                                        errors.is_empty(),
+                                        "streaming retry errors: {errors:?}"
+                                    );
+                                    streamer.service(session)?;
+                                    std::thread::sleep(Duration::from_millis(10));
+                                };
+                                prepared = prepare_missing_generation(
+                                    targets,
+                                    &streamer,
+                                    session,
+                                    &staged_world_path,
+                                    &dimension,
+                                    &stream_guard,
+                                    &game,
+                                )?;
+                                target = *prepared
+                                    .targets()
+                                    .first()
+                                    .context("missing target absent")?;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                };
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                let biomed = loop {
+                    if let Some(result) = biomes.try_result(&streamer, session)? {
+                        break result;
+                    }
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "missing chunk biome generation timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                ensure!(biomed.targets() == [target], "biome targets changed");
+                let mut terrain = crate::chunk_stream::MissingGenerationTerrainWorker::start(
+                    biomed,
+                    &streamer,
+                    session,
+                    usize::MAX,
+                    BTreeMap::new(),
+                )
+                .map_err(|failure| failure.error)?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                let generated = loop {
+                    if let Some(result) = terrain.try_result(&streamer, session)? {
+                        break result;
+                    }
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "missing chunk terrain generation timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                };
                 ensure!(
-                    std::time::Instant::now() < deadline,
-                    "generation preparation timed out"
+                    generated.generated().first() == Some(&target),
+                    "target terrain was not generated"
                 );
-                std::thread::sleep(Duration::from_millis(2));
-            };
+                ensure!(generated.remaining() == 0, "terrain requirements remain");
+                eprintln!(
+                    "Generated {} terrain chunks and restored {} saved terrain chunks",
+                    generated.generated().len(),
+                    generated.saved().len()
+                );
+                let failure = match crate::chunk_stream::MissingGenerationAssemblyWorker::start(
+                    generated, &streamer, session,
+                ) {
+                    Ok(_) => anyhow::bail!("dirty live terrain was accepted for assembly"),
+                    Err(failure) => failure,
+                };
+                eprintln!("Live assembly remains gated: {:#}", failure.error);
+                let biomed = failure.terrain.into_checked_state(&streamer, session)?;
+                let (work, _, _, _, _, _) = biomed.into_checked_parts(&streamer, session)?;
+                ensure!(
+                    work.schedule().completed(target) == Some(GenerationStage::Terrain),
+                    "target did not reach terrain stage"
+                );
+                let biome = work
+                    .biomes()
+                    .chunk([target.x, target.z])
+                    .context("target biome volume is missing")?;
+                let biome_source = oracle.path().join("GeneratedMissingBiomeOracle.java");
+                std::fs::write(
+                    &biome_source,
+                    include_str!("GeneratedMissingBiomeOracle.java"),
+                )?;
+                let compiled = Command::new(java.join("javac.exe"))
+                    .arg("-classpath")
+                    .arg(&classpath)
+                    .arg(&biome_source)
+                    .output()?;
+                ensure!(
+                    compiled.status.success(),
+                    "Java biome oracle compilation failed: {}",
+                    String::from_utf8_lossy(&compiled.stderr)
+                );
+                let compared = Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&classpath)
+                    .arg("GeneratedMissingBiomeOracle")
+                    .args([seed.to_string(), target.x.to_string(), target.z.to_string()])
+                    .output()?;
+                ensure!(
+                    compared.status.success(),
+                    "Java biome oracle failed: {} {}",
+                    String::from_utf8_lossy(&compared.stdout),
+                    String::from_utf8_lossy(&compared.stderr)
+                );
+                let output = std::str::from_utf8(&compared.stdout)?;
+                let header = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("V "))
+                    .context("Java biome height is missing")?;
+                ensure!(
+                    header == format!("{} {}", biome.min_y(), biome.height()),
+                    "Java biome height differs"
+                );
+                let quart_height = usize::try_from(biome.height() / 4)?;
+                let mut columns = BTreeSet::new();
+                for row in output.lines().filter_map(|line| line.strip_prefix("B ")) {
+                    let mut fields = row.split_whitespace();
+                    let x: usize = fields.next().context("biome X is missing")?.parse()?;
+                    let z: usize = fields.next().context("biome Z is missing")?.parse()?;
+                    ensure!(
+                        x < 4 && z < 4 && columns.insert((x, z)),
+                        "invalid biome column"
+                    );
+                    for y in 0..quart_height {
+                        let expected = fields.next().context("Java biome value is missing")?;
+                        let actual = &biome.values()[(z * 4 + x) * quart_height + y];
+                        ensure!(
+                            *actual == native_resources::packs::ResourceId::parse(expected)?,
+                            "generated biome differs at local quart ({x}, {y}, {z})"
+                        );
+                    }
+                    ensure!(fields.next().is_none(), "extra Java biome values");
+                }
+                ensure!(columns.len() == 16, "Java biome columns are incomplete");
+                eprintln!(
+                    "Generated missing terrain at {target:?}; matched {} Java biome samples",
+                    columns.len() * quart_height
+                );
+                return Ok(());
+            }
             let (schedule, generator, restored, observed) =
                 prepared.into_checked_parts(&streamer, session)?;
             if check == GenerationCheck::StagedTerrain {

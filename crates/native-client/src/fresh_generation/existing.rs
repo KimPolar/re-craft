@@ -7234,6 +7234,40 @@ impl PreparedExistingGenerator {
         })
     }
 
+    /// Infer a structure-key order for an intermediate terrain pass only when
+    /// every possible Java key order yields the same clipped contributions.
+    pub fn unambiguous_captured_terrain_order(
+        &mut self,
+        work: &CapturedBiomeSchedule,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<Option<Vec<ResourceId>>> {
+        let keys = match self.captured_terrain_input(work, position)? {
+            CapturedTerrainInput::New { structure_keys }
+            | CapturedTerrainInput::Resume { structure_keys } => structure_keys,
+            CapturedTerrainInput::Saved { .. } => bail!("saved terrain needs no generation order"),
+        };
+        if keys.len() <= 1 {
+            return Ok(Some(keys));
+        }
+        let saved;
+        let references = if let Some(generated) = work.generated_references.get(&position) {
+            &generated.references
+        } else {
+            saved =
+                self.restore_saved_structure_references(native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                })?;
+            validate_saved_decoration_references(&saved)?;
+            &saved.references
+        };
+        native_session::worldgen::saved_structure_starts::unambiguous_beardifier_structure_order(
+            position,
+            references,
+            |id, source| self.captured_terrain_pieces(&work.generated_starts, id, source),
+        )
+    }
+
     /// Resume a captured protochunk using the schedule's already restored or
     /// generated biome neighborhood. Stages before saved structure references
     /// require new structure generation to be disabled. The result is not writable.
@@ -7957,35 +7991,41 @@ impl PreparedExistingGenerator {
         structure_order: &[ResourceId],
         generated_starts: &CapturedGeneratedStarts,
     ) -> Result<native_core::beardifier::Beardifier> {
-        use native_session::worldgen::saved_structure_starts::{
-            RestoredStructureStart, beardifier_for_ordered_references,
-        };
+        use native_session::worldgen::saved_structure_starts::beardifier_for_ordered_references;
         beardifier_for_ordered_references(
             target,
             &references.references,
             structure_order,
-            |id, position| {
-                if let Some(generated) = generated_starts.get(&position) {
-                    ensure!(
-                        generated.position() == position,
-                        "structure start source differs"
-                    );
-                    return generated.terrain_pieces(id);
-                }
-                let start = self
-                    .captured_structure_starts
-                    .get(&position)
-                    .and_then(|entries| entries.get(id))
-                    .context("referenced structure start is missing")?;
-                if let RestoredStructureStart::Present { chunk, .. } = start {
-                    ensure!(
-                        *chunk == position,
-                        "saved structure start belongs to another chunk"
-                    );
-                }
-                start.terrain_pieces()
-            },
+            |id, position| self.captured_terrain_pieces(generated_starts, id, position),
         )
+    }
+
+    fn captured_terrain_pieces(
+        &self,
+        generated_starts: &CapturedGeneratedStarts,
+        id: &ResourceId,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<Vec<native_core::beardifier::StructurePiece>> {
+        use native_session::worldgen::saved_structure_starts::RestoredStructureStart;
+        if let Some(generated) = generated_starts.get(&position) {
+            ensure!(
+                generated.position() == position,
+                "structure start source differs"
+            );
+            return generated.terrain_pieces(id);
+        }
+        let start = self
+            .captured_structure_starts
+            .get(&position)
+            .and_then(|entries| entries.get(id))
+            .context("referenced structure start is missing")?;
+        if let RestoredStructureStart::Present { chunk, .. } = start {
+            ensure!(
+                *chunk == position,
+                "saved structure start belongs to another chunk"
+            );
+        }
+        start.terrain_pieces()
     }
 
     /// Prepare terrain adaptation from captured starts and references. The

@@ -174,6 +174,7 @@ struct GuardedTerrainChunk {
 pub struct GenerationTerrainGuard {
     session: Arc<()>,
     chunks: BTreeMap<ChunkPos, GuardedTerrainChunk>,
+    deferred_shapes: Option<GenerationDeferredShapes>,
 }
 
 /// POI inputs observed in one session. Disk and data-pack snapshots still
@@ -181,6 +182,17 @@ pub struct GenerationTerrainGuard {
 pub struct GenerationPoiGuard {
     session: Arc<()>,
     chunks: BTreeMap<ChunkPos, Option<SavedPoiData>>,
+    deferred_shapes: Option<GenerationDeferredShapes>,
+}
+
+/// Shape callbacks may be waiting for an absent chunk. Preserve their exact
+/// order and inputs while that chunk is generated; publishing must still
+/// replay them on the live session after the required chunks are installed.
+#[derive(Clone, PartialEq, Eq)]
+struct GenerationDeferredShapes {
+    stairs: BTreeMap<ChunkPos, BTreeSet<BlockPosition>>,
+    fences: BTreeMap<ChunkPos, BTreeSet<(BlockPosition, BlockPosition)>>,
+    lichen: VecDeque<(BlockPosition, BlockPosition, BlockStateId)>,
 }
 
 /// Captured entity sidecars and tracked simulated entities for generation.
@@ -6098,7 +6110,7 @@ impl LoadedSession {
             || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z))
     }
 
-    fn generation_terrain_pending(&self) -> BTreeSet<ChunkPos> {
+    fn generation_non_shape_pending(&self) -> BTreeSet<ChunkPos> {
         self.incoming
             .iter()
             .map(|pending| pending.pos)
@@ -6110,13 +6122,15 @@ impl LoadedSession {
                 let max_z = block.z.saturating_add(radius).div_euclid(16);
                 (min_x..=max_x).flat_map(move |x| (min_z..=max_z).map(move |z| ChunkPos { x, z }))
             }))
-            .chain(
-                self.pending_stair_updates
-                    .iter()
-                    .flat_map(|(waiting, stairs)| {
-                        std::iter::once(*waiting).chain(stairs.iter().map(|stair| stair.chunk()))
-                    }),
-            )
+            .collect()
+    }
+
+    fn generation_shape_positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.pending_stair_updates
+            .iter()
+            .flat_map(|(waiting, stairs)| {
+                std::iter::once(*waiting).chain(stairs.iter().map(|stair| stair.chunk()))
+            })
             .chain(
                 self.pending_fence_updates
                     .iter()
@@ -6133,7 +6147,59 @@ impl LoadedSession {
                     .iter()
                     .flat_map(|(target, source, _)| [target.chunk(), source.chunk()]),
             )
-            .collect()
+    }
+
+    fn generation_terrain_pending(&self) -> BTreeSet<ChunkPos> {
+        let mut pending = self.generation_non_shape_pending();
+        pending.extend(self.generation_shape_positions());
+        pending
+    }
+
+    fn capture_deferred_generation_shapes(
+        &self,
+    ) -> anyhow::Result<Option<GenerationDeferredShapes>> {
+        if self.pending_stair_updates.is_empty()
+            && self.pending_fence_updates.is_empty()
+            && self.pending_lichen_updates.is_empty()
+        {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.ready_shape_update_chunks().is_empty(),
+            "a queued shape update is ready before generation"
+        );
+        Ok(Some(GenerationDeferredShapes {
+            stairs: self.pending_stair_updates.clone(),
+            fences: self.pending_fence_updates.clone(),
+            lichen: self.pending_lichen_updates.clone(),
+        }))
+    }
+
+    fn generation_guard_pending(
+        &self,
+        deferred: Option<&GenerationDeferredShapes>,
+    ) -> anyhow::Result<BTreeSet<ChunkPos>> {
+        if let Some(deferred) = deferred {
+            anyhow::ensure!(
+                deferred.stairs == self.pending_stair_updates
+                    && deferred.fences == self.pending_fence_updates
+                    && deferred.lichen == self.pending_lichen_updates,
+                "queued shape updates changed during generation"
+            );
+            anyhow::ensure!(
+                self.ready_shape_update_chunks().is_empty(),
+                "a queued shape update became ready during generation"
+            );
+            let pending = self.generation_non_shape_pending();
+            anyhow::ensure!(
+                self.generation_shape_positions()
+                    .all(|position| !pending.contains(&position)),
+                "a queued shape dependency has pending streaming or light changes"
+            );
+            Ok(pending)
+        } else {
+            Ok(self.generation_terrain_pending())
+        }
     }
 
     fn validate_generation_terrain_readiness(&self) -> anyhow::Result<()> {
@@ -6180,6 +6246,27 @@ impl LoadedSession {
         source: &World,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> anyhow::Result<GenerationTerrainGuard> {
+        self.capture_generation_terrain_inner(source, positions, None)
+    }
+
+    /// Also allow shape updates that cannot yet run because chunks are
+    /// missing. The exact queues stay guarded and must be replayed after
+    /// publication; this does not authorize publishing or saving the result.
+    pub fn capture_generation_terrain_with_deferred_shapes(
+        &self,
+        source: &World,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<GenerationTerrainGuard> {
+        let shapes = self.capture_deferred_generation_shapes()?;
+        self.capture_generation_terrain_inner(source, positions, shapes)
+    }
+
+    fn capture_generation_terrain_inner(
+        &self,
+        source: &World,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        deferred_shapes: Option<GenerationDeferredShapes>,
+    ) -> anyhow::Result<GenerationTerrainGuard> {
         self.validate_generation_terrain_readiness()?;
         anyhow::ensure!(
             source.dimension == self.world.dimension,
@@ -6189,7 +6276,7 @@ impl LoadedSession {
             source.block_edits().next().is_none() && source.live_block_entities.is_empty(),
             "generation terrain source contains live edits"
         );
-        let pending = self.generation_terrain_pending();
+        let pending = self.generation_guard_pending(deferred_shapes.as_ref())?;
         let mut chunks = BTreeMap::new();
         for position in positions {
             anyhow::ensure!(
@@ -6235,6 +6322,7 @@ impl LoadedSession {
         Ok(GenerationTerrainGuard {
             session: Arc::clone(&self.generation_identity),
             chunks,
+            deferred_shapes,
         })
     }
 
@@ -6246,7 +6334,7 @@ impl LoadedSession {
             Arc::ptr_eq(&self.generation_identity, &guard.session),
             "generation terrain belongs to another session"
         );
-        let pending = self.generation_terrain_pending();
+        let pending = self.generation_guard_pending(guard.deferred_shapes.as_ref())?;
         for (&position, expected) in &guard.chunks {
             anyhow::ensure!(
                 !self.has_unsaved_chunk_changes(position) && !pending.contains(&position),
@@ -6275,8 +6363,26 @@ impl LoadedSession {
         &self,
         source: &BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
     ) -> anyhow::Result<GenerationPoiGuard> {
+        self.capture_generation_poi_inner(source, None)
+    }
+
+    /// Bind POI inputs while retaining blocked shape callbacks for later
+    /// replay. This does not validate any resulting POI changes or tickets.
+    pub fn capture_generation_poi_with_deferred_shapes(
+        &self,
+        source: &BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
+    ) -> anyhow::Result<GenerationPoiGuard> {
+        let shapes = self.capture_deferred_generation_shapes()?;
+        self.capture_generation_poi_inner(source, shapes)
+    }
+
+    fn capture_generation_poi_inner(
+        &self,
+        source: &BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
+        deferred_shapes: Option<GenerationDeferredShapes>,
+    ) -> anyhow::Result<GenerationPoiGuard> {
         anyhow::ensure!(!source.is_empty(), "no generation POI inputs");
-        let pending = self.generation_terrain_pending();
+        let pending = self.generation_guard_pending(deferred_shapes.as_ref())?;
         let mut chunks = BTreeMap::new();
         for (&position, expected) in source {
             anyhow::ensure!(
@@ -6306,6 +6412,7 @@ impl LoadedSession {
         Ok(GenerationPoiGuard {
             session: Arc::clone(&self.generation_identity),
             chunks,
+            deferred_shapes,
         })
     }
 
@@ -6316,7 +6423,7 @@ impl LoadedSession {
             Arc::ptr_eq(&self.generation_identity, &guard.session),
             "generation POI belongs to another session"
         );
-        let pending = self.generation_terrain_pending();
+        let pending = self.generation_guard_pending(guard.deferred_shapes.as_ref())?;
         for (&position, expected) in &guard.chunks {
             anyhow::ensure!(
                 !self.has_unsaved_chunk_changes(position)
@@ -30869,6 +30976,287 @@ pub(crate) mod tests {
             .set_block_id(origin.x, 0, origin.z, stone)
             .unwrap();
         assert!(live.verify_generation_terrain(&guard).is_err());
+    }
+
+    #[test]
+    fn generation_guards_preserve_blocked_shape_updates() {
+        let (mut source, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let missing = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let other_missing = ChunkPos {
+            x: home.x + 2,
+            z: home.z,
+        };
+        source
+            .saved_block_entities
+            .insert(home, native_world::loaded::SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            source.clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session
+            .set_initial_poi_chunk(home, SavedPoiData::Missing)
+            .unwrap();
+        let poi = BTreeMap::from([(home, None), (missing, None)]);
+        let home_block = BlockPosition {
+            x: origin.x + 15,
+            y: 2,
+            z: origin.z + 8,
+        };
+        let missing_block = BlockPosition {
+            x: origin.x + 16,
+            ..home_block
+        };
+        let empty_terrain = session
+            .capture_generation_terrain_with_deferred_shapes(&source, [home, missing])
+            .unwrap();
+        let empty_poi = session
+            .capture_generation_poi_with_deferred_shapes(&poi)
+            .unwrap();
+        assert!(empty_terrain.deferred_shapes.is_none());
+        assert!(empty_poi.deferred_shapes.is_none());
+        let distant = ChunkPos {
+            x: home.x + 100,
+            z: home.z,
+        };
+        session.pending_stair_updates.insert(
+            distant,
+            BTreeSet::from([BlockPosition {
+                x: distant.x * 16,
+                ..home_block
+            }]),
+        );
+        session.verify_generation_terrain(&empty_terrain).unwrap();
+        session.verify_generation_poi(&empty_poi).unwrap();
+        session.pending_stair_updates.clear();
+        session
+            .pending_stair_updates
+            .insert(missing, BTreeSet::from([home_block]));
+        session
+            .pending_fence_updates
+            .insert(missing, BTreeSet::from([(home_block, missing_block)]));
+        session
+            .pending_lichen_updates
+            .push_back((missing_block, home_block, session.states[0]));
+        // This group is outside the captured inputs; if it becomes runnable,
+        // publishing must still wait so its callbacks cannot be reordered.
+        session
+            .pending_stair_updates
+            .insert(other_missing, BTreeSet::from([home_block]));
+
+        assert!(
+            session
+                .capture_generation_terrain(&source, [home, missing])
+                .is_err()
+        );
+        assert!(session.capture_generation_poi(&poi).is_err());
+        let terrain = session
+            .capture_generation_terrain_with_deferred_shapes(&source, [home, missing])
+            .unwrap();
+        let poi_guard = session
+            .capture_generation_poi_with_deferred_shapes(&poi)
+            .unwrap();
+        session.verify_generation_terrain(&terrain).unwrap();
+        session.verify_generation_poi(&poi_guard).unwrap();
+
+        let stairs = session.pending_stair_updates.clone();
+        session.pending_stair_updates.remove(&missing);
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        session.pending_stair_updates = stairs;
+
+        let fences = session.pending_fence_updates.clone();
+        session
+            .pending_fence_updates
+            .get_mut(&missing)
+            .unwrap()
+            .insert((
+                home_block,
+                BlockPosition {
+                    y: 3,
+                    ..missing_block
+                },
+            ));
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        session.pending_fence_updates = fences;
+
+        session
+            .pending_lichen_updates
+            .push_back((missing_block, home_block, session.states[0]));
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        session.pending_lichen_updates.pop_back();
+        session.verify_generation_terrain(&terrain).unwrap();
+        session.verify_generation_poi(&poi_guard).unwrap();
+
+        // A pending arrival for a different dependency can make another
+        // queued callback runnable before this result is published.
+        session.queue_missing_chunk(other_missing);
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        assert!(
+            session
+                .capture_generation_terrain_with_deferred_shapes(&source, [home, missing])
+                .is_err()
+        );
+        assert!(
+            session
+                .capture_generation_poi_with_deferred_shapes(&poi)
+                .is_err()
+        );
+        session.incoming.clear();
+        session.queue_missing_chunk(missing);
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        session.incoming.clear();
+        session.dirty_chunks.insert(home);
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        session.dirty_chunks.remove(&home);
+        session.pending_light.insert(
+            home_block,
+            PendingLight {
+                change: native_world::block_light::LightChange::unknown(),
+                last_attempt: None,
+            },
+        );
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        session.pending_light.clear();
+        session.verify_generation_terrain(&terrain).unwrap();
+        session.verify_generation_poi(&poi_guard).unwrap();
+
+        let mut ready = source.chunks[&home].as_ref().clone();
+        ready.position = other_missing;
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(other_missing, Arc::new(ready));
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi_guard).is_err());
+        assert!(
+            session
+                .capture_generation_terrain_with_deferred_shapes(&source, [home, missing])
+                .is_err()
+        );
+        assert!(
+            session
+                .capture_generation_poi_with_deferred_shapes(&poi)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn guarded_missing_chunk_arrival_replays_its_fence_update() {
+        let (mut source, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let missing = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let stone = source
+            .states()
+            .find(|(_, state)| state.name == "minecraft:stone")
+            .unwrap()
+            .0;
+        let home_chunk = Arc::make_mut(source.chunks.get_mut(&home).unwrap());
+        let home_section = Arc::make_mut(home_chunk.sections.get_mut(&0).unwrap());
+        home_section.blocks.as_mut().unwrap()[15 + 8 * 16 + 3 * 256] = stone;
+        source
+            .saved_block_entities
+            .insert(home, native_world::loaded::SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            source.clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_fence_connection_tags(fixture_fence_tags(false));
+        session
+            .set_initial_poi_chunk(home, SavedPoiData::Missing)
+            .unwrap();
+        session.queue_fence_update(
+            IVec3::new(16, 3, 8),
+            IVec3::new(15, 3, 8),
+            IVec3::new(16, 3, 8),
+        );
+        let terrain = session
+            .capture_generation_terrain_with_deferred_shapes(&source, [home, missing])
+            .unwrap();
+        let poi = session
+            .capture_generation_poi_with_deferred_shapes(&BTreeMap::from([
+                (home, None),
+                (missing, None),
+            ]))
+            .unwrap();
+        session.verify_generation_terrain(&terrain).unwrap();
+        session.verify_generation_poi(&poi).unwrap();
+
+        let mut incoming = World::new("minecraft:overworld");
+        let air = incoming.intern_state(state("minecraft:air", &[]));
+        let fence = incoming.intern_state(state(
+            "minecraft:oak_fence",
+            &[
+                ("north", "false"),
+                ("east", "false"),
+                ("south", "false"),
+                ("west", "false"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 * 16 + 3 * 256] = fence;
+        incoming.chunks.insert(
+            missing,
+            Arc::new(Chunk {
+                position: missing,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        session.queue_loaded_chunk(missing, incoming);
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi).is_err());
+        session.apply_streaming();
+        assert!(session.pending_fence_updates.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(origin.x + 16, 3, origin.z + 8)
+                .unwrap()
+                .properties["west"],
+            "true"
+        );
+        assert!(session.verify_generation_terrain(&terrain).is_err());
+        assert!(session.verify_generation_poi(&poi).is_err());
     }
 
     #[test]

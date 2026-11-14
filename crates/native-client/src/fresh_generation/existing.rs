@@ -8507,6 +8507,15 @@ impl PreparedExistingGenerator {
         session: &native_session::loaded::LoadedSession,
         restored: &RestoredSavedTerrain,
     ) -> Result<native_session::loaded::GenerationTerrainGuard> {
+        self.capture_live_terrain_inner(session, restored, false)
+    }
+
+    fn capture_live_terrain_inner(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        restored: &RestoredSavedTerrain,
+        deferred_shapes: bool,
+    ) -> Result<native_session::loaded::GenerationTerrainGuard> {
         ensure!(
             Arc::ptr_eq(&self.identity, &restored.identity),
             "restored terrain belongs to another capture"
@@ -8519,12 +8528,14 @@ impl PreparedExistingGenerator {
                 "captured terrain was not fully restored at {key:?}"
             );
         }
-        session.capture_generation_terrain(
-            &restored.world,
-            sources
-                .keys()
-                .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z }),
-        )
+        let positions = sources
+            .keys()
+            .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z });
+        if deferred_shapes {
+            session.capture_generation_terrain_with_deferred_shapes(&restored.world, positions)
+        } else {
+            session.capture_generation_terrain(&restored.world, positions)
+        }
     }
 
     /// Bind the POI sidecars from the same disk capture to the live session.
@@ -8533,6 +8544,14 @@ impl PreparedExistingGenerator {
     pub fn capture_live_poi(
         &self,
         session: &native_session::loaded::LoadedSession,
+    ) -> Result<native_session::loaded::GenerationPoiGuard> {
+        self.capture_live_poi_inner(session, false)
+    }
+
+    fn capture_live_poi_inner(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        deferred_shapes: bool,
     ) -> Result<native_session::loaded::GenerationPoiGuard> {
         let source = self
             .context
@@ -8547,7 +8566,11 @@ impl PreparedExistingGenerator {
                 )
             })
             .collect();
-        session.capture_generation_poi(&source)
+        if deferred_shapes {
+            session.capture_generation_poi_with_deferred_shapes(&source)
+        } else {
+            session.capture_generation_poi(&source)
+        }
     }
 
     /// Capture live dependencies without allowing a guard from a different
@@ -8561,6 +8584,22 @@ impl PreparedExistingGenerator {
             identity: Arc::clone(&self.identity),
             terrain: self.capture_live_terrain(session, restored)?,
             poi: self.capture_live_poi(session)?,
+            entities: self.capture_live_entities(session)?,
+        })
+    }
+
+    /// Allow blocked shape callbacks to remain queued while their missing
+    /// chunks are prepared. The caller must replay them after publication and
+    /// still validate every other live and persistence dependency.
+    pub fn capture_live_inputs_with_deferred_shapes(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        restored: &RestoredSavedTerrain,
+    ) -> Result<LiveGenerationInputs> {
+        Ok(LiveGenerationInputs {
+            identity: Arc::clone(&self.identity),
+            terrain: self.capture_live_terrain_inner(session, restored, true)?,
+            poi: self.capture_live_poi_inner(session, true)?,
             entities: self.capture_live_entities(session)?,
         })
     }
@@ -10471,6 +10510,11 @@ mod tests {
         )
         .map_err(anyhow::Error::msg)?;
         assert!(actual.capture_live_inputs(&live, &restored).is_err());
+        assert!(
+            actual
+                .capture_live_inputs_with_deferred_shapes(&live, &restored)
+                .is_err()
+        );
         live.set_initial_poi_chunk(
             second,
             native_session::loaded::SavedPoiData::Present(Arc::clone(&existing_poi_source)),
@@ -10483,8 +10527,11 @@ mod tests {
         live.set_initial_entity_chunk(third, native_session::loaded::SavedEntityData::Empty)?;
         let guard = actual.capture_live_inputs(&live, &restored)?;
         actual.verify_live_inputs(&live, &guard)?;
+        let deferred_guard = actual.capture_live_inputs_with_deferred_shapes(&live, &restored)?;
+        actual.verify_live_inputs(&live, &deferred_guard)?;
         live.queue_missing_chunk(second);
         assert!(actual.verify_live_inputs(&live, &guard).is_err());
+        assert!(actual.verify_live_inputs(&live, &deferred_guard).is_err());
         assert_eq!(
             actual.context.inputs().sources().chunks()[&saved_second]
                 .terrain

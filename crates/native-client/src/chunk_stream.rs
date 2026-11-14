@@ -971,7 +971,7 @@ impl MissingGenerationAssemblyWorker {
         let live = match terrain
             .state
             .generator
-            .capture_live_inputs(session, &terrain.state.terrain)
+            .capture_live_inputs_with_deferred_shapes(session, &terrain.state.terrain)
         {
             Ok(live) => live,
             Err(error) => {

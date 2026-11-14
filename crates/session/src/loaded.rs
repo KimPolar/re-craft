@@ -11687,6 +11687,12 @@ impl LoadedSession {
         required
     }
 
+    /// Absent chunks directly observed by the current sky-light job. This is
+    /// a scheduling hint, not a complete list of light dependencies.
+    pub fn missing_sky_chunks(&self) -> &BTreeSet<ChunkPos> {
+        self.sky_lighting.missing_chunks()
+    }
+
     /// Select complete dependency groups so one absent chunk does not hold
     /// unrelated updates back or repeatedly reactivate their parked chunks.
     fn ready_shape_update_chunks(&self) -> BTreeSet<ChunkPos> {
@@ -12608,6 +12614,7 @@ impl LoadedSession {
     fn apply_streaming(&mut self) {
         let mut changed = false;
         let mut respawn_changed = false;
+        let mut sky_inputs_changed = false;
         let required_shapes = self.required_shape_update_chunks();
         let required_sky = self.sky_lighting.required_chunks();
         if let Some(window) = self.pending_respawn_window.take()
@@ -12842,7 +12849,11 @@ impl LoadedSession {
             let respawn = self
                 .respawn_window
                 .is_some_and(|window| within_window(pos, window));
-            if !primary && !respawn && !required_shapes.contains(&pos) {
+            if !primary
+                && !respawn
+                && !required_shapes.contains(&pos)
+                && !required_sky.contains(&pos)
+            {
                 continue;
             }
             match source {
@@ -13013,6 +13024,7 @@ impl LoadedSession {
                                     .expect("imported respawn chunk");
                                 self.parked_chunks.insert(pos, chunk);
                                 respawn_changed = true;
+                                sky_inputs_changed |= required_sky.contains(&pos);
                             }
                         }
                         Ok(false) => {}
@@ -13061,6 +13073,8 @@ impl LoadedSession {
             self.retry_lichen_updates();
             self.revision += 1;
             self.light_generation = self.light_generation.wrapping_add(1);
+            self.sky_lighting.streaming_changed();
+        } else if sky_inputs_changed {
             self.sky_lighting.streaming_changed();
         }
         for pos in temporary_shapes {

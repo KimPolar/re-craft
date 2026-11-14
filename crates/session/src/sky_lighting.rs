@@ -37,6 +37,7 @@ struct Computed {
 struct Reply {
     generation: u64,
     result: Option<(Computed, Vec<usize>)>,
+    missing_chunks: BTreeSet<ChunkPos>,
 }
 
 #[derive(Default)]
@@ -48,6 +49,7 @@ pub(crate) struct SkyLighting {
     retry_delay: u8,
     worker: Option<(u64, Receiver<Reply>)>,
     pending: Vec<Edit>,
+    missing_chunks: BTreeSet<ChunkPos>,
     // Restoration inspects a one-chunk allocation halo around the light
     // update's own at-most-one-chunk propagation halo.
     required_chunks: Arc<BTreeSet<ChunkPos>>,
@@ -69,13 +71,22 @@ impl SkyLighting {
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.configured = true;
+        self.missing_chunks.clear();
         self.invalidate();
     }
 
     pub(crate) fn invalidate(&mut self) {
         if self.enabled {
             self.generation = self.generation.wrapping_add(1);
+            self.missing_chunks.clear();
         }
+    }
+
+    /// Only chunks directly observed absent by the current failed work are
+    /// reported. Unavailable light or unsupported block states are not
+    /// evidence that their chunks are missing.
+    pub(crate) fn missing_chunks(&self) -> &BTreeSet<ChunkPos> {
+        &self.missing_chunks
     }
 
     pub(crate) fn streaming_changed(&mut self) {
@@ -148,6 +159,7 @@ impl SkyLighting {
                 Ok(reply) => {
                     self.worker = None;
                     if self.enabled && reply.generation == self.generation {
+                        self.missing_chunks = reply.missing_chunks;
                         let result = reply.result.and_then(|(result, completed)| {
                             if completed.is_empty()
                                 || completed
@@ -176,6 +188,9 @@ impl SkyLighting {
                                     extend_required_chunks(&mut required, edit.position);
                                 }
                                 self.required_chunks = Arc::new(required);
+                                if self.pending.is_empty() {
+                                    self.missing_chunks.clear();
+                                }
                                 self.sources = sources;
                                 self.failed_generation =
                                     (!self.pending.is_empty()).then_some(self.generation);
@@ -236,8 +251,13 @@ impl SkyLighting {
                     }
                     Arc::new(with_parked)
                 };
-                let result = compute_available(&snapshot, bounds, &edits, &originals, sources);
-                let _ = tx.send(Reply { generation, result });
+                let (result, missing_chunks) =
+                    compute_available(&snapshot, bounds, &edits, &originals, sources);
+                let _ = tx.send(Reply {
+                    generation,
+                    result,
+                    missing_chunks,
+                });
             });
         if spawned.is_ok() {
             self.worker = Some((generation, rx));
@@ -351,46 +371,70 @@ fn compute_available(
     edits: &[Edit],
     originals: &BTreeMap<ChunkPos, Arc<Chunk>>,
     sources: SkySources,
-) -> Option<(Computed, Vec<usize>)> {
+) -> (Option<(Computed, Vec<usize>)>, BTreeSet<ChunkPos>) {
     let groups = independent_edit_groups(edits);
+    let mut missing = BTreeSet::new();
     if groups.len() <= 1 {
-        return compute(snapshot, bounds, edits, originals, sources);
+        let result = compute(snapshot, bounds, edits, originals, sources, &mut missing);
+        return (result, missing);
     }
-    let attempt = compute(snapshot, bounds, edits, originals, sources.clone());
+    let attempt = compute(
+        snapshot,
+        bounds,
+        edits,
+        originals,
+        sources.clone(),
+        &mut missing,
+    );
     if attempt
         .as_ref()
         .is_some_and(|(_, completed)| completed.len() == edits.len())
     {
-        return attempt;
+        return (attempt, BTreeSet::new());
     }
 
     let mut world = snapshot.clone();
     let mut sources = sources;
     let mut changed = BTreeSet::new();
     let mut completed = Vec::new();
+    missing.clear();
     for indices in groups {
         let group: Vec<_> = indices.iter().map(|&index| edits[index]).collect();
-        if let Some((result, local_completed)) =
-            compute(&world, bounds, &group, originals, sources.clone())
-        {
+        let mut group_missing = BTreeSet::new();
+        if let Some((result, local_completed)) = compute(
+            &world,
+            bounds,
+            &group,
+            originals,
+            sources.clone(),
+            &mut group_missing,
+        ) {
+            if local_completed.len() != group.len() {
+                missing.extend(group_missing);
+            }
             world = result.world;
             sources = result.sources;
             changed.extend(result.changed);
             completed.extend(local_completed.into_iter().map(|index| indices[index]));
+        } else {
+            missing.extend(group_missing);
         }
     }
     if completed.is_empty() {
-        return None;
+        return (None, missing);
     }
     completed.sort_unstable();
-    Some((
-        Computed {
-            world,
-            changed,
-            sources,
-        },
-        completed,
-    ))
+    (
+        Some((
+            Computed {
+                world,
+                changed,
+                sources,
+            },
+            completed,
+        )),
+        missing,
+    )
 }
 
 fn source_for(
@@ -407,12 +451,58 @@ fn source_for(
     Some(column)
 }
 
+fn observed_source_for(
+    sources: &mut SkySources,
+    scanner: &mut SkySourceScanner<'_>,
+    world: &World,
+    x: i32,
+    z: i32,
+    missing: &mut BTreeSet<ChunkPos>,
+) -> Option<SkyColumn> {
+    let chunk = ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
+    };
+    if let Some(column) = sources.get(&(x, z)) {
+        if world.chunks.contains_key(&chunk) {
+            return Some(*column);
+        }
+        missing.insert(chunk);
+        return None;
+    }
+    match scanner.load(x, z) {
+        Some(column) => {
+            sources.insert((x, z), column);
+            Some(column)
+        }
+        None => {
+            if !world.chunks.contains_key(&chunk) {
+                missing.insert(chunk);
+            }
+            None
+        }
+    }
+}
+
+fn observed_block_id(
+    world: &World,
+    position: BlockPosition,
+    missing: &mut BTreeSet<ChunkPos>,
+) -> Option<BlockStateId> {
+    let id = world.block_id(position.x, position.y, position.z);
+    if id.is_none() && !world.chunks.contains_key(&position.chunk()) {
+        missing.insert(position.chunk());
+    }
+    id
+}
+
 fn compute(
     snapshot: &World,
     bounds: LightBounds,
     edits: &[Edit],
     originals: &BTreeMap<ChunkPos, Arc<Chunk>>,
     mut sources: SkySources,
+    missing: &mut BTreeSet<ChunkPos>,
 ) -> Option<(Computed, Vec<usize>)> {
     let original_sources = sources.clone();
     let edited_columns: BTreeSet<_> = sources
@@ -426,7 +516,7 @@ fn compute(
     for edit in edits.iter().rev() {
         let old = edit.old?;
         let p = edit.position;
-        if work.block_id(p.x, p.y, p.z)? != edit.new || work.state(old).is_none() {
+        if observed_block_id(&work, p, missing)? != edit.new || work.state(old).is_none() {
             return None;
         }
         work.set_block_id(p.x, p.y, p.z, old).ok()?;
@@ -444,11 +534,12 @@ fn compute(
     for edit in edits {
         let p = edit.position;
         let old = edit.old?;
-        if work.block_id(p.x, p.y, p.z)? != old {
+        if observed_block_id(&work, p, missing)? != old {
             return None;
         }
         let affects_sky = sky_change_for_edit(work.state(old), work.state(edit.new)?);
-        let mut column = source_for(&mut sources, &mut scanner, p.x, p.z)?;
+        let mut column =
+            observed_source_for(&mut sources, &mut scanner, &historical, p.x, p.z, missing)?;
         let previous_source = column.lowest_source_y();
         work.set_block_id(p.x, p.y, p.z, edit.new).ok()?;
         column.update(&work, p.y)?;
@@ -487,7 +578,8 @@ fn compute(
         }
     }
     let changed = relight_changes(&mut work, bounds, &changes, |x, z| {
-        source_for(&mut sources, &mut scanner, x, z).map(SkyColumn::lowest_source_y)
+        observed_source_for(&mut sources, &mut scanner, &historical, x, z, missing)
+            .map(SkyColumn::lowest_source_y)
     });
     let Some(mut changed) = changed else {
         // A column with no sky behavior or direct-source change does not
@@ -864,6 +956,7 @@ mod tests {
         );
         assert!(finish(&mut sky, &mut world, bounds).is_empty());
         assert_eq!(sky.pending.len(), 1);
+        assert!(sky.missing_chunks().is_empty());
         sky.advance(&mut world, Some(bounds));
         assert!(sky.worker.is_none());
         edit(
@@ -892,6 +985,92 @@ mod tests {
         assert!(!finish(&mut sky, &mut world, bounds).is_empty());
         assert_eq!(world.light(15, 14, 15, true), Some(14));
         assert_eq!(world.light(16, 14, 15, true), Some(14));
+    }
+
+    #[test]
+    fn missing_sky_sources_identify_the_absent_chunk() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition {
+                x: 31,
+                y: 15,
+                z: 15,
+            },
+            state("stone", &[]),
+        );
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.missing_chunks(), &BTreeSet::from([missing]));
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        assert!(sky.missing_chunks().is_empty());
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        assert!(sky.missing_chunks().is_empty());
+    }
+
+    #[test]
+    fn cached_sky_sources_do_not_hide_an_absent_chunk() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        for x in 32..48 {
+            for z in 0..16 {
+                sky.sources
+                    .insert((x, z), SkyColumn::load(&world, bounds, x, z).unwrap());
+            }
+        }
+        Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition {
+                x: 31,
+                y: 15,
+                z: 15,
+            },
+            state("stone", &[]),
+        );
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.missing_chunks(), &BTreeSet::from([missing]));
+    }
+
+    #[test]
+    fn stale_sky_work_cannot_report_an_old_missing_chunk() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition {
+                x: 31,
+                y: 15,
+                z: 15,
+            },
+            state("stone", &[]),
+        );
+        sky.advance(&mut world, Some(bounds));
+        sky.wait_for_worker();
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        assert!(sky.advance(&mut world, Some(bounds)).is_empty());
+        assert!(sky.missing_chunks().is_empty());
+        sky.wait_for_worker();
+        assert!(!sky.advance(&mut world, Some(bounds)).is_empty());
+        assert!(sky.settled());
+        assert!(sky.missing_chunks().is_empty());
     }
 
     #[test]
@@ -1100,6 +1279,7 @@ mod tests {
         );
         assert!(sky.sources.contains_key(&(neutral.x, neutral.z)));
         assert!(!sky.sources.contains_key(&(changed.x, changed.z)));
+        assert_eq!(sky.missing_chunks(), &BTreeSet::from([missing]));
         assert!(!sky.settled());
 
         Arc::make_mut(&mut world).chunks.insert(missing, unloaded);

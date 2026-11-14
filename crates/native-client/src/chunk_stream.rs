@@ -51,7 +51,7 @@ struct Response {
 struct Request {
     pos: ChunkPos,
     entities_only: bool,
-    shape_required: bool,
+    priority_required: bool,
     stamp: Option<WorldReadStamp>,
 }
 
@@ -83,6 +83,7 @@ pub struct ChunkStreamer {
     failed: BTreeMap<ChunkPos, (Instant, u32)>,
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
     shape_required: BTreeSet<ChunkPos>,
+    light_required: BTreeSet<ChunkPos>,
     _world_guard: Option<native_persistence::save::WorldSessionGuard>,
     observed_epoch: Option<u64>,
     generation_owner: Arc<()>,
@@ -2225,6 +2226,7 @@ pub(crate) fn light_worker_test_fixture(
     streamer.center = session.player_chunk();
     streamer.respawn = session.requested_respawn_window();
     streamer.shape_required = session.required_shape_update_chunks();
+    streamer.light_required = session.missing_sky_chunks().clone();
     streamer.targets = vec![target];
     streamer.missing.insert(target);
     streamer.observed_epoch = Some(stamp.epoch());
@@ -2266,6 +2268,7 @@ impl MissingGenerationTargets {
 
 fn select_generation_targets(
     shape_required: &BTreeSet<ChunkPos>,
+    light_required: &BTreeSet<ChunkPos>,
     targets: &[ChunkPos],
     limit: usize,
     mut eligible: impl FnMut(ChunkPos) -> bool,
@@ -2273,6 +2276,7 @@ fn select_generation_targets(
     let mut seen = BTreeSet::new();
     shape_required
         .iter()
+        .chain(light_required.iter())
         .chain(targets.iter())
         .copied()
         .filter(|pos| eligible(*pos) && seen.insert(*pos))
@@ -2281,9 +2285,9 @@ fn select_generation_targets(
 }
 
 impl ChunkStreamer {
-    /// Prioritize absent chunks needed by deferred shape updates, followed by
-    /// the active streaming order. Return no snapshot if the world or session
-    /// moved since `service` last refreshed the cache.
+    /// Prioritize absent chunks needed by deferred shape or sky-light updates,
+    /// followed by the active streaming order. Return no snapshot if the world
+    /// or session moved since `service` last refreshed the cache.
     pub(crate) fn missing_generation_targets(
         &self,
         session: &LoadedSession,
@@ -2296,19 +2300,25 @@ impl ChunkStreamer {
             || Some(center) != session.player_chunk()
             || self.respawn != session.requested_respawn_window()
             || self.shape_required != session.required_shape_update_chunks()
+            || &self.light_required != session.missing_sky_chunks()
         {
             return None;
         }
         let pending_data = session.pending_stream_data_positions();
-        let targets =
-            select_generation_targets(&self.shape_required, &self.targets, limit, |pos| {
+        let targets = select_generation_targets(
+            &self.shape_required,
+            &self.light_required,
+            &self.targets,
+            limit,
+            |pos| {
                 self.missing.contains(&pos)
                     && !self.pending.contains(&pos)
                     && !self.awaiting_attachment.contains(&pos)
                     && !self.awaiting_competing_attachment.contains(&pos)
                     && !pending_data.contains(&pos)
                     && !session.has_chunk_or_pending(pos)
-            });
+            },
+        );
         if !stamp.is_current() {
             return None;
         }
@@ -2439,7 +2449,7 @@ impl ChunkStreamer {
                     let current = *worker_window
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let stale = !request.shape_required
+                    let stale = !request.priority_required
                         && current.is_some_and(|windows| !windows.contains(pos));
                     let result = if stale {
                         Ok(None)
@@ -2480,6 +2490,7 @@ impl ChunkStreamer {
             failed: BTreeMap::new(),
             entity_retry: BTreeMap::new(),
             shape_required: BTreeSet::new(),
+            light_required: BTreeSet::new(),
             _world_guard: None,
             observed_epoch: None,
             generation_owner: Arc::new(()),
@@ -2526,14 +2537,25 @@ impl ChunkStreamer {
             respawn,
         };
         let shape_required = session.required_shape_update_chunks();
-        if self.shape_required != shape_required {
+        let light_required = session.missing_sky_chunks();
+        if self.shape_required != shape_required || &self.light_required != light_required {
             self.shape_required = shape_required;
-            self.awaiting_competing_attachment
-                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
-            self.missing
-                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
-            self.failed
-                .retain(|pos, _| windows.contains(*pos) || self.shape_required.contains(pos));
+            self.light_required = light_required.clone();
+            self.awaiting_competing_attachment.retain(|pos| {
+                windows.contains(*pos)
+                    || self.shape_required.contains(pos)
+                    || self.light_required.contains(pos)
+            });
+            self.missing.retain(|pos| {
+                windows.contains(*pos)
+                    || self.shape_required.contains(pos)
+                    || self.light_required.contains(pos)
+            });
+            self.failed.retain(|pos, _| {
+                windows.contains(*pos)
+                    || self.shape_required.contains(pos)
+                    || self.light_required.contains(pos)
+            });
         }
         if windows_changed {
             self.settled_prefix = 0;
@@ -2553,13 +2575,22 @@ impl ChunkStreamer {
             // Missing entries are only useful in an active window. Keeping
             // every absent chunk ever visited grows without bound and can
             // suppress a fresh disk read when a distant area is revisited.
-            self.missing
-                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
-            self.awaiting_competing_attachment
-                .retain(|pos| windows.contains(*pos) || self.shape_required.contains(pos));
+            self.missing.retain(|pos| {
+                windows.contains(*pos)
+                    || self.shape_required.contains(pos)
+                    || self.light_required.contains(pos)
+            });
+            self.awaiting_competing_attachment.retain(|pos| {
+                windows.contains(*pos)
+                    || self.shape_required.contains(pos)
+                    || self.light_required.contains(pos)
+            });
             self.entity_retry.retain(|pos, _| windows.contains(*pos));
-            self.failed
-                .retain(|pos, _| windows.contains(*pos) || self.shape_required.contains(pos));
+            self.failed.retain(|pos, _| {
+                windows.contains(*pos)
+                    || self.shape_required.contains(pos)
+                    || self.light_required.contains(pos)
+            });
             for &pos in &self.targets {
                 if matches!(
                     session.saved_entity_chunk(pos),
@@ -2612,7 +2643,8 @@ impl ChunkStreamer {
                     // future visit to that chunk.
                     if response.stale
                         || (!windows.contains(response.pos)
-                            && !self.shape_required.contains(&response.pos))
+                            && !self.shape_required.contains(&response.pos)
+                            && !self.light_required.contains(&response.pos))
                         || response
                             .stamp
                             .as_ref()
@@ -2714,7 +2746,10 @@ impl ChunkStreamer {
         };
         for pos in attached {
             self.awaiting_attachment.remove(&pos);
-            if !windows.contains(pos) && !self.shape_required.contains(&pos) {
+            if !windows.contains(pos)
+                && !self.shape_required.contains(&pos)
+                && !self.light_required.contains(&pos)
+            {
                 continue;
             }
             if !session.has_resident_or_parked_chunk(pos) {
@@ -2756,9 +2791,9 @@ impl ChunkStreamer {
                 && !session.has_chunk_or_pending(*pos)
         });
         let retry_due = entity_retry_due || terrain_retry_due;
-        // Shape updates can depend on saved chunks outside the render window.
+        // Shape and sky-light updates can need saved chunks outside the render window.
         // Recheck every service call, including after a full request queue.
-        for &pos in &self.shape_required {
+        for &pos in self.shape_required.iter().chain(self.light_required.iter()) {
             if self.missing.contains(&pos)
                 || self.pending.contains(&pos)
                 || self.awaiting_attachment.contains(&pos)
@@ -2774,7 +2809,7 @@ impl ChunkStreamer {
                 .try_send(Request {
                     pos,
                     entities_only: false,
-                    shape_required: true,
+                    priority_required: true,
                     stamp: active_stamp.clone(),
                 }) {
                 Ok(()) => {
@@ -2827,7 +2862,7 @@ impl ChunkStreamer {
                     .try_send(Request {
                         pos,
                         entities_only: retry && session.has_chunk_or_pending(pos),
-                        shape_required: false,
+                        priority_required: false,
                         stamp: active_stamp.clone(),
                     }) {
                     Ok(()) => {
@@ -2990,22 +3025,23 @@ mod tests {
     }
 
     #[test]
-    fn generation_targets_prioritize_shape_dependencies_without_duplicates() {
+    fn generation_targets_prioritize_shape_and_light_dependencies_without_duplicates() {
         let a = ChunkPos { x: -2, z: 0 };
         let b = ChunkPos { x: 3, z: 1 };
         let c = ChunkPos { x: 0, z: 0 };
         let d = ChunkPos { x: 1, z: 0 };
         let shape = BTreeSet::from([a, b]);
+        let light = BTreeSet::from([b, d]);
         let window = [c, a, d, b];
         assert_eq!(
-            select_generation_targets(&shape, &window, 3, |_| true),
-            vec![a, b, c]
+            select_generation_targets(&shape, &light, &window, 3, |_| true),
+            vec![a, b, d]
         );
         assert_eq!(
-            select_generation_targets(&shape, &window, 9, |pos| pos != b),
-            vec![a, c, d]
+            select_generation_targets(&shape, &light, &window, 9, |pos| pos != b),
+            vec![a, d, c]
         );
-        assert!(select_generation_targets(&shape, &window, 0, |_| true).is_empty());
+        assert!(select_generation_targets(&shape, &light, &window, 0, |_| true).is_empty());
     }
 
     #[cfg(windows)]
@@ -5181,6 +5217,171 @@ mod tests {
             }),
         );
         world
+    }
+
+    fn lit_chunk_world(pos: ChunkPos) -> World {
+        use native_world::loaded::LIGHT_BYTES;
+        let mut world = chunk_world(pos);
+        let air = world
+            .states()
+            .find_map(|(id, state)| (state.name == "minecraft:air").then_some(id))
+            .unwrap();
+        let chunk = Arc::make_mut(world.chunks.get_mut(&pos).unwrap());
+        chunk.block_light_correct = true;
+        for y in -1..=2 {
+            let section = chunk.sections.entry(y).or_insert_with(|| {
+                Arc::new(Section {
+                    blocks: (0..=1).contains(&y).then(|| Box::new([air; BLOCK_COUNT])),
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                })
+            });
+            let section = Arc::make_mut(section);
+            section.block_light = Some(Box::new([0; LIGHT_BYTES]));
+            section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        }
+        world
+    }
+
+    #[test]
+    fn requests_outside_chunk_needed_by_live_sky_light() {
+        use native_world::loaded::SavedFluidTick;
+        for exists in [true, false] {
+            let source_chunk = ChunkPos { x: 1, z: 0 };
+            let target = ChunkPos { x: 2, z: -1 };
+            let mut world = World::new("minecraft:overworld");
+            for x in -1..=1 {
+                for z in -1..=1 {
+                    let pos = ChunkPos { x, z };
+                    assert!(world.import_chunk(&lit_chunk_world(pos), pos).unwrap());
+                }
+            }
+            let water = world.intern_state(BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), "0".into())]),
+            });
+            let stone = world.intern_state(BlockState {
+                name: "minecraft:stone".into(),
+                properties: BTreeMap::new(),
+            });
+            world.set_block_id(28, 3, 8, water).unwrap();
+            for (x, y, z) in [
+                (28, 2, 8),
+                (29, 2, 8),
+                (27, 3, 8),
+                (28, 3, 7),
+                (28, 3, 9),
+                (30, 3, 8),
+                (29, 3, 7),
+                (29, 3, 9),
+            ] {
+                world.set_block_id(x, y, z, stone).unwrap();
+            }
+            world.saved_fluid_ticks.insert(
+                source_chunk,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: [28, 3, 8],
+                    delay: 0,
+                    priority: 0,
+                }],
+            );
+            let player = PlayerState {
+                position: Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let mut session = LoadedSession::new(
+                world,
+                IVec3::ZERO,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            session.set_has_skylight(true).unwrap();
+            session.set_random_tick_speed(0);
+            let (sent, received) = mpsc::channel();
+            let mut streamer = ChunkStreamer::with_source(1, BTreeSet::new(), move |pos| {
+                sent.send(pos).unwrap();
+                Ok((pos == target && exists).then(|| lit_chunk_world(pos)))
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut requests = 0;
+            let mut observed = BTreeSet::new();
+            loop {
+                streamer.service(&mut session).unwrap();
+                session.update(Duration::from_millis(50));
+                for pos in received.try_iter() {
+                    requests += usize::from(pos == target);
+                    observed.insert(pos);
+                }
+                if requests > 0
+                    && ((exists && session.has_resident_or_parked_chunk(target))
+                        || (!exists && streamer.missing.contains(&target)))
+                {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let snapshot = session.snapshot();
+                    let loaded = snapshot.world.loaded().unwrap();
+                    panic!(
+                        "sky-light dependency was not read: exists={exists}, requests={requests}, observed={observed:?}, missing={:?}, priority={:?}, shapes={:?}, water={:?}",
+                        session.missing_sky_chunks(),
+                        streamer.light_required,
+                        session.required_shape_update_chunks(),
+                        loaded.block(29, 3, 8)
+                    );
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!session.required_shape_update_chunks().contains(&target));
+            assert!(
+                !session
+                    .snapshot()
+                    .world
+                    .loaded()
+                    .unwrap()
+                    .chunks
+                    .contains_key(&target)
+            );
+            if exists {
+                loop {
+                    streamer.service(&mut session).unwrap();
+                    session.update(Duration::from_millis(50));
+                    for pos in received.try_iter() {
+                        requests += usize::from(pos == target);
+                        observed.insert(pos);
+                    }
+                    if observed.iter().any(|pos| *pos != target) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "light work did not advance to another missing neighbor"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(requests, 1, "loaded light dependency was requested again");
+            } else {
+                for _ in 0..10 {
+                    streamer.service(&mut session).unwrap();
+                    session.update(Duration::from_millis(50));
+                    requests += received.try_iter().filter(|pos| *pos == target).count();
+                }
+                assert_eq!(
+                    requests, 1,
+                    "missing sky dependency was requested repeatedly"
+                );
+            }
+        }
     }
 
     #[test]

@@ -997,6 +997,10 @@ fn generated_world_round_trips_through_java(seed: i64, check_live_inputs: bool) 
                             "Dirty chunks during generation: {:?}",
                             session.dirty_chunk_positions()
                         );
+                        eprintln!(
+                            "Missing sky-light chunks during generation: {:?}",
+                            session.missing_sky_chunks()
+                        );
                         return Err(error.context("cannot bind seed 1 live generation inputs"));
                     }
                 }

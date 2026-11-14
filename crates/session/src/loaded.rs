@@ -1,6 +1,10 @@
 //! Experimental in-memory play session over loaded saved chunks.
 //! No edits are written to disk. Unimplemented collision states act as barriers.
 
+#[cfg(test)]
+#[path = "loaded_frosted_ice_tests.rs"]
+mod frosted_ice_save_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -11100,12 +11104,8 @@ impl LoadedSession {
             "chunk ticks have not been loaded"
         );
         ensure!(
-            !self
-                .ice_ticks
-                .values()
-                .chain(self.ice_deferred.values())
-                .any(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z),
-            "frosted ice tick storage is not yet supported"
+            !self.unresolved_ice_tick,
+            "frosted ice tick effects are not yet fully tracked for saving"
         );
         if let Some(original) = self.world.saved_block_ticks.get(&pos) {
             ensure!(
@@ -11119,7 +11119,10 @@ impl LoadedSession {
                         || BubbleTickKind::from_id(&tick.block).is_some()
                         || matches!(
                             tick.block.as_str(),
-                            "minecraft:redstone_lamp" | "redstone_lamp"
+                            "minecraft:redstone_lamp"
+                                | "redstone_lamp"
+                                | "minecraft:frosted_ice"
+                                | "frosted_ice"
                         )
                 }),
                 "chunk contains block ticks that are not simulated"
@@ -11200,6 +11203,34 @@ impl LoadedSession {
                 .filter(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
                 .all(|key| queued_lamps.contains(key)),
             "lamp tick is missing its scheduled order"
+        );
+        let mut queued_ice = BTreeSet::new();
+        for (order, &(x, y, z)) in self
+            .ice_ticks
+            .iter()
+            .chain(&self.ice_deferred)
+            .filter(|(_, (x, _, z))| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+        {
+            queued_ice.insert((x, y, z));
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
+                .context("frosted ice tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: "minecraft:frosted_ice".into(),
+                    position: [x, y, z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.ice_pending
+                .iter()
+                .filter(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+                .all(|key| queued_ice.contains(key)),
+            "frosted ice tick is missing its scheduled order"
         );
         let mut queued_soil = BTreeSet::new();
         for (order, &(absolute, soil)) in
@@ -18119,9 +18150,9 @@ impl LoadedSession {
             }
             let [x, y, z] = tick.position;
             let key = (x, y, z);
-            if !self.ice_pending.insert(key) {
-                continue;
-            }
+            // Java retains duplicate saved ticks while tracking their identity
+            // once for future scheduling.
+            self.ice_pending.insert(key);
             self.tick_chunks_needing_dirty.insert(ChunkPos {
                 x: x.div_euclid(16),
                 z: z.div_euclid(16),
@@ -19255,11 +19286,8 @@ impl LoadedSession {
                     self.set_with_notify(relative, next, false);
                 }
             } else if let CollectedBlockTick::Ice(key) = entry {
-                // Until all lighting and neighbor effects are supported,
-                // gameplay can advance only the verified cases and must not
-                // authorize a world save after a frosted-ice tick became due.
-                self.unresolved_ice_tick = true;
                 let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                    self.unresolved_ice_tick = true;
                     self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
@@ -19276,6 +19304,7 @@ impl LoadedSession {
                     continue;
                 };
                 let Some(current) = self.world.state(id) else {
+                    self.unresolved_ice_tick = true;
                     self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
@@ -19285,6 +19314,10 @@ impl LoadedSession {
 
                     continue;
                 }
+                // Executing frosted ice can change light and neighbors; those
+                // effects still require complete save coverage. Deferred and
+                // stale ticks above did not execute the block callback.
+                self.unresolved_ice_tick = true;
                 let age = if current.properties.len() == 1 {
                     current
                         .properties
@@ -30240,7 +30273,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn session() -> LoadedSession {
+    pub(super) fn session() -> LoadedSession {
         let (world, origin, player) = fixture();
         let mut session = LoadedSession::new(
             world,
@@ -57431,7 +57464,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_heightmap_tags() -> Arc<HeightmapTags> {
+    pub(super) fn test_heightmap_tags() -> Arc<HeightmapTags> {
         struct Provider;
         impl native_resources::packs::ResourceProvider for Provider {
             fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -67653,7 +67686,7 @@ pub(crate) mod tests {
         assert_eq!(equipped.armor.unwrap().armor, 4.25);
     }
 
-    fn fixture_chunk_document(position: ChunkPos) -> native_persistence::nbt::NamedTag {
+    pub(super) fn fixture_chunk_document(position: ChunkPos) -> native_persistence::nbt::NamedTag {
         use native_persistence::{
             nbt::{NamedTag, Tag, TagType},
             palette,

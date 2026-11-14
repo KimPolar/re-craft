@@ -533,7 +533,7 @@ impl ChunkDraft {
         self.replace_block_ticks_inner(ticks, false)
     }
 
-    /// Replace supported falling-block, button, lamp, soil, water and bubble-column ticks.
+    /// Replace supported falling-block, button, lamp, soil, frosted ice, water and bubble-column ticks.
     /// Other chunk data, including lighting and entities, remains unvalidated.
     pub fn replace_block_ticks(
         &mut self,
@@ -566,6 +566,8 @@ impl ChunkDraft {
                             | "dirt_path"
                             | "minecraft:farmland"
                             | "farmland"
+                            | "minecraft:frosted_ice"
+                            | "frosted_ice"
                             | "minecraft:water"
                             | "water"
                             | "minecraft:bubble_column"
@@ -1312,6 +1314,38 @@ mod tests {
         };
         assert!(draft.replace_falling_block_ticks(&[bad]).is_err());
         assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn frosted_ice_ticks_round_trip_without_widening_falling_only_drafts() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let original = fixture(1, false);
+        let ticks: Vec<_> = ["minecraft:frosted_ice", "frosted_ice"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| native_world::loaded::SavedBlockTick {
+                block: id.into(),
+                position: [-15, -60, 33],
+                delay: index as i32 * 10 - 3,
+                priority: index as i32 - 1,
+            })
+            .collect();
+        let mut first = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        first.replace_block_ticks(&ticks).unwrap();
+        assert!(first.matches_source(&original).unwrap());
+        let source = first.document().clone();
+        let mut second = draft_chunk_blocks(&source, pos, &[]).unwrap();
+        second.replace_block_ticks(&ticks).unwrap();
+        assert_eq!(
+            source.value.get("block_ticks"),
+            second.document().value.get("block_ticks")
+        );
+        let before = crate::nbt::write(second.document()).unwrap();
+        assert!(second.replace_falling_block_ticks(&[]).is_err());
+        let mut invalid = ticks;
+        invalid[1].priority = 4;
+        assert!(second.replace_block_ticks(&invalid).is_err());
+        assert_eq!(crate::nbt::write(second.document()).unwrap(), before);
     }
 
     #[test]

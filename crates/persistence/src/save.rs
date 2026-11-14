@@ -1278,6 +1278,20 @@ pub struct SavedTreasureSource<'a> {
     pub region_timestamp_seconds: u32,
 }
 
+/// One source-bound generation replacement and its sidecar storage actions.
+/// The caller must establish complete generation, entity and POI coverage and
+/// revalidate the live session separately before publishing this plan.
+pub struct CapturedGeneratedChunk<'a> {
+    pub position: crate::world::ChunkPos,
+    pub source_terrain: Option<&'a nbt::NamedTag>,
+    pub source_entities: Option<&'a nbt::NamedTag>,
+    pub source_poi: Option<&'a nbt::NamedTag>,
+    pub terrain: &'a nbt::NamedTag,
+    pub entities: Option<&'a nbt::NamedTag>,
+    pub poi: Option<&'a nbt::NamedTag>,
+    pub region_timestamp_seconds: u32,
+}
+
 struct PlannedTreasureSource {
     dimension: DimensionId,
     position: crate::world::ChunkPos,
@@ -1365,6 +1379,7 @@ struct PlannedChunk {
 struct PlannedGeneratedChunk {
     dimension: DimensionId,
     position: crate::world::ChunkPos,
+    source_nbt: Option<Vec<u8>>,
     document: Vec<u8>,
     region_timestamp_seconds: u32,
 }
@@ -1438,6 +1453,8 @@ struct RegionChange {
     replacement: Option<Vec<u8>>,
     timestamp: u32,
     check_only: bool,
+    /// A source-bound generation replacement may start from a protochunk.
+    source_proto: bool,
     /// Only validated saved treasure-start edits may rewrite protochunks.
     treasure_source: bool,
 }
@@ -1772,6 +1789,7 @@ impl WorldSavePlan {
         self.generated_chunks.push(PlannedGeneratedChunk {
             dimension: dimension.clone(),
             position,
+            source_nbt: None,
             document: terrain,
             region_timestamp_seconds,
         });
@@ -1789,6 +1807,140 @@ impl WorldSavePlan {
             replacement: poi,
             region_timestamp_seconds,
         });
+        Ok(())
+    }
+
+    /// Stage a complete captured generation batch, including protochunk
+    /// replacements, as one in-memory operation. Every source must belong to
+    /// the already bound generation context. No live-session save is implied.
+    pub fn add_captured_generated_chunks(
+        &mut self,
+        dimension: DimensionId,
+        chunks: &[CapturedGeneratedChunk<'_>],
+    ) -> Result<()> {
+        ensure!(!chunks.is_empty(), "no captured generated chunks");
+        ensure!(
+            self.generation_settings.is_some()
+                && self.generation_packs.is_some()
+                && self.generation_source_session.is_some(),
+            "complete generation context is required"
+        );
+        let captured: BTreeMap<_, _> = self
+            .generation_dependencies
+            .iter()
+            .map(|entry| {
+                (
+                    (&entry.dimension, entry.kind, entry.position),
+                    entry.source_nbt.as_deref(),
+                )
+            })
+            .collect();
+        let occupied: BTreeSet<_> = self
+            .chunks
+            .iter()
+            .filter(|entry| entry.dimension == dimension)
+            .map(|entry| entry.draft.position())
+            .chain(
+                self.generated_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
+                self.treasure_sources
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
+                self.entity_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
+                self.poi_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .collect();
+        let encode = |document: &nbt::NamedTag| -> Result<Vec<u8>> {
+            let bytes = nbt::write(document)?;
+            ensure!(
+                bytes.len() <= nbt::MAX_NBT_BYTES,
+                "generated chunk exceeds NBT limit"
+            );
+            Ok(bytes)
+        };
+        let mut seen = BTreeSet::new();
+        let mut terrain = Vec::with_capacity(chunks.len());
+        let mut entities = Vec::with_capacity(chunks.len());
+        let mut poi = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let position = chunk.position;
+            ensure!(
+                seen.insert(position) && !occupied.contains(&position),
+                "world save plan contains duplicate chunk data"
+            );
+            if let Some(source) = chunk.source_terrain {
+                validate_generation_chunk(&source.value, position.x, position.z)?;
+                ensure!(
+                    !matches!(source.value.get("Status"), Some(Tag::String(status)) if status.matches("minecraft:full")),
+                    "captured FULL chunks cannot be replaced as generated protochunks"
+                );
+            }
+            if let Some(source) = chunk.source_entities {
+                validate_entity_document(source, position)?;
+            }
+            if let Some(source) = chunk.source_poi {
+                crate::world::decode_poi_chunk(source.clone(), position)?;
+            }
+            validate_chunk(&chunk.terrain.value, position.x, position.z)?;
+            if let Some(document) = chunk.entities {
+                validate_entity_document(document, position)?;
+            }
+            if let Some(document) = chunk.poi {
+                crate::world::decode_poi_chunk(document.clone(), position)?;
+            }
+            let terrain_source = chunk.source_terrain.map(&encode).transpose()?;
+            let entity_source = chunk.source_entities.map(&encode).transpose()?;
+            let poi_source = chunk.source_poi.map(&encode).transpose()?;
+            for (kind, source) in [
+                (RegionKind::Blocks, &terrain_source),
+                (RegionKind::Entities, &entity_source),
+                (RegionKind::Poi, &poi_source),
+            ] {
+                ensure!(
+                    captured.get(&(&dimension, kind, position)) == Some(&source.as_deref()),
+                    "chunk source differs from generation capture"
+                );
+            }
+            terrain.push(PlannedGeneratedChunk {
+                dimension: dimension.clone(),
+                position,
+                source_nbt: terrain_source,
+                document: encode(chunk.terrain)?,
+                region_timestamp_seconds: chunk.region_timestamp_seconds,
+            });
+            entities.push(PlannedEntityChunk {
+                dimension: dimension.clone(),
+                position,
+                source_nbt: entity_source,
+                replacement: chunk.entities.map(&encode).transpose()?,
+                region_timestamp_seconds: chunk.region_timestamp_seconds,
+            });
+            poi.push(PlannedEntityChunk {
+                dimension: dimension.clone(),
+                position,
+                source_nbt: poi_source,
+                replacement: chunk.poi.map(&encode).transpose()?,
+                region_timestamp_seconds: chunk.region_timestamp_seconds,
+            });
+        }
+        self.generated_chunks.extend(terrain);
+        self.entity_chunks.extend(entities);
+        self.poi_chunks.extend(poi);
         Ok(())
     }
 
@@ -1872,6 +2024,7 @@ impl WorldSavePlan {
             self.generated_chunks.push(PlannedGeneratedChunk {
                 dimension: dimension.clone(),
                 position,
+                source_nbt: None,
                 document,
                 region_timestamp_seconds: timestamp,
             });
@@ -2999,12 +3152,17 @@ impl WorldWriteGuard {
                 || plan.level_time.is_some(),
             "world save plan is empty"
         );
-        if !plan.treasure_sources.is_empty() {
+        if !plan.treasure_sources.is_empty()
+            || plan
+                .generated_chunks
+                .iter()
+                .any(|chunk| chunk.source_nbt.is_some())
+        {
             ensure!(
                 !plan.generated_chunks.is_empty()
                     && plan.generation_settings.is_some()
                     && plan.generation_packs.is_some(),
-                "treasure source changes require generated chunks and a complete generation context"
+                "source-bound generation changes require generated chunks and a complete generation context"
             );
             let captured: BTreeMap<_, _> = plan
                 .generation_dependencies
@@ -3023,11 +3181,42 @@ impl WorldWriteGuard {
                     "treasure source is absent from generation capture"
                 );
             }
+            let entity_sources: BTreeMap<_, _> = plan
+                .entity_chunks
+                .iter()
+                .map(|entry| {
+                    (
+                        (&entry.dimension, entry.position),
+                        entry.source_nbt.as_deref(),
+                    )
+                })
+                .collect();
+            let poi_sources: BTreeMap<_, _> = plan
+                .poi_chunks
+                .iter()
+                .map(|entry| {
+                    (
+                        (&entry.dimension, entry.position),
+                        entry.source_nbt.as_deref(),
+                    )
+                })
+                .collect();
             for chunk in &plan.generated_chunks {
-                for kind in [RegionKind::Blocks, RegionKind::Entities, RegionKind::Poi] {
+                let key = (&chunk.dimension, chunk.position);
+                let entity = *entity_sources
+                    .get(&key)
+                    .context("generated entity source is missing")?;
+                let poi = *poi_sources
+                    .get(&key)
+                    .context("generated POI source is missing")?;
+                for (kind, source) in [
+                    (RegionKind::Blocks, chunk.source_nbt.as_deref()),
+                    (RegionKind::Entities, entity),
+                    (RegionKind::Poi, poi),
+                ] {
                     ensure!(
-                        captured.get(&(&chunk.dimension, kind, chunk.position)) == Some(&None),
-                        "generated chunk and sidecars must be absent in generation capture"
+                        captured.get(&(&chunk.dimension, kind, chunk.position)) == Some(&source),
+                        "generated chunk source differs from generation capture"
                     );
                 }
             }
@@ -3083,6 +3272,7 @@ impl WorldWriteGuard {
                     replacement: Some(replacement),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    source_proto: false,
                     treasure_source: false,
                 });
         }
@@ -3098,10 +3288,11 @@ impl WorldWriteGuard {
                 .or_default()
                 .push(RegionChange {
                     position,
-                    source_nbt: None,
+                    source_nbt: chunk.source_nbt.clone(),
                     replacement: Some(chunk.document.clone()),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    source_proto: chunk.source_nbt.is_some(),
                     treasure_source: false,
                 });
         }
@@ -3121,6 +3312,7 @@ impl WorldWriteGuard {
                     replacement: Some(chunk.replacement.clone()),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    source_proto: false,
                     treasure_source: true,
                 });
         }
@@ -3140,6 +3332,7 @@ impl WorldWriteGuard {
                     replacement: chunk.replacement.clone(),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    source_proto: false,
                     treasure_source: false,
                 });
         }
@@ -3159,6 +3352,7 @@ impl WorldWriteGuard {
                     replacement: chunk.replacement.clone(),
                     timestamp: chunk.region_timestamp_seconds,
                     check_only: false,
+                    source_proto: false,
                     treasure_source: false,
                 });
         }
@@ -3184,6 +3378,7 @@ impl WorldWriteGuard {
                     replacement: None,
                     timestamp: 0,
                     check_only: true,
+                    source_proto: false,
                     treasure_source: false,
                 });
             }
@@ -3430,7 +3625,11 @@ impl WorldWriteGuard {
                 if let Some(original) = &original_nbt {
                     let source = nbt::read(original)?;
                     match kind {
-                        RegionKind::Blocks if planned.check_only || planned.treasure_source => {
+                        RegionKind::Blocks
+                            if planned.check_only
+                                || planned.treasure_source
+                                || planned.source_proto =>
+                        {
                             validate_generation_chunk(&source.value, position.x, position.z)?
                         }
                         RegionKind::Blocks => {
@@ -9424,6 +9623,176 @@ mod tests {
                 .document,
             editable_chunk(generated_pos.x)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_generated_batch_replaces_proto_and_rejects_stale_sources() -> Result<()> {
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld")?;
+        let saved_pos = ChunkPos { x: 1, z: 0 };
+        let new_pos = ChunkPos { x: 32, z: 0 };
+        let mut source = editable_chunk(saved_pos.x);
+        *unique_treasure_field_mut(&mut source.value, "Status")? =
+            Tag::String("minecraft:biomes".into());
+        store_record(&mut region, 1, 3, &source, 1001);
+        fs::write(&region_path, &region)?;
+        let settings_dir = world.path().join("data/minecraft");
+        fs::create_dir_all(&settings_dir)?;
+        fs::write(
+            settings_dir.join("world_gen_settings.dat"),
+            nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    (
+                        "data".into(),
+                        Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                    ),
+                ]),
+            })?,
+        )?;
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone())?;
+        let session = reader.session_guard().context("session missing")?;
+        let capture = reader.capture_generation_context([saved_pos, new_pos])?;
+        let saved_full = editable_chunk(saved_pos.x);
+        let new_full = editable_chunk(new_pos.x);
+        let saved_entities = entity_chunk(
+            saved_pos.x,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let entries = || {
+            [
+                CapturedGeneratedChunk {
+                    position: saved_pos,
+                    source_terrain: Some(&source),
+                    source_entities: None,
+                    source_poi: None,
+                    terrain: &saved_full,
+                    entities: Some(&saved_entities),
+                    poi: None,
+                    region_timestamp_seconds: 17,
+                },
+                CapturedGeneratedChunk {
+                    position: new_pos,
+                    source_terrain: None,
+                    source_entities: None,
+                    source_poi: None,
+                    terrain: &new_full,
+                    entities: None,
+                    poi: None,
+                    region_timestamp_seconds: 18,
+                },
+            ]
+        };
+        let mut unbound = WorldSavePlan::new();
+        assert!(
+            unbound
+                .add_captured_generated_chunks(dimension.clone(), &entries())
+                .is_err()
+        );
+        assert_eq!(unbound.chunk_count(), 0);
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_context(&capture)?;
+        let mut invalid = entries();
+        invalid[1].source_terrain = Some(&new_full);
+        assert!(
+            plan.add_captured_generated_chunks(dimension.clone(), &invalid)
+                .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 0);
+        plan.add_captured_generated_chunks(dimension.clone(), &entries())?;
+        assert_eq!(plan.chunk_count(), 2);
+        assert!(
+            plan.add_captured_generated_chunks(dimension.clone(), &entries())
+                .is_err()
+        );
+        let mut changed = source.clone();
+        let Tag::Compound(fields) = &mut changed.value else {
+            unreachable!()
+        };
+        fields.push(("intervening".into(), Tag::Int(1)));
+        store_record(&mut region, 1, 3, &changed, 1002);
+        fs::write(&region_path, &region)?;
+        let mut writer = session.acquire_write()?;
+        assert!(writer.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path)?, region);
+        assert!(
+            !world
+                .path()
+                .join("dimensions/minecraft/overworld/region/r.1.0.mca")
+                .exists()
+        );
+        store_record(&mut region, 1, 3, &source, 1001);
+        fs::write(&region_path, &region)?;
+        let entity_dir = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&entity_dir)?;
+        let entity_path = entity_dir.join("r.0.0.mca");
+        let mut appeared = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut appeared, 1, 2, &entity_chunk(saved_pos.x, vec![]), 1);
+        fs::write(&entity_path, &appeared)?;
+        let mut sidecar_conflict = WorldSavePlan::new();
+        sidecar_conflict.add_generation_context(&capture)?;
+        sidecar_conflict.add_captured_generated_chunks(dimension.clone(), &entries())?;
+        assert!(writer.write_plan(sidecar_conflict, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path)?, region);
+        assert_eq!(fs::read(&entity_path)?, appeared);
+        fs::remove_file(&entity_path)?;
+
+        let poi_dir = world.path().join("dimensions/minecraft/overworld/poi");
+        fs::create_dir_all(&poi_dir)?;
+        let poi_path = poi_dir.join("r.0.0.mca");
+        let mut appeared_poi = poi_document();
+        let Tag::Compound(record) = &mut poi_records_mut(&mut appeared_poi)[0] else {
+            unreachable!()
+        };
+        record
+            .iter_mut()
+            .find(|(name, _)| name.matches("pos"))
+            .unwrap()
+            .1 = Tag::IntArray(vec![16, 0, 0]);
+        let mut poi_region = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut poi_region, 1, 2, &appeared_poi, 1);
+        fs::write(&poi_path, &poi_region)?;
+        let mut poi_conflict = WorldSavePlan::new();
+        poi_conflict.add_generation_context(&capture)?;
+        poi_conflict.add_captured_generated_chunks(dimension.clone(), &entries())?;
+        assert!(writer.write_plan(poi_conflict, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path)?, region);
+        assert_eq!(fs::read(&poi_path)?, poi_region);
+        fs::remove_file(&poi_path)?;
+
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_context(&capture)?;
+        plan.add_captured_generated_chunks(dimension.clone(), &entries())?;
+        let result = writer.write_plan(plan, |_, _| Ok(()))?;
+        assert!(!result.backup_directory.as_os_str().is_empty());
+        drop(writer);
+        let mut check = crate::world::WorldReader::open(world.path(), dimension)?;
+        assert_eq!(
+            *check
+                .read_chunk(saved_pos.x, saved_pos.z)?
+                .unwrap()
+                .document,
+            saved_full
+        );
+        assert_eq!(
+            *check.read_chunk(new_pos.x, new_pos.z)?.unwrap().document,
+            new_full
+        );
+        assert_eq!(
+            *check
+                .read_entity_chunk(saved_pos.x, saved_pos.z)?
+                .unwrap()
+                .document,
+            saved_entities
+        );
+        assert!(check.read_entity_chunk(new_pos.x, new_pos.z)?.is_none());
         Ok(())
     }
 

@@ -301,6 +301,18 @@ pub fn fall_distance_after_move(distance: f64, actual_y: f64, on_ground: bool) -
     }
 }
 
+/// Entity.move clips up to eight blocks along fast movement only while an
+/// existing fall distance is nonzero. The collision-adjusted movement is used.
+pub(crate) fn fall_reset_clip_end(start: DVec3, actual: DVec3, distance: f64) -> Option<DVec3> {
+    let length_squared = actual.length_squared();
+    if distance == 0.0 || length_squared < 1.0 {
+        return None;
+    }
+    let length = length_squared.sqrt();
+    let unit = DVec3::new(actual.x / length, actual.y / length, actual.z / length);
+    Some(start + unit * length.min(8.0))
+}
+
 impl AirborneMotion {
     /// Java creates the falling entity at the horizontal center of the block.
     pub fn from_block(position: IVec3) -> Self {

@@ -125,6 +125,40 @@ pub fn raycast_shapes_with_fluid<'a>(
     if start == end {
         return None;
     }
+    clip_segment(start, end, |cell| {
+        let (block, fluid) = shapes(cell).ok_or(())?;
+        let block_hit = clip_shape(block, cell, start, end);
+        let fluid_hit = if fluid.is_empty() {
+            None
+        } else {
+            clip_shape(fluid, cell, start, end)
+        };
+        Ok::<_, ()>(match (block_hit, fluid_hit) {
+            (Some(block), Some(fluid)) => {
+                if start.distance_squared(block.location) <= start.distance_squared(fluid.location)
+                {
+                    Some(block)
+                } else {
+                    Some(fluid)
+                }
+            }
+            (block, fluid) => block.or(fluid),
+        })
+    })
+    .unwrap_or(None)
+}
+
+/// Traverse a double-precision segment in Java's block order. The visitor
+/// clips the original segment inside each cell; an error preserves the
+/// distinction between an unavailable cell and an unobstructed segment.
+pub fn clip_segment<E>(
+    start: DVec3,
+    end: DVec3,
+    mut clip: impl FnMut(IVec3) -> Result<Option<ShapeRayHit>, E>,
+) -> Result<Option<ShapeRayHit>, E> {
+    if !start.is_finite() || !end.is_finite() || start == end {
+        return Ok(None);
+    }
     // Vanilla extends both ends by a tiny amount before visiting block cells.
     // Shape clipping still uses the unextended segment.
     let traversal_start = start + (end - start) * -1.0e-7;
@@ -160,29 +194,11 @@ pub fn raycast_shapes_with_fluid<'a>(
             };
     }
     loop {
-        let (block, fluid) = shapes(cell)?;
-        let block_hit = clip_shape(block, cell, start, end);
-        let fluid_hit = if fluid.is_empty() {
-            None
-        } else {
-            clip_shape(fluid, cell, start, end)
-        };
-        let hit = match (block_hit, fluid_hit) {
-            (Some(block), Some(fluid)) => {
-                if start.distance_squared(block.location) <= start.distance_squared(fluid.location)
-                {
-                    Some(block)
-                } else {
-                    Some(fluid)
-                }
-            }
-            (block, fluid) => block.or(fluid),
-        };
-        if let Some(hit) = hit {
-            return Some(hit);
+        if let Some(hit) = clip(cell)? {
+            return Ok(Some(hit));
         }
         if next.x > 1.0 && next.y > 1.0 && next.z > 1.0 {
-            return None;
+            return Ok(None);
         }
         let axis = if next.x < next.y {
             if next.x < next.z { 0 } else { 2 }
@@ -192,7 +208,10 @@ pub fn raycast_shapes_with_fluid<'a>(
             2
         };
         next[axis] += delta[axis];
-        cell[axis] = cell[axis].checked_add(step[axis])?;
+        let Some(next_cell) = cell[axis].checked_add(step[axis]) else {
+            return Ok(None);
+        };
+        cell[axis] = next_cell;
     }
 }
 
@@ -208,6 +227,33 @@ mod tests {
         min: Vec3::ZERO,
         max: Vec3::new(1.0, 0.5, 1.0),
     }];
+
+    #[test]
+    fn double_precision_segment_distinguishes_hits_and_missing_cells() {
+        let start = DVec3::new(16_000_000.25, 4.5, -15_999_999.75);
+        let end = start + DVec3::new(0.0, -3.0, 0.0);
+        let target = IVec3::new(16_000_000, 2, -16_000_000);
+        let hit = clip_segment(start, end, |cell| {
+            Ok::<_, ()>(clip_shape(
+                if cell == target { &FULL } else { &[] },
+                cell,
+                start,
+                end,
+            ))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.position, target);
+        assert_eq!(hit.location, DVec3::new(start.x, 3.0, start.z));
+        let missing = clip_segment(start, end, |cell| {
+            if cell.y == 3 {
+                Err("missing")
+            } else {
+                Ok(None)
+            }
+        });
+        assert_eq!(missing, Err("missing"));
+    }
 
     #[test]
     fn partial_block_is_skipped_when_the_ray_passes_above_it() {

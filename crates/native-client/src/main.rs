@@ -1538,6 +1538,13 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
                     Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::load_fall_damage_resetting_tag(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tag) => session.set_fall_damage_resetting_tag(Arc::new(tag)),
+                    Err(error) => eprintln!("Fall-damage-resetting tag is unavailable: {error:#}"),
+                }
                 let leaf_tag = native_resources::packs::ResourceId::parse(
                     "minecraft:prevents_nearby_leaf_decay",
                 )?;

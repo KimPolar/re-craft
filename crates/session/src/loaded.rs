@@ -3,7 +3,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+    },
     time::Duration,
 };
 
@@ -703,6 +706,7 @@ pub struct LoadedSession {
     stair_octants: Vec<Option<u8>>,
     outlines: Vec<Option<Vec<Aabb>>>,
     fluids: Vec<Option<FluidState>>,
+    fluid_shapes: Arc<FluidShapeCache>,
     origin: IVec3,
     bounds: BuildBounds,
     player: PlayerState,
@@ -1025,6 +1029,7 @@ pub struct LoadedSession {
     player_uuid: Option<[i32; 4]>,
     uncoordinated_falling_lifecycle: bool,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
+    fall_damage_resetting_tag: Option<Arc<BTreeSet<String>>>,
     snow_support_tags: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
     snowy_tag: Option<Arc<BTreeSet<String>>>,
     bubble_column_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
@@ -1546,6 +1551,7 @@ struct FallingSand {
     previous: DVec3,
     fall_distance: f64,
     fall_distance_verified: bool,
+    impact_distance_verified: bool,
     stalactite: Option<crate::falling_block::FallingStalactite>,
     kind: FallingKind,
     drop_item: bool,
@@ -1553,6 +1559,71 @@ struct FallingSand {
     on_ground: bool,
     source: Option<Arc<native_persistence::nbt::Tag>>,
     created: Option<CreatedFallingSand>,
+}
+
+/// Java caches each flowing-fluid state's first computed clipping shape in the
+/// fluid singleton. Each entry is a positive f32 height; zero means uncached.
+struct FluidShapeCache {
+    water: [AtomicU32; 18],
+    lava: [AtomicU32; 18],
+}
+
+impl Default for FluidShapeCache {
+    fn default() -> Self {
+        Self {
+            water: std::array::from_fn(|_| AtomicU32::new(0)),
+            lava: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+}
+
+impl FluidShapeCache {
+    fn height(&self, fluid: FluidState, resolve: impl FnOnce() -> Option<f32>) -> Option<f32> {
+        let index = if fluid.source {
+            if fluid.amount != 8 {
+                return None;
+            }
+            usize::from(fluid.falling)
+        } else {
+            if !(1..=8).contains(&fluid.amount) {
+                return None;
+            }
+            2 + usize::from(fluid.amount - 1) * 2 + usize::from(fluid.falling)
+        };
+        let slots = match fluid.kind {
+            FluidKind::Water => &self.water,
+            FluidKind::Lava => &self.lava,
+        };
+        let slot = &slots[index];
+        let cached = slot.load(AtomicOrdering::Relaxed);
+        if cached != 0 {
+            return Some(f32::from_bits(cached));
+        }
+        let height = resolve()?;
+        let bits = height.to_bits();
+        let value = match slot.compare_exchange(
+            0,
+            bits,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => bits,
+            Err(existing) => existing,
+        };
+        Some(f32::from_bits(value))
+    }
+}
+
+fn shared_fluid_shapes() -> Arc<FluidShapeCache> {
+    #[cfg(test)]
+    {
+        Arc::new(FluidShapeCache::default())
+    }
+    #[cfg(not(test))]
+    {
+        static SHAPES: OnceLock<Arc<FluidShapeCache>> = OnceLock::new();
+        Arc::clone(SHAPES.get_or_init(|| Arc::new(FluidShapeCache::default())))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -6332,6 +6403,10 @@ impl LoadedSession {
         self.sand_deferred_revision = None;
     }
 
+    pub fn set_fall_damage_resetting_tag(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.fall_damage_resetting_tag = Some(tag);
+    }
+
     pub fn set_snow_support_tags(
         &mut self,
         tags: Arc<native_resources::respawn_tags::SnowSupportTags>,
@@ -7353,6 +7428,7 @@ impl LoadedSession {
             stair_octants,
             outlines,
             fluids,
+            fluid_shapes: shared_fluid_shapes(),
             origin,
             bounds,
             player,
@@ -7664,6 +7740,7 @@ impl LoadedSession {
             player_uuid: None,
             uncoordinated_falling_lifecycle: false,
             falling_fire_tag: None,
+            fall_damage_resetting_tag: None,
             snow_support_tags: None,
             snowy_tag: None,
             bubble_column_tags: None,
@@ -12726,6 +12803,7 @@ impl LoadedSession {
                     previous: saved.position,
                     fall_distance: saved.fall_distance,
                     fall_distance_verified: true,
+                    impact_distance_verified: true,
                     stalactite,
                     kind,
                     drop_item: saved.drop_item,
@@ -14327,6 +14405,26 @@ impl LoadedSession {
         true
     }
 
+    fn fluid_clip_height(&self, relative: IVec3, fluid: FluidState) -> Option<f32> {
+        self.fluid_shapes.height(fluid, || {
+            let above = add(relative, IVec3::Y)?;
+            let Cell::State(id) =
+                cell(&self.world, self.origin, self.bounds, above, self.states[0])
+            else {
+                return None;
+            };
+            let state = self.world.state(id)?;
+            let above_fluid = FluidState::from_block(state).ok()?;
+            Some(
+                if above_fluid.is_some_and(|above| above.kind == fluid.kind) {
+                    1.0
+                } else {
+                    fluid.own_height()
+                },
+            )
+        })
+    }
+
     /// Both buckets and bottles target fluid sources as well as block outlines.
     fn source_fluid_hit(&self) -> Option<ShapeRayHit> {
         const SOURCE: &[Aabb] = &[Aabb {
@@ -14360,20 +14458,8 @@ impl LoadedSession {
                         .unwrap_or_else(|| unknown_barrier());
                 let fluid = self.fluids.get(id.0 as usize).copied().flatten();
                 if let Some(fluid) = fluid.filter(|fluid| fluid.source) {
-                    let above = add(relative, IVec3::Y).and_then(|p| {
-                        match cell(&self.world, self.origin, self.bounds, p, self.states[0]) {
-                            Cell::State(id) => self.fluids.get(id.0 as usize).copied().flatten(),
-                            Cell::Missing => None,
-                        }
-                    });
-                    return Some((
-                        outline,
-                        if above.is_some_and(|above| above.kind == fluid.kind) {
-                            FULL
-                        } else {
-                            SOURCE
-                        },
-                    ));
+                    let height = self.fluid_clip_height(relative, fluid)?;
+                    return Some((outline, if height == 1.0 { FULL } else { SOURCE }));
                 }
                 Some((outline, &[]))
             },
@@ -18723,6 +18809,7 @@ impl LoadedSession {
                         previous: motion.position,
                         fall_distance: 0.0,
                         fall_distance_verified: true,
+                        impact_distance_verified: true,
                         stalactite: None,
                         motion,
                         kind: key.kind,
@@ -19512,6 +19599,67 @@ impl LoadedSession {
         })
     }
 
+    /// Java clips the movement of a fast-falling entity against the active
+    /// fall-resetting block tag and the active water fluid tag.
+    fn falling_reset_clip(&self, start: DVec3, end: DVec3) -> Option<bool> {
+        const FULL: [Aabb; 1] = [Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::ONE,
+        }];
+        let blocks = self.fall_damage_resetting_tag.as_ref()?;
+        native_world::raycast::clip_segment(start, end, |position| {
+            let relative = subtract(position, self.origin).ok_or(())?;
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                relative,
+                self.states[0],
+            ) else {
+                return Err(());
+            };
+            let state = self.world.state(id).ok_or(())?;
+            let block_hit = blocks
+                .contains(&state.name)
+                .then(|| native_world::raycast::clip_shape(&FULL, position, start, end))
+                .flatten();
+            let fluid = FluidState::from_block(state).map_err(|_| ())?;
+            let Some(fluid) = fluid else {
+                return Ok(block_hit);
+            };
+            let water_tag = self.farmland_water_tag.ok_or(())?;
+            let fluid_bit = match (fluid.kind, fluid.source) {
+                (FluidKind::Water, true) => 1 << 1,
+                (FluidKind::Water, false) => 1 << 2,
+                (FluidKind::Lava, true) => 1 << 3,
+                (FluidKind::Lava, false) => 1 << 4,
+            };
+            if water_tag & fluid_bit == 0 {
+                return Ok(block_hit);
+            }
+            let height = self.fluid_clip_height(relative, fluid).ok_or(())?;
+            let shape = [Aabb {
+                min: Vec3::ZERO,
+                max: Vec3::new(1.0, height, 1.0),
+            }];
+            let fluid_hit = native_world::raycast::clip_shape(&shape, position, start, end);
+            Ok(match (block_hit, fluid_hit) {
+                (Some(block), Some(fluid)) => {
+                    if start.distance_squared(block.location)
+                        <= start.distance_squared(fluid.location)
+                    {
+                        Some(block)
+                    } else {
+                        Some(fluid)
+                    }
+                }
+                (block, fluid) => block.or(fluid),
+            })
+        })
+        .ok()
+        .map(|hit| hit.is_some())
+    }
+
     fn advance_falling_sand(&mut self) {
         let before = self.falling_sand.len();
         let removed_before = self.removed_falling_sand.len();
@@ -19640,16 +19788,39 @@ impl LoadedSession {
                 None => self.unresolved_bubble_tick = true,
             }
             entity.on_ground = collision.on_ground;
-            if entity.fall_distance_verified {
-                let safe = path_cache.safe(
+            if entity.fall_distance_verified || entity.impact_distance_verified {
+                let tracking_save = entity.fall_distance_verified;
+                let dry_safe = path_cache.safe(
                     &self.world,
                     self.origin,
                     self.bounds,
                     probe.bounds(),
                     collision.actual,
                 );
-                entity.fall_distance_verified = safe;
-                if safe {
+                let mut motion_safe = entity.impact_distance_verified
+                    && (dry_safe
+                        || path_cache.falling_water_safe(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            probe.bounds(),
+                            collision.actual,
+                        ));
+                if motion_safe
+                    && let Some(end) = crate::falling_block::fall_reset_clip_end(
+                        entity.previous,
+                        collision.actual,
+                        entity.fall_distance,
+                    )
+                {
+                    match self.falling_reset_clip(entity.previous, end) {
+                        Some(true) => entity.fall_distance = 0.0,
+                        Some(false) => {}
+                        None => motion_safe = false,
+                    }
+                }
+                entity.impact_distance_verified = motion_safe;
+                if motion_safe {
                     let landing_distance = crate::fall::accumulate_distance(
                         entity.fall_distance,
                         collision.actual.y,
@@ -19723,8 +19894,12 @@ impl LoadedSession {
                         entity.on_ground,
                     );
                 }
-                if let Some(created) = &mut entity.created {
-                    created.verify(entity.previous, entity.motion.position, safe);
+                if tracking_save {
+                    let safe = dry_safe && motion_safe;
+                    entity.fall_distance_verified = safe;
+                    if let Some(created) = &mut entity.created {
+                        created.verify(entity.previous, entity.motion.position, safe);
+                    }
                 }
             }
             if collision.on_ground {
@@ -20482,6 +20657,7 @@ impl LoadedSession {
                 previous: motion.position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: Some(body),
                 motion,
                 kind,
@@ -24907,11 +25083,13 @@ struct CreatedItemPathProof<'a> {
 #[derive(Default)]
 struct ItemPathRegionCache {
     regions: HashMap<(IVec3, IVec3), bool>,
+    falling_water_regions: HashMap<(IVec3, IVec3), bool>,
 }
 
 impl ItemPathRegionCache {
     fn clear(&mut self) {
         self.regions.clear();
+        self.falling_water_regions.clear();
     }
 
     fn safe(
@@ -24936,6 +25114,29 @@ impl ItemPathRegionCache {
         };
         region_safe && created_item_start_clear(world, origin, bounds)
     }
+
+    fn falling_water_safe(
+        &mut self,
+        world: &World,
+        origin: IVec3,
+        build: BuildBounds,
+        bounds: BoundingBox,
+        actual: DVec3,
+    ) -> bool {
+        let Some(region) = created_item_path_region(bounds, actual) else {
+            return false;
+        };
+        let region_safe = if let Some(result) = self.falling_water_regions.get(&region) {
+            *result
+        } else {
+            let result = movement_region_safe(world, origin, build, region.0, region.1, true);
+            if self.falling_water_regions.len() < 4096 {
+                self.falling_water_regions.insert(region, result);
+            }
+            result
+        };
+        region_safe && movement_start_clear(world, origin, bounds, true)
+    }
 }
 
 impl<'a> CreatedItemPathProof<'a> {
@@ -24958,6 +25159,20 @@ impl<'a> CreatedItemPathProof<'a> {
 // entrapment and applies a separate escape algorithm. That algorithm is not
 // yet modeled, so reject any initial overlap with one of our full cubes.
 fn created_item_start_clear(world: &World, origin: IVec3, bounds: BoundingBox) -> bool {
+    movement_start_clear(world, origin, bounds, false)
+}
+
+fn ordinary_water_block(state: &BlockState) -> bool {
+    state.name == "minecraft:water"
+        && matches!(FluidState::from_block(state), Ok(Some(fluid)) if fluid.kind == FluidKind::Water)
+}
+
+fn movement_start_clear(
+    world: &World,
+    origin: IVec3,
+    bounds: BoundingBox,
+    allow_water: bool,
+) -> bool {
     let low = bounds.min + DVec3::splat(1.0e-7);
     let high = bounds.max - DVec3::splat(1.0e-7);
     if !low.cmple(high).all() {
@@ -24978,7 +25193,8 @@ fn created_item_start_clear(world: &World, origin: IVec3, bounds: BoundingBox) -
                 if !matches!(
                     state.name.as_str(),
                     "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-                ) {
+                ) && !(allow_water && ordinary_water_block(state))
+                {
                     return false;
                 }
             }
@@ -24995,6 +25211,17 @@ fn created_item_region_safe(
     build: BuildBounds,
     low: IVec3,
     high: IVec3,
+) -> bool {
+    movement_region_safe(world, origin, build, low, high, false)
+}
+
+fn movement_region_safe(
+    world: &World,
+    origin: IVec3,
+    build: BuildBounds,
+    low: IVec3,
+    high: IVec3,
+    allow_water: bool,
 ) -> bool {
     for x in low.x..=high.x {
         for y in low.y..=high.y {
@@ -25020,7 +25247,8 @@ fn created_item_region_safe(
                 else {
                     return false;
                 };
-                if !created_item_plain_block(state) {
+                if !created_item_plain_block(state) && !(allow_water && ordinary_water_block(state))
+                {
                     return false;
                 }
             }
@@ -29655,6 +29883,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.set_fall_damage_resetting_tag(Arc::new(BTreeSet::new()));
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session.set_farmland_water_tag(Arc::new(BTreeSet::from([
@@ -34331,6 +34560,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
@@ -34370,6 +34600,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
@@ -34452,6 +34683,7 @@ pub(crate) mod tests {
                 previous: entity_pos,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
@@ -44441,6 +44673,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 4.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 kind: FallingKind::Sand,
                 drop_item: true,
@@ -44471,6 +44704,316 @@ pub(crate) mod tests {
                     .iter()
                     .all(|event| event.position.y == 2.0 && event.tick == 1)
             );
+        }
+    }
+
+    #[test]
+    fn falling_stalactite_retains_impact_damage_after_water() {
+        let mut session = session();
+        session.set_speleothem_tags(test_speleothem_tags());
+        session.set_entity_drops(false);
+        session.motion.position = DVec3::new(8.5, 1.0, 8.5);
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(8, 3, 8), water, false));
+        let block = state(
+            "minecraft:pointed_dripstone",
+            &[
+                ("vertical_direction", "down"),
+                ("thickness", "tip"),
+                ("waterlogged", "false"),
+            ],
+        );
+        let body = crate::falling_block::FallingStalactite::from_source(&block, 20, 14).unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(8.5, 5.5, 8.5);
+        session.falling_sand.push(FallingSand {
+            motion: crate::falling_block::AirborneMotion {
+                position,
+                velocity: DVec3::new(0.0, -1.5, 0.0),
+                age: 1,
+                no_gravity: false,
+            },
+            previous: position,
+            fall_distance: 8.0,
+            fall_distance_verified: true,
+            impact_distance_verified: true,
+            stalactite: Some(body),
+            kind: FallingKind::PointedDripstone,
+            drop_item: false,
+            cancel_drop: false,
+            on_ground: false,
+            source: None,
+            created: None,
+        });
+        session.advance_falling_sand();
+        let falling = &session.falling_sand[0];
+        assert!(falling.impact_distance_verified);
+        assert!(!falling.fall_distance_verified);
+        assert!(
+            falling.fall_distance > 8.0,
+            "the first move ends above the water"
+        );
+        session.advance_falling_sand();
+        let falling = &session.falling_sand[0];
+        assert!(falling.impact_distance_verified);
+        assert!(
+            falling.fall_distance < 2.0,
+            "the fast water crossing resets the accumulated fall"
+        );
+        for _ in 0..5 {
+            session.advance_falling_sand();
+            if session.falling_sand.is_empty() {
+                break;
+            }
+        }
+        assert!(session.falling_sand.is_empty());
+        assert!(session.vitals.health > 0.0 && session.vitals.health < 20.0);
+        assert!(session.uncoordinated_falling_lifecycle);
+    }
+
+    #[test]
+    fn falling_reset_clip_uses_active_block_and_fluid_tags() {
+        let mut session = session();
+        let position = session.origin + IVec3::new(8, 5, 8);
+        let start = position.as_dvec3() + DVec3::new(0.5, 2.0, 0.5);
+        let end = start + DVec3::new(0.0, -3.0, 0.0);
+        let water = session.intern_block(state("minecraft:water", &[("level", "1")]));
+        Arc::make_mut(&mut session.world)
+            .set_block_id(position.x, position.y, position.z, water)
+            .unwrap();
+        assert_eq!(session.falling_reset_clip(start, end), Some(true));
+        session.set_farmland_water_tag(Arc::new(BTreeSet::from(["minecraft:water".into()])));
+        assert_eq!(session.falling_reset_clip(start, end), Some(false));
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        Arc::make_mut(&mut session.world)
+            .set_block_id(position.x, position.y, position.z, stone)
+            .unwrap();
+        assert_eq!(session.falling_reset_clip(start, end), Some(false));
+        session.set_fall_damage_resetting_tag(Arc::new(BTreeSet::from(["minecraft:stone".into()])));
+        assert_eq!(session.falling_reset_clip(start, end), Some(true));
+        session.fall_damage_resetting_tag = None;
+        assert_eq!(session.falling_reset_clip(start, end), None);
+    }
+
+    #[test]
+    fn fluid_clipping_caches_the_first_height_for_each_fluid_state() {
+        let mut session = session();
+        let relative = IVec3::new(8, 5, 8);
+        let position = session.origin + relative;
+        let source = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        let flowing = session.intern_block(state("minecraft:water", &[("level", "1")]));
+        let air = session.states[0];
+        Arc::make_mut(&mut session.world)
+            .set_block_id(position.x, position.y + 1, position.z, source)
+            .unwrap();
+        let source_state = session.fluids[source.0 as usize].unwrap();
+        let flowing_state = session.fluids[flowing.0 as usize].unwrap();
+        assert_eq!(session.fluid_clip_height(relative, source_state), Some(1.0));
+        Arc::make_mut(&mut session.world)
+            .set_block_id(position.x, position.y + 1, position.z, air)
+            .unwrap();
+        assert_eq!(session.fluid_clip_height(relative, source_state), Some(1.0));
+        assert_eq!(
+            session.fluid_clip_height(relative, flowing_state),
+            Some(7.0 / 9.0)
+        );
+        Arc::make_mut(&mut session.world)
+            .set_block_id(position.x, position.y + 1, position.z, source)
+            .unwrap();
+        assert_eq!(
+            session.fluid_clip_height(relative, flowing_state),
+            Some(7.0 / 9.0)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn falling_reset_clip_matches_java_water_shapes_and_tags() {
+        use std::{path::PathBuf, process::Command};
+
+        let mut session = session();
+        let origin = session.origin.as_dvec3();
+        let block = session.origin + IVec3::new(8, 5, 8);
+        let movements = [
+            (DVec3::new(8.5, 8.25, 8.5), DVec3::new(0.0, -3.0, 0.0)),
+            (DVec3::new(8.5, 6.0, 8.5), DVec3::new(0.0, -1.0, 0.0)),
+            (DVec3::new(8.5, 14.25, 8.5), DVec3::new(0.0, -9.5, 0.0)),
+            (DVec3::new(7.2, 5.72, 8.5), DVec3::new(2.2, 0.0, 0.0)),
+            (DVec3::new(7.4, 7.2, 8.5), DVec3::new(2.0, -2.0, 0.0)),
+            (
+                DVec3::new(8.5, 6.5, 8.5),
+                DVec3::new(0.0, -0.999_999_9, 0.0),
+            ),
+        ];
+        let mut cases = Vec::new();
+        for level in [-1, 0, 1, 4, 7, 8, 15] {
+            for stacked in [false, true] {
+                for source_tag in [false, true] {
+                    for flowing_tag in [false, true] {
+                        for stone in [false, true] {
+                            for stone_tag in [false, true] {
+                                for (start, movement) in movements {
+                                    for distance in [0.0, 2.5] {
+                                        cases.push(serde_json::json!({
+                                            "cell": block.to_array(),
+                                            "level": level,
+                                            "stacked": stacked,
+                                            "source_tag": source_tag,
+                                            "flowing_tag": flowing_tag,
+                                            "stone": stone,
+                                            "stone_tag": stone_tag,
+                                            "start": (origin + start).to_array(),
+                                            "movement": movement.to_array(),
+                                            "distance": distance,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let source = temp.path().join("FallingWaterResetOracle.java");
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FallingWaterResetOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("FallingWaterResetOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java falling-water oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let expected: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(cases.len(), expected.len());
+        let air = session.states[0];
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        let water_source = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        for (case, expected) in cases.iter().zip(&expected) {
+            let level = case["level"].as_i64().unwrap();
+            let water = if level < 0 {
+                air
+            } else {
+                session.intern_block(state("minecraft:water", &[("level", &level.to_string())]))
+            };
+            let top = if case["stacked"].as_bool().unwrap() {
+                water_source
+            } else {
+                air
+            };
+            let below = if case["stone"].as_bool().unwrap() {
+                stone
+            } else {
+                air
+            };
+            let world = Arc::make_mut(&mut session.world);
+            world
+                .set_block_id(block.x, block.y, block.z, water)
+                .unwrap();
+            world
+                .set_block_id(block.x, block.y + 1, block.z, top)
+                .unwrap();
+            world
+                .set_block_id(block.x, block.y - 1, block.z, below)
+                .unwrap();
+            let mut fluid_tag = BTreeSet::new();
+            if case["source_tag"].as_bool().unwrap() {
+                fluid_tag.insert("minecraft:water".into());
+            }
+            if case["flowing_tag"].as_bool().unwrap() {
+                fluid_tag.insert("minecraft:flowing_water".into());
+            }
+            session.set_farmland_water_tag(Arc::new(fluid_tag));
+            session.set_fall_damage_resetting_tag(Arc::new(
+                if case["stone_tag"].as_bool().unwrap() {
+                    BTreeSet::from(["minecraft:stone".into()])
+                } else {
+                    BTreeSet::new()
+                },
+            ));
+            let vector = |key: &str| {
+                let values = case[key].as_array().unwrap();
+                DVec3::new(
+                    values[0].as_f64().unwrap(),
+                    values[1].as_f64().unwrap(),
+                    values[2].as_f64().unwrap(),
+                )
+            };
+            let start = vector("start");
+            let end = crate::falling_block::fall_reset_clip_end(
+                start,
+                vector("movement"),
+                case["distance"].as_f64().unwrap(),
+            );
+            assert_eq!(
+                end.is_some(),
+                expected["eligible"].as_bool().unwrap(),
+                "{case}"
+            );
+            if let Some(end) = end {
+                let expected_end = expected["end"].as_array().unwrap();
+                assert_eq!(
+                    end.to_array(),
+                    [
+                        expected_end[0].as_f64().unwrap(),
+                        expected_end[1].as_f64().unwrap(),
+                        expected_end[2].as_f64().unwrap()
+                    ],
+                    "{case}"
+                );
+                assert_eq!(
+                    session.falling_reset_clip(start, end),
+                    expected["reset"].as_bool(),
+                    "{case}"
+                );
+            }
         }
     }
 
@@ -45528,6 +46071,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: distance,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 motion: crate::falling_block::AirborneMotion {
                     position,
@@ -70078,6 +70622,7 @@ pub(crate) mod tests {
                 previous: motion.position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 motion,
                 kind: FallingKind::Sand,
@@ -76424,6 +76969,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 motion: crate::falling_block::AirborneMotion {
                     position,
@@ -76588,6 +77134,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 motion: crate::falling_block::AirborneMotion::from_block(
                     session.origin + IVec3::new(10, 4, 8),
@@ -76626,6 +77173,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 0.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: None,
                 motion: crate::falling_block::AirborneMotion {
                     position,
@@ -80365,6 +80913,7 @@ pub(crate) mod tests {
             motion,
             fall_distance: 0.0,
             fall_distance_verified: true,
+            impact_distance_verified: true,
             stalactite: Some(body),
             kind: FallingKind::PointedDripstone,
             drop_item: true,
@@ -80415,6 +80964,7 @@ pub(crate) mod tests {
                 previous: position,
                 fall_distance: 2.0,
                 fall_distance_verified: true,
+                impact_distance_verified: true,
                 stalactite: Some(body),
                 motion: crate::falling_block::AirborneMotion {
                     position,

@@ -45,6 +45,25 @@ pub fn load_fire_tag(
     .context("cannot resolve falling-block fire tag")
 }
 
+/// Resolve the blocks that reset an entity's fall distance during a fast move.
+pub fn load_fall_damage_resetting_tag(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:fall_damage_resetting")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve fall-damage-resetting block tag")
+}
+
 /// Resolve the active climbable tag for movement event distance accounting.
 pub fn load_climbable_tag(
     provider: &mut impl ResourceProvider,
@@ -457,6 +476,28 @@ mod tests {
             .collect();
         assert_eq!(
             load_farmland_maintainers(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:stone".into()])
+        );
+    }
+
+    #[test]
+    fn fall_damage_resetting_tag_resolves_active_pack_layers() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/fall_damage_resetting.json".into(),
+                vec![
+                    br#"{"values":["minecraft:dirt"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#example:resetters"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/example/tags/block/resetters.json".into(),
+                vec![br#"{"values":["minecraft:stone"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = BTreeSet::from(["minecraft:stone".into(), "minecraft:dirt".into()]);
+        assert_eq!(
+            load_fall_damage_resetting_tag(&mut provider, &registry).unwrap(),
             BTreeSet::from(["minecraft:stone".into()])
         );
     }

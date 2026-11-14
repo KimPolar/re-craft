@@ -168,6 +168,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lava_drain_shapes")){
             scenarios.clear();for(var wet:List.of("dry","wet"))for(var block:List.of("slab_bottom","slab_top","stair","fence","ladder","lichen","leaves"))scenarios.add("lava_"+wet+"_"+block+"_drain");
         }
+        if(args.length>0 && args[0].equals("lava_drain_liquids")){
+            scenarios.clear();for(var side:List.of("west","east","north","south","below","above"))for(var amount:List.of("source","flow"))for(var suffix:List.of("","_unconfigured"))scenarios.add("lava_drain_liquid_water_"+side+"_"+amount+suffix);
+            for(var amount:List.of("source","flow"))scenarios.add("lava_drain_liquid_lava_below_"+amount);
+        }
         if(args.length>0 && args[0].equals("down_containers")){
             scenarios.clear();
             for(var kind:List.of("slab_bottom","slab_top","stair_bottom","stair_top","fence"))
@@ -252,9 +256,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(scenario.startsWith("lava_drain_")){
                 var suffix=scenario.substring("lava_drain_".length());
                 var falling=switch(suffix){case "sand", "sand_all" -> Blocks.SAND;case "red_sand" -> Blocks.RED_SAND;case "gravel" -> Blocks.GRAVEL;default -> null;};
-                blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,falling==null?Integer.parseInt(suffix):4));
+                blocks.put(pos,Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL,falling==null&&!suffix.startsWith("liquid_")?Integer.parseInt(suffix):4));
                 if(suffix.equals("sand_all"))for(var p:List.of(pos.west(),pos.east(),pos.north(),pos.south(),pos.below(),pos.above()))blocks.put(p,falling.defaultBlockState());
                 else if(falling!=null)blocks.put(pos.above(),falling.defaultBlockState());
+                if(suffix.startsWith("liquid_")){
+                    var parts=suffix.split("_");
+                    var neighbor=switch(parts[2]){case "west" -> pos.west();case "east" -> pos.east();case "north" -> pos.north();case "south" -> pos.south();case "below" -> pos.below();case "above" -> pos.above();default -> throw new AssertionError(suffix);};
+                    var liquid=parts[1].equals("water")?Blocks.WATER:Blocks.LAVA;
+                    blocks.put(neighbor,liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,parts[3].equals("flow")?4:0));
+                    attributes=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,false).build()).build();
+                }
             }
             if(scenario.startsWith("dry_lichen_")) {
                 var target=(scenario.equals("dry_lichen_down") || scenario.equals("dry_lichen_support"))?pos.below():pos.east();

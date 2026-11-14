@@ -2766,6 +2766,7 @@ impl GeneratedBlockView<'_> {
     ) -> Result<()> {
         let old = self.read(pos)?;
         ensure!(liquid_state(&old)? == Some(fluid), "lava origin changed");
+        let mut has_water_neighbor = false;
         for delta in [
             [-1, 0, 0],
             [1, 0, 0],
@@ -2776,13 +2777,38 @@ impl GeneratedBlockView<'_> {
         ] {
             let neighbor = [pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2]];
             let state = self.read(neighbor)?;
+            if let Some(other) = liquid_state(&state)? {
+                ensure!(
+                    other.kind == native_world::fluid::FluidKind::Water,
+                    "generated lava settings unavailable"
+                );
+                has_water_neighbor = true;
+            } else {
+                ensure!(
+                    matches!(
+                        supported_postprocessing_block(&state),
+                        Ok(DryBlock::Plain | DryBlock::Falling)
+                    ) || self.lava_shape_neighbor(&state),
+                    "exhausted lava requires unsupported neighbor callbacks"
+                );
+            }
+        }
+        if has_water_neighbor {
+            let water = self.water_fluids.context("water fluid tags unavailable")?;
             ensure!(
-                matches!(
-                    supported_postprocessing_block(&state),
-                    Ok(DryBlock::Plain | DryBlock::Falling)
-                ) || self.lava_shape_neighbor(&state),
-                "exhausted lava requires unsupported neighbor callbacks"
+                !water.contains("minecraft:empty")
+                    && !water.contains("minecraft:lava")
+                    && !water.contains("minecraft:flowing_lava"),
+                "empty fluid or lava is in the water fluid tag"
             );
+            let bubble = self.bubble_tags.context("bubble-column tags unavailable")?;
+            ensure!(
+                !bubble.can_occupy_fluid("minecraft:lava")
+                    && !bubble.can_occupy_fluid("minecraft:flowing_lava"),
+                "lava can trigger bubble-column callbacks"
+            );
+            // No neighboring lava can be scheduled, so its unknown delay is unused.
+            return self.apply_lava_change(glam::IVec3::from_array(pos), None, 0);
         }
         let chunk = ChunkPos {
             x: pos[0].div_euclid(16),
@@ -8800,7 +8826,9 @@ mod tests {
             }
             case if case.starts_with("lava_drain_") => {
                 let material = case.strip_prefix("lava_drain_").unwrap();
-                let level = if matches!(material, "sand" | "red_sand" | "gravel" | "sand_all") {
+                let level = if matches!(material, "sand" | "red_sand" | "gravel" | "sand_all")
+                    || material.starts_with("liquid_")
+                {
                     4
                 } else {
                     case.strip_prefix("lava_drain_")
@@ -8839,6 +8867,34 @@ mod tests {
                     } else {
                         world.set_block_id(origin_x, 9, 8, falling).unwrap();
                     }
+                }
+                if let Some(liquid_case) = material.strip_prefix("liquid_") {
+                    let liquid_case = liquid_case
+                        .strip_suffix("_unconfigured")
+                        .unwrap_or(liquid_case);
+                    let parts: Vec<_> = liquid_case.split('_').collect();
+                    let [kind, direction, amount] = parts.as_slice() else {
+                        panic!("invalid liquid case")
+                    };
+                    let position = match *direction {
+                        "west" => [7, 8, 8],
+                        "east" => [9, 8, 8],
+                        "north" => [8, 8, 7],
+                        "south" => [8, 8, 9],
+                        "below" => [8, 7, 8],
+                        "above" => [8, 9, 8],
+                        _ => panic!("invalid liquid direction"),
+                    };
+                    let neighbor = world.intern_state(BlockState {
+                        name: format!("minecraft:{kind}"),
+                        properties: BTreeMap::from([(
+                            "level".into(),
+                            if *amount == "flow" { "4" } else { "0" }.into(),
+                        )]),
+                    });
+                    world
+                        .set_block_id(position[0], position[1], position[2], neighbor)
+                        .unwrap();
                 }
             }
             "dry_lichen_on" | "dry_lichen_off" | "dry_lichen_down" | "dry_lichen_support" => {
@@ -9602,6 +9658,7 @@ mod tests {
             || case.starts_with("lava_touch_")
             || case.starts_with("lava_wet_")
             || case.starts_with("lava_dry_")
+            || case.starts_with("lava_drain_liquid_")
             || case.starts_with("water_touch_lava_")
         {
             let mut water =
@@ -9613,7 +9670,10 @@ mod tests {
                 water.insert("minecraft:empty".into());
             }
             stage.set_water_fluid_tags(Some(Arc::new(water)));
-            if case != "lava_down_unknown" {
+            if case != "lava_down_unknown"
+                && !case.ends_with("_drain")
+                && !case.ends_with("_unconfigured")
+            {
                 stage
                     .set_lava_rules(GeneratedLavaRules {
                         fast_lava: case.ends_with("_fast"),
@@ -9762,6 +9822,14 @@ mod tests {
                 before_random.next_int()
             );
             return vec!["rolled back".into()];
+        }
+        if case == "lava_drain_liquid_lava_below_source_unconfigured" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            assert!(stage.edits.is_empty());
+            return vec![format!("{error:#}")];
         }
         if matches!(
             case,
@@ -11970,6 +12038,55 @@ mod tests {
             })
             .flat_map(|case| water_spread_trace(&case))
             .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exhausted_generated_lava_updates_neighboring_liquids() {
+        for direction in ["west", "east", "north", "south", "below", "above"] {
+            for amount in ["source", "flow"] {
+                for suffix in ["", "_unconfigured"] {
+                    let case = format!("lava_drain_liquid_water_{direction}_{amount}{suffix}");
+                    let trace = water_spread_trace(&case);
+                    assert_eq!(trace[1], "state 8,8,8 minecraft:air -", "{case}");
+                    assert!(
+                        trace
+                            .iter()
+                            .any(|line| line.starts_with("fluid minecraft:")),
+                        "{case}: {trace:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            water_spread_trace("lava_drain_liquid_lava_below_source_unconfigured")[0]
+                .contains("generated lava settings unavailable")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn exhausted_generated_lava_liquid_neighbors_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_drain_liquids"],
+        );
+        let mut expected = Vec::new();
+        for direction in ["west", "east", "north", "south", "below", "above"] {
+            for amount in ["source", "flow"] {
+                for suffix in ["", "_unconfigured"] {
+                    expected.extend(water_spread_trace(&format!(
+                        "lava_drain_liquid_water_{direction}_{amount}{suffix}"
+                    )));
+                }
+            }
+        }
+        for amount in ["source", "flow"] {
+            expected.extend(water_spread_trace(&format!(
+                "lava_drain_liquid_lava_below_{amount}"
+            )));
+        }
         assert_eq!(actual, expected);
     }
 

@@ -23,6 +23,16 @@ struct CorridorRegion<'a, 'b, F, U> {
 
 /// Center support on the bottom face, before applying the active unstable tag.
 pub(super) fn mineshaft_center_support(state: &BlockState) -> Option<bool> {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:calcite"
+            | "minecraft:smooth_basalt"
+            | "minecraft:amethyst_block"
+            | "minecraft:budding_amethyst"
+    ) && state.properties.is_empty()
+    {
+        return Some(true);
+    }
     if native_world::collision::fence_waterlogged(state).is_some()
         || native_world::collision::pane_waterlogged(state).is_some()
         || jigsaw::jigsaw_wood(state)
@@ -657,12 +667,28 @@ impl<F> MineshaftRegion<'_, '_, F> {
             "mineshaft would replace a block entity"
         );
         ensure!(
-            known_piece_block(&old) || monster_block_flags(&old).is_ok(),
+            known_piece_block(&old)
+                || monster_block_flags(&old).is_ok()
+                || (geode_crystal(&old)?
+                    && old.properties.get("waterlogged").map(String::as_str) == Some("false")),
             "unsupported mineshaft replacement effects: {}",
             old.name
         );
-        self.region.set_proto_block(position, &state)
+        self.region.mineshaft_block_write = true;
+        let result = self.region.set_proto_block(position, &state);
+        self.region.mineshaft_block_write = false;
+        result
     }
+}
+
+#[cfg(test)]
+pub(super) fn carve_test_block(region: &mut DecorationRegion<'_>, pos: [i32; 3]) -> Result<()> {
+    let mut biome = |_: [i32; 3], _: &World| Ok(false);
+    MineshaftRegion {
+        region,
+        blocking_biome: &mut biome,
+    }
+    .set_cave_air(pos)
 }
 
 impl<F, U> MineshaftPlacementWorld for CorridorRegion<'_, '_, F, U>
@@ -1432,6 +1458,39 @@ mod tests {
     }
 
     #[test]
+    fn mineshaft_crystal_carving_validates_waterlogging() {
+        for waterlogged in [false, true] {
+            let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+            let mut crystal = BlockState {
+                name: "minecraft:small_amethyst_bud".into(),
+                properties: BTreeMap::from([
+                    ("facing".into(), "up".into()),
+                    ("waterlogged".into(), waterlogged.to_string()),
+                ]),
+            };
+            let world = Arc::make_mut(&mut terrain.world);
+            let id = world.intern_state(crystal.clone());
+            world.set_block_id(3, 2, 3, id).unwrap();
+            let before = Arc::clone(&terrain.world);
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            let result = carve_test_block(&mut region, [3, 2, 3]);
+            if waterlogged {
+                assert!(result.is_err());
+                drop(region);
+                assert!(Arc::ptr_eq(&terrain.world, &before));
+            } else {
+                result.unwrap();
+                region.finish().unwrap();
+                crystal.name = "minecraft:cave_air".into();
+                crystal.properties.clear();
+                assert_eq!(terrain.world.block(3, 2, 3), Some(&crystal));
+            }
+        }
+    }
+
+    #[test]
     fn room_commits_to_draft_and_preserves_previous_snapshot() {
         let (mut terrain, tags, motion, _) = super::super::tests::fixture();
         let before = Arc::clone(&terrain.world);
@@ -1480,6 +1539,15 @@ mod tests {
 
     #[test]
     fn center_support_recognizes_fences_and_validates_states() {
+        for name in ["calcite", "smooth_basalt", "amethyst_block", "budding_amethyst"] {
+            let mut block = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            assert_eq!(mineshaft_center_support(&block), Some(true));
+            block.properties.insert("invalid".into(), "true".into());
+            assert_eq!(mineshaft_center_support(&block), None);
+        }
         let mut fence = BlockState {
             name: "minecraft:oak_fence".into(),
             properties: ["north", "south", "east", "west", "waterlogged"]

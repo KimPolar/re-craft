@@ -822,6 +822,7 @@ pub struct DecorationRegion<'a> {
     magma_block_write: bool,
     monster_room_block_write: bool,
     geode_block_write: bool,
+    mineshaft_block_write: bool,
     failed: bool,
 }
 
@@ -3706,6 +3707,7 @@ impl CarvedTerrainWorld {
             magma_block_write: false,
             monster_room_block_write: false,
             geode_block_write: false,
+            mineshaft_block_write: false,
             failed: false,
         })
     }
@@ -8298,6 +8300,11 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                     && state.properties.is_empty())
                                     || geode_full_cube(state)?
                                     || (old_air && geode_crystal(state)?))));
+                    let mineshaft_crystal_light_update = self.mineshaft_block_write
+                        && geode_crystal(&old)?
+                        && old.properties.get("waterlogged").map(String::as_str) == Some("false")
+                        && state.name == "minecraft:cave_air"
+                        && state.properties.is_empty();
                     // Transparent plants do not enqueue a block light check,
                     // but the first non-air block still allocates a section.
                     let vegetation_allocation = old_air
@@ -8326,6 +8333,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || lake_light_update
                                 || room_light_update
                                 || geode_light_update
+                                || mineshaft_crystal_light_update
                                 || magma_light_update
                                 || staged_patch_water
                                 || staged_patch_vines
@@ -8352,6 +8360,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lake_light_update
                             || room_light_update
                             || geode_light_update
+                            || mineshaft_crystal_light_update
                             || magma_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
@@ -8424,6 +8433,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || lake_light_update
                         || room_light_update
                         || geode_light_update
+                        || mineshaft_crystal_light_update
                         || magma_light_update
                         || new_section
                     {
@@ -8436,6 +8446,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lake_light_update
                             || room_light_update
                             || geode_light_update
+                            || mineshaft_crystal_light_update
                             || magma_light_update
                             || staged_patch_water
                             || staged_patch_vines
@@ -8450,6 +8461,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lake_light_update
                             || room_light_update
                             || geode_light_update
+                            || mineshaft_crystal_light_update
                             || magma_light_update
                             || patch_check
                             || staged_patch_vines
@@ -12935,6 +12947,18 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_mineshaft_replaces_crystals_like_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_mineshaft_small_amethyst_bud_to_cave_air",
+            "vine_active_self_mineshaft_small_amethyst_bud_to_cave_air",
+            "vine_active_mineshaft_medium_amethyst_bud_to_cave_air",
+            "vine_active_mineshaft_large_amethyst_bud_to_cave_air",
+            "vine_active_self_mineshaft_amethyst_cluster_to_cave_air",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_village_piles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_pile_snow",
@@ -13514,6 +13538,7 @@ mod tests {
                 .split("_room_")
                 .nth(1)
                 .or_else(|| mode.split("_geode_").nth(1))
+                .or_else(|| mode.split("_mineshaft_").nth(1))
             {
                 let name = name
                     .split_once("_to_")
@@ -13541,6 +13566,12 @@ mod tests {
                         ("waterlogged".into(), "false".into()),
                         ("west".into(), "false".into()),
                     ]);
+                }
+                if name.ends_with("amethyst_bud") || name == "amethyst_cluster" {
+                    source.properties.insert("facing".into(), "up".into());
+                    source
+                        .properties
+                        .insert("waterlogged".into(), "false".into());
                 }
                 let id = world.intern_state(source);
                 world.set_block_id(16, 10, 8, id).unwrap();
@@ -13690,6 +13721,10 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_mineshaft_") {
+                    mineshaft::carve_test_block(&mut draft, p).unwrap();
+                    continue;
+                }
                 if mode.contains("_geode_") {
                     let (_, target) = mode.split_once("_to_").unwrap();
                     let mut block = state(target);
@@ -14098,7 +14133,10 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_room_") || mode.contains("_geode_") {
+            let expected_checks = if mode.contains("_room_")
+                || mode.contains("_geode_")
+                || mode.contains("_mineshaft_")
+            {
                 1
             } else if mode.contains("_plant_") || mode.contains("_kelp_") {
                 0

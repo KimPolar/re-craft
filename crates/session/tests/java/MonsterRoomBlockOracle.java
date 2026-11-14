@@ -66,7 +66,7 @@ public class MonsterRoomBlockOracle {
      for(var direction:Direction.values())out.printf(" %s",state.isFaceSturdy(world,new BlockPos(1,4,1),direction));
      out.println();
     }
-    if(supportNames.contains(name) || block instanceof net.minecraft.world.level.block.DoorBlock || name.equals("oak_slab") || name.equals("oak_stairs"))
+    if(supportNames.contains(name) || block instanceof net.minecraft.world.level.block.DoorBlock || name.equals("oak_slab") || name.equals("oak_stairs") || List.of("calcite","smooth_basalt","amethyst_block","budding_amethyst").contains(name))
      out.printf("CENTER %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isFaceSturdy(world,new BlockPos(1,4,1),Direction.DOWN,net.minecraft.world.level.block.SupportType.CENTER));
    }
   }

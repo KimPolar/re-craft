@@ -8937,21 +8937,67 @@ mod tests {
             .is_err()
         );
         assert_eq!(batch.schedule().completed(second), before);
-        let (mut actual, mut batch, mut staged) = std::thread::scope(|scope| {
-            scope
-                .spawn(move || -> Result<_> {
-                    crate::chunk_stream::propagate_captured_light_sequence(
-                        &actual,
-                        &mut batch,
-                        &mut staged,
-                        &[second, third, neighbor, structure_target],
-                        || Ok(()),
-                    )?;
-                    Ok((actual, batch, staged))
-                })
-                .join()
-                .expect("light worker panicked")
-        })?;
+        let player = native_session::PlayerState {
+            position: glam::Vec3::new(8.5, lighting.min_y as f32 + 2.0, 40.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut worker_session = native_session::loaded::LoadedSession::new(
+            restored.world().clone(),
+            glam::IVec3::ZERO,
+            native_session::loaded::BuildBounds {
+                min_y: lighting.min_y,
+                max_y: lighting.min_y + lighting.height,
+            },
+            player,
+        )
+        .map_err(anyhow::Error::msg)?;
+        for pos in [second, third] {
+            worker_session
+                .set_initial_poi_chunk(pos, native_session::loaded::SavedPoiData::Missing)?;
+            worker_session
+                .set_initial_entity_chunk(pos, native_session::loaded::SavedEntityData::Empty)?;
+        }
+        let (streamer, initialized) = crate::chunk_stream::light_worker_test_fixture(
+            actual,
+            batch,
+            restored,
+            staged,
+            &worker_session,
+            reader
+                .session_guard()
+                .context("world session lock missing")?,
+            target,
+        )?;
+        let order = vec![second, third, neighbor, structure_target];
+        let mut worker = crate::chunk_stream::MissingGenerationPropagationWorker::start(
+            initialized,
+            &streamer,
+            &worker_session,
+            order.clone(),
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let propagated = loop {
+            if let Some(result) = worker.try_result(&streamer, &worker_session)? {
+                break result;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "light propagation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_eq!(propagated.positions(), order);
+        let initialized = propagated.into_checked_light(&streamer, &worker_session)?;
+        let (assembled, mut staged) = initialized.into_checked_parts(&streamer, &worker_session)?;
+        let (mut batch, mut actual, _restored, _evaluator, _observed, _live) =
+            assembled.into_checked_parts(&streamer, &worker_session)?;
+        drop(worker);
+        drop(streamer);
         let visible = actual.propagate_captured_light(&mut batch, &mut staged, target)?;
         assert!(visible.raw_brightness(marker, 0).is_some());
         assert!(staged.activated.contains(&target));

@@ -1657,6 +1657,46 @@ impl Drop for MissingGenerationPropagationWorker {
     }
 }
 
+/// Build a controlled scheduling observation around real captured generation
+/// data so the worker's ownership and result path can be exercised in tests.
+#[cfg(test)]
+pub(crate) fn light_worker_test_fixture(
+    generator: crate::fresh_generation::existing::PreparedExistingGenerator,
+    batch: crate::fresh_generation::existing::CapturedTerrainBatch,
+    restored: crate::fresh_generation::existing::RestoredSavedTerrain,
+    light: crate::fresh_generation::existing::CapturedStagedLight,
+    session: &LoadedSession,
+    guard: native_persistence::save::WorldSessionGuard,
+    target: ChunkPos,
+) -> Result<(ChunkStreamer, InitializedMissingGenerationLight)> {
+    let live = generator.capture_live_inputs(session, &restored)?;
+    let stamp = guard.read_stamp()?;
+    let mut streamer = ChunkStreamer::with_source(1, BTreeSet::new(), |_| Ok(None))?;
+    streamer.center = session.player_chunk();
+    streamer.respawn = session.requested_respawn_window();
+    streamer.shape_required = session.required_shape_update_chunks();
+    streamer.targets = vec![target];
+    streamer.missing.insert(target);
+    streamer.observed_epoch = Some(stamp.epoch());
+    streamer._world_guard = Some(guard);
+    let observed = streamer
+        .missing_generation_targets(session, 1)
+        .context("test generation observation unavailable")?;
+    anyhow::ensure!(
+        observed.targets() == [target],
+        "test generation target unavailable"
+    );
+    let state = AssembledMissingGeneration {
+        batch,
+        generator,
+        restored,
+        evaluator: native_resources::density::DensityEvaluator::default(),
+        observed,
+        live,
+    };
+    Ok((streamer, InitializedMissingGenerationLight { state, light }))
+}
+
 impl MissingGenerationTargets {
     pub fn targets(&self) -> &[ChunkPos] {
         &self.targets

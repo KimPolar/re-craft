@@ -1763,17 +1763,11 @@ fn wet_upward_speleothem_tip(state: &BlockState) -> bool {
         && state.properties.get("waterlogged").map(String::as_str) == Some("true")
 }
 
-fn wet_upward_speleothem(state: &BlockState) -> bool {
+fn supported_speleothem(state: &BlockState) -> bool {
     matches!(
         state.name.as_str(),
         "minecraft:pointed_dripstone" | "minecraft:sulfur_spike"
-    ) && state
-        .properties
-        .get("vertical_direction")
-        .map(String::as_str)
-        == Some("up")
-        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
-        && native_world::block_light::same_light_behavior(state, state).is_some()
+    ) && native_world::block_light::same_light_behavior(state, state).is_some()
 }
 
 fn bonus_water_shape_schedules(state: &BlockState) -> Result<bool> {
@@ -3852,7 +3846,7 @@ impl GeneratedBlockView<'_> {
             // postprocessing at an explicitly chosen light-engine boundary.
             return self.write_postprocessed_state(pos, &old, next);
         }
-        if wet_upward_speleothem(&old) && wet_upward_speleothem(next) {
+        if supported_speleothem(&old) && supported_speleothem(next) {
             let mut expected = old.clone();
             expected
                 .properties
@@ -4203,8 +4197,10 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
-        if wet_upward_speleothem(state) {
-            self.schedule_contained_water(pos)?;
+        if supported_speleothem(state) {
+            if state.properties["waterlogged"] == "true" {
+                self.schedule_contained_water(pos)?;
+            }
             if direction[1] == 0 {
                 ensure!(
                     matches!(direction, [-1, 0, 0] | [1, 0, 0] | [0, 0, -1] | [0, 0, 1]),
@@ -4216,9 +4212,27 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                 matches!(direction, [0, -1, 0] | [0, 1, 0]),
                 "invalid speleothem update direction"
             );
-            if direction == [0, -1, 0] {
+            let facing = state.properties["vertical_direction"].as_str();
+            let down = facing == "down";
+            let offset = if down { -1 } else { 1 };
+            if down {
+                let chunk = ChunkPos {
+                    x: pos[0].div_euclid(16),
+                    z: pos[2].div_euclid(16),
+                };
+                if self
+                    .ticks
+                    .chunk(chunk)
+                    .context("speleothem tick container is missing")?
+                    .blocks
+                    .contains(&state.name, pos)?
+                {
+                    return Ok(state.clone());
+                }
+            }
+            if direction == [0, -offset, 0] {
                 let same_support =
-                    self.speleothem_in_direction(neighbor, "up")? && neighbor.name == state.name;
+                    self.speleothem_in_direction(neighbor, facing)? && neighbor.name == state.name;
                 let sturdy = if same_support {
                     true
                 } else if neighbor.properties.is_empty()
@@ -4226,14 +4240,21 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                 {
                     true
                 } else {
-                    native_world::collision::button_support_face(neighbor, glam::IVec3::Y)
-                        .context("speleothem support face unavailable")?
+                    native_world::collision::button_support_face(
+                        neighbor,
+                        glam::IVec3::new(0, offset, 0),
+                    )
+                    .context("speleothem support face unavailable")?
                 };
                 if !sturdy {
                     ensure!(
-                        self.ticks
-                            .schedule(TickRegistry::Block, &state.name, pos, 1, 0)?
-                            != ScheduleOutcome::MissingChunk,
+                        self.ticks.schedule(
+                            TickRegistry::Block,
+                            &state.name,
+                            pos,
+                            if down { 2 } else { 1 },
+                            0
+                        )? != ScheduleOutcome::MissingChunk,
                         "speleothem tick container is missing"
                     );
                     return Ok(state.clone());
@@ -4241,37 +4262,42 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
             }
             let tip = self.read([
                 pos[0],
-                pos[1].checked_add(1).context("speleothem Y overflow")?,
+                pos[1]
+                    .checked_add(offset)
+                    .context("speleothem Y overflow")?,
                 pos[2],
             ])?;
-            let thickness = if self.speleothem_in_direction(&tip, "down")? && tip.name == state.name
-            {
-                if state.properties["thickness"] == "tip_merge"
-                    || tip.properties.get("thickness").map(String::as_str) == Some("tip_merge")
-                {
-                    "tip_merge"
-                } else {
+            let opposite = if down { "up" } else { "down" };
+            let thickness =
+                if self.speleothem_in_direction(&tip, opposite)? && tip.name == state.name {
+                    if state.properties["thickness"] == "tip_merge"
+                        || tip.properties.get("thickness").map(String::as_str) == Some("tip_merge")
+                    {
+                        "tip_merge"
+                    } else {
+                        "tip"
+                    }
+                } else if !self.speleothem_in_direction(&tip, facing)? {
                     "tip"
-                }
-            } else if !self.speleothem_in_direction(&tip, "up")? {
-                "tip"
-            } else if matches!(
-                tip.properties.get("thickness").map(String::as_str),
-                Some("tip" | "tip_merge")
-            ) {
-                "frustum"
-            } else {
-                let base = self.read([
-                    pos[0],
-                    pos[1].checked_sub(1).context("speleothem Y overflow")?,
-                    pos[2],
-                ])?;
-                if self.speleothem_in_direction(&base, "up")? {
-                    "middle"
+                } else if matches!(
+                    tip.properties.get("thickness").map(String::as_str),
+                    Some("tip" | "tip_merge")
+                ) {
+                    "frustum"
                 } else {
-                    "base"
-                }
-            };
+                    let base = self.read([
+                        pos[0],
+                        pos[1]
+                            .checked_sub(offset)
+                            .context("speleothem Y overflow")?,
+                        pos[2],
+                    ])?;
+                    if self.speleothem_in_direction(&base, facing)? {
+                        "middle"
+                    } else {
+                        "base"
+                    }
+                };
             let mut next = state.clone();
             next.properties.insert("thickness".into(), thickness.into());
             return Ok(next);
@@ -4466,6 +4492,9 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
         if wet_upward_speleothem_tip(state) {
             return Ok(self.fluid_cell_from_state(state).contained_fluid());
+        }
+        if supported_speleothem(state) && state.properties["waterlogged"] == "false" {
+            return Ok(None);
         }
         if let Some((facing, waterlogged)) = ladder_state(state) {
             return Ok(native_world::fluid_sim::Cell::Ladder {
@@ -9246,7 +9275,10 @@ mod tests {
             }
             "marked_speleothem_sulfur"
             | "marked_speleothem_dripstone"
-            | "marked_speleothem_sulfur_stack" => {
+            | "marked_speleothem_sulfur_stack"
+            | "marked_speleothem_sulfur_down"
+            | "marked_speleothem_sulfur_falling" => {
+                let down = case.ends_with("_down") || case.ends_with("_falling");
                 let spike = world.intern_state(BlockState {
                     name: if case.contains("_sulfur") {
                         "minecraft:sulfur_spike"
@@ -9255,15 +9287,28 @@ mod tests {
                     }
                     .into(),
                     properties: BTreeMap::from([
-                        ("thickness".into(), "tip".into()),
-                        ("vertical_direction".into(), "up".into()),
-                        ("waterlogged".into(), "true".into()),
+                        (
+                            "thickness".into(),
+                            if down { "frustum" } else { "tip" }.into(),
+                        ),
+                        (
+                            "vertical_direction".into(),
+                            if down { "down" } else { "up" }.into(),
+                        ),
+                        ("waterlogged".into(), (!down).to_string()),
                     ]),
                 });
                 world.set_block_id(8, 8, 8, spike).unwrap();
-                world
-                    .set_block_id(8, 9, 8, if case.ends_with("_stack") { spike } else { air })
-                    .unwrap();
+                if down {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                    if case.ends_with("_falling") {
+                        world.set_block_id(8, 9, 8, air).unwrap();
+                    }
+                } else {
+                    world
+                        .set_block_id(8, 9, 8, if case.ends_with("_stack") { spike } else { air })
+                        .unwrap();
+                }
             }
             "barrier_sulfur"
             | "barrier_cinnabar"
@@ -11934,6 +11979,8 @@ mod tests {
             "marked_speleothem_sulfur",
             "marked_speleothem_dripstone",
             "marked_speleothem_sulfur_stack",
+            "marked_speleothem_sulfur_down",
+            "marked_speleothem_sulfur_falling",
         ]
         .into_iter()
         .flat_map(water_spread_trace)

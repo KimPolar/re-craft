@@ -139,7 +139,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("lichen_destroy")){scenarios.clear();scenarios.addAll(List.of("marked_lichen_destroy_on","marked_lichen_destroy_off"));}
         if(args.length>0 && args[0].equals("dry_lichen")){scenarios.clear();scenarios.addAll(List.of("dry_lichen_on","dry_lichen_off","dry_lichen_down","dry_lichen_support"));}
         if(args.length>0 && args[0].equals("wet_tip_neighbor")){scenarios.clear();scenarios.addAll(List.of("wet_tip_neighbor_sulfur","wet_tip_neighbor_dripstone"));}
-        if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack"));}
+        if(args.length>0 && args[0].equals("marked_speleothem")){scenarios.clear();scenarios.addAll(List.of("marked_speleothem_sulfur","marked_speleothem_dripstone","marked_speleothem_sulfur_stack","marked_speleothem_sulfur_down","marked_speleothem_sulfur_falling"));}
         if(args.length>0 && args[0].equals("potent_sulfur_barrier")){scenarios.clear();scenarios.add("barrier_potent_sulfur_wet");}
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
             if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
@@ -285,8 +285,12 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             }
             if(scenario.startsWith("marked_speleothem_")) {
                 var block=scenario.contains("_sulfur")?Blocks.SULFUR_SPIKE:Blocks.POINTED_DRIPSTONE;
-                blocks.put(pos,block.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,Direction.UP).setValue(BlockStateProperties.WATERLOGGED,true));
-                blocks.put(pos.above(),scenario.endsWith("_stack")?get(pos):Blocks.AIR.defaultBlockState());
+                var down=scenario.endsWith("_down")||scenario.endsWith("_falling");
+                var spike=block.defaultBlockState().setValue(BlockStateProperties.VERTICAL_DIRECTION,down?Direction.DOWN:Direction.UP).setValue(BlockStateProperties.WATERLOGGED,!down);
+                if(down)spike=spike.setValue(SpeleothemBlock.THICKNESS,net.minecraft.world.level.block.state.properties.SpeleothemThickness.FRUSTUM);
+                blocks.put(pos,spike);
+                if(down){blocks.put(pos.below(),Blocks.AIR.defaultBlockState());if(scenario.endsWith("_falling"))blocks.put(pos.above(),Blocks.AIR.defaultBlockState());}
+                else blocks.put(pos.above(),scenario.endsWith("_stack")?get(pos):Blocks.AIR.defaultBlockState());
             }
             if(snowyWater || snowyFence) {
                 var parts=scenario.split("_");

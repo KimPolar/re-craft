@@ -101,6 +101,8 @@ pub(crate) fn block_fall_sound(id: &str) -> Option<&'static str> {
         "minecraft:sand" | "minecraft:red_sand" => Some("block.sand.fall"),
         "minecraft:crafting_table" => Some("block.wood.fall"),
         "minecraft:honey_block" => Some("block.honey_block.fall"),
+        "minecraft:pointed_dripstone" => Some("block.pointed_dripstone.fall"),
+        "minecraft:sulfur_spike" => Some("block.sulfur_spike.fall"),
         _ => None,
     }
 }
@@ -1052,6 +1054,8 @@ mod tests {
             "minecraft:crafting_table",
             "minecraft:cobblestone",
             "minecraft:stone_bricks",
+            "minecraft:pointed_dripstone",
+            "minecraft:sulfur_spike",
         ];
         ids.extend(Planks::ALL.into_iter().map(Planks::id));
         ids.extend(Wood::all().map(Wood::id));
@@ -2042,6 +2046,88 @@ mod tests {
         apply(&tracker, None, &mut vitals);
         assert_eq!(vitals.absorption, 0.0);
         assert_eq!(vitals.health, 18.6);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn speleothem_landing_rules_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SpeleothemFallOracle.java");
+        let output = temp.path().join("landing.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SpeleothemFallOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("SpeleothemFallOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 120);
+        for row in rows {
+            let block = BlockState {
+                name: row["id"].as_str().unwrap().into(),
+                properties: row["properties"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap().into()))
+                    .collect(),
+            };
+            let surface = FallSurface::for_state(Some(&block));
+            let distance = row["input"].as_f64().unwrap();
+            assert_eq!(
+                distance * surface.distance_multiplier + surface.added_distance,
+                row["distance"].as_f64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                surface.damage_multiplier.to_bits(),
+                (row["factor"].as_f64().unwrap() as f32).to_bits(),
+                "{row}"
+            );
+            assert_eq!(
+                surface.damage_type,
+                row["source"].as_str().unwrap(),
+                "{row}"
+            );
+        }
     }
 
     #[test]

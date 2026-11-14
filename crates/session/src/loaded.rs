@@ -22928,7 +22928,10 @@ impl LoadedSession {
                 legacy,
                 self.states[0],
             ) {
-                Cell::State(id) if self.shapes.get(id.0 as usize).is_some_and(Option::is_some) => {
+                Cell::State(id)
+                    if shape_at_relative(&self.world, &self.shapes, id, self.origin, legacy)
+                        .is_some() =>
+                {
                     Some(id)
                 }
                 _ => None,
@@ -22959,9 +22962,6 @@ impl LoadedSession {
                 self.queue_player_sound("block.honey_block.slide", 1.0, 1.0);
                 self.push_honey_particles(HoneyParticleKind::Landing);
             }
-            let is_stalagmite = landing_state
-                .and_then(|id| self.world.state(id))
-                .is_some_and(|state| state.name == "minecraft:pointed_dripstone");
             let before_landing_inventory = Arc::clone(&self.inventory);
             let landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id)) {
                 match self.fall.land_with_equipment(
@@ -23019,7 +23019,7 @@ impl LoadedSession {
             }
             if self.death.is_none() && self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
-                    cause: if is_stalagmite {
+                    cause: if landing.source == Some("minecraft:stalagmite") {
                         DeathCause::Stalagmite
                     } else if self.fall_distance > 5.0 {
                         DeathCause::FallHigh
@@ -38651,6 +38651,86 @@ pub(crate) mod tests {
                     expected,
                     "distance={distance} silent={silent}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn positioned_speleothem_landing_applies_the_correct_damage_and_death_source() {
+        for (name, direction, thickness, stalagmite) in [
+            ("minecraft:pointed_dripstone", "up", "tip", true),
+            ("minecraft:pointed_dripstone", "up", "tip_merge", false),
+            ("minecraft:pointed_dripstone", "down", "tip", false),
+            ("minecraft:pointed_dripstone", "up", "base", false),
+            ("minecraft:sulfur_spike", "up", "tip", false),
+        ] {
+            for (enabled, initial_health) in [(true, 20.0), (true, 5.0), (false, 20.0)] {
+                let mut test = session();
+                test.set_random_tick_speed(0);
+                test.survival_rules.fall_damage = enabled;
+                test.survival_rules.natural_health_regeneration = false;
+                let block = state(
+                    name,
+                    &[
+                        ("vertical_direction", direction),
+                        ("thickness", thickness),
+                        ("waterlogged", "false"),
+                    ],
+                );
+                let relative = IVec3::new(8, 1, 8);
+                let shape = native_world::collision::positioned_speleothem_shape(
+                    &block,
+                    test.origin + relative,
+                )
+                .unwrap()[0];
+                let id = test.intern_block(block);
+                assert!(test.set(relative, id));
+                test.motion.position = DVec3::new(
+                    f64::from(relative.x) + f64::from((shape.min.x + shape.max.x) * 0.5),
+                    f64::from(relative.y) + f64::from(shape.max.y),
+                    f64::from(relative.z) + f64::from((shape.min.z + shape.max.z) * 0.5),
+                );
+                test.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+                test.motion.on_ground = false;
+                test.player.position = test.motion.position.as_vec3();
+                test.player.on_ground = false;
+                test.fall_distance = 8.0;
+                test.vitals.health = initial_health;
+                test.update(TICK);
+                assert!(test.motion.on_ground, "{name} {direction} {thickness}");
+                let damage = if enabled {
+                    if stalagmite { 15.0 } else { 5.0 }
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    test.vitals.health,
+                    (initial_health - damage).max(0.0),
+                    "{name} {direction} {thickness} enabled={enabled}"
+                );
+                let expected_sound = if name == "minecraft:pointed_dripstone" {
+                    "block.pointed_dripstone.fall"
+                } else {
+                    "block.sulfur_spike.fall"
+                };
+                assert!(
+                    test.take_consume_sounds()
+                        .iter()
+                        .any(|sound| sound.info.event == expected_sound),
+                    "missing {expected_sound} for {direction} {thickness}"
+                );
+                if enabled && initial_health <= damage {
+                    assert_eq!(
+                        test.death.as_ref().unwrap().cause,
+                        if stalagmite {
+                            DeathCause::Stalagmite
+                        } else {
+                            DeathCause::FallHigh
+                        }
+                    );
+                } else {
+                    assert!(test.death.is_none());
+                }
             }
         }
     }

@@ -803,6 +803,7 @@ pub(crate) struct CapturedPostprocessedComponents {
     structures: BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
     external_structure_sources: BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
     missing_poi: BTreeMap<native_world::loaded::ChunkPos, Option<NamedTag>>,
+    generated_empty_entities: BTreeSet<native_world::loaded::ChunkPos>,
 }
 
 impl CapturedPostprocessedComponents {
@@ -810,6 +811,9 @@ impl CapturedPostprocessedComponents {
     /// revalidating source data, live state, packs and entity/POI sidecars.
     /// The POI map contains only chunks whose captured storage was absent:
     /// a missing key is unknown, while a present `None` means no POI was found.
+    /// The entity set covers this chunk's captured proto/sidecar and the
+    /// verified generated contribution. Other stored and live entity sources
+    /// remain unresolved.
     pub fn outputs(
         &self,
     ) -> (
@@ -820,12 +824,14 @@ impl CapturedPostprocessedComponents {
         &BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
         &BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
         &BTreeMap<native_world::loaded::ChunkPos, Option<NamedTag>>,
+        &BTreeSet<native_world::loaded::ChunkPos>,
     ) {
         (
             &self.chunks,
             &self.structures,
             &self.external_structure_sources,
             &self.missing_poi,
+            &self.generated_empty_entities,
         )
     }
 
@@ -868,6 +874,35 @@ fn captured_missing_poi_positions(
         }
     }
     Ok(missing)
+}
+
+/// Establish only the empty generated-entity case. Saved/live sidecars and
+/// spawning rules must still be revalidated before these records are used.
+fn captured_generated_entities_are_empty(
+    source: Option<&NamedTag>,
+    entity_sidecar: Option<&NamedTag>,
+    feature_coverage: bool,
+    structure_sources_present: bool,
+    generated_entities: &[Tag],
+    drops_occurred: bool,
+) -> Result<bool> {
+    if entity_sidecar.is_some()
+        || !feature_coverage
+        || structure_sources_present
+        || !generated_entities.is_empty()
+        || drops_occurred
+    {
+        return Ok(false);
+    }
+    let original = source
+        .map(|document| unique_root_field(document, "entities"))
+        .transpose()?
+        .flatten();
+    let entities = native_persistence::generated_chunk::append_proto_entity_records(original, &[])?;
+    if matches!(entities, Some(Tag::List { values, .. }) if !values.is_empty()) {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 impl CapturedPostprocessedRegion {
@@ -2448,6 +2483,7 @@ impl PreparedExistingGenerator {
         };
         let mut chunks = BTreeMap::new();
         let mut structures = BTreeMap::new();
+        let mut generated_empty_entities = BTreeSet::new();
         for (pos, data) in data {
             let proof = completed
                 .proofs
@@ -2461,6 +2497,36 @@ impl PreparedExistingGenerator {
                 proof.matches_source(source.as_deref())?,
                 "postprocessing source differs"
             );
+            let captured = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+                .context("entity source was not captured")?;
+            ensure!(
+                match (&captured.terrain, source) {
+                    (None, None) => true,
+                    (Some(saved), Some(source)) => Arc::ptr_eq(&saved.document, source),
+                    _ => false,
+                },
+                "captured entity terrain source differs"
+            );
+            if captured_generated_entities_are_empty(
+                source.as_deref(),
+                captured
+                    .entities
+                    .as_ref()
+                    .map(|sidecar| sidecar.document.as_ref()),
+                batch.feature_entity_sources.covers(pos),
+                self.generate_structures || !batch.treasure_starts.is_empty(),
+                batch.terrain.recorded_generated_entities(pos)?,
+                completed.region.block_drops().is_some_and(|drops| {
+                    drops.operations() != 0 || drops.item_chunks().next().is_some()
+                }),
+            )? {
+                generated_empty_entities.insert(pos);
+            }
             let mut document = if let Some(draft) = updated_sources.remove(&pos) {
                 draft.document
             } else {
@@ -2506,6 +2572,7 @@ impl PreparedExistingGenerator {
             structures,
             external_structure_sources,
             missing_poi,
+            generated_empty_entities,
         })
     }
 
@@ -8918,6 +8985,15 @@ mod tests {
         assert!(saved_spawn.entity_sidecar_source().is_none());
         assert!(new_spawn.has_entity_free_feature_coverage());
         assert!(saved_spawn.has_entity_free_feature_coverage());
+        let empty_new_entities = captured_generated_entities_are_empty(
+            None,
+            new_spawn.entity_sidecar_source(),
+            new_spawn.has_entity_free_feature_coverage(),
+            actual.generate_structures || !batch.treasure_starts.is_empty(),
+            batch.terrain.recorded_generated_entities(target)?,
+            false,
+        )?;
+        assert!(empty_new_entities);
         assert_eq!(
             new_spawn.document().value.get("Status"),
             Some(&Tag::String("minecraft:spawn".into()))
@@ -9716,6 +9792,84 @@ mod tests {
     }
 
     #[test]
+    fn captured_empty_entities_require_each_source_to_be_proven_empty() -> Result<()> {
+        let empty = |element_type| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "entities".into(),
+                Tag::List {
+                    element_type,
+                    values: vec![],
+                },
+            )]),
+        };
+        let compound = Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]);
+        let populated = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![compound.clone()],
+                },
+            )]),
+        };
+        let sidecar = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        fn proof(
+            source: Option<&NamedTag>,
+            sidecar: Option<&NamedTag>,
+            coverage: bool,
+            structures: bool,
+            records: &[Tag],
+            drops: bool,
+        ) -> Result<bool> {
+            captured_generated_entities_are_empty(
+                source, sidecar, coverage, structures, records, drops,
+            )
+        }
+        assert!(proof(None, None, true, false, &[], false)?);
+        let empty_end = empty(TagType::End);
+        let empty_compound = empty(TagType::Compound);
+        assert!(proof(Some(&empty_end), None, true, false, &[], false)?);
+        assert!(proof(Some(&empty_compound), None, true, false, &[], false)?);
+        assert!(!proof(Some(&populated), None, true, false, &[], false)?);
+        assert!(!proof(None, Some(&sidecar), true, false, &[], false)?);
+        assert!(!proof(None, None, false, false, &[], false)?);
+        assert!(!proof(None, None, true, true, &[], false)?);
+        assert!(!proof(None, None, true, false, &[compound], false)?);
+        assert!(!proof(None, None, true, false, &[], true)?);
+        let invalid = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("entities".into(), Tag::Int(1))]),
+        };
+        assert!(proof(Some(&invalid), None, true, false, &[], false).is_err());
+        let duplicate = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                (
+                    "entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+                (
+                    "entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+            ]),
+        };
+        assert!(proof(Some(&duplicate), None, true, false, &[], false).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn resumed_light_neighborhood_requires_all_columns_and_checked_coordinates() {
         use native_world::loaded::ChunkPos;
         let center = ChunkPos { x: -2, z: 3 };
@@ -9845,8 +9999,9 @@ mod tests {
             structures: BTreeMap::from([(first, Some(Tag::Int(1)))]),
             external_structure_sources: external,
             missing_poi: BTreeMap::from([(first, None)]),
+            generated_empty_entities: BTreeSet::from([first]),
         };
-        let (chunks, structures, pending, poi) = components.outputs();
+        let (chunks, structures, pending, poi, empty_entities) = components.outputs();
         assert!(chunks.is_empty());
         assert_eq!(structures.get(&first), Some(&Some(Tag::Int(1))));
         assert_eq!(pending[&second].document(), &changed);
@@ -9854,6 +10009,7 @@ mod tests {
         assert!(!pending[&second].matches_source(&changed)?);
         assert_eq!(poi.get(&first), Some(&None));
         assert!(!poi.contains_key(&second));
+        assert_eq!(empty_entities, &BTreeSet::from([first]));
         Ok(())
     }
 

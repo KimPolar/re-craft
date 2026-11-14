@@ -3403,12 +3403,53 @@ impl PreparedExistingGenerator {
         border: native_session::respawn::RespawnBorder,
         construction: native_session::worldgen::FreshCreatureConstruction,
     ) -> Result<native_session::worldgen::GeneratedCreaturePose> {
-        use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
         ensure!(
             plan.matches_state(world, light, spawn_mobs, clocks),
             "creature plan is stale"
         );
         self.validate_resumed_spawn(world, schedule, light, plan.position)?;
+        Self::validate_creature_construction(plan, border, construction)?;
+        self.check_known_entity_id(world, construction.uuid)?;
+        Self::mark_creature_constructed(plan, construction)
+    }
+
+    /// Construct a checked mixed-terrain candidate without publishing it. The
+    /// caller must also verify identities outside this capture and other plans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn construct_captured_creature(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        plan: &mut CapturedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+        construction: native_session::worldgen::FreshCreatureConstruction,
+    ) -> Result<native_session::worldgen::GeneratedCreaturePose> {
+        ensure!(
+            plan.matches_state(batch, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.validate_captured_spawn(batch, light, plan.inner.position)?;
+        Self::validate_creature_construction(&mut plan.inner, border, construction)?;
+        self.check_terrain_entity_id(
+            &batch.terrain,
+            &batch.revision,
+            batch
+                .sources
+                .keys()
+                .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z }),
+            construction.uuid,
+        )?;
+        Self::mark_creature_constructed(&mut plan.inner, construction)
+    }
+
+    fn validate_creature_construction(
+        plan: &mut ResumedCreaturePlan,
+        border: native_session::respawn::RespawnBorder,
+        construction: native_session::worldgen::FreshCreatureConstruction,
+    ) -> Result<()> {
+        use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
         ensure!(plan.border == Some(border), "creature spawn border differs");
         ensure!(
             plan.construction.is_some() && plan.constructed.is_none(),
@@ -3442,7 +3483,13 @@ impl PreparedExistingGenerator {
             !plan.used_uuids.contains(&construction.uuid),
             "duplicate generated creature UUID"
         );
-        self.check_known_entity_id(world, construction.uuid)?;
+        Ok(())
+    }
+
+    fn mark_creature_constructed(
+        plan: &mut ResumedCreaturePlan,
+        construction: native_session::worldgen::FreshCreatureConstruction,
+    ) -> Result<native_session::worldgen::GeneratedCreaturePose> {
         let pose = plan
             .probe
             .as_mut()
@@ -3455,6 +3502,24 @@ impl PreparedExistingGenerator {
     }
 
     fn check_known_entity_id(&mut self, world: &ResumedTerrainWorld, uuid: [i32; 4]) -> Result<()> {
+        self.check_terrain_entity_id(
+            &world.terrain,
+            &world.revision,
+            world
+                .sources
+                .keys()
+                .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z }),
+            uuid,
+        )
+    }
+
+    fn check_terrain_entity_id(
+        &mut self,
+        terrain: &native_session::worldgen::CarvedTerrainWorld,
+        revision: &Arc<()>,
+        positions: impl Iterator<Item = native_world::loaded::ChunkPos>,
+        uuid: [i32; 4],
+    ) -> Result<()> {
         let captured = self.captured_entity_ids.get_or_insert_with(|| {
             let mut ids = KnownEntityIds::default();
             for chunk in self.context.inputs().sources().chunks().values() {
@@ -3474,14 +3539,13 @@ impl PreparedExistingGenerator {
         if !self
             .generated_entity_ids
             .as_ref()
-            .is_some_and(|(revision, _)| Arc::ptr_eq(revision, &world.revision))
+            .is_some_and(|(cached, _)| Arc::ptr_eq(cached, revision))
         {
             let mut ids = KnownEntityIds::default();
-            for pos in world.sources.keys() {
-                let pos = native_world::loaded::ChunkPos { x: pos.x, z: pos.z };
-                ids.observe_records(world.terrain.recorded_generated_entities(pos)?);
+            for pos in positions {
+                ids.observe_records(terrain.recorded_generated_entities(pos)?);
             }
-            self.generated_entity_ids = Some((Arc::clone(&world.revision), ids));
+            self.generated_entity_ids = Some((Arc::clone(revision), ids));
         }
         ensure!(
             !self
@@ -3508,14 +3572,42 @@ impl PreparedExistingGenerator {
         clocks: &BTreeMap<ResourceId, i64>,
         border: native_session::respawn::RespawnBorder,
     ) -> Result<ResumedCreatureInstance> {
-        use native_session::worldgen::{
-            GeneratedCreatureInstanceRuleProgress, GeneratedCreatureObstructionProgress,
-        };
         ensure!(
             plan.matches_state(world, light, spawn_mobs, clocks),
             "creature plan is stale"
         );
         self.validate_resumed_spawn(world, schedule, light, plan.position)?;
+        self.check_creature_instance(&world.terrain, plan, border)
+    }
+
+    /// Check the constructed mixed-terrain entity's own rule and obstruction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_captured_creature_instance(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        plan: &mut CapturedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+    ) -> Result<ResumedCreatureInstance> {
+        ensure!(
+            plan.matches_state(batch, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.validate_captured_spawn(batch, light, plan.inner.position)?;
+        self.check_creature_instance(&batch.terrain, &mut plan.inner, border)
+    }
+
+    fn check_creature_instance(
+        &self,
+        terrain: &native_session::worldgen::CarvedTerrainWorld,
+        plan: &mut ResumedCreaturePlan,
+        border: native_session::respawn::RespawnBorder,
+    ) -> Result<ResumedCreatureInstance> {
+        use native_session::worldgen::{
+            GeneratedCreatureInstanceRuleProgress, GeneratedCreatureObstructionProgress,
+        };
         ensure!(plan.border == Some(border), "creature spawn border differs");
         let pose = plan.pose.context("constructed creature is missing")?;
         if plan.finalizable {
@@ -3539,7 +3631,7 @@ impl PreparedExistingGenerator {
             .ambient_light
             .context("dimension ambient light is missing")?;
         let mut view = native_session::worldgen::GeneratedMobPlacementView::from_captured_terrain(
-            &world.terrain,
+            terrain,
             visible,
             registry,
             ambient,
@@ -9214,7 +9306,7 @@ mod tests {
             target.z,
             true,
             0.999_999_9_f32,
-            forced.spawns,
+            forced.spawns.clone(),
         )?;
         let attempt = pending.advance(&batch, &staged, true, &clocks)?;
         assert!(matches!(
@@ -9299,6 +9391,170 @@ mod tests {
             rejected,
             "excluded captured candidate did not finish placement"
         );
+        let mut animal = actual.plan_captured_creatures(&batch, &staged, target, true, &clocks)?;
+        animal.inner.planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+            42,
+            target.x,
+            target.z,
+            true,
+            0.999_999_9_f32,
+            forced.spawns,
+        )?;
+        let mut constructed = false;
+        for _ in 0..512 {
+            match animal.advance(&batch, &staged, true, &clocks)? {
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished => break,
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Pending => continue,
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_) => {}
+            }
+            let check = actual.check_captured_creature_candidate(
+                &batch,
+                &staged,
+                &mut animal,
+                true,
+                &clocks,
+                changed_border,
+                64,
+            )?;
+            match check {
+                ResumedCreatureCheck::Pending => continue,
+                ResumedCreatureCheck::Rejected => continue,
+                ResumedCreatureCheck::NeedsConstruction(_) => {}
+            }
+            let construction = native_session::worldgen::FreshCreatureConstruction {
+                uuid: [42, 43, 44, 45],
+                chicken_egg_time: None,
+            };
+            let invalid = native_session::worldgen::FreshCreatureConstruction {
+                chicken_egg_time: Some(9000),
+                ..construction
+            };
+            assert!(
+                actual
+                    .construct_captured_creature(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &clocks,
+                        changed_border,
+                        invalid,
+                    )
+                    .is_err()
+            );
+            assert!(
+                actual
+                    .construct_captured_creature(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &wrong_clocks,
+                        changed_border,
+                        construction,
+                    )
+                    .is_err()
+            );
+            actual.check_terrain_entity_id(
+                &batch.terrain,
+                &batch.revision,
+                batch
+                    .sources
+                    .keys()
+                    .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z }),
+                construction.uuid,
+            )?;
+            actual
+                .captured_entity_ids
+                .as_mut()
+                .unwrap()
+                .0
+                .insert(construction.uuid);
+            assert!(
+                actual
+                    .construct_captured_creature(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &clocks,
+                        changed_border,
+                        construction,
+                    )
+                    .is_err()
+            );
+            actual
+                .captured_entity_ids
+                .as_mut()
+                .unwrap()
+                .0
+                .remove(&construction.uuid);
+            let pose = actual.construct_captured_creature(
+                &batch,
+                &staged,
+                &mut animal,
+                true,
+                &clocks,
+                changed_border,
+                construction,
+            )?;
+            assert!(
+                actual
+                    .construct_captured_creature(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &clocks,
+                        changed_border,
+                        construction,
+                    )
+                    .is_err()
+            );
+            assert!(
+                actual
+                    .check_captured_creature_instance(
+                        &batch,
+                        &staged,
+                        &mut animal,
+                        true,
+                        &wrong_clocks,
+                        changed_border,
+                    )
+                    .is_err()
+            );
+            match actual.check_captured_creature_instance(
+                &batch,
+                &staged,
+                &mut animal,
+                true,
+                &clocks,
+                changed_border,
+            )? {
+                ResumedCreatureInstance::Rejected => {
+                    assert!(animal.inner.probe.is_none());
+                    assert!(animal.inner.constructed.is_none());
+                }
+                ResumedCreatureInstance::NeedsFinalization(actual_pose) => {
+                    assert_eq!(actual_pose, pose);
+                    assert_eq!(
+                        actual.check_captured_creature_instance(
+                            &batch,
+                            &staged,
+                            &mut animal,
+                            true,
+                            &clocks,
+                            changed_border,
+                        )?,
+                        ResumedCreatureInstance::NeedsFinalization(pose)
+                    );
+                }
+            }
+            assert!(pose.geometry.position.iter().all(|v| v.is_finite()));
+            constructed = true;
+            break;
+        }
+        assert!(constructed, "no captured creature reached construction");
         let light_revision = Arc::clone(&staged.light_revision);
         staged.light_revision = Arc::new(());
         assert!(

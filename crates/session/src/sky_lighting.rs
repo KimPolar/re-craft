@@ -342,8 +342,9 @@ fn independent_edit_groups(edits: &[Edit]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// Prefer one atomic pass. If it cannot run, commit only spatially independent
-/// groups that have complete input, retaining all other edits for a later retry.
+/// Prefer one atomic pass. If it cannot run, commit spatially independent
+/// groups with complete input and columns proven not to change sky light.
+/// All remaining edits keep their original order for a later retry.
 fn compute_available(
     snapshot: &World,
     bounds: LightBounds,
@@ -353,11 +354,14 @@ fn compute_available(
 ) -> Option<(Computed, Vec<usize>)> {
     let groups = independent_edit_groups(edits);
     if groups.len() <= 1 {
-        return compute(snapshot, bounds, edits, originals, sources)
-            .map(|result| (result, (0..edits.len()).collect()));
+        return compute(snapshot, bounds, edits, originals, sources);
     }
-    if let Some(result) = compute(snapshot, bounds, edits, originals, sources.clone()) {
-        return Some((result, (0..edits.len()).collect()));
+    let attempt = compute(snapshot, bounds, edits, originals, sources.clone());
+    if attempt
+        .as_ref()
+        .is_some_and(|(_, completed)| completed.len() == edits.len())
+    {
+        return attempt;
     }
 
     let mut world = snapshot.clone();
@@ -366,11 +370,13 @@ fn compute_available(
     let mut completed = Vec::new();
     for indices in groups {
         let group: Vec<_> = indices.iter().map(|&index| edits[index]).collect();
-        if let Some(result) = compute(&world, bounds, &group, originals, sources.clone()) {
+        if let Some((result, local_completed)) =
+            compute(&world, bounds, &group, originals, sources.clone())
+        {
             world = result.world;
             sources = result.sources;
             changed.extend(result.changed);
-            completed.extend(indices);
+            completed.extend(local_completed.into_iter().map(|index| indices[index]));
         }
     }
     if completed.is_empty() {
@@ -407,7 +413,8 @@ fn compute(
     edits: &[Edit],
     originals: &BTreeMap<ChunkPos, Arc<Chunk>>,
     mut sources: SkySources,
-) -> Option<Computed> {
+) -> Option<(Computed, Vec<usize>)> {
+    let original_sources = sources.clone();
     let edited_columns: BTreeSet<_> = sources
         .keys()
         .copied()
@@ -479,16 +486,52 @@ fn compute(
             }
         }
     }
-    let mut changed = relight_changes(&mut work, bounds, &changes, |x, z| {
+    let changed = relight_changes(&mut work, bounds, &changes, |x, z| {
         source_for(&mut sources, &mut scanner, x, z).map(SkyColumn::lowest_source_y)
-    })?;
+    });
+    let Some(mut changed) = changed else {
+        // A column with no sky behavior or direct-source change does not
+        // depend on diffuse propagation. Keep every edit in a changed column
+        // together so its source history and callback order stay intact.
+        let affected: BTreeSet<_> = changes
+            .iter()
+            .map(|change| (change.position.x, change.position.z))
+            .collect();
+        let completed: Vec<_> = edits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, edit)| {
+                (!affected.contains(&(edit.position.x, edit.position.z))).then_some(index)
+            })
+            .collect();
+        if completed.is_empty() {
+            return None;
+        }
+        let mut neutral_sources = original_sources;
+        for &index in &completed {
+            let p = edits[index].position;
+            let column = *sources.get(&(p.x, p.z))?;
+            neutral_sources.insert((p.x, p.z), column);
+        }
+        return Some((
+            Computed {
+                world: snapshot.clone(),
+                changed: BTreeSet::new(),
+                sources: neutral_sources,
+            },
+            completed,
+        ));
+    };
     changed.extend(restored);
     sources.retain(|position, _| edited_columns.contains(position));
-    Some(Computed {
-        world: work,
-        changed,
-        sources,
-    })
+    Some((
+        Computed {
+            world: work,
+            changed,
+            sources,
+        },
+        (0..edits.len()).collect(),
+    ))
 }
 
 fn apply(
@@ -1019,6 +1062,91 @@ mod tests {
     }
 
     #[test]
+    fn neutral_columns_can_finish_while_overlapping_light_waits() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let neutral = BlockPosition {
+            x: 30,
+            y: 15,
+            z: 15,
+        };
+        let changed = BlockPosition { x: 31, ..neutral };
+        let same_column = BlockPosition { y: 14, ..changed };
+        let missing = ChunkPos { x: 2, z: 0 };
+        let run_edits = |sky: &mut SkyLighting, world: &mut Arc<World>| {
+            edit(sky, world, neutral, state("torch", &[]));
+            edit(sky, world, changed, state("stone", &[]));
+            edit(sky, world, same_column, state("torch", &[]));
+        };
+
+        let mut expected = fixture();
+        let mut baseline = SkyLighting::default();
+        baseline.set_enabled(true);
+        run_edits(&mut baseline, &mut expected);
+        finish(&mut baseline, &mut expected, bounds);
+        assert!(baseline.settled());
+
+        let mut world = fixture();
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        run_edits(&mut sky, &mut world);
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(
+            sky.pending
+                .iter()
+                .map(|edit| edit.position)
+                .collect::<Vec<_>>(),
+            [changed, same_column]
+        );
+        assert!(sky.sources.contains_key(&(neutral.x, neutral.z)));
+        assert!(!sky.sources.contains_key(&(changed.x, changed.z)));
+        assert!(!sky.settled());
+
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for (pos, expected) in &expected.chunks {
+            for (y, section) in &expected.sections {
+                assert_eq!(world.chunks[pos].sections[y].sky_light, section.sky_light);
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_light_retains_a_neutral_edit_that_changes_the_source() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let position = BlockPosition { x: 31, y: 0, z: 15 };
+        let slab = Arc::make_mut(&mut world).intern_state(state(
+            "stone_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        ));
+        Arc::make_mut(&mut world)
+            .set_block_id(position.x, position.y, position.z, slab)
+            .unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        sky.sources.insert(
+            (position.x, position.z),
+            SkyColumn::load(&world, bounds, position.x, position.z).unwrap(),
+        );
+        Arc::make_mut(&mut world)
+            .chunks
+            .remove(&ChunkPos { x: 2, z: 0 });
+        edit(
+            &mut sky,
+            &mut world,
+            position,
+            state("oak_slab", &[("type", "bottom"), ("waterlogged", "false")]),
+        );
+        assert_eq!(sky.pending.len(), 1);
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.pending.len(), 1);
+        assert_eq!(sky.pending[0].position, position);
+    }
+
+    #[test]
     fn later_column_uses_original_section_air_status() {
         let bounds = LightBounds::new(0, 32).unwrap();
         let mut world = fixture();
@@ -1208,7 +1336,7 @@ mod tests {
             .arg(&input)
             .arg(&output));
         let expected: Vec<Vec<u8>> =
-            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(expected.len(), 1);
         let mut world = fixture();
         let mut sky = SkyLighting::default();
@@ -1239,6 +1367,63 @@ mod tests {
                         combined.light(x, y, z, true).unwrap(),
                         expected[0][index],
                         "after parked boundary edits, at {x},{y},{z}"
+                    );
+                }
+            }
+        }
+
+        let deferred_edits = [
+            serde_json::json!({"x":30,"y":24,"z":15,"state":"glass","defer":true}),
+            serde_json::json!({"x":31,"y":24,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":31,"y":23,"z":15,"state":"glass","defer":false}),
+        ];
+        std::fs::write(&input, serde_json::to_vec(&deferred_edits).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 1);
+        let mut world = fixture();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        for (x, y, block) in [(30, 24, "glass"), (31, 24, "stone"), (31, 23, "glass")] {
+            edit(
+                &mut sky,
+                &mut world,
+                BlockPosition { x, y, z: 15 },
+                state(block, &[]),
+            );
+        }
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.pending.len(), 2);
+        assert_eq!(sky.pending[0].position.x, 31);
+        assert_eq!(sky.pending[1].position.x, 31);
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..16 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(world.light(x, y, z, true).unwrap(), expected[0][index]);
+                }
+            }
+        }
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(
+                        world.light(x, y, z, true).unwrap(),
+                        expected[0][index],
+                        "after deferred neutral edit, at {x},{y},{z}"
                     );
                 }
             }

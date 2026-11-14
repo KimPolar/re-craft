@@ -23657,16 +23657,28 @@ impl GameSession for LoadedSession {
                 &mut self.experience_orbs,
             );
             crate::collect_water_entry_sounds(&mut self.consume_sounds, &mut self.dropped_items);
+            let vibrations: Vec<_> = self.dropped_items.drain_vibrations().collect();
+            for vibration in vibrations {
+                match vibration {
+                    crate::items::ItemVibration::Splash(entry) => self.dispatch_item_splash(entry),
+                    crate::items::ItemVibration::CactusDamage(position) => self.dispatch_vibration(
+                        "minecraft:entity_damage",
+                        position,
+                        None,
+                        None,
+                        None,
+                    ),
+                }
+            }
             let entries: Vec<_> = self.dropped_items.drain_water_entries().collect();
             for mut entry in entries {
                 entry.tick = self.tick;
-                self.dispatch_item_splash(entry);
                 if self.item_water_entries.len() == 4096 {
                     self.item_water_entries.pop_front();
                 }
                 self.item_water_entries.push_back(entry);
             }
-            // Server block entities run after entity ticks, so a splash cannot
+            // Server block entities run after entity ticks, so an item event cannot
             // replace a vibration that is still in flight during this tick.
             self.advance_saved_sculk_listeners();
             processed += 1;
@@ -31753,6 +31765,7 @@ pub(crate) mod tests {
             "minecraft:calibrated_sculk_sensor",
             "minecraft:redstone_lamp",
             "minecraft:water",
+            "minecraft:cactus",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -43968,6 +43981,50 @@ pub(crate) mod tests {
                 .iter()
                 .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
         );
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn item_cactus_damage_reaches_sculk_listener() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut stack = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(stack.vanilla_item_registry().unwrap());
+        let damage =
+            Arc::new(native_resources::enchantments::OxygenEnchantments::load(&mut stack).unwrap());
+        let (mut session, sensor) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        let (_, blocks) = splash_test_tags();
+        session.set_vibration_tags(
+            Arc::new(native_resources::game_event_tags::GameEventTags::new(
+                BTreeSet::from(["minecraft:entity_damage".into()]),
+                BTreeSet::new(),
+            )),
+            blocks,
+        );
+        session.set_random_tick_speed(0);
+        session.set_game_mode(GameMode::Spectator);
+        session.dropped_items.set_damage_rules(registry, damage);
+        let cactus = session.intern_block(state("minecraft:cactus", &[("age", "0")]));
+        assert!(session.set(IVec3::new(8, 5, 8), cactus));
+        session.dropped_items.spawn_from_entity(
+            session.origin.as_dvec3() + DVec3::new(8.5, 5.0, 8.5),
+            ItemStack::new(
+                "minecraft:stone".into(),
+                1,
+                64,
+                native_persistence::nbt::Tag::Compound(vec![]),
+            )
+            .unwrap(),
+        );
+        session.update(TICK);
+        let (_, event) = session.sculk_listeners[&sensor.to_array()]
+            .vibration
+            .pending()
+            .expect("item damage vibration");
+        assert_eq!(event.event, "minecraft:entity_damage");
+        assert_eq!(event.source, None);
     }
 
     #[test]

@@ -181,6 +181,8 @@ fn collect_item_water_entries(
         }
         queue.push_back(event);
     }
+    // The temporary demo has no sculk listeners.
+    items.drain_vibrations().for_each(drop);
 }
 
 fn collect_water_entry_sounds(queue: &mut VecDeque<ConsumeSound>, items: &mut items::ItemEntities) {

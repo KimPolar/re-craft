@@ -33,13 +33,14 @@ public class ItemLavaOracle {
   }
   static class Item extends ItemEntity {
     World world; ItemStack stack; DamageSources sources; boolean removed;
+    int events; Holder<GameEvent> lastEvent; Entity lastSource;
     BlockPos blockPos;
     Item() { super(null,0,0,0,ItemStack.EMPTY); }
     @Override public Level level() { return world; }
     @Override public EntityType<?> getType() { return EntityTypes.ITEM; }
     @Override public ItemStack getItem() { return stack; }
     @Override public DamageSources damageSources() { return sources; }
-    @Override public void gameEvent(Holder<GameEvent> event, Entity source) { }
+    @Override public void gameEvent(Holder<GameEvent> event, Entity source) { events++; lastEvent=event; lastSource=source; }
     @Override public void clearFreeze() { }
     @Override public void remove(Entity.RemovalReason reason) { removed=true; }
     @Override public boolean isSilent() { return true; }
@@ -126,7 +127,9 @@ public class ItemLavaOracle {
       for(int tick=0;tick<6;tick++) {
         item.hurtServer(world,cactusSource,1.0f);
         var row=new JsonObject(); row.addProperty("health",health.getInt(item));
-        row.addProperty("removed",item.removed); rows.add(row);
+        row.addProperty("removed",item.removed); row.addProperty("events",item.events);
+        row.addProperty("isDamage",item.lastEvent==GameEvent.ENTITY_DAMAGE);
+        row.addProperty("sourceIsNull",item.lastSource==null); rows.add(row);
         if(item.removed) break;
       }
       cactusOut.add(rows);

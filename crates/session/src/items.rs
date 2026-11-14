@@ -553,6 +553,11 @@ struct ItemDamageState {
     invulnerable_time: i32,
 }
 
+pub(crate) enum ItemVibration {
+    Splash(crate::ItemWaterEntry),
+    CactusDamage(DVec3),
+}
+
 type ItemDamageRules = (
     Arc<native_resources::item_registry::ItemRegistry>,
     Arc<native_resources::enchantments::OxygenEnchantments>,
@@ -684,6 +689,7 @@ pub(crate) struct ItemEntities {
     extinguish_sounds: VecDeque<crate::ExtinguishSound>,
     water_entry_sounds: VecDeque<crate::ConsumeSound>,
     water_entries: VecDeque<crate::ItemWaterEntry>,
+    vibrations: VecDeque<ItemVibration>,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -713,6 +719,7 @@ impl Default for ItemEntities {
             extinguish_sounds: VecDeque::new(),
             water_entry_sounds: VecDeque::new(),
             water_entries: VecDeque::new(),
+            vibrations: VecDeque::new(),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1503,6 +1510,10 @@ impl ItemEntities {
         &mut self,
     ) -> impl Iterator<Item = crate::ItemWaterEntry> + '_ {
         self.water_entries.drain(..)
+    }
+
+    pub(crate) fn drain_vibrations(&mut self) -> impl Iterator<Item = ItemVibration> + '_ {
+        self.vibrations.drain(..)
     }
 
     #[cfg(test)]
@@ -2571,7 +2582,7 @@ impl ItemEntities {
                 &mut entity.random,
             );
             if let Some(info) = splash {
-                self.water_entries.push_back(crate::ItemWaterEntry {
+                let entry = crate::ItemWaterEntry {
                     tick: 0,
                     entity_id: entity.id,
                     position: entity.item.position,
@@ -2585,7 +2596,9 @@ impl ItemEntities {
                                 .flatten()
                         })
                         .or_else(|| entity.created.as_ref().and_then(|created| created.uuid)),
-                });
+                };
+                self.water_entries.push_back(entry);
+                self.vibrations.push_back(ItemVibration::Splash(entry));
                 let silent = entity
                     ._saved_source
                     .as_ref()
@@ -2781,19 +2794,32 @@ impl ItemEntities {
                 match cactus(item_bounds(from - origin.as_dvec3()), movement, original) {
                     Some(0) => {}
                     Some(count) => {
-                        // Damage game events and item destruction callbacks are not yet persisted.
-                        self.unresolved_cactus_effect = true;
                         if let Some(rules) = damage_rules {
                             for _ in 0..count {
+                                let before = entity._damage_state.health;
                                 match apply_cactus_contact(entity, rules) {
-                                    Ok(Some(true)) => {
-                                        removed[index] = true;
+                                    Ok(Some(destroyed)) => {
+                                        if entity._damage_state.health != before {
+                                            // Saving the damage and destruction side effects still
+                                            // requires coordinated path and item lifecycle proof.
+                                            self.unresolved_cactus_effect = true;
+                                            self.vibrations.push_back(ItemVibration::CactusDamage(
+                                                entity.item.position,
+                                            ));
+                                        }
+                                        if destroyed {
+                                            removed[index] = true;
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) | Err(_) => {
+                                        self.unresolved_cactus_effect = true;
                                         break;
                                     }
-                                    Ok(Some(false)) => {}
-                                    Ok(None) | Err(_) => break,
                                 }
                             }
+                        } else {
+                            self.unresolved_cactus_effect = true;
                         }
                     }
                     None => self.unresolved_cactus_effect = true,
@@ -4726,13 +4752,13 @@ mod tests {
         live.entities[0].velocity = DVec3::ZERO;
         live.entities[0].no_gravity = true;
         let mut inventory = Arc::new(PlayerInventory::default());
-        for expected in (0..5).rev() {
-            live.tick_with_fluid_bubbles_and_proof(
+        let tick_contact = |items: &mut ItemEntities, inventory: &mut Arc<PlayerInventory>| {
+            items.tick_with_fluid_bubbles_and_proof(
                 IVec3::ZERO,
                 DVec3::splat(100.0),
                 PlayerPose::Standing,
                 GameMode::Spectator,
-                &mut inventory,
+                inventory,
                 |_| &[],
                 |_| 0.6,
                 |_| 0.0,
@@ -4746,6 +4772,16 @@ mod tests {
                 |_| {},
                 |_, _, _| Some(1),
             );
+        };
+        for expected in (0..5).rev() {
+            tick_contact(&mut live, &mut inventory);
+            let events: Vec<_> = live.drain_vibrations().collect();
+            assert_eq!(events.len(), 1);
+            assert!(matches!(events[0], ItemVibration::CactusDamage(_)));
+            let java = &cactus_oracle[0][(4 - expected) as usize];
+            assert_eq!(java["events"].as_u64(), Some((5 - expected) as u64));
+            assert_eq!(java["isDamage"].as_bool(), Some(true));
+            assert_eq!(java["sourceIsNull"].as_bool(), Some(true));
             if expected > 0 {
                 assert_eq!(live.entities[0]._damage_state.health, expected);
             } else {
@@ -4753,6 +4789,16 @@ mod tests {
             }
         }
         assert!(live.ensure_rain_resolved().is_err());
+        let mut immune = ItemEntities::default();
+        immune.set_damage_rules(Arc::clone(&rules.0), Arc::clone(&rules.1));
+        immune.spawn_from_entity(
+            DVec3::new(8.5, 10.0, 8.5),
+            ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap(),
+        );
+        immune.entities[0]._damage_state.invulnerable = true;
+        tick_contact(&mut immune, &mut inventory);
+        assert_eq!(immune.drain_vibrations().count(), 0);
+        assert!(immune.ensure_rain_resolved().is_ok());
         let rain_oracle: Vec<bool> =
             serde_json::from_slice(&std::fs::read(rain_result).unwrap()).unwrap();
         let mut index = 0;

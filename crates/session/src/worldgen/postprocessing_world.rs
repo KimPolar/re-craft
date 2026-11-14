@@ -2028,7 +2028,12 @@ impl GeneratedBlockView<'_> {
                     fast_lava,
                 };
                 let changes = try_tick(
-                    &|p| self.fluid_cell(p),
+                    &|p| match self.fluid_cell(p) {
+                        Cell::Unknown if fluid.kind == FluidKind::Lava => {
+                            self.lava_cell_for_spread(p)
+                        }
+                        cell => cell,
+                    },
                     glam::IVec3::from_array(pos),
                     fluid,
                     settings,
@@ -2191,6 +2196,17 @@ impl GeneratedBlockView<'_> {
         match self.fluid_cell(pos) {
             Cell::Air => Cell::Air,
             Cell::Solid => Cell::Solid,
+            cell @ (Cell::Slab {
+                waterlogged: false, ..
+            }
+            | Cell::Stairs {
+                waterlogged: false, ..
+            }
+            | Cell::Ladder {
+                waterlogged: false, ..
+            }
+            | Cell::FenceDry
+            | Cell::OpenDry) => cell,
             Cell::Fluid(fluid) if fluid.kind == FluidKind::Lava => Cell::Fluid(fluid),
             Cell::Fluid(fluid) if fluid.kind == FluidKind::Water && tagged_water() => {
                 Cell::Fluid(fluid)
@@ -2211,21 +2227,30 @@ impl GeneratedBlockView<'_> {
             {
                 cell
             }
+            Cell::Unknown => {
+                if self.read(pos.to_array()).is_ok_and(|state| {
+                    leaf_distance(&state).ok().flatten().is_some()
+                        && state
+                            .properties
+                            .get("waterlogged")
+                            .is_some_and(|v| v == "false")
+                }) {
+                    Cell::Solid
+                } else {
+                    Cell::Unknown
+                }
+            }
             _ => Cell::Unknown,
         }
     }
 
-    fn lava_wet_neighbor(&self, state: &BlockState) -> bool {
-        self.slab(state).is_some_and(|(_, wet)| wet)
-            || self.stair(state).is_some_and(|(_, wet)| wet)
-            || native_world::collision::fence_waterlogged(state) == Some(true)
-            || ladder_state(state).is_some_and(|(_, wet)| wet)
-            || (super::ore::valid_lichen(state) && state.properties["waterlogged"] == "true")
+    fn lava_shape_neighbor(&self, state: &BlockState) -> bool {
+        self.slab(state).is_some()
+            || self.stair(state).is_some()
+            || native_world::collision::fence_waterlogged(state).is_some()
+            || ladder_state(state).is_some()
+            || super::ore::valid_lichen(state)
             || leaf_distance(state).ok().flatten().is_some()
-                && state
-                    .properties
-                    .get("waterlogged")
-                    .is_some_and(|value| value == "true")
     }
 
     fn tick_generated_lava(
@@ -2305,7 +2330,7 @@ impl GeneratedBlockView<'_> {
             if liquid_state(&state)?.is_none() {
                 ensure!(
                     matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain))
-                        || self.lava_wet_neighbor(&state),
+                        || self.lava_shape_neighbor(&state),
                     "lava requires unsupported neighbor callbacks"
                 );
             }
@@ -2313,7 +2338,7 @@ impl GeneratedBlockView<'_> {
         Ok(())
     }
 
-    fn update_lava_wet_neighbor(
+    fn update_lava_shape_neighbor(
         &mut self,
         pos: glam::IVec3,
         state: &BlockState,
@@ -2322,7 +2347,7 @@ impl GeneratedBlockView<'_> {
         depth: usize,
     ) -> Result<()> {
         ensure!(
-            depth > 0 && self.lava_wet_neighbor(state),
+            depth > 0 && self.lava_shape_neighbor(state),
             "unsupported lava neighbor shape"
         );
         let direction = changed_pos - pos;
@@ -2415,7 +2440,7 @@ impl GeneratedBlockView<'_> {
             } else {
                 ensure!(
                     matches!(supported_postprocessing_block(&state), Ok(DryBlock::Plain))
-                        || self.lava_wet_neighbor(&state),
+                        || self.lava_shape_neighbor(&state),
                     "lava reaction encounters unsupported neighbor"
                 );
                 match state.name.as_str() {
@@ -2537,8 +2562,8 @@ impl GeneratedBlockView<'_> {
                         }
                     }
                 }
-            } else if self.lava_wet_neighbor(&state) {
-                self.update_lava_wet_neighbor(pos, &state, target, &solid, depth - 1)?;
+            } else if self.lava_shape_neighbor(&state) {
+                self.update_lava_shape_neighbor(pos, &state, target, &solid, depth - 1)?;
             }
         }
         self.lava_fizz.push(BlockPosition {
@@ -2725,8 +2750,8 @@ impl GeneratedBlockView<'_> {
                         }
                     }
                 }
-            } else if self.lava_wet_neighbor(&state) {
-                self.update_lava_wet_neighbor(p, &state, target, &next_state, 511)?;
+            } else if self.lava_shape_neighbor(&state) {
+                self.update_lava_shape_neighbor(p, &state, target, &next_state, 511)?;
             }
         }
         Ok(())
@@ -8581,16 +8606,19 @@ mod tests {
                 || case.starts_with("lava_convert_")
                 || case.starts_with("lava_water_down_")
                 || case.starts_with("lava_touch_")
-                || case.starts_with("lava_wet_") =>
+                || case.starts_with("lava_wet_")
+                || case.starts_with("lava_dry_") =>
             {
                 let lava = world.intern_state(BlockState {
                     name: "minecraft:lava".into(),
                     properties: BTreeMap::from([("level".into(), "0".into())]),
                 });
                 world.set_block_id(origin_x, 8, 8, lava).unwrap();
-                if case.starts_with("lava_wet_") {
+                if case.starts_with("lava_wet_") || case.starts_with("lava_dry_") {
                     world.set_block_id(origin_x + 1, 8, 8, air).unwrap();
-                    let (name, properties): (&str, Vec<(&str, &str)>) = match case {
+                    let wet_case = case.replacen("lava_dry_", "lava_wet_", 1);
+                    let fixture_case = wet_case.strip_suffix("_target").unwrap_or(&wet_case);
+                    let (name, properties): (&str, Vec<(&str, &str)>) = match fixture_case {
                         "lava_wet_slab_bottom" => (
                             "stone_slab",
                             vec![("type", "bottom"), ("waterlogged", "true")],
@@ -8646,10 +8674,19 @@ mod tests {
                         name: format!("minecraft:{name}"),
                         properties: properties
                             .into_iter()
-                            .map(|(key, value)| (key.into(), value.into()))
+                            .map(|(key, value)| {
+                                let value = if key == "waterlogged" && case.starts_with("lava_dry_")
+                                {
+                                    "false"
+                                } else {
+                                    value
+                                };
+                                (key.into(), value.into())
+                            })
                             .collect(),
                     });
-                    world.set_block_id(origin_x + 1, 8, 7, block).unwrap();
+                    let z = if case.ends_with("_target") { 8 } else { 7 };
+                    world.set_block_id(origin_x + 1, 8, z, block).unwrap();
                 }
                 if case.starts_with("lava_touch_") {
                     world.set_block_id(origin_x + 1, 8, 8, air).unwrap();
@@ -9502,6 +9539,7 @@ mod tests {
             || case.starts_with("lava_water_down_")
             || case.starts_with("lava_touch_")
             || case.starts_with("lava_wet_")
+            || case.starts_with("lava_dry_")
             || case.starts_with("water_touch_lava_")
         {
             let mut water =
@@ -10051,10 +10089,11 @@ mod tests {
                 trace.push(format!("reaction 7,7,8 {}", state.name));
             }
         }
-        if case.starts_with("lava_wet_") {
-            let state = result.world.block(9, 8, 7).unwrap();
+        if case.starts_with("lava_wet_") || case.starts_with("lava_dry_") {
+            let z = if case.ends_with("_target") { 8 } else { 7 };
+            let state = result.world.block(9, 8, z).unwrap();
             trace.push(format!(
-                "wet 9,8,7 {} {}",
+                "wet 9,8,{z} {} {}",
                 state.name, state.properties["waterlogged"]
             ));
             if state.name == "minecraft:oak_stairs" {
@@ -11691,6 +11730,85 @@ mod tests {
             "lava_wet_ladder",
             "lava_wet_lichen",
             "lava_wet_leaves",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_lava_spreads_next_to_dry_blocks() {
+        for case in [
+            "lava_dry_slab_bottom",
+            "lava_dry_slab_top",
+            "lava_dry_stair",
+            "lava_dry_fence",
+            "lava_dry_ladder",
+            "lava_dry_lichen",
+            "lava_dry_leaves",
+        ] {
+            let trace = water_spread_trace(case);
+            assert_eq!(trace[6], "state 9,8,8 minecraft:lava 2", "{case}");
+            assert!(
+                trace
+                    .iter()
+                    .any(|line| line.starts_with("wet 9,8,7 ") && line.ends_with(" false")),
+                "{case}"
+            );
+            assert!(
+                !trace.iter().any(|line| line.starts_with("fizz ")),
+                "{case}"
+            );
+            if case == "lava_dry_leaves" {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == "block minecraft:oak_leaves 9,8,7 1")
+                );
+            }
+        }
+        for (case, block) in [
+            ("lava_dry_slab_bottom_target", "minecraft:stone_slab"),
+            ("lava_dry_slab_top_target", "minecraft:stone_slab"),
+            ("lava_dry_stair_target", "minecraft:oak_stairs"),
+            ("lava_dry_fence_target", "minecraft:oak_fence"),
+            ("lava_dry_ladder_target", "minecraft:ladder"),
+            ("lava_dry_lichen_target", "minecraft:glow_lichen"),
+            ("lava_dry_leaves_target", "minecraft:oak_leaves"),
+        ] {
+            let trace = water_spread_trace(case);
+            assert_eq!(trace[6], format!("state 9,8,8 {block} false"), "{case}");
+            assert!(
+                !trace.iter().any(|line| line.starts_with("fizz ")),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_lava_dry_neighbors_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lava_dry_neighbors"],
+        );
+        let expected = [
+            "lava_dry_slab_bottom",
+            "lava_dry_slab_top",
+            "lava_dry_stair",
+            "lava_dry_fence",
+            "lava_dry_ladder",
+            "lava_dry_lichen",
+            "lava_dry_leaves",
+            "lava_dry_slab_bottom_target",
+            "lava_dry_slab_top_target",
+            "lava_dry_stair_target",
+            "lava_dry_fence_target",
+            "lava_dry_ladder_target",
+            "lava_dry_lichen_target",
+            "lava_dry_leaves_target",
         ]
         .into_iter()
         .flat_map(water_spread_trace)

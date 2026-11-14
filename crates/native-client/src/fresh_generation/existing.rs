@@ -158,6 +158,61 @@ struct SavedStructurePlan {
     order: Vec<(ResourceId, Vec<SavedStructureKey>)>,
 }
 
+impl SavedStructurePlan {
+    fn planned(
+        &self,
+    ) -> Result<Vec<native_session::worldgen::structure_batch::PlannedStructureDecoration<'_>>>
+    {
+        let mut planned = Vec::with_capacity(self.order.len());
+        for (id, keys) in &self.order {
+            let entry = self
+                .schedule
+                .as_ref()
+                .context("structure schedule is missing")?
+                .steps()
+                .iter()
+                .flatten()
+                .find(|entry| &entry.id == id)
+                .context("structure schedule entry disappeared")?;
+            let starts = keys.iter().map(|key| &self.starts[key].placement).collect();
+            planned.push(
+                native_session::worldgen::structure_batch::PlannedStructureDecoration {
+                    entry,
+                    starts,
+                },
+            );
+        }
+        Ok(planned)
+    }
+
+    fn apply_updates(
+        &mut self,
+        updates: Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    ) {
+        debug_assert_eq!(self.order.len(), updates.len());
+        for ((_, keys), updated) in self.order.iter().zip(updates) {
+            debug_assert_eq!(keys.len(), updated.len());
+            for (key, placement) in keys.iter().zip(updated) {
+                self.starts
+                    .get_mut(key)
+                    .expect("structure start was planned")
+                    .placement = placement;
+            }
+        }
+    }
+}
+
+fn ensure_structure_sources_in_output(
+    sources: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+    mut contains: impl FnMut(native_world::loaded::ChunkPos) -> bool,
+) -> Result<()> {
+    ensure!(
+        sources.into_iter().all(&mut contains),
+        "postprocessed output omits an updated structure source"
+    );
+    Ok(())
+}
+
 /// Decoration inputs from one captured biome neighborhood and pack snapshot.
 /// This plan does not place features or establish terrain or save readiness.
 pub(crate) struct SavedDecorationContext {
@@ -247,6 +302,7 @@ pub(crate) struct CapturedTerrainBatch {
         native_session::worldgen::schedule::GenerationStage,
     >,
     generated_references: BTreeMap<native_world::loaded::ChunkPos, CapturedGeneratedReferences>,
+    treasure_starts: BTreeMap<SavedStructureKey, ResumedTreasureStart>,
     feature_entity_sources: ResumedFeatureEntitySources,
     revision: Arc<()>,
 }
@@ -2323,6 +2379,10 @@ impl PreparedExistingGenerator {
                 ),
             "captured postprocessing inputs changed"
         );
+        ensure_structure_sources_in_output(
+            batch.treasure_starts.keys().map(|(_, source)| *source),
+            |source| sections.sections.contains_key(&source),
+        )?;
         let assets = self
             .terrain_assets
             .as_ref()
@@ -2348,10 +2408,22 @@ impl PreparedExistingGenerator {
                 proof.matches_source(source.as_deref())?,
                 "postprocessing source differs"
             );
-            let mut document = source.as_deref().cloned().unwrap_or_else(|| NamedTag {
-                name: "".into(),
-                value: Tag::Compound(vec![]),
-            });
+            let mut document = if batch
+                .treasure_starts
+                .keys()
+                .any(|(_, source)| *source == pos)
+            {
+                self.draft_captured_structure_starts(
+                    batch,
+                    native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+                )?
+                .document
+            } else {
+                source.as_deref().cloned().unwrap_or_else(|| NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                })
+            };
             if let Some(references) = batch.generated_references.get(&pos) {
                 merge_generated_structure_references(&mut document, references)?;
             } else {
@@ -3521,6 +3593,27 @@ impl PreparedExistingGenerator {
             Arc::ptr_eq(&self.identity, &world.identity),
             "structure belongs to another generation capture"
         );
+        self.draft_saved_treasure_starts(&world.treasure_starts, position)
+    }
+
+    /// Retain the changed structure source independently of terrain output.
+    pub fn draft_captured_structure_starts(
+        &self,
+        batch: &CapturedTerrainBatch,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<ResumedStructureDraft> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "structure belongs to another generation capture"
+        );
+        self.draft_saved_treasure_starts(&batch.treasure_starts, position)
+    }
+
+    fn draft_saved_treasure_starts(
+        &self,
+        treasure_starts: &BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<ResumedStructureDraft> {
         let source = self
             .context
             .inputs()
@@ -3533,8 +3626,7 @@ impl PreparedExistingGenerator {
             x: position.x,
             z: position.z,
         };
-        let updates: Vec<_> = world
-            .treasure_starts
+        let updates: Vec<_> = treasure_starts
             .iter()
             .filter(|((_, pos), _)| *pos == source_pos)
             .collect();
@@ -3796,18 +3888,21 @@ impl PreparedExistingGenerator {
         world: &ResumedTerrainWorld,
         target: native_persistence::world::ChunkPos,
     ) -> Result<SavedStructurePlan> {
+        let references = self.restore_saved_structure_references(target)?;
+        validate_saved_decoration_references(&references)?;
+        self.prepare_captured_structure_plan(&world.treasure_starts, &references.references)
+    }
+
+    fn prepare_captured_structure_plan(
+        &mut self,
+        previous: &BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+        references: &native_session::worldgen::structure_references::OrderedStructureReferences,
+    ) -> Result<SavedStructurePlan> {
         use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
         use native_session::worldgen::saved_structure_starts::{
             RestoredStructurePiece, RestoredStructureStart,
         };
-        let references = self.restore_saved_structure_references(target)?;
-        validate_saved_decoration_references(&references)?;
-        if references
-            .references
-            .membership()
-            .values()
-            .all(BTreeSet::is_empty)
-        {
+        if references.membership().values().all(BTreeSet::is_empty) {
             return Ok(SavedStructurePlan {
                 schedule: None,
                 starts: BTreeMap::new(),
@@ -3834,7 +3929,6 @@ impl PreparedExistingGenerator {
             .collect();
         ensure!(
             references
-                .references
                 .membership()
                 .keys()
                 .all(|id| registered.contains(id)),
@@ -3844,7 +3938,7 @@ impl PreparedExistingGenerator {
         let mut starts = BTreeMap::new();
         let mut order = Vec::new();
         for entry in schedule.steps().iter().flatten() {
-            let Some(sources) = references.references.order(&entry.id) else {
+            let Some(sources) = references.order(&entry.id) else {
                 continue;
             };
             let mut keys = Vec::new();
@@ -3869,7 +3963,7 @@ impl PreparedExistingGenerator {
                         .context("referenced structure source missing")?
                         .document,
                 );
-                let value = if let Some(value) = world.treasure_starts.get(&key) {
+                let value = if let Some(value) = previous.get(&key) {
                     ensure!(
                         Arc::ptr_eq(&value.source, &captured),
                         "saved structure source differs"
@@ -4065,28 +4159,7 @@ impl PreparedExistingGenerator {
         let attempt = priming.and_then(|()| {
             self.with_saved_prepared_decoration(context, |prepared| {
                 if let Some(structures) = &structures {
-                    let mut planned = Vec::with_capacity(structures.order.len());
-                    for (id, keys) in &structures.order {
-                        let entry = structures
-                            .schedule
-                            .as_ref()
-                            .context("structure schedule is missing")?
-                            .steps()
-                            .iter()
-                            .flatten()
-                            .find(|entry| &entry.id == id)
-                            .context("structure schedule entry disappeared")?;
-                        let starts = keys
-                            .iter()
-                            .map(|key| &structures.starts[key].placement)
-                            .collect();
-                        planned.push(
-                            native_session::worldgen::structure_batch::PlannedStructureDecoration {
-                                entry,
-                                starts,
-                            },
-                        );
-                    }
+                    let planned = structures.planned()?;
                     if let Some(light) = light {
                         schedule.run_features_with_structure_plan_and_visible_light(
                             &mut world.terrain,
@@ -4128,18 +4201,10 @@ impl PreparedExistingGenerator {
             }
         };
         if let Some(structures) = structures.as_mut() {
-            debug_assert_eq!(structures.order.len(), updates.len());
-            for ((_, keys), updated) in structures.order.iter().zip(updates) {
-                debug_assert_eq!(keys.len(), updated.len());
-                for (key, placement) in keys.iter().zip(updated) {
-                    structures
-                        .starts
-                        .get_mut(key)
-                        .expect("structure start was planned")
-                        .placement = placement;
-                    world.feature_touched.insert(key.1);
-                }
-            }
+            structures.apply_updates(updates);
+            world
+                .feature_touched
+                .extend(structures.starts.keys().map(|key| key.1));
             world.treasure_starts.append(&mut structures.starts);
         }
         world.feature_touched.extend(positions);
@@ -4285,8 +4350,8 @@ impl PreparedExistingGenerator {
         })
     }
 
-    /// Run FEATURES for a mixed captured batch when its structure references
-    /// are empty or new structure generation is disabled.
+    /// Run FEATURES for a mixed captured batch, including supported saved
+    /// buried-treasure references. Generated starts remain unsupported.
     /// A light-dependent feature fails until an appropriate light view exists.
     /// Results remain intermediate and do not authorize saving the world.
     pub fn run_captured_features(
@@ -4334,24 +4399,18 @@ impl PreparedExistingGenerator {
             "features dependencies are incomplete"
         );
         let structures_enabled = self.generate_structures;
-        if structures_enabled {
-            let empty = if let Some(generated) = batch.generated_references.get(&center) {
-                generated
-                    .references
-                    .membership()
-                    .values()
-                    .all(BTreeSet::is_empty)
+        let mut structures = if structures_enabled {
+            let references = if let Some(generated) = batch.generated_references.get(&center) {
+                generated.references.clone()
             } else {
                 let saved = self.restore_saved_structure_references(context.position)?;
                 validate_saved_decoration_references(&saved)?;
-                saved
-                    .references
-                    .membership()
-                    .values()
-                    .all(BTreeSet::is_empty)
+                saved.references
             };
-            ensure!(empty, "captured structure decoration is not prepared");
-        }
+            Some(self.prepare_captured_structure_plan(&batch.treasure_starts, &references)?)
+        } else {
+            None
+        };
         let captured = self.context.inputs().sources().chunks();
         let mut positions = Vec::with_capacity(9);
         for dz in -1i32..=1 {
@@ -4424,35 +4483,43 @@ impl PreparedExistingGenerator {
         })();
         let result = priming.and_then(|()| {
             self.with_saved_prepared_decoration(context, |prepared| {
-                match (structures_enabled, light) {
-                    (true, Some(light)) => batch
-                        .schedule
-                        .run_features_with_structure_plan_and_visible_light(
+                if let Some(structures) = &structures {
+                    let planned = structures.planned()?;
+                    match light {
+                        Some(light) => batch
+                            .schedule
+                            .run_features_with_structure_plan_and_visible_light(
+                                &mut batch.terrain,
+                                prepared,
+                                &planned,
+                                &light.light,
+                            ),
+                        None => batch.schedule.run_features_with_structure_plan(
                             &mut batch.terrain,
                             prepared,
-                            &[],
-                            &light.light,
-                        )
-                        .map(|(features, _)| features),
-                    (true, None) => batch
-                        .schedule
-                        .run_features_with_structure_plan(&mut batch.terrain, prepared, &[])
-                        .map(|(features, _)| features),
-                    (false, Some(light)) => batch.schedule.run_features_with_visible_light(
-                        &mut batch.terrain,
-                        prepared,
-                        false,
-                        &light.light,
-                    ),
-                    (false, None) => {
-                        batch
-                            .schedule
-                            .run_features(&mut batch.terrain, prepared, false, None)
+                            &planned,
+                        ),
                     }
+                } else {
+                    let features = match light {
+                        Some(light) => batch.schedule.run_features_with_visible_light(
+                            &mut batch.terrain,
+                            prepared,
+                            false,
+                            &light.light,
+                        )?,
+                        None => batch.schedule.run_features(
+                            &mut batch.terrain,
+                            prepared,
+                            false,
+                            None,
+                        )?,
+                    };
+                    Ok((features, Vec::new()))
                 }
             })
         });
-        let result = match result {
+        let (result, updates) = match result {
             Ok(result) => result,
             Err(error) => {
                 batch.terrain = previous_terrain;
@@ -4460,6 +4527,10 @@ impl PreparedExistingGenerator {
                 return Err(error);
             }
         };
+        if let Some(structures) = structures.as_mut() {
+            structures.apply_updates(updates);
+            batch.treasure_starts.append(&mut structures.starts);
+        }
         batch.feature_entity_sources.complete(center, entity_free);
         batch.revision = Arc::new(());
         Ok(result)
@@ -5220,6 +5291,7 @@ impl PreparedExistingGenerator {
             sources,
             saved_stages: BTreeMap::new(),
             generated_references,
+            treasure_starts: BTreeMap::new(),
             feature_entity_sources: ResumedFeatureEntitySources::default(),
             revision: Arc::new(()),
         })
@@ -9622,6 +9694,21 @@ mod tests {
     }
 
     #[test]
+    fn postprocessed_output_requires_every_changed_structure_source() {
+        use native_world::loaded::ChunkPos;
+
+        let first = ChunkPos { x: -1, z: 2 };
+        let second = ChunkPos { x: 3, z: -4 };
+        let output = BTreeSet::from([first]);
+        let error =
+            ensure_structure_sources_in_output([first, second], |pos| output.contains(&pos))
+                .expect_err("a changed structure source must not be omitted");
+        assert!(format!("{error:#}").contains("omits an updated structure source"));
+        ensure_structure_sources_in_output([first], |pos| output.contains(&pos)).unwrap();
+        ensure_structure_sources_in_output([], |_| false).unwrap();
+    }
+
+    #[test]
     fn saved_decoration_references_reject_discarded_data() -> Result<()> {
         use native_session::worldgen::structure_references::restore_saved_structure_references;
         let center = native_world::loaded::ChunkPos { x: 3, z: 3 };
@@ -12472,6 +12559,7 @@ mod tests {
                 .collect(),
             saved_stages: BTreeMap::new(),
             generated_references: BTreeMap::new(),
+            treasure_starts: BTreeMap::new(),
             feature_entity_sources: ResumedFeatureEntitySources::default(),
             revision: Arc::new(()),
         };
@@ -12505,7 +12593,7 @@ mod tests {
                 &captured_light,
             )
             .expect_err("a nonempty structure plan must not be skipped");
-        assert!(format!("{error:#}").contains("captured structure decoration is not prepared"));
+        assert!(format!("{error:#}").contains("referenced structure start missing"));
         assert!(Arc::ptr_eq(&before, &captured_batch.terrain().snapshot()));
         assert_eq!(
             captured_batch.schedule().completed(center),
@@ -12788,6 +12876,54 @@ mod tests {
                 columns,
             )
             .context("light snapshot unavailable")?;
+        let mut captured_biomes = restored.generator.biome_neighborhood()?;
+        for z in 2..=4 {
+            for x in 2..=4 {
+                captured_biomes.insert(Arc::clone(
+                    decoration.biomes.chunk([x, z]).context("biome missing")?,
+                ))?;
+            }
+        }
+        let mut captured = CapturedTerrainBatch {
+            identity: Arc::clone(&restored.identity),
+            schedule: schedule.clone(),
+            biomes: captured_biomes,
+            terrain: terrain.terrain.clone(),
+            sources: terrain
+                .sources
+                .iter()
+                .map(|(pos, source)| (*pos, Some(Arc::clone(source))))
+                .collect(),
+            saved_stages: BTreeMap::new(),
+            generated_references: BTreeMap::new(),
+            treasure_starts: BTreeMap::new(),
+            feature_entity_sources: ResumedFeatureEntitySources::default(),
+            revision: Arc::new(()),
+        };
+        let captured_context = restored.prepare_captured_decoration(&captured, saved_center)?;
+        let captured_light =
+            restored.bind_captured_initial_feature_light(&captured, light.clone())?;
+        let before = captured.terrain().snapshot();
+        assert!(
+            restored
+                .run_captured_features(&mut captured, &captured_context)
+                .is_err()
+        );
+        assert!(captured.treasure_starts.is_empty());
+        assert!(Arc::ptr_eq(&before, &captured.terrain().snapshot()));
+        assert_eq!(
+            captured.schedule().completed(center),
+            Some(GenerationStage::Terrain)
+        );
+        assert_eq!(
+            restored.run_captured_features_with_initial_light(
+                &mut captured,
+                &captured_context,
+                &captured_light
+            )?,
+            vec![true]
+        );
+        assert!(!captured_light.matches_batch(&captured));
         let light = restored.bind_initial_feature_light(&terrain, light)?;
         assert_eq!(
             restored.run_saved_features_with_initial_light(
@@ -12822,6 +12958,25 @@ mod tests {
             treasure.placement.bounds
         );
         let draft = restored.draft_resumed_structure_starts(&terrain, saved_center)?;
+        let captured_draft = restored.draft_captured_structure_starts(&captured, saved_center)?;
+        assert_eq!(captured_draft.document(), draft.document());
+        assert!(captured_draft.matches_source(&treasure.source)?);
+        assert_eq!(
+            captured.treasure_starts[&key].placement.bounds,
+            treasure.placement.bounds
+        );
+        let captured_world = captured.terrain().snapshot();
+        let normal_world = terrain.terrain().snapshot();
+        for yy in restored.lighting.min_y..restored.lighting.min_y + restored.lighting.height {
+            for zz in 32..80 {
+                for xx in 32..80 {
+                    assert_eq!(
+                        captured_world.block(xx, yy, zz),
+                        normal_world.block(xx, yy, zz)
+                    );
+                }
+            }
+        }
         assert!(draft.matches_source(&treasure.source)?);
         assert_eq!(
             draft.document().value.get("Status"),

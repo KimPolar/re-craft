@@ -120,6 +120,31 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
+        if(args.length>0 && args[0].equals("speleothem_tick")) {
+            var tickMethod=SpeleothemBlock.class.getDeclaredMethod("tick",BlockState.class,ServerLevel.class,BlockPos.class,RandomSource.class);
+            tickMethod.setAccessible(true);
+            for(var block:List.of(Blocks.POINTED_DRIPSTONE,Blocks.SULFUR_SPIKE))
+                for(var direction:List.of(Direction.UP,Direction.DOWN))
+                    for(var wet:List.of(false,true)) for(var restored:List.of(false,true)) {
+                        blocks.clear();lightChecks.clear();fizzEvents.clear();
+                        var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
+                        blockAccess=new LevelTicks<Block>(p->true);fluidAccess=new LevelTicks<Fluid>(p->true);
+                        blockAccess.addContainer(new ChunkPos(0,0),bt);fluidAccess.addContainer(new ChunkPos(0,0),ft);
+                        counter=0;random=RandomSource.create(42);set(level,"random",random);updater=new CollectingNeighborUpdater(level,100000);
+                        var spike=block.defaultBlockState().setValue(SpeleothemBlock.TIP_DIRECTION,direction).setValue(SpeleothemBlock.WATERLOGGED,wet);
+                        var support=pos.relative(direction.getOpposite());blocks.put(pos,spike);
+                        if(!level.setBlock(support,Blocks.AIR.defaultBlockState(),3,512))throw new AssertionError("support unchanged");
+                        var scheduled=bt.pack(100);
+                        if(scheduled.size()!=1)throw new AssertionError("expected one speleothem tick: "+scheduled);
+                        int delay=scheduled.getFirst().delay();
+                        if(restored)level.setBlock(support,Blocks.STONE.defaultBlockState(),3,512);
+                        if(direction==Direction.UP)tickMethod.invoke(block,get(pos),level,pos,random);
+                        var result=get(pos);
+                        out.printf("%s %s %s %s %d %s%n",BuiltInRegistries.BLOCK.getKey(block),direction,wet,restored,delay,BuiltInRegistries.BLOCK.getKey(result.getBlock()));
+                    }
+            out.println("END_RESULT");
+            return;
+        }
         var leafTypes = new LinkedHashMap<String,Block>();
         leafTypes.put("oak_leaves",Blocks.OAK_LEAVES); leafTypes.put("spruce_leaves",Blocks.SPRUCE_LEAVES);
         leafTypes.put("birch_leaves",Blocks.BIRCH_LEAVES); leafTypes.put("jungle_leaves",Blocks.JUNGLE_LEAVES);

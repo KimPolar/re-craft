@@ -957,6 +957,10 @@ pub struct LoadedSession {
     leaf_deferred: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
     leaf_deferred_revision: Option<u64>,
     leaf_pending: BTreeSet<LeafTickKey>,
+    speleothem_ticks: BTreeMap<(i128, i32, i64, u64), SpeleothemTickKey>,
+    speleothem_deferred: BTreeMap<(i128, i32, i64, u64), SpeleothemTickKey>,
+    speleothem_deferred_revision: Option<u64>,
+    speleothem_pending: BTreeSet<SpeleothemTickKey>,
     unresolved_leaf_shape: bool,
     unresolved_fence_shape: bool,
     unresolved_leaf_decay: bool,
@@ -1172,6 +1176,7 @@ enum GeneratedBlockTickKind {
     Bubble(BubbleTickKind),
     Soil(SoilKind),
     Leaf(LeafKind),
+    Speleothem(SpeleothemKind),
 }
 
 impl GeneratedBlockTickKind {
@@ -1184,6 +1189,9 @@ impl GeneratedBlockTickKind {
         }
         if let Some(kind) = LeafKind::from_id(id) {
             return Some(Self::Leaf(kind));
+        }
+        if let Some(kind) = SpeleothemKind::from_id(id) {
+            return Some(Self::Speleothem(kind));
         }
         match id {
             "minecraft:air" | "air" => Some(Self::Air(AirKind::Air)),
@@ -1198,6 +1206,37 @@ impl GeneratedBlockTickKind {
                 .or_else(|| SoilKind::from_name(id).map(Self::Soil)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SpeleothemKind {
+    Dripstone,
+    Sulfur,
+}
+
+impl SpeleothemKind {
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "minecraft:pointed_dripstone" => Some(Self::Dripstone),
+            "minecraft:sulfur_spike" => Some(Self::Sulfur),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Dripstone => "minecraft:pointed_dripstone",
+            Self::Sulfur => "minecraft:sulfur_spike",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SpeleothemTickKey {
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: SpeleothemKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1270,6 +1309,7 @@ enum CollectedBlockTick {
     Bubble(BubbleTickKey),
     Sensor((i32, i32, i32, bool)),
     Leaf(LeafTickKey),
+    Speleothem(SpeleothemTickKey),
 }
 
 impl CollectedBlockTick {
@@ -1283,6 +1323,7 @@ impl CollectedBlockTick {
             Self::Ice((x, y, z)) => ("minecraft:frosted_ice", [x, y, z]),
             Self::Bubble(k) => (k.kind.id(), [k.x, k.y, k.z]),
             Self::Leaf(k) => (k.kind.id(), [k.x, k.y, k.z]),
+            Self::Speleothem(k) => (k.kind.id(), [k.x, k.y, k.z]),
             Self::Sensor((x, y, z, calibrated)) => (
                 if calibrated {
                     "minecraft:calibrated_sculk_sensor"
@@ -1315,6 +1356,9 @@ fn generated_block_key(
         }
         GeneratedBlockTickKind::Leaf(kind) => {
             CollectedBlockTick::Leaf(LeafTickKey { x, y, z, kind })
+        }
+        GeneratedBlockTickKind::Speleothem(kind) => {
+            CollectedBlockTick::Speleothem(SpeleothemTickKey { x, y, z, kind })
         }
         GeneratedBlockTickKind::Sensor(calibrated) => {
             CollectedBlockTick::Sensor((x, y, z, calibrated))
@@ -6314,6 +6358,7 @@ impl LoadedSession {
 
     pub fn set_speleothem_tags(&mut self, tags: Arc<native_resources::ore_feature::OreBlockTags>) {
         self.speleothem_tags = Some(tags);
+        self.speleothem_deferred_revision = None;
     }
 
     pub fn set_bubble_column_tags(
@@ -6760,6 +6805,11 @@ impl LoadedSession {
                     self.leaf_pending.insert(key);
                     self.leaf_ticks.insert(order, key);
                 }
+                GeneratedBlockTickKind::Speleothem(kind) => {
+                    let key = SpeleothemTickKey { x, y, z, kind };
+                    self.speleothem_pending.insert(key);
+                    self.speleothem_ticks.insert(order, key);
+                }
             }
         }
         for (chunk, tick, kind, source) in fluids {
@@ -6859,6 +6909,7 @@ impl LoadedSession {
         count_ticks!(self.bubble_ticks, CollectedBlockTick::Bubble);
         count_ticks!(self.sensor_ticks, CollectedBlockTick::Sensor);
         count_ticks!(self.leaf_ticks, CollectedBlockTick::Leaf);
+        count_ticks!(self.speleothem_ticks, CollectedBlockTick::Speleothem);
         count_ticks!(self.air_ticks, CollectedBlockTick::Air);
         ensure!(
             actual == expected,
@@ -7013,6 +7064,7 @@ impl LoadedSession {
     pub fn set_block_loot(&mut self, loot: Arc<BlockLootTables>) {
         self.loot = Some(loot);
         self.sand_deferred_revision = None;
+        self.speleothem_deferred_revision = None;
     }
 
     pub fn set_washed_away_blocks(&mut self, blocks: Arc<BTreeSet<String>>) {
@@ -7540,6 +7592,10 @@ impl LoadedSession {
             leaf_deferred: BTreeMap::new(),
             leaf_deferred_revision: None,
             leaf_pending: BTreeSet::new(),
+            speleothem_ticks: BTreeMap::new(),
+            speleothem_deferred: BTreeMap::new(),
+            speleothem_deferred_revision: None,
+            speleothem_pending: BTreeSet::new(),
             unresolved_leaf_shape: false,
             unresolved_fence_shape: false,
             unresolved_leaf_decay: false,
@@ -7636,6 +7692,7 @@ impl LoadedSession {
             session.enqueue_saved_bubble(&ticks);
             session.enqueue_saved_soil(&ticks);
             session.enqueue_saved_leaves(&ticks);
+            session.enqueue_saved_speleothems(&ticks);
             session.enqueue_saved_air(&ticks);
         }
         let resident: Vec<_> = session.world.chunks.keys().copied().collect();
@@ -10609,6 +10666,7 @@ impl LoadedSession {
                     FallingKind::from_id(&tick.block).is_some()
                         || SoilKind::from_name(&tick.block).is_some()
                         || LeafKind::from_id(&tick.block).is_some()
+                        || SpeleothemKind::from_id(&tick.block).is_some()
                         || AirKind::from_id(&tick.block).is_some()
                         || native_core::button::Button::from_id(&tick.block).is_some()
                         || BubbleTickKind::from_id(&tick.block).is_some()
@@ -10781,6 +10839,41 @@ impl LoadedSession {
                 .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
                 .all(|key| queued_leaves.contains(key)),
             "leaf tick is missing its scheduled order"
+        );
+        let mut queued_speleothems = BTreeSet::new();
+        for (order, &key) in self
+            .speleothem_ticks
+            .iter()
+            .chain(&self.speleothem_deferred)
+            .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+        {
+            queued_speleothems.insert(key);
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
+                .context("speleothem tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: key.kind.id().into(),
+                    position: [key.x, key.y, key.z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.speleothem_pending
+                .iter()
+                .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+                .all(|key| queued_speleothems.contains(key)),
+            "speleothem tick is missing its scheduled order"
+        );
+        ensure!(
+            !self
+                .speleothem_deferred
+                .values()
+                .any(|key| { key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z }),
+            "a speleothem tick could not be simulated for saving"
         );
         let mut queued_air = BTreeSet::new();
         for (order, &key) in self
@@ -17165,6 +17258,7 @@ impl LoadedSession {
         self.enqueue_saved_bubble(blocks);
         self.enqueue_saved_soil(blocks);
         self.enqueue_saved_leaves(blocks);
+        self.enqueue_saved_speleothems(blocks);
         self.enqueue_saved_air(blocks);
         if let Some(order) = &mut fluid_order {
             let supported = fluids.iter().all(|tick| {
@@ -17760,6 +17854,62 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_speleothems(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
+        for (index, tick) in ticks.iter().enumerate() {
+            let Some(kind) = SpeleothemKind::from_id(&tick.block) else {
+                continue;
+            };
+            let [x, y, z] = tick.position;
+            let key = SpeleothemTickKey { x, y, z, kind };
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            self.speleothem_pending.insert(key);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.speleothem_ticks.insert(
+                (
+                    self.scheduled_tick() + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
+    fn schedule_speleothem(&mut self, absolute: IVec3, kind: SpeleothemKind, delay: i32) {
+        let key = SpeleothemTickKey {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+            kind,
+        };
+        let subtick = self.next_scheduled_sub_tick();
+        let duplicate = !self.speleothem_pending.insert(key);
+        self.mirror_generated_block_tick(kind.id(), absolute, i64::from(delay), subtick, duplicate);
+        if duplicate {
+            return;
+        }
+        self.mark_tick_chunk_dirty(key.x, key.z);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+        self.speleothem_ticks.insert(
+            (
+                self.scheduled_tick() + i128::from(delay),
+                0,
+                subtick,
+                sequence,
+            ),
+            key,
+        );
+    }
+
     fn enqueue_saved_air(&mut self, ticks: &[SavedBlockTick]) {
         self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
@@ -18071,6 +18221,9 @@ impl LoadedSession {
                 .first_key_value()
                 .map(|(order, _)| order.0),
             self.leaf_ticks.first_key_value().map(|(order, _)| order.0),
+            self.speleothem_ticks
+                .first_key_value()
+                .map(|(order, _)| order.0),
             self.air_ticks.first_key_value().map(|(order, _)| order.0),
         ];
         if next
@@ -18136,6 +18289,9 @@ impl LoadedSession {
                 CollectedBlockTick::Leaf(_) => {
                     find_order!(self.leaf_ticks, CollectedBlockTick::Leaf, 7)
                 }
+                CollectedBlockTick::Speleothem(_) => {
+                    find_order!(self.speleothem_ticks, CollectedBlockTick::Speleothem, 9)
+                }
                 CollectedBlockTick::Air(_) => {
                     find_order!(self.air_ticks, CollectedBlockTick::Air, 8)
                 }
@@ -18189,6 +18345,10 @@ impl LoadedSession {
                 CollectedBlockTick::Leaf(key) => {
                     self.leaf_ticks.remove(order);
                     self.leaf_pending.remove(&key);
+                }
+                CollectedBlockTick::Speleothem(key) => {
+                    self.speleothem_ticks.remove(order);
+                    self.speleothem_pending.remove(&key);
                 }
                 CollectedBlockTick::Air(key) => {
                     self.air_ticks.remove(order);
@@ -18247,6 +18407,9 @@ impl LoadedSession {
         if process_leaves && self.leaf_deferred_revision != Some(revision) {
             self.leaf_ticks.append(&mut self.leaf_deferred);
         }
+        if process_leaves && self.speleothem_deferred_revision != Some(revision) {
+            self.speleothem_ticks.append(&mut self.speleothem_deferred);
+        }
         if process_leaves && self.air_deferred_revision != Some(revision) {
             self.air_ticks.append(&mut self.air_deferred);
         }
@@ -18258,6 +18421,7 @@ impl LoadedSession {
         let mut deferred_bubble = Vec::new();
         let mut deferred_sensors = Vec::new();
         let mut deferred_leaves = Vec::new();
+        let mut deferred_speleothems = Vec::new();
         let mut deferred_air = Vec::new();
         let indexed = if process_sand
             && process_buttons
@@ -18300,6 +18464,13 @@ impl LoadedSession {
             let leaf_order = process_leaves
                 .then(|| self.leaf_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
+            let speleothem_order = process_leaves
+                .then(|| {
+                    self.speleothem_ticks
+                        .first_key_value()
+                        .map(|(order, _)| *order)
+                })
+                .flatten();
             let air_order = process_leaves
                 .then(|| self.air_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
@@ -18313,6 +18484,7 @@ impl LoadedSession {
                 (sensor_order, 6),
                 (leaf_order, 7),
                 (air_order, 8),
+                (speleothem_order, 9),
             ]
             .into_iter()
             .filter_map(|(order, kind)| order.map(|order| (order, kind)))
@@ -18354,6 +18526,10 @@ impl LoadedSession {
                 }
                 8 => {
                     let key = self.air_ticks[&order];
+                    IVec3::new(key.x, key.y, key.z)
+                }
+                9 => {
+                    let key = self.speleothem_ticks[&order];
                     IVec3::new(key.x, key.y, key.z)
                 }
                 _ => unreachable!(),
@@ -18437,6 +18613,13 @@ impl LoadedSession {
                         self.air_pending.remove(&key);
                     }
                     CollectedBlockTick::Air(key)
+                }
+                9 => {
+                    let key = self.speleothem_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.speleothem_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Speleothem(key)
                 }
                 _ => unreachable!(),
             };
@@ -18988,6 +19171,11 @@ impl LoadedSession {
                     }
                 }
                 self.mark_tick_chunk_dirty(key.x, key.z);
+            } else if let CollectedBlockTick::Speleothem(key) = entry {
+                if !self.advance_speleothem_tick(key) {
+                    self.speleothem_pending.insert(key);
+                    deferred_speleothems.push((order, key));
+                }
             } else {
                 let CollectedBlockTick::Soil(absolute, soil) = entry else {
                     unreachable!("all block tick kinds are handled");
@@ -19058,6 +19246,7 @@ impl LoadedSession {
             || !deferred_bubble.is_empty()
             || !deferred_sensors.is_empty()
             || !deferred_leaves.is_empty()
+            || !deferred_speleothems.is_empty()
         {
             self.generated_block_order = None;
         }
@@ -19094,6 +19283,8 @@ impl LoadedSession {
         if process_leaves {
             self.leaf_deferred.extend(deferred_leaves);
             self.leaf_deferred_revision = Some(revision);
+            self.speleothem_deferred.extend(deferred_speleothems);
+            self.speleothem_deferred_revision = Some(revision);
             self.air_deferred.extend(deferred_air);
             self.air_deferred_revision = Some(revision);
         }
@@ -19917,7 +20108,116 @@ impl LoadedSession {
             !self.unresolved_speleothem_shape,
             "a speleothem neighbor update could not be resolved for saving"
         );
+        anyhow::ensure!(
+            self.speleothem_deferred.is_empty(),
+            "a speleothem tick could not be simulated for saving"
+        );
         Ok(())
+    }
+
+    /// Return false when the tick requires data or a falling entity that this
+    /// session cannot yet simulate; callers retain the original scheduled tick.
+    fn advance_speleothem_tick(&mut self, key: SpeleothemTickKey) -> bool {
+        let absolute = IVec3::new(key.x, key.y, key.z);
+        let Some(relative) = subtract(absolute, self.origin) else {
+            return false;
+        };
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        let Some(block) = self.world.state(id).cloned() else {
+            return false;
+        };
+        if block.name != key.kind.id() {
+            self.mark_tick_chunk_dirty(key.x, key.z);
+            return true;
+        }
+        if native_world::collision::positioned_speleothem_shape(&block, IVec3::ZERO).is_none() {
+            return false;
+        }
+        if block.properties["vertical_direction"] == "down" {
+            // A stalactite creates falling entities, including tip-specific
+            // damage. Do not consume its tick until those effects are modeled.
+            return false;
+        }
+        let Some(support_pos) = add(relative, IVec3::NEG_Y) else {
+            return false;
+        };
+        let Cell::State(support_id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            support_pos,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        let Some(support) = self.world.state(support_id) else {
+            return false;
+        };
+        let Some(tags) = &self.speleothem_tags else {
+            return false;
+        };
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:speleothems").expect("static tag")
+        });
+        let Ok(tagged) = tags.contains(tag, &support.name) else {
+            return false;
+        };
+        let same = tagged
+            && support.name == block.name
+            && support
+                .properties
+                .get("vertical_direction")
+                .is_some_and(|direction| direction == "up");
+        let sturdy = if same {
+            true
+        } else {
+            let Some(sturdy) = native_world::collision::button_support_face(support, IVec3::Y)
+            else {
+                return false;
+            };
+            sturdy
+        };
+        if sturdy {
+            self.mark_tick_chunk_dirty(key.x, key.z);
+            return true;
+        }
+        let replacement = if block.properties["waterlogged"] == "true" {
+            self.intern_block(state("minecraft:water", &[("level", "0")]))
+        } else {
+            self.states[0]
+        };
+        let Some(checked) = self.check_block_set(relative, replacement, true, false) else {
+            return false;
+        };
+        let Ok((drops, _)) = self.stage_block_loot_without_entity(&block) else {
+            return false;
+        };
+        self.dropped_items.drop_block_resources(
+            absolute,
+            drops,
+            None,
+            self.block_drops,
+            &mut self.level_random,
+        );
+        assert!(self.apply_block_set(relative, replacement, true, checked));
+        self.dispatch_vibration(
+            "minecraft:block_destroy",
+            absolute.as_dvec3() + DVec3::splat(0.5),
+            None,
+            None,
+            Some(&block.name),
+        );
+        self.mark_tick_chunk_dirty(key.x, key.z);
+        true
     }
 
     fn validate_lichen_updates(&self) -> anyhow::Result<()> {
@@ -20147,22 +20447,16 @@ impl LoadedSession {
             let facing = state.properties["vertical_direction"].as_str();
             let offset = if facing == "down" { -1 } else { 1 };
             let absolute = add(self.origin, position).context("speleothem position overflow")?;
-            let chunk = ChunkPos {
-                x: absolute.x.div_euclid(16),
-                z: absolute.z.div_euclid(16),
-            };
+            let kind = SpeleothemKind::from_id(&state.name).context("unknown speleothem")?;
             if facing == "down"
-                && self
-                    .world
-                    .saved_block_ticks
-                    .get(&chunk)
-                    .is_some_and(|ticks| {
-                        ticks.iter().any(|tick| {
-                            tick.block == state.name && tick.position == absolute.to_array()
-                        })
-                    })
+                && self.speleothem_pending.contains(&SpeleothemTickKey {
+                    x: absolute.x,
+                    y: absolute.y,
+                    z: absolute.z,
+                    kind,
+                })
             {
-                anyhow::bail!("pending speleothem fall is not simulated");
+                return Ok(());
             }
             let tags = self
                 .speleothem_tags
@@ -20200,7 +20494,10 @@ impl LoadedSession {
                         IVec3::new(0, offset, 0),
                     )
                     .context("unknown support face")?;
-                anyhow::ensure!(sturdy, "unsupported speleothem tick is not simulated");
+                if !sturdy {
+                    self.schedule_speleothem(absolute, kind, if facing == "down" { 2 } else { 1 });
+                    return Ok(());
+                }
             }
             let read = |at: IVec3| -> anyhow::Result<BlockState> {
                 let Cell::State(id) =
@@ -79238,6 +79535,408 @@ pub(crate) mod tests {
             assert!(session.unresolved_speleothem_shape);
             assert!(session.validate_speleothem_updates().is_err());
             assert!(session.validate_generation_terrain_readiness().is_err());
+        }
+    }
+
+    fn test_speleothem_tags() -> Arc<native_resources::ore_feature::OreBlockTags> {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:pointed_dripstone","minecraft:sulfur_spike"]}"#
+                        .to_vec(),
+                ])
+            }
+        }
+        let registry = [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:pointed_dripstone",
+            "minecraft:sulfur_spike",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let tag = ResourceId::parse("minecraft:speleothems").unwrap();
+        Arc::new(
+            native_resources::ore_feature::OreBlockTags::load(
+                &mut Tags,
+                &registry,
+                &BTreeSet::from([tag]),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn test_speleothem_loot() -> Arc<BlockLootTables> {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path.ends_with("/pointed_dripstone.json") || path.ends_with("/sulfur_spike.json"))
+                    .then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#.to_vec()))
+            }
+        }
+        Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    #[test]
+    fn speleothem_support_ticks_recheck_upward_and_retain_unimplemented_falls() {
+        for kind in [SpeleothemKind::Dripstone, SpeleothemKind::Sulfur] {
+            for direction in ["up", "down"] {
+                for wet in [false, true] {
+                    for restored in [false, true] {
+                        let mut session = session();
+                        session.set_speleothem_tags(test_speleothem_tags());
+                        session.set_block_loot(test_speleothem_loot());
+                        let pos = IVec3::new(8, 8, 8);
+                        let support = pos
+                            + if direction == "up" {
+                                IVec3::NEG_Y
+                            } else {
+                                IVec3::Y
+                            };
+                        let stone = session.intern_block(state("minecraft:stone", &[]));
+                        assert!(session.set(support, stone));
+                        let spike = session.intern_block(state(
+                            kind.id(),
+                            &[
+                                ("vertical_direction", direction),
+                                ("thickness", "tip"),
+                                ("waterlogged", if wet { "true" } else { "false" }),
+                            ],
+                        ));
+                        assert!(session.set(pos, spike));
+                        assert!(session.set(support, session.states[0]));
+                        let absolute = session.origin + pos;
+                        let key = SpeleothemTickKey {
+                            x: absolute.x,
+                            y: absolute.y,
+                            z: absolute.z,
+                            kind,
+                        };
+                        assert!(session.speleothem_pending.contains(&key));
+                        assert_eq!(
+                            session.speleothem_ticks.first_key_value().unwrap().0.0,
+                            if direction == "up" { 1 } else { 2 }
+                        );
+                        if restored {
+                            assert!(session.set(support, stone));
+                        }
+                        session.tick = if direction == "up" { 1 } else { 2 };
+                        session.advance_block_ticks();
+                        let actual = session
+                            .world
+                            .block(absolute.x, absolute.y, absolute.z)
+                            .unwrap();
+                        if direction == "down" {
+                            assert_eq!(actual.name, kind.id());
+                            assert!(session.speleothem_pending.contains(&key));
+                            assert_eq!(session.speleothem_deferred.len(), 1);
+                            assert!(session.validate_speleothem_updates().is_err());
+                        } else {
+                            assert!(
+                                !session.speleothem_pending.contains(&key),
+                                "{kind:?} {direction} wet={wet} restored={restored}"
+                            );
+                            assert!(session.validate_speleothem_updates().is_ok());
+                            assert_eq!(
+                                actual.name,
+                                if restored {
+                                    kind.id()
+                                } else if wet {
+                                    "minecraft:water"
+                                } else {
+                                    "minecraft:air"
+                                }
+                            );
+                            let drops = session.dropped_items.snapshot();
+                            assert_eq!(drops.len(), usize::from(!restored));
+                            if !restored {
+                                assert_eq!(drops[0].stack.id(), "minecraft:stick");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_speleothem_tick_retries_after_tags_are_loaded() {
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let pos = origin + IVec3::new(8, 8, 8);
+        let spike = world.intern_state(state(
+            "minecraft:pointed_dripstone",
+            &[
+                ("vertical_direction", "up"),
+                ("thickness", "tip"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        let stone = world.intern_state(state("minecraft:stone", &[]));
+        world.set_block_id(pos.x, pos.y, pos.z, spike).unwrap();
+        world.set_block_id(pos.x, pos.y - 1, pos.z, stone).unwrap();
+        world.saved_block_ticks.insert(
+            home,
+            vec![SavedBlockTick {
+                block: "minecraft:pointed_dripstone".into(),
+                position: pos.to_array(),
+                delay: 1,
+                priority: 0,
+            }],
+        );
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(session.speleothem_deferred.len(), 1);
+        assert!(session.draft_block_ticks(home).is_err());
+        session.set_speleothem_tags(test_speleothem_tags());
+        session.tick = 2;
+        session.advance_block_ticks();
+        assert!(session.speleothem_deferred.is_empty());
+        assert!(session.speleothem_pending.is_empty());
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
+    }
+
+    #[test]
+    fn speleothem_ticks_round_trip_and_share_generated_order() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        for indexed in [false, true] {
+            let mut session = session();
+            let home = *session.world.chunks.keys().next().unwrap();
+            let position = (session.origin + IVec3::new(8, 8, 8)).to_array();
+            let saved = vec![
+                SavedTick {
+                    kind: "minecraft:sulfur_spike".into(),
+                    position,
+                    delay: 2,
+                    priority: 1,
+                },
+                SavedTick {
+                    kind: "minecraft:air".into(),
+                    position,
+                    delay: 1,
+                    priority: -1,
+                },
+                SavedTick {
+                    kind: "minecraft:pointed_dripstone".into(),
+                    position,
+                    delay: 3,
+                    priority: 0,
+                },
+            ];
+            let region = RegionTicks::new(
+                BTreeMap::from([(
+                    home,
+                    ConvertedChunkTicks {
+                        blocks: ChunkTicks::from_saved(home, saved.clone()).unwrap(),
+                        fluids: ChunkTicks::from_saved(home, vec![]).unwrap(),
+                    },
+                )]),
+                42,
+                0,
+            )
+            .unwrap();
+            let snapshot = region.activated_snapshot();
+            session.install_generated_ticks(&snapshot).unwrap();
+            if indexed {
+                session
+                    .install_generated_block_order(
+                        &snapshot,
+                        region
+                            .captured_indexed_queue(TickRegistry::Block, &[home])
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let actual: Vec<_> = session
+                .draft_block_ticks(home)
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.block, t.position, t.delay, t.priority))
+                .collect();
+            let expected: Vec<_> = saved
+                .into_iter()
+                .map(|t| (t.kind, t.position, t.delay, t.priority))
+                .collect();
+            assert_eq!(actual, expected);
+            for tick in 1..=3 {
+                session.tick = tick;
+                session.advance_block_ticks();
+                assert_eq!(
+                    session.draft_block_ticks(home).unwrap().len(),
+                    3 - tick as usize
+                );
+            }
+            assert!(session.speleothem_pending.is_empty());
+            assert_eq!(session.generated_block_order.is_some(), indexed);
+        }
+
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let saved = vec![SavedBlockTick {
+            block: "minecraft:pointed_dripstone".into(),
+            position: (origin + IVec3::new(8, 8, 8)).to_array(),
+            delay: 5,
+            priority: -1,
+        }];
+        world.saved_block_ticks.insert(home, saved.clone());
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert_eq!(session.draft_block_ticks(home).unwrap(), saved);
+        session.tick = 5;
+        session.advance_block_ticks();
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn speleothem_support_ticks_match_java() {
+        use native_resources::packs::ResourceStack;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let source = temp
+            .path()
+            .join("GeneratedWaterSpreadPostprocessingOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .args([
+                "GeneratedWaterSpreadPostprocessingOracle",
+                "speleothem_tick",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let rows: Vec<_> = output
+            .lines()
+            .skip_while(|line| *line != "BEGIN_RESULT")
+            .skip(1)
+            .take_while(|line| *line != "END_RESULT")
+            .collect();
+        assert_eq!(rows.len(), 16, "{output}");
+        let loot =
+            Arc::new(BlockLootTables::load(&mut ResourceStack::open(&game).unwrap()).unwrap());
+        for row in rows {
+            let parts: Vec<_> = row.split_whitespace().collect();
+            let kind = SpeleothemKind::from_id(parts[0]).unwrap();
+            let up = parts[1] == "up";
+            let restored = parts[3] == "true";
+            let delay: i128 = parts[4].parse().unwrap();
+            let mut session = session();
+            session.set_speleothem_tags(test_speleothem_tags());
+            session.set_block_loot(Arc::clone(&loot));
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            let pos = IVec3::new(8, 8, 8);
+            let support = pos + if up { IVec3::NEG_Y } else { IVec3::Y };
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            assert!(session.set(support, stone));
+            let spike = session.intern_block(state(
+                kind.id(),
+                &[
+                    ("vertical_direction", parts[1]),
+                    ("thickness", "tip"),
+                    ("waterlogged", parts[2]),
+                ],
+            ));
+            assert!(session.set(pos, spike));
+            assert!(session.set(support, session.states[0]));
+            assert_eq!(
+                session.speleothem_ticks.first_key_value().unwrap().0.0,
+                delay,
+                "{row}"
+            );
+            if restored {
+                assert!(session.set(support, stone));
+            }
+            session.tick = delay as u64;
+            session.advance_block_ticks();
+            let p = session.origin + pos;
+            assert_eq!(
+                session.world.block(p.x, p.y, p.z).unwrap().name,
+                parts[5],
+                "{row}"
+            );
+            if up && !restored {
+                let drops = session.dropped_items.snapshot();
+                assert_eq!(drops.len(), 1, "{row}");
+                assert_eq!(drops[0].stack.id(), kind.id(), "{row}");
+            }
         }
     }
 

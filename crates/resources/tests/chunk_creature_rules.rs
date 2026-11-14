@@ -26,12 +26,15 @@ fn vanilla_ground_tags_resolve_from_installed_packs() {
     assert!(tags.contains(GroundSpawnTag::Goats, "minecraft:stone"));
     assert!(!tags.contains(GroundSpawnTag::Animals, "minecraft:stone"));
     assert!(tags.contains(GroundSpawnTag::Rabbits, "minecraft:sand"));
+    assert!(tags.contains(GroundSpawnTag::Sand, "minecraft:sand"));
+    assert!(tags.contains(GroundSpawnTag::Sand, "minecraft:red_sand"));
 }
 
 struct World {
     pos: IVec3,
     light: u8,
     mask: u8,
+    sea: i32,
     calls: Vec<&'static str>,
 }
 impl GroundCreatureSpawnWorld for World {
@@ -48,8 +51,13 @@ impl GroundCreatureSpawnWorld for World {
                 GroundSpawnTag::Animals => 1,
                 GroundSpawnTag::Goats => 2,
                 GroundSpawnTag::Rabbits => 4,
+                GroundSpawnTag::Sand => 8,
             }
             != 0)
+    }
+    fn sea_level(&mut self) -> Result<i32> {
+        self.calls.push("sea");
+        Ok(self.sea)
     }
 }
 
@@ -72,6 +80,16 @@ fn ground_rules_match_java_results_call_order_and_random() {
                     for peaceful in [false, true] {
                         cases.push(json!({"entity":format!("minecraft:{entity}"),"mask":mask,"light":light,"position":position,"seed":42,"peaceful":peaceful}));
                     }
+                }
+            }
+        }
+    }
+    for sea in [-64, 0, 63, 320, i32::MAX - 3] {
+        for y in [-65, -61, 0, 3, 4, 62, 63, 66, 67, 68, 319, 323, 324] {
+            for mask in [0, 8] {
+                for light in 0..=15 {
+                    cases.push(json!({"entity":"minecraft:turtle","mask":mask,"light":light,
+                        "position":[0,y,0],"seed":42,"peaceful":false,"sea":sea}));
                 }
             }
         }
@@ -127,6 +145,7 @@ fn ground_rules_match_java_results_call_order_and_random() {
             pos,
             light: case["light"].as_u64().unwrap() as u8,
             mask: case["mask"].as_u64().unwrap() as u8,
+            sea: case["sea"].as_i64().unwrap_or(63) as i32,
             calls: Vec::new(),
         };
         let entity = ResourceId::parse(case["entity"].as_str().unwrap()).unwrap();

@@ -87,7 +87,7 @@ enum Stage {
 }
 
 /// Owns the region RNG and group state across resumable candidate checks.
-/// Sheep, horses, and donkeys are enabled by default. Pigs, cows, and chickens require
+/// Sheep, horses, donkeys, and turtles are enabled by default. Pigs, cows, and chickens require
 /// their active variant registries; unsupported creatures remain unresolved.
 pub struct GeneratedSheepSpawner {
     planner: ChunkCreatureSpawner,
@@ -313,7 +313,7 @@ impl GeneratedSheepSpawner {
                         (attempt.entity.namespace == "minecraft"
                             && matches!(
                                 attempt.entity.path.as_str(),
-                                "sheep" | "horse" | "donkey"
+                                "sheep" | "horse" | "donkey" | "turtle"
                             ))
                             || farm_index(&attempt.entity)
                                 .is_some_and(|index| self.farm_variants[index].is_some()),
@@ -389,6 +389,15 @@ impl GeneratedSheepSpawner {
                         &mut self.planner,
                         &mut self.random,
                         &mut self.donkey_group,
+                        construction.uuid,
+                    )?
+                } else if attempt.entity.path == "turtle"
+                    && attempt.entity.namespace == "minecraft"
+                {
+                    probe.prepare_fresh_turtle(
+                        &mut self.planner,
+                        &mut self.random,
+                        &mut self.group,
                         construction.uuid,
                     )?
                 } else if let Some(index) = farm_index(&attempt.entity) {

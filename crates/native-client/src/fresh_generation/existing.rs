@@ -4777,7 +4777,7 @@ impl PreparedExistingGenerator {
             attempt.entity.namespace == "minecraft"
                 && matches!(
                     attempt.entity.path.as_str(),
-                    "sheep" | "horse" | "donkey" | "pig" | "cow" | "chicken"
+                    "sheep" | "horse" | "donkey" | "pig" | "cow" | "chicken" | "turtle"
                 ),
             "unsupported generated creature {}:{}",
             attempt.entity.namespace,
@@ -4839,6 +4839,7 @@ impl PreparedExistingGenerator {
             ambient,
             self.lighting.min_y,
             self.lighting.height,
+            self.generator.sea_level(),
             native_resources::mob_spawn_placement::MobSpawnHeightmap::MotionBlockingNoLeaves,
             border,
             &assets.prevent_inside,
@@ -5134,6 +5135,7 @@ impl PreparedExistingGenerator {
             ambient,
             self.lighting.min_y,
             self.lighting.height,
+            self.generator.sea_level(),
             native_resources::mob_spawn_placement::MobSpawnHeightmap::MotionBlockingNoLeaves,
             border,
             &assets.prevent_inside,
@@ -5417,6 +5419,12 @@ impl PreparedExistingGenerator {
                 &mut plan.planner,
                 &mut plan.random,
                 &mut plan.donkey_group,
+                construction.uuid,
+            )?,
+            "turtle" => probe.prepare_fresh_turtle(
+                &mut plan.planner,
+                &mut plan.random,
+                &mut plan.sheep_group,
                 construction.uuid,
             )?,
             "pig" | "cow" | "chicken" => {

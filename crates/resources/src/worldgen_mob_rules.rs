@@ -13,6 +13,7 @@ pub enum GroundSpawnTag {
     Animals,
     Goats,
     Rabbits,
+    Sand,
 }
 
 #[derive(Clone, Debug)]
@@ -20,16 +21,18 @@ pub struct GroundSpawnTags {
     animals: BTreeSet<String>,
     goats: BTreeSet<String>,
     rabbits: BTreeSet<String>,
+    sand: BTreeSet<String>,
 }
 
 impl GroundSpawnTags {
-    /// Resolve all three tags from the same active pack stack and complete
+    /// Resolve all ground tags from the same active pack stack and complete
     /// block registry as the generated world.
     pub fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Result<Self> {
         let ids = [
             "minecraft:animals_spawnable_on",
             "minecraft:goats_spawnable_on",
             "minecraft:rabbits_spawnable_on",
+            "minecraft:sand",
         ]
         .map(|id| ResourceId::parse(id).expect("built-in tag ID"));
         let mut raw = BTreeMap::new();
@@ -43,6 +46,7 @@ impl GroundSpawnTags {
             animals: get(&ids[0])?,
             goats: get(&ids[1])?,
             rabbits: get(&ids[2])?,
+            sand: get(&ids[3])?,
         })
     }
     pub fn contains(&self, tag: GroundSpawnTag, block: &str) -> bool {
@@ -50,6 +54,7 @@ impl GroundSpawnTags {
             GroundSpawnTag::Animals => &self.animals,
             GroundSpawnTag::Goats => &self.goats,
             GroundSpawnTag::Rabbits => &self.rabbits,
+            GroundSpawnTag::Sand => &self.sand,
         }
         .contains(block)
     }
@@ -58,6 +63,7 @@ impl GroundSpawnTags {
 pub trait GroundCreatureSpawnWorld {
     fn raw_brightness(&mut self, position: IVec3) -> Result<u8>;
     fn tagged_ground(&mut self, position: IVec3, tag: GroundSpawnTag) -> Result<bool>;
+    fn sea_level(&mut self) -> Result<i32>;
 }
 
 /// Inputs used by Animal.getWalkTargetValue after an entity is constructed.
@@ -127,6 +133,24 @@ pub fn check_ground_creature_spawn(
     if entity.namespace != "minecraft" {
         bail!("unsupported creature spawn rule");
     }
+    if entity.path == "turtle" {
+        if position.y >= world.sea_level()?.wrapping_add(4) {
+            return Ok(false);
+        }
+        let below = IVec3::new(
+            position.x,
+            position
+                .y
+                .checked_sub(1)
+                .context("spawn ground Y underflow")?,
+            position.z,
+        );
+        return if world.tagged_ground(below, GroundSpawnTag::Sand)? {
+            bright_enough(world, position)
+        } else {
+            Ok(false)
+        };
+    }
     let (tag, light_first) = match entity.path.as_str() {
         "pig" | "cow" | "sheep" | "chicken" | "horse" | "donkey" => (GroundSpawnTag::Animals, true),
         "goat" => (GroundSpawnTag::Goats, false),
@@ -171,6 +195,9 @@ mod tests {
                 "data/minecraft/tags/block/rabbits_spawnable_on.json" => {
                     Some(br#"{"values":[]}"#.to_vec())
                 }
+                "data/minecraft/tags/block/sand.json" => {
+                    Some(br#"{"values":["minecraft:stone"]}"#.to_vec())
+                }
                 "data/example/tags/block/ground.json" => {
                     Some(br#"{"values":["minecraft:dirt"]}"#.to_vec())
                 }
@@ -186,7 +213,54 @@ mod tests {
         assert!(!tags.contains(GroundSpawnTag::Goats, "minecraft:dirt"));
         assert!(tags.contains(GroundSpawnTag::Goats, "minecraft:stone"));
         assert!(!tags.contains(GroundSpawnTag::Rabbits, "minecraft:stone"));
+        assert!(tags.contains(GroundSpawnTag::Sand, "minecraft:stone"));
         assert!(GroundSpawnTags::load(&mut Data, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn turtle_checks_sea_level_sand_and_light_in_order() {
+        struct World {
+            sea: i32,
+            sand: bool,
+            light: u8,
+            calls: Vec<&'static str>,
+        }
+        impl GroundCreatureSpawnWorld for World {
+            fn raw_brightness(&mut self, _: IVec3) -> Result<u8> {
+                self.calls.push("light");
+                Ok(self.light)
+            }
+            fn tagged_ground(&mut self, _: IVec3, tag: GroundSpawnTag) -> Result<bool> {
+                assert_eq!(tag, GroundSpawnTag::Sand);
+                self.calls.push("sand");
+                Ok(self.sand)
+            }
+            fn sea_level(&mut self) -> Result<i32> {
+                self.calls.push("sea");
+                Ok(self.sea)
+            }
+        }
+        let entity = ResourceId::parse("minecraft:turtle").unwrap();
+        let mut world = World {
+            sea: 63,
+            sand: true,
+            light: 9,
+            calls: Vec::new(),
+        };
+        assert!(check_ground_creature_spawn(&entity, IVec3::new(0, 66, 0), &mut world).unwrap());
+        assert_eq!(world.calls, ["sea", "sand", "light"]);
+        world.calls.clear();
+        assert!(!check_ground_creature_spawn(&entity, IVec3::new(0, 67, 0), &mut world).unwrap());
+        assert_eq!(world.calls, ["sea"]);
+        world.calls.clear();
+        world.sand = false;
+        assert!(!check_ground_creature_spawn(&entity, IVec3::new(0, 66, 0), &mut world).unwrap());
+        assert_eq!(world.calls, ["sea", "sand"]);
+        world.calls.clear();
+        world.sand = true;
+        world.light = 8;
+        assert!(!check_ground_creature_spawn(&entity, IVec3::new(0, 66, 0), &mut world).unwrap());
+        assert_eq!(world.calls, ["sea", "sand", "light"]);
     }
 
     #[test]

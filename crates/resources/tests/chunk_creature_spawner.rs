@@ -69,6 +69,7 @@ fn creature_generation_attempts_match_java() {
         "donkey",
         "goat",
         "rabbit",
+        "turtle",
         "slime",
         "magma_cube",
         "sulfur_cube",

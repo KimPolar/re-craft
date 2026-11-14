@@ -3139,6 +3139,7 @@ mod tests {
                 } else if path == "data/minecraft/tags/block/animals_spawnable_on.json"
                     || path == "data/minecraft/tags/block/goats_spawnable_on.json"
                     || path == "data/minecraft/tags/block/rabbits_spawnable_on.json"
+                    || path == "data/minecraft/tags/block/sand.json"
                 {
                     Some(br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec())
                 } else if path.starts_with("data/minecraft/worldgen/noise/") {

@@ -53,6 +53,7 @@ mod generated_potent_sulfur;
 mod generated_sheep;
 mod generated_spawner;
 mod generated_trial_spawner;
+mod generated_turtle;
 mod generated_vault;
 mod generated_village_villager;
 mod generated_zombie_nautilus;
@@ -104,6 +105,7 @@ pub use generated_potent_sulfur::GeneratedPotentSulfur;
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::{GeneratedCaveSpiderSpawner, GeneratedMonsterSpawner};
 pub use generated_trial_spawner::GeneratedTrialSpawner;
+pub use generated_turtle::draft_fresh_turtle;
 pub use generated_vault::GeneratedVault;
 pub use generated_zombie_nautilus::draft_fresh_structure_zombie_nautilus;
 pub use local_difficulty::LocalDifficulty;
@@ -5004,6 +5006,7 @@ mod tests {
                     "data/minecraft/tags/block/animals_spawnable_on.json"
                         | "data/minecraft/tags/block/goats_spawnable_on.json"
                         | "data/minecraft/tags/block/rabbits_spawnable_on.json"
+                        | "data/minecraft/tags/block/sand.json"
                 ) {
                     return Ok(Some(
                         br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec(),
@@ -5632,6 +5635,86 @@ mod tests {
                     .check_instance_rules(&mut bright_planner, &mut view)
                     .is_err()
             );
+            // Exercise a turtle from the candidate through its saved draft.
+            // The fixture's active sand tag includes the stone surface.
+            view.set_sea_level_for_test(16);
+            let mut turtle_spawns = native_resources::mob_spawns::CreatureSpawns::default();
+            turtle_spawns.apply(
+                native_resources::mob_spawns::CreatureSpawnLayer::from_attributes(
+                    &json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":"minecraft:turtle","count":2,"weight":1}]},"spawn_costs":{}}}),
+                    |_| Some(false),
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            let mut turtle_planner = batch
+                .plan_creature_spawning(center, true, 0.999_999_9, turtle_spawns)
+                .unwrap();
+            let CreatureSpawnProgress::Attempt(turtle_attempt) = turtle_planner.next(1).unwrap()
+            else {
+                panic!("expected turtle attempt")
+            };
+            let mut turtle = GeneratedCreatureProbe::new(turtle_attempt, 0, false, true);
+            loop {
+                match turtle.poll(&mut turtle_planner, &mut view, 1).unwrap() {
+                    GeneratedCreatureProbeProgress::Pending => continue,
+                    GeneratedCreatureProbeProgress::NeedsCollision(_) => break,
+                    GeneratedCreatureProbeProgress::Rejected => panic!("turtle placement rejected"),
+                }
+            }
+            let GeneratedCreatureCollisionProgress::NeedsSpawnRules(turtle_geometry) =
+                turtle.check_collision(&mut turtle_planner, &view).unwrap()
+            else {
+                panic!("turtle collision rejected")
+            };
+            assert_eq!(
+                turtle
+                    .check_spawn_rules(&mut turtle_planner, &mut view, &ground_spawn_tags)
+                    .unwrap(),
+                GeneratedCreatureRuleProgress::NeedsConstruction(turtle_geometry)
+            );
+            let turtle_pose = turtle.mark_constructed(&mut turtle_planner).unwrap();
+            assert_eq!(
+                turtle
+                    .check_instance_rules(&mut turtle_planner, &mut view)
+                    .unwrap(),
+                GeneratedCreatureInstanceRuleProgress::NeedsObstruction(turtle_pose)
+            );
+            let turtle_bounds = native_world::movement::BoundingBox {
+                min: glam::DVec3::from_array(turtle_geometry.min),
+                max: glam::DVec3::from_array(turtle_geometry.max),
+            };
+            assert_eq!(
+                turtle
+                    .check_obstruction(&mut turtle_planner, &mut view, turtle_bounds)
+                    .unwrap(),
+                GeneratedCreatureObstructionProgress::NeedsFinalization(turtle_pose)
+            );
+            let mut turtle_random = batch.spawn_region_random(center);
+            let mut turtle_group =
+                native_resources::worldgen_region_random::AnimalGroupData::default();
+            let addition = turtle
+                .prepare_fresh_turtle(
+                    &mut turtle_planner,
+                    &mut turtle_random,
+                    &mut turtle_group,
+                    [0, 1, 0, 2],
+                )
+                .unwrap();
+            let GeneratedEntityRecord::Saved(tag) = addition.record else {
+                panic!("expected saved turtle")
+            };
+            assert_eq!(
+                tag.get("id"),
+                Some(&native_persistence::nbt::Tag::String("minecraft:turtle".into()))
+            );
+            assert_eq!(
+                tag.get("home_pos"),
+                Some(&native_persistence::nbt::Tag::IntArray(
+                    addition.block_position.to_vec()
+                ))
+            );
+            assert_eq!(turtle_group.size, 1);
             // The harness's constructed sheep has the verified unscaled box;
             // spawn_scale for this type is 1.0.
             let entity_bounds = native_world::movement::BoundingBox {
@@ -6900,6 +6983,7 @@ mod tests {
             Some(false)
         );
         let air_id = changed_world.intern_state(air);
+        let previous_id = changed_world.block_id(8, 8, 8).unwrap();
         assert!(changed_world.set_block_id(8, 8, 8, air_id).unwrap());
         processed.world = Arc::new(changed_world);
         processed.sealed_world = Arc::clone(&processed.world);
@@ -6911,6 +6995,7 @@ mod tests {
             .edits
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
         processed.sealed_edits = processed.edits.clone();
+        processed.edit_states.push((previous_id, air_id));
         let changed_components = batch
             .postprocessed_chunk_components(&processed, [center])
             .unwrap();
@@ -6998,6 +7083,7 @@ mod tests {
         processed.sealed_checks.clear();
         processed.edits.clear();
         processed.sealed_edits.clear();
+        processed.edit_states.clear();
         processed
             .edits
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
@@ -7092,12 +7178,14 @@ mod tests {
             name: "minecraft:air".into(),
             properties: Default::default(),
         });
+        let previous_id = edited.block_id(8, 8, 8).unwrap();
         assert!(edited.set_block_id(8, 8, 8, air).unwrap());
         processed.world = Arc::new(edited);
         processed.sealed_world = Arc::clone(&processed.world);
         let position = native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 };
         processed.edits.push(position);
         processed.sealed_edits.push(position);
+        processed.edit_states.push((previous_id, air));
         processed.light_checks.push(position);
         processed.sealed_checks.push(position);
         let checkpoint = batch

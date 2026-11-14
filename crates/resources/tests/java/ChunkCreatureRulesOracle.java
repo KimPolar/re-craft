@@ -29,11 +29,13 @@ public final class ChunkCreatureRulesOracle {
             if ((mask & 1) != 0) tags.add(BlockTags.ANIMALS_SPAWNABLE_ON);
             if ((mask & 2) != 0) tags.add(BlockTags.GOATS_SPAWNABLE_ON);
             if ((mask & 4) != 0) tags.add(BlockTags.RABBITS_SPAWNABLE_ON);
+            if ((mask & 8) != 0) tags.add(BlockTags.SAND);
             bind.invoke(Blocks.STONE.builtInRegistryHolder(), tags);
             var p = test.getAsJsonArray("position"); var pos = new BlockPos(p.get(0).getAsInt(), p.get(1).getAsInt(), p.get(2).getAsInt());
             var calls = new JsonArray();
             var world = (ServerLevelAccessor) Proxy.newProxyInstance(ServerLevelAccessor.class.getClassLoader(), new Class<?>[]{ServerLevelAccessor.class}, (obj, method, a) -> {
                 return switch (method.getName()) {
+                    case "getSeaLevel" -> { calls.add("sea"); yield test.has("sea") ? test.get("sea").getAsInt() : 63; }
                     case "getRawBrightness" -> { if (!pos.equals(a[0]) || ((Integer)a[1]) != 0) throw new AssertionError("light position"); calls.add("light"); yield light; }
                     case "getBlockState" -> { if (!pos.below().equals(a[0])) throw new AssertionError("ground position"); calls.add("ground"); yield Blocks.STONE.defaultBlockState(); }
                     case "getDifficulty" -> { calls.add("difficulty"); yield test.get("peaceful").getAsBoolean() ? Difficulty.PEACEFUL : Difficulty.NORMAL; }

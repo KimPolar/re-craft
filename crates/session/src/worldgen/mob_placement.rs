@@ -73,6 +73,7 @@ pub struct GeneratedCreatureProbe {
     placement_passed: bool,
     collision_passed: bool,
     rules_passed: bool,
+    turtle_rule_world: Option<Arc<World>>,
     constructed_yaw: Option<f32>,
     instance_rules_passed: bool,
     obstruction_passed: bool,
@@ -95,6 +96,7 @@ impl GeneratedCreatureProbe {
             placement_passed: false,
             collision_passed: false,
             rules_passed: false,
+            turtle_rule_world: None,
             constructed_yaw: None,
             instance_rules_passed: false,
             obstruction_passed: false,
@@ -181,6 +183,9 @@ impl GeneratedCreatureProbe {
             self.rejected = true;
             return Ok(GeneratedCreatureRuleProgress::Rejected);
         }
+        if self.attempt.entity.namespace == "minecraft" && self.attempt.entity.path == "turtle" {
+            self.turtle_rule_world = Some(Arc::clone(&world.world));
+        }
         self.rules_passed = true;
         Ok(GeneratedCreatureRuleProgress::NeedsConstruction(geometry))
     }
@@ -226,11 +231,27 @@ impl GeneratedCreatureProbe {
         let geometry =
             self.collision_geometry(self.top.context("creature position is missing")?)?;
         let pos = geometry_block_position(geometry)?;
-        if !native_resources::worldgen_mob_rules::check_animal_instance_spawn(
-            &self.attempt.entity,
-            pos,
-            world,
-        )? {
+        let passes = if self.attempt.entity.namespace == "minecraft"
+            && self.attempt.entity.path == "turtle"
+        {
+            // The registered turtle rule already required tagged sand below
+            // this exact position. Its instance rule accepts that sand for
+            // every fluid and brightness state, provided terrain is unchanged.
+            ensure!(
+                self.turtle_rule_world
+                    .as_ref()
+                    .is_some_and(|checked| Arc::ptr_eq(checked, &world.world)),
+                "turtle placement terrain changed after its spawn rule"
+            );
+            true
+        } else {
+            native_resources::worldgen_mob_rules::check_animal_instance_spawn(
+                &self.attempt.entity,
+                pos,
+                world,
+            )?
+        };
+        if !passes {
             planner.finish_entity(false)?;
             self.rejected = true;
             return Ok(GeneratedCreatureInstanceRuleProgress::Rejected);
@@ -511,6 +532,52 @@ impl GeneratedCreatureProbe {
         })
     }
 
+    /// Prepare a turtle while retaining atomic planner and RNG updates.
+    pub fn prepare_fresh_turtle(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+    ) -> Result<super::GeneratedEntityAddition> {
+        ensure!(
+            self.attempt.entity.namespace == "minecraft" && self.attempt.entity.path == "turtle",
+            "pending creature is not a turtle"
+        );
+        ensure!(
+            self.obstruction_passed && !self.rejected && !self.finalized,
+            "turtle is not ready for finalization"
+        );
+        ensure!(
+            planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed turtle is no longer pending"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        let position = geometry_block_position(geometry)?.to_array();
+        let mut next_random = random.clone();
+        let mut next_group = *group;
+        let initialized = native_resources::worldgen_region_random::finalize_animal_base(
+            &mut next_random,
+            &mut next_group,
+            false,
+        );
+        let tag = super::draft_fresh_turtle(uuid, geometry.position, yaw, initialized)?;
+        let mut next_planner = planner.clone();
+        next_planner.finish_entity(true)?;
+        *planner = next_planner;
+        *random = next_random;
+        *group = next_group;
+        self.finalized = true;
+        Ok(super::GeneratedEntityAddition {
+            block_position: position,
+            record: super::GeneratedEntityRecord::Saved(tag),
+        })
+    }
+
     /// Prepare a donkey while retaining atomic planner and RNG updates.
     pub fn prepare_fresh_donkey(
         &mut self,
@@ -761,6 +828,7 @@ pub struct GeneratedMobPlacementView<'a> {
     height_tags: &'a native_resources::heightmap_tags::HeightmapTags,
     min_y: i32,
     max_y: i32,
+    sea_level: i32,
     void_air: BlockState,
     last_facts: Option<(IVec3, PlacementBlockFacts)>,
     computed_heights: BTreeMap<(i32, i32), i32>,
@@ -793,6 +861,7 @@ impl<'a> GeneratedMobPlacementView<'a> {
             height_tags,
             min_y,
             max_y,
+            sea_level: batch.sea_level(),
             void_air: BlockState {
                 name: "minecraft:void_air".into(),
                 properties: Default::default(),
@@ -815,6 +884,7 @@ impl<'a> GeneratedMobPlacementView<'a> {
         ambient_light: f32,
         min_y: i32,
         height: i32,
+        sea_level: i32,
         heightmap: MobSpawnHeightmap,
         border: RespawnBorder,
         prevent_inside: &'a BTreeSet<String>,
@@ -846,6 +916,7 @@ impl<'a> GeneratedMobPlacementView<'a> {
             height_tags,
             min_y,
             max_y,
+            sea_level,
             void_air: BlockState {
                 name: "minecraft:void_air".into(),
                 properties: Default::default(),
@@ -928,6 +999,11 @@ impl<'a> GeneratedMobPlacementView<'a> {
     ) {
         self.rule_light.insert(pos, light);
     }
+
+    #[cfg(test)]
+    pub(super) fn set_sea_level_for_test(&mut self, sea_level: i32) {
+        self.sea_level = sea_level;
+    }
 }
 
 impl super::mob_obstruction::FluidScanWorld for GeneratedMobPlacementView<'_> {
@@ -985,6 +1061,9 @@ impl native_resources::worldgen_mob_rules::GroundCreatureSpawnWorld
         tag: native_resources::worldgen_mob_rules::GroundSpawnTag,
     ) -> Result<bool> {
         Ok(self.tags.contains(tag, &self.view.block(position)?.name))
+    }
+    fn sea_level(&mut self) -> Result<i32> {
+        Ok(self.view.sea_level)
     }
 }
 

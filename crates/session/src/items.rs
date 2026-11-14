@@ -558,6 +558,38 @@ type ItemDamageRules = (
     Arc<native_resources::enchantments::OxygenEnchantments>,
 );
 
+fn apply_cactus_contact(
+    entity: &mut ItemEntity,
+    rules: &ItemDamageRules,
+) -> anyhow::Result<Option<bool>> {
+    let (items, tags) = rules;
+    if tags.damage_type_has_tag("minecraft:is_fire", "minecraft:cactus")? {
+        match damage_resistant_in_world(&entity.item.stack, items, tags, "minecraft:in_fire")? {
+            Some(true) => return Ok(Some(false)),
+            Some(false) => {}
+            None => return Ok(None),
+        }
+    }
+    // Fall immunity depends on the active entity-type tag, which is not part
+    // of these damage rules yet.
+    if tags.damage_type_has_tag("minecraft:is_fall", "minecraft:cactus")? {
+        return Ok(None);
+    }
+    let Some(resists) =
+        damage_resistant_in_world(&entity.item.stack, items, tags, "minecraft:cactus")?
+    else {
+        return Ok(None);
+    };
+    let immune = entity._damage_state.invulnerable || entity._damage_state.invulnerable_time > 0;
+    let bypass = immune
+        && tags.damage_type_has_tag("minecraft:bypasses_invulnerability", "minecraft:cactus")?;
+    if !resists && (!immune || bypass) {
+        entity._damage_state.health = ((entity._damage_state.health as f32) - 1.0) as i32;
+        return Ok(Some(entity._damage_state.health <= 0));
+    }
+    Ok(Some(false))
+}
+
 fn apply_lava_contact(entity: &mut ItemEntity, rules: &ItemDamageRules) -> anyhow::Result<bool> {
     let (items, tags) = rules;
     let Some(fire_immune) =
@@ -659,6 +691,7 @@ pub(crate) struct ItemEntities {
     // Unknown rain can affect a later merge, pickup, or removal, so retain it
     // until the session is restarted instead of accepting partial save drafts.
     unresolved_rain_effect: bool,
+    unresolved_cactus_effect: bool,
     random: LegacyRandom,
     entity_seeder: Option<native_core::random::XoroshiroRandom>,
     entity_seed_checked: bool,
@@ -685,6 +718,7 @@ impl Default for ItemEntities {
             saved_merges: Vec::new(),
             uncoordinated_saved_merge: false,
             unresolved_rain_effect: false,
+            unresolved_cactus_effect: false,
             random: LegacyRandom::new(0),
             entity_seeder: None,
             entity_seed_checked: false,
@@ -813,6 +847,10 @@ impl ItemEntities {
         anyhow::ensure!(
             !self.unresolved_rain_effect,
             "item rain effects could not be resolved"
+        );
+        anyhow::ensure!(
+            !self.unresolved_cactus_effect,
+            "item cactus damage events or destruction effects cannot yet be saved"
         );
         Ok(())
     }
@@ -2372,6 +2410,7 @@ impl ItemEntities {
             |_| Some(false),
             |_, _, _| Some(Vec::new()),
             |_| {},
+            |_, _, _| Some(0),
         );
     }
 
@@ -2414,6 +2453,7 @@ impl ItemEntities {
             rain_at,
             |_, _, _| Some(Vec::new()),
             |_| {},
+            |_, _, _| Some(0),
         );
     }
 
@@ -2441,6 +2481,7 @@ impl ItemEntities {
             DVec3,
         ) -> Option<Vec<crate::bubble_column::EntityContact>>,
         on_bubble: impl FnMut(Option<Option<IVec3>>),
+        cactus: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<usize>,
     ) {
         self.tick_with_threshold(
             origin,
@@ -2460,6 +2501,7 @@ impl ItemEntities {
             rain_at,
             bubble,
             on_bubble,
+            cactus,
         );
     }
 
@@ -2487,6 +2529,7 @@ impl ItemEntities {
             DVec3,
         ) -> Option<Vec<crate::bubble_column::EntityContact>>,
         mut on_bubble: impl FnMut(Option<Option<IVec3>>),
+        mut cactus: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<usize>,
     ) {
         let player_box = movement::player_bounds(player, pose.height());
         let pickup = BoundingBox {
@@ -2735,6 +2778,29 @@ impl ItemEntities {
                         on_bubble(None);
                     }
                 }
+                match cactus(item_bounds(from - origin.as_dvec3()), movement, original) {
+                    Some(0) => {}
+                    Some(count) => {
+                        // Damage game events and item destruction callbacks are not yet persisted.
+                        self.unresolved_cactus_effect = true;
+                        if let Some(rules) = damage_rules {
+                            for _ in 0..count {
+                                match apply_cactus_contact(entity, rules) {
+                                    Ok(Some(true)) => {
+                                        removed[index] = true;
+                                        break;
+                                    }
+                                    Ok(Some(false)) => {}
+                                    Ok(None) | Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    None => self.unresolved_cactus_effect = true,
+                }
+            }
+            if removed[index] {
+                continue;
             }
             if let Some(drag) = item_drag {
                 entity.velocity *= drag;
@@ -3829,6 +3895,7 @@ mod tests {
                 }])
             },
             |event| seen.push(event),
+            |_, _, _| Some(0),
         );
         assert_eq!(items.entities[0].velocity.y, 0.1 * f64::from(0.98_f32));
         assert_eq!(seen, vec![Some(Some(IVec3::new(8, 10, 8)))]);
@@ -3859,6 +3926,7 @@ mod tests {
                 }])
             },
             |event| seen.push(event),
+            |_, _, _| Some(0),
         );
         assert_eq!(items.entities[0].velocity.y, -0.03);
         assert_eq!(seen.last(), Some(&Some(None)));
@@ -3953,6 +4021,7 @@ mod tests {
                     }])
                 },
                 |event| seen.push(event),
+                |_, _, _| Some(0),
             );
             let item = &items.entities[0];
             let expected = |name: &str| row[name].as_f64().unwrap();
@@ -4592,13 +4661,15 @@ mod tests {
         let result = temp.path().join("lava.json");
         let fire_result = temp.path().join("fire.json");
         let rain_result = temp.path().join("rain.json");
+        let cactus_result = temp.path().join("cactus.json");
         run(std::process::Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&classpath)
             .arg("ItemLavaOracle")
             .arg(&result)
             .arg(&fire_result)
-            .arg(&rain_result));
+            .arg(&rain_result)
+            .arg(&cactus_result));
         let oracle: serde_json::Value =
             serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
         for mode in 0..4 {
@@ -4623,6 +4694,65 @@ mod tests {
                 );
             }
         }
+        let cactus_oracle: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cactus_result).unwrap()).unwrap();
+        for mode in 0..4 {
+            let mut item = make(match mode {
+                1 => "minecraft:netherite_ingot",
+                3 => "minecraft:nether_star",
+                _ => "minecraft:stone",
+            });
+            item._damage_state.invulnerable = mode == 2;
+            for row in cactus_oracle[mode].as_array().unwrap() {
+                let removed = apply_cactus_contact(&mut item, &rules).unwrap().unwrap();
+                assert_eq!(
+                    removed,
+                    row["removed"].as_bool().unwrap(),
+                    "cactus mode {mode}"
+                );
+                assert_eq!(
+                    i64::from(item._damage_state.health),
+                    row["health"].as_i64().unwrap(),
+                    "cactus mode {mode}"
+                );
+            }
+        }
+        let mut live = ItemEntities::default();
+        live.set_damage_rules(Arc::clone(&rules.0), Arc::clone(&rules.1));
+        live.spawn_from_entity(
+            DVec3::new(8.5, 10.0, 8.5),
+            ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap(),
+        );
+        live.entities[0].velocity = DVec3::ZERO;
+        live.entities[0].no_gravity = true;
+        let mut inventory = Arc::new(PlayerInventory::default());
+        for expected in (0..5).rev() {
+            live.tick_with_fluid_bubbles_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                &mut inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| Some(Vec::new()),
+                |_, _| false,
+                |_| Some(false),
+                |_, _, _| Some(Vec::new()),
+                |_| {},
+                |_, _, _| Some(1),
+            );
+            if expected > 0 {
+                assert_eq!(live.entities[0]._damage_state.health, expected);
+            } else {
+                assert!(live.entities.is_empty());
+            }
+        }
+        assert!(live.ensure_rain_resolved().is_err());
         let rain_oracle: Vec<bool> =
             serde_json::from_slice(&std::fs::read(rain_result).unwrap()).unwrap();
         let mut index = 0;
@@ -5748,6 +5878,7 @@ mod tests {
                                 |_| Some(false),
                                 |_, _, _| Some(Vec::new()),
                                 |_| {},
+                                |_, _, _| Some(0),
                             );
                         }
                         timings[i].push(start.elapsed().as_secs_f64() * 1000.0);

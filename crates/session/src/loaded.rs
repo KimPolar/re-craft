@@ -21332,6 +21332,9 @@ impl LoadedSession {
                         }
                     }
                 },
+                |item_bounds, actual, requested| {
+                    fluid_view.cactus_contacts(item_bounds, actual, requested)
+                },
             );
             self.tick_experience_orbs(false);
             self.tick += 1;
@@ -23401,6 +23404,9 @@ impl LoadedSession {
                         );
                     }
                 }
+            },
+            |item_bounds, actual, requested| {
+                fluid_view.cactus_contacts(item_bounds, actual, requested)
             },
         );
         update_recipe_unlocks(&mut self.inventory, &before_pickup, self.recipes.as_deref());
@@ -25946,6 +25952,71 @@ struct FluidView<'a> {
 }
 
 impl FluidView<'_> {
+    fn cactus_contacts(
+        &self,
+        bounds: BoundingBox,
+        actual: DVec3,
+        requested: DVec3,
+    ) -> Option<usize> {
+        if !bounds.min.is_finite()
+            || !bounds.max.is_finite()
+            || !actual.is_finite()
+            || !requested.is_finite()
+        {
+            return None;
+        }
+        let area = bounds.expanded_towards(actual);
+        if !area.min.cmple(area.max).all()
+            || area.min.min_element() < f64::from(i32::MIN)
+            || area.max.max_element() > f64::from(i32::MAX)
+        {
+            return None;
+        }
+        let low = area.min.floor().as_ivec3();
+        let high = area.max.floor().as_ivec3();
+        let count = (i64::from(high.x) - i64::from(low.x) + 1)
+            .checked_mul(i64::from(high.y) - i64::from(low.y) + 1)?
+            .checked_mul(i64::from(high.z) - i64::from(low.z) + 1)?;
+        if !(1..=4096).contains(&count) {
+            return None;
+        }
+        let mut found = false;
+        for x in low.x..=high.x {
+            for y in low.y..=high.y {
+                for z in low.z..=high.z {
+                    let Cell::State(id) = cell(
+                        self.world,
+                        self.origin,
+                        self.bounds,
+                        IVec3::new(x, y, z),
+                        self.air,
+                    ) else {
+                        return None;
+                    };
+                    let state = self.world.state(id)?;
+                    if state.name == "minecraft:cactus" {
+                        native_world::collision::block_shape(state)?;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if !found {
+            return Some(0);
+        }
+        let hits = crate::fire_contact::swept(bounds, actual, requested, |pos| {
+            let Cell::State(id) = cell(self.world, self.origin, self.bounds, pos, self.air) else {
+                return None;
+            };
+            let state = self.world.state(id)?;
+            Some(
+                (state.name == "minecraft:cactus")
+                    .then_some(crate::fire_contact::InsideBlock::Cactus),
+            )
+        })?;
+        Some(hits.len())
+    }
+
     fn bubble_contacts(
         &self,
         bounds: BoundingBox,
@@ -61872,6 +61943,37 @@ pub(crate) mod tests {
         assert!(session.take_consume_sounds().is_empty());
         assert_eq!(session.vitals.exhaustion, 0.0);
         assert_eq!(session.player_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn item_cactus_contacts_follow_the_swept_full_block_volume() {
+        let mut test = session();
+        let cactus = test.intern_block(state("minecraft:cactus", &[("age", "0")]));
+        assert!(test.set(IVec3::new(9, 1, 8), cactus));
+        let view = FluidView {
+            world: &test.world,
+            shapes: &test.shapes,
+            fluids: &test.fluids,
+            origin: test.origin,
+            bounds: test.bounds,
+            air: test.states[0],
+        };
+        let bounds = BoundingBox {
+            min: DVec3::new(8.625, 1.0, 8.375),
+            max: DVec3::new(8.875, 1.25, 8.625),
+        };
+        assert_eq!(
+            view.cactus_contacts(bounds, DVec3::ZERO, DVec3::ZERO),
+            Some(0)
+        );
+        assert_eq!(
+            view.cactus_contacts(bounds, DVec3::X * 0.2, DVec3::X * 0.2),
+            Some(1)
+        );
+        assert_eq!(
+            view.cactus_contacts(bounds, DVec3::splat(f64::NAN), DVec3::ZERO),
+            None
+        );
     }
 
     #[test]

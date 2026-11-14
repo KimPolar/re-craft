@@ -114,5 +114,23 @@ public class ItemLavaOracle {
       }
     }
     Files.writeString(Path.of(args[2]),new Gson().toJson(rainOut));
+    var cactus=lookup.getOrThrow(DamageTypes.CACTUS);
+    bind.invoke(cactus,List.of(DamageTypeTags.NO_KNOCKBACK));
+    var cactusSource=new DamageSource(cactus);
+    var cactusOut=new JsonArray();
+    for(int mode=0;mode<4;mode++) {
+      var item=(Item)unsafe.allocateInstance(Item.class); item.world=world; item.sources=sources;
+      item.stack=new ItemStack(mode==1 ? Items.NETHERITE_INGOT : mode==3 ? Items.NETHER_STAR : Items.STONE);
+      health.setInt(item,5); invuln.setBoolean(item,mode==2);
+      var rows=new JsonArray();
+      for(int tick=0;tick<6;tick++) {
+        item.hurtServer(world,cactusSource,1.0f);
+        var row=new JsonObject(); row.addProperty("health",health.getInt(item));
+        row.addProperty("removed",item.removed); rows.add(row);
+        if(item.removed) break;
+      }
+      cactusOut.add(rows);
+    }
+    Files.writeString(Path.of(args[3]),new Gson().toJson(cactusOut));
   }
 }

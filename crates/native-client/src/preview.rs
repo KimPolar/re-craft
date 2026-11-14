@@ -697,6 +697,8 @@ impl PreviewMaterials {
                         .select_indices(blockstates::positional_seed(
                             position.x, position.y, position.z,
                         ))?;
+                let block_position = relative_position(position, origin)
+                    + native_world::collision::block_model_offset(&state.name, position);
                 let mut cached_tints: [Option<(i32, [f32; 3])>; 4] = [None; 4];
                 for (group, selected) in block.baked.groups.iter().zip(selections) {
                     let weighted = group.get(selected).context("invalid selected model")?;
@@ -757,7 +759,6 @@ impl PreviewMaterials {
                             }
                             value
                         };
-                        let block_position = relative_position(position, origin);
                         let vertices = std::array::from_fn(|i| {
                             let vertex = quad.vertices[[0, 1, 2, 0, 2, 3][i]];
                             Vertex {
@@ -2820,6 +2821,218 @@ mod tests {
         assert!(scene.translucent_len() == 0);
         assert_eq!(scene.warnings.len(), 1);
         assert!(scene.warnings[0].contains("example:unknown"));
+    }
+
+    #[test]
+    fn offset_mesh_moves_model_but_not_water_with_absolute_position() {
+        fn mesh(name: &str, wet: bool, local: IVec3) -> Arc<ChunkMesh> {
+            let mut world = World::new("minecraft:overworld");
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            let block = world.intern_state(BlockState {
+                name: name.into(),
+                properties: BTreeMap::from([
+                    ("thickness".into(), "tip".into()),
+                    ("vertical_direction".into(), "up".into()),
+                    ("waterlogged".into(), wet.to_string()),
+                ]),
+            });
+            let chunk = ChunkPos {
+                x: 12345,
+                z: -23456,
+            };
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            blocks[(local.x + local.z * 16 + local.y * 256) as usize] = block;
+            world.chunks.insert(
+                chunk,
+                Arc::new(Chunk {
+                    position: chunk,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+            let origin = IVec3::new(chunk.x * 16, 0, chunk.z * 16);
+            Arc::clone(
+                &PreviewScene::prepare(&world, &mut Empty, origin, 128)
+                    .unwrap()
+                    .chunks[&chunk],
+            )
+        }
+
+        for local in [IVec3::new(3, 2, 5), IVec3::new(8, 2, 10)] {
+            let absolute = IVec3::new(12345 * 16, 0, -23456 * 16) + local;
+            let model_count = mesh("example:control", false, local).opaque.len();
+            assert!(model_count > 0);
+            for wet in [false, true] {
+                let control = mesh("example:control", wet, local);
+                for name in [
+                    "minecraft:sulfur_spike",
+                    "minecraft:pointed_dripstone",
+                    "minecraft:short_grass",
+                    "minecraft:dandelion",
+                    "minecraft:small_dripleaf",
+                ] {
+                    if wet
+                        && !matches!(
+                            name,
+                            "minecraft:sulfur_spike" | "minecraft:pointed_dripstone"
+                        )
+                    {
+                        continue;
+                    }
+                    let offset = native_world::collision::block_model_offset(name, absolute);
+                    let result = mesh(name, wet, local);
+                    assert_eq!(result.opaque.len(), control.opaque.len());
+                    let fluid_count = result.opaque.len() - model_count;
+                    assert_eq!(
+                        fluid_count > 0,
+                        wet,
+                        "expected visible water only in the wet case"
+                    );
+                    for (actual, expected) in result.opaque[..fluid_count]
+                        .iter()
+                        .zip(&control.opaque[..fluid_count])
+                    {
+                        assert_eq!(
+                            actual.position, expected.position,
+                            "water moved at {absolute:?}"
+                        );
+                    }
+                    for (actual, expected) in result.opaque[fluid_count..]
+                        .iter()
+                        .zip(&control.opaque[fluid_count..])
+                    {
+                        let delta =
+                            Vec3::from_array(actual.position) - Vec3::from_array(expected.position);
+                        assert!(
+                            delta.distance(offset) < 1.0e-6,
+                            "{name} at {absolute:?}: {delta:?} vs {offset:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 assets"]
+    fn vanilla_offset_mesh_applies_java_model_offset() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let chunk = ChunkPos { x: -15, z: 23 };
+        let origin = IVec3::new(chunk.x * 16, 0, chunk.z * 16);
+        for name in [
+            "minecraft:sulfur_spike",
+            "minecraft:pointed_dripstone",
+            "minecraft:short_grass",
+            "minecraft:dandelion",
+            "minecraft:small_dripleaf",
+        ] {
+            for local in [IVec3::new(3, 2, 5), IVec3::new(8, 2, 10)] {
+                let state = BlockState {
+                    name: name.into(),
+                    properties: match name {
+                        "minecraft:sulfur_spike" | "minecraft:pointed_dripstone" => {
+                            BTreeMap::from([
+                                ("thickness".into(), "tip".into()),
+                                ("vertical_direction".into(), "up".into()),
+                                ("waterlogged".into(), "false".into()),
+                            ])
+                        }
+                        "minecraft:small_dripleaf" => BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("half".into(), "lower".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]),
+                        _ => BTreeMap::new(),
+                    },
+                };
+                let mut world = World::new("minecraft:overworld");
+                let air = world.intern_state(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: BTreeMap::new(),
+                });
+                let id = world.intern_state(state.clone());
+                let mut blocks = Box::new([air; BLOCK_COUNT]);
+                blocks[(local.x + local.z * 16 + local.y * 256) as usize] = id;
+                world.chunks.insert(
+                    chunk,
+                    Arc::new(Chunk {
+                        position: chunk,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: false,
+                        sections: BTreeMap::from([(
+                            0,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        )]),
+                    }),
+                );
+                let baked =
+                    geometry::bake_blockstate(&mut resources, &state.name, &state.properties)
+                        .unwrap();
+                let position = origin + local;
+                let selected = baked
+                    .definition
+                    .select_indices(blockstates::positional_seed(
+                        position.x, position.y, position.z,
+                    ))
+                    .unwrap();
+                let model_origin =
+                    local.as_vec3() + native_world::collision::block_model_offset(name, position);
+                let mut expected = Vec::new();
+                for (group, index) in baked.groups.iter().zip(selected) {
+                    for quad in &group[index].model.quads {
+                        for vertex in [0, 1, 2, 0, 2, 3] {
+                            expected.push(
+                                (model_origin + Vec3::from_array(quad.vertices[vertex].position))
+                                    .to_array(),
+                            );
+                        }
+                    }
+                }
+                let scene = PreviewScene::prepare(&world, &mut resources, origin, 2048).unwrap();
+                let mesh = &scene.chunks[&chunk];
+                let mut actual: Vec<_> = mesh
+                    .opaque
+                    .iter()
+                    .map(|v| v.position)
+                    .chain(
+                        mesh.translucent
+                            .iter()
+                            .flat_map(|quad| quad.vertices.iter().map(|v| v.position)),
+                    )
+                    .collect();
+                assert!(!expected.is_empty(), "{name}");
+                let sort = |values: &mut Vec<[f32; 3]>| {
+                    values.sort_by(|a, b| {
+                        a[0].total_cmp(&b[0])
+                            .then(a[1].total_cmp(&b[1]))
+                            .then(a[2].total_cmp(&b[2]))
+                    })
+                };
+                sort(&mut actual);
+                sort(&mut expected);
+                assert_eq!(actual, expected, "{name} at {position:?}");
+            }
+        }
     }
 
     #[test]

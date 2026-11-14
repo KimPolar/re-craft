@@ -1376,6 +1376,80 @@ fn potent_sulfur_state(state: &BlockState) -> bool {
         )
 }
 
+fn block_offset_indices(pos: IVec3) -> (usize, usize, usize) {
+    let seed =
+        i64::from(pos.x.wrapping_mul(3_129_871)) ^ i64::from(pos.z).wrapping_mul(116_129_781);
+    let seed = seed
+        .wrapping_mul(seed)
+        .wrapping_mul(42_317_861)
+        .wrapping_add(seed.wrapping_mul(11))
+        >> 16;
+    (
+        (seed & 15) as usize,
+        ((seed >> 4) & 15) as usize,
+        ((seed >> 8) & 15) as usize,
+    )
+}
+
+fn block_axis_offset(value: usize, limit: f64) -> f64 {
+    ((f64::from(value as f32 / 15.0) - 0.5) * 0.5).clamp(-limit, limit)
+}
+
+/// Java 26.3's state-independent model translations for registered blocks.
+pub fn block_model_offset(id: &str, pos: IVec3) -> Vec3 {
+    let (horizontal, vertical) = match id {
+        "minecraft:sulfur_spike" | "minecraft:pointed_dripstone" => (0.125, 0.0_f32),
+        "minecraft:small_dripleaf" => (0.25, 0.1_f32),
+        "minecraft:short_grass"
+        | "minecraft:fern"
+        | "minecraft:short_dry_grass"
+        | "minecraft:tall_dry_grass" => (0.25, 0.2_f32),
+        "minecraft:mangrove_propagule"
+        | "minecraft:tall_seagrass"
+        | "minecraft:dandelion"
+        | "minecraft:golden_dandelion"
+        | "minecraft:torchflower"
+        | "minecraft:poppy"
+        | "minecraft:blue_orchid"
+        | "minecraft:allium"
+        | "minecraft:azure_bluet"
+        | "minecraft:red_tulip"
+        | "minecraft:orange_tulip"
+        | "minecraft:white_tulip"
+        | "minecraft:pink_tulip"
+        | "minecraft:oxeye_daisy"
+        | "minecraft:cornflower"
+        | "minecraft:wither_rose"
+        | "minecraft:lily_of_the_valley"
+        | "minecraft:sunflower"
+        | "minecraft:lilac"
+        | "minecraft:rose_bush"
+        | "minecraft:peony"
+        | "minecraft:tall_grass"
+        | "minecraft:large_fern"
+        | "minecraft:pitcher_plant"
+        | "minecraft:bamboo_sapling"
+        | "minecraft:bamboo"
+        | "minecraft:warped_roots"
+        | "minecraft:nether_sprouts"
+        | "minecraft:crimson_roots"
+        | "minecraft:hanging_roots"
+        | "minecraft:open_eyeblossom"
+        | "minecraft:closed_eyeblossom" => (0.25, 0.0_f32),
+        _ => return Vec3::ZERO,
+    };
+    let (x, y, z) = block_offset_indices(pos);
+    Vec3::new(
+        block_axis_offset(x, horizontal) as f32,
+        if vertical == 0.0 {
+            0.0
+        } else {
+            ((f64::from(y as f32 / 15.0) - 1.0) * f64::from(vertical)) as f32
+        },
+        block_axis_offset(z, horizontal) as f32,
+    )
+}
+
 /// The two vanilla speleothems use a horizontal, position-dependent offset.
 /// Their finite set of boxes is shared so collision and ray queries need no
 /// allocation. Other dynamic blocks remain unsupported here.
@@ -1405,15 +1479,7 @@ pub fn positioned_speleothem_shape(state: &BlockState, pos: IVec3) -> Option<&'s
         "base" => 5,
         _ => return None,
     };
-    let seed =
-        i64::from(pos.x.wrapping_mul(3_129_871)) ^ i64::from(pos.z).wrapping_mul(116_129_781);
-    let seed = seed
-        .wrapping_mul(seed)
-        .wrapping_mul(42_317_861)
-        .wrapping_add(seed.wrapping_mul(11))
-        >> 16;
-    let x = (seed & 15) as usize;
-    let z = ((seed >> 8) & 15) as usize;
+    let (x, _, z) = block_offset_indices(pos);
     static SHAPES: OnceLock<[[Aabb; 256]; 6]> = OnceLock::new();
     let shapes = SHAPES.get_or_init(|| {
         std::array::from_fn(|kind| {
@@ -1427,11 +1493,8 @@ pub fn positioned_speleothem_shape(state: &BlockState, pos: IVec3) -> Option<&'s
                 _ => unreachable!(),
             };
             std::array::from_fn(|index| {
-                let offset = |value: usize| {
-                    ((f64::from(value as f32 / 15.0) - 0.5) * 0.5).clamp(-0.125, 0.125)
-                };
-                let dx = offset(index & 15);
-                let dz = offset(index >> 4);
+                let dx = block_axis_offset(index & 15, 0.125);
+                let dz = block_axis_offset(index >> 4, 0.125);
                 Aabb {
                     min: Vec3::new(
                         (min / 16.0 + dx) as f32,

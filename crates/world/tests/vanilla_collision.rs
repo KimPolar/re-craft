@@ -877,6 +877,14 @@ fn positioned_speleothem_shapes_match_java() {
             p[1].as_i64().unwrap() as i32,
             p[2].as_i64().unwrap() as i32,
         );
+        let offset = native_world::collision::block_model_offset(&state.name, pos).to_array();
+        for (actual, expected) in offset.into_iter().zip(record["offset"].as_array().unwrap()) {
+            assert_eq!(
+                actual.to_bits(),
+                (expected.as_f64().unwrap() as f32).to_bits(),
+                "{state:?} {pos:?}: {actual} vs {expected}"
+            );
+        }
         let actual = native_world::collision::positioned_speleothem_shape(&state, pos).unwrap();
         for key in ["collision", "spawnCollision", "outline"] {
             let expected = record[key].as_array().unwrap();
@@ -899,4 +907,58 @@ fn positioned_speleothem_shapes_match_java() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn registered_block_model_offsets_match_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("BlockModelOffsetOracle.java");
+    let output = temp.path().join("offsets.json");
+    std::fs::write(&source, include_str!("java/BlockModelOffsetOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("BlockModelOffsetOracle")
+        .arg(&output));
+    let records: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let records = records.as_array().unwrap();
+    assert!(records.len() > 6000, "missing registered blocks");
+    let mut shifted = 0;
+    for record in records {
+        let id = record["id"].as_str().unwrap();
+        let position = record["position"].as_array().unwrap();
+        let pos = glam::IVec3::new(
+            position[0].as_i64().unwrap() as i32,
+            position[1].as_i64().unwrap() as i32,
+            position[2].as_i64().unwrap() as i32,
+        );
+        let actual = native_world::collision::block_model_offset(id, pos);
+        shifted += usize::from(actual != glam::Vec3::ZERO);
+        for (actual, expected) in actual
+            .to_array()
+            .into_iter()
+            .zip(record["offset"].as_array().unwrap())
+        {
+            assert_eq!(
+                actual.to_bits(),
+                (expected.as_f64().unwrap() as f32).to_bits(),
+                "{id} {pos:?}: {actual} vs {expected}"
+            );
+        }
+    }
+    assert_eq!(shifted, 39 * 6);
 }

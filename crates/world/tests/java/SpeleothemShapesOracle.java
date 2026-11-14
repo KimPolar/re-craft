@@ -44,6 +44,10 @@ public class SpeleothemShapesOracle {
                     var position = new JsonArray();
                     position.add(pos.getX()); position.add(pos.getY()); position.add(pos.getZ());
                     record.add("position", position);
+                    var translation = state.getOffset(pos);
+                    var offset = new JsonArray();
+                    offset.add(translation.x); offset.add(translation.y); offset.add(translation.z);
+                    record.add("offset", offset);
                     record.add("collision", boxes(state.getCollisionShape(EmptyBlockGetter.INSTANCE, pos)));
                     record.add("spawnCollision", boxes(state.getCollisionShape(EmptyBlockGetter.INSTANCE, pos,
                         net.minecraft.world.phys.shapes.CollisionContext.emptyWithFluidCollisions())));

@@ -1815,6 +1815,7 @@ pub(crate) fn fence_connection(
                 | "minecraft:smooth_basalt"
                 | "minecraft:amethyst_block"
                 | "minecraft:budding_amethyst"
+                | "minecraft:spawner"
         )
     {
         return Ok(true);

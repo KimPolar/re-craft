@@ -1790,6 +1790,9 @@ pub(crate) fn fence_connection(
     if super::ore::generation_rail_state(neighbor) {
         return Ok(false);
     }
+    if neighbor.name == "minecraft:cobweb" && neighbor.properties.is_empty() {
+        return Ok(false);
+    }
     let except = leaf_distance(neighbor)?.is_some()
         || matches!(
             neighbor.name.as_str(),

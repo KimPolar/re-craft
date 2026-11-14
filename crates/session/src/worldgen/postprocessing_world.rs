@@ -278,6 +278,15 @@ pub(super) struct PostprocessingLightCheckpoint {
 }
 
 impl PostprocessedGeneratedRegion {
+    /// Candidate proto-entity records captured by the pass. These do not by
+    /// themselves establish complete sidecars or unchanged live entities.
+    pub fn recorded_entity_candidates(
+        &self,
+        position: ChunkPos,
+    ) -> Option<Option<&Arc<Vec<native_persistence::nbt::Tag>>>> {
+        self.entity_candidates.get(&position).map(Option::as_ref)
+    }
+
     /// Ordered block transitions for a converted chunk. The caller must first
     /// validate the completed pass and still reconcile POIs and live tickets.
     pub fn block_changes_for_chunk(

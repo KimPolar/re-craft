@@ -748,6 +748,20 @@ impl CapturedPostprocessingProof {
         }
     }
 
+    fn matches_source(&self, source: Option<&NamedTag>) -> Result<bool> {
+        match self {
+            Self::Empty(proof) => proof.matches_source(source),
+            Self::Planned(proof) => proof.matches_source(source),
+        }
+    }
+
+    fn other_fields(&self) -> &[(native_persistence::nbt::JavaString, Tag)] {
+        match self {
+            Self::Empty(proof) => proof.other_fields(),
+            Self::Planned(proof) => proof.other_fields(),
+        }
+    }
+
     fn matches_state(
         &self,
         batch: &CapturedTerrainBatch,
@@ -890,6 +904,7 @@ impl CapturedMixedPostprocessingStage {
             "postprocessing still needs a retry"
         );
         Ok(CapturedMixedPostprocessedRegion {
+            identity: Arc::new(()),
             proofs: self.proofs,
             region: self.stage.finish()?,
             game_time: self.game_time,
@@ -900,6 +915,7 @@ impl CapturedMixedPostprocessingStage {
 }
 
 pub(crate) struct CapturedMixedPostprocessedRegion {
+    identity: Arc<()>,
     proofs: BTreeMap<native_world::loaded::ChunkPos, CapturedPostprocessingProof>,
     region: native_session::worldgen::PostprocessedGeneratedRegion,
     game_time: i64,
@@ -926,6 +942,74 @@ impl CapturedMixedPostprocessedRegion {
                 .proofs
                 .values()
                 .all(|proof| proof.matches_state(batch, light, inputs))
+    }
+}
+
+/// Encoded sections bound to one completed mixed postprocessing pass.
+pub(crate) struct CapturedMixedPostprocessedSections {
+    result_identity: Arc<()>,
+    sections: BTreeMap<native_world::loaded::ChunkPos, Tag>,
+}
+
+impl CapturedMixedPostprocessedSections {
+    pub fn sections(&self) -> &BTreeMap<native_world::loaded::ChunkPos, Tag> {
+        &self.sections
+    }
+
+    pub fn matches_state(
+        &self,
+        completed: &CapturedMixedPostprocessedRegion,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        Arc::ptr_eq(&self.result_identity, &completed.identity)
+            && completed.matches_state(batch, light, inputs)
+    }
+}
+
+/// Isolated output for a sealed mixed pass, still requiring live and disk
+/// source checks and one coordinated save transaction.
+pub(crate) struct CapturedMixedPostprocessedComponents {
+    result_identity: Arc<()>,
+    chunks: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_session::worldgen::PostprocessedChunkComponents,
+    >,
+    structures: BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
+    external_structure_sources: BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+    missing_poi: BTreeMap<native_world::loaded::ChunkPos, Option<NamedTag>>,
+}
+
+impl CapturedMixedPostprocessedComponents {
+    pub fn outputs(
+        &self,
+    ) -> (
+        &BTreeMap<
+            native_world::loaded::ChunkPos,
+            native_session::worldgen::PostprocessedChunkComponents,
+        >,
+        &BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
+        &BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+        &BTreeMap<native_world::loaded::ChunkPos, Option<NamedTag>>,
+    ) {
+        (
+            &self.chunks,
+            &self.structures,
+            &self.external_structure_sources,
+            &self.missing_poi,
+        )
+    }
+
+    pub fn matches_state(
+        &self,
+        completed: &CapturedMixedPostprocessedRegion,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> bool {
+        Arc::ptr_eq(&self.result_identity, &completed.identity)
+            && completed.matches_state(batch, light, inputs)
     }
 }
 
@@ -2952,6 +3036,256 @@ impl PreparedExistingGenerator {
             &light.engine,
             &assets.blocks,
         )
+    }
+
+    /// Resume a sealed mixed pass without repeating completed callbacks.
+    pub fn resume_captured_mixed_postprocessing(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedMixedPostprocessedRegion,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedPostprocessingStage> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && completed.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let stage = batch.terrain.resume_captured_postprocessing(
+            &assets.blocks,
+            &light.engine,
+            &completed.region,
+        )?;
+        Ok(CapturedMixedPostprocessingStage {
+            proofs: completed.proofs.clone(),
+            stage,
+            game_time: inputs.game_time,
+            next_sub_tick: inputs.next_sub_tick,
+            water_source_conversion: inputs.water_source_conversion,
+            waiting_neighbor: None,
+            retry_target: None,
+        })
+    }
+
+    /// Encode terrain and drained light from the exact sealed mixed pass.
+    pub fn captured_mixed_postprocessed_sections(
+        &mut self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedMixedPostprocessedRegion,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedPostprocessedSections> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && completed.matches_state(batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        let mut selected = BTreeSet::new();
+        for pos in positions {
+            ensure!(selected.insert(pos), "duplicate postprocessed chunk");
+            ensure!(
+                completed.proofs.contains_key(&pos) && completed.region.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+        }
+        ensure!(!selected.is_empty(), "no postprocessed chunks selected");
+        let biomes: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/biome")?
+            .into_iter()
+            .collect();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let visible = batch.terrain.captured_postprocessed_light_snapshot(
+            &completed.region,
+            &light.engine,
+            &assets.blocks,
+            selected.iter().copied(),
+        )?;
+        let mut sections = BTreeMap::new();
+        for pos in selected {
+            let source = batch
+                .sources
+                .get(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+                .context("terrain source was not captured")?;
+            ensure!(
+                completed.proofs[&pos].matches_source(source.as_deref())?,
+                "postprocessing source differs"
+            );
+            let generated = native_persistence::generated_section::encode_generated_sections(
+                &completed.region.world,
+                pos,
+                self.lighting.min_y,
+                self.lighting.height,
+                self.lighting.has_skylight,
+                |state| {
+                    assets
+                        .blocks
+                        .is_canonical_state(&state.name, &state.properties)
+                },
+                |name| {
+                    ResourceId::parse(name)
+                        .ok()
+                        .is_some_and(|id| biomes.contains(&id))
+                },
+            )?;
+            let merged = merge_captured_postprocessed_sections(source.as_deref(), &generated)?;
+            let merged = native_persistence::generated_section::merge_generated_light_sections(
+                &merged,
+                &visible,
+                pos,
+                self.lighting.min_y,
+                self.lighting.height,
+                self.lighting.has_skylight,
+            )?;
+            sections.insert(pos, merged);
+        }
+        Ok(CapturedMixedPostprocessedSections {
+            result_identity: Arc::clone(&completed.identity),
+            sections,
+        })
+    }
+
+    /// Gather sealed terrain and entity candidates without claiming a safe save.
+    pub fn captured_mixed_postprocessed_components(
+        &self,
+        batch: &CapturedTerrainBatch,
+        light: &CapturedStagedLight,
+        completed: &CapturedMixedPostprocessedRegion,
+        sections: &CapturedMixedPostprocessedSections,
+        inputs: CapturedPostprocessingInputs<'_>,
+    ) -> Result<CapturedMixedPostprocessedComponents> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity)
+                && sections.matches_state(completed, batch, light, inputs),
+            "captured postprocessing inputs changed"
+        );
+        let (mut updated_sources, external_structure_sources) =
+            partition_structure_sources(self.draft_captured_structure_sources(batch)?, |source| {
+                sections.sections.contains_key(&source)
+            });
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let data = batch.terrain.captured_postprocessed_chunk_data(
+            &completed.region,
+            &assets.blocks,
+            &assets.block_ids,
+            sections.sections.keys().copied(),
+        )?;
+        let missing_poi_positions = captured_missing_poi_positions(
+            self.context.inputs().sources().chunks(),
+            sections.sections.keys().copied(),
+        )?;
+        let missing_poi = if missing_poi_positions.is_empty() {
+            BTreeMap::new()
+        } else {
+            batch.terrain.captured_postprocessed_missing_poi_snapshot(
+                &completed.region,
+                &assets.blocks,
+                missing_poi_positions,
+            )?
+        };
+        let drops_occurred = completed
+            .region
+            .block_drops()
+            .is_some_and(|drops| drops.operations() != 0 || drops.item_chunks().next().is_some());
+        let mut chunks = BTreeMap::new();
+        let mut structures = BTreeMap::new();
+        for (pos, data) in data {
+            let proof = completed
+                .proofs
+                .get(&pos)
+                .context("postprocessing proof is missing")?;
+            let key = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let source = batch
+                .sources
+                .get(&key)
+                .context("terrain source was not captured")?;
+            ensure!(
+                proof.matches_source(source.as_deref())?,
+                "postprocessing source differs"
+            );
+            let captured = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&key)
+                .context("entity source was not captured")?;
+            ensure!(
+                match (&captured.terrain, source) {
+                    (None, None) => true,
+                    (Some(saved), Some(source)) => Arc::ptr_eq(&saved.document, source),
+                    _ => false,
+                },
+                "captured entity terrain source differs"
+            );
+            let mut document = if let Some(draft) = updated_sources.remove(&pos) {
+                draft.document
+            } else {
+                source.as_deref().cloned().unwrap_or_else(|| NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                })
+            };
+            if let Some(references) = batch.generated_references.get(&pos) {
+                merge_generated_structure_references(&mut document, references)?;
+            } else {
+                ensure!(
+                    source.is_some(),
+                    "generated structure references are missing"
+                );
+            }
+            structures.insert(pos, unique_root_field(&document, "structures")?.cloned());
+            let heightmaps =
+                merge_captured_postprocessed_heightmaps(proof.other_fields(), data.heightmaps)?;
+            // Block drops and their listener effects require a separate validated
+            // integration. Unknown candidates must never become an empty list.
+            let entity_records = if drops_occurred {
+                None
+            } else {
+                completed
+                    .region
+                    .recorded_entity_candidates(pos)
+                    .flatten()
+                    .cloned()
+            };
+            chunks.insert(
+                pos,
+                native_session::worldgen::PostprocessedChunkComponents {
+                    sections: sections
+                        .sections
+                        .get(&pos)
+                        .context("postprocessed sections are missing")?
+                        .clone(),
+                    heightmaps,
+                    block_ticks: data.block_ticks,
+                    fluid_ticks: data.fluid_ticks,
+                    block_entities: data.block_entities,
+                    entity_records,
+                },
+            );
+        }
+        ensure!(
+            updated_sources.is_empty(),
+            "postprocessed structure source is missing"
+        );
+        Ok(CapturedMixedPostprocessedComponents {
+            result_identity: Arc::clone(&completed.identity),
+            chunks,
+            structures,
+            external_structure_sources,
+            missing_poi,
+        })
     }
 
     /// Prepare an isolated converted region in the caller's registration
@@ -8884,6 +9218,16 @@ mod tests {
         let second = native_world::loaded::ChunkPos { x: 0, z: 2 };
         let third = native_world::loaded::ChunkPos { x: 1, z: 2 };
         let neighbor = native_world::loaded::ChunkPos { x: -1, z: 1 };
+        let support = [
+            native_world::loaded::ChunkPos { x: -2, z: 1 },
+            native_world::loaded::ChunkPos { x: -2, z: 2 },
+            native_world::loaded::ChunkPos { x: -2, z: 3 },
+            native_world::loaded::ChunkPos { x: 0, z: 1 },
+            native_world::loaded::ChunkPos { x: 1, z: 1 },
+            native_world::loaded::ChunkPos { x: -1, z: 3 },
+            native_world::loaded::ChunkPos { x: 0, z: 3 },
+            native_world::loaded::ChunkPos { x: 1, z: 3 },
+        ];
         let (lighting, _, _) = GeneratedDimensionLighting::load_preset_with_definition(
             &mut resources,
             "minecraft:normal",
@@ -9190,6 +9534,9 @@ mod tests {
         schedule.request(second, GenerationStage::Spawn)?;
         schedule.request(third, GenerationStage::Spawn)?;
         schedule.request(neighbor, GenerationStage::Spawn)?;
+        for &position in &support {
+            schedule.request(position, GenerationStage::Spawn)?;
+        }
         schedule.request(structure_target, GenerationStage::Spawn)?;
         let mut actual = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
         assert!(!actual.generate_structures);
@@ -10097,7 +10444,8 @@ mod tests {
                 .context("world session lock missing")?,
             target,
         )?;
-        let order = vec![second, third, neighbor, structure_target];
+        let mut order = vec![second, third, neighbor, structure_target];
+        order.extend(support);
         let mut worker = crate::chunk_stream::MissingGenerationPropagationWorker::start(
             initialized,
             &streamer,
@@ -10105,7 +10453,7 @@ mod tests {
             order.clone(),
         )
         .map_err(|failure| failure.error)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         let propagated = loop {
             if let Some(result) = worker.try_result(&streamer, &worker_session)? {
                 break result;
@@ -10718,7 +11066,7 @@ mod tests {
             Some(&Tag::Int(73))
         );
         let mut additional_spawns = Vec::new();
-        for position in [third, neighbor] {
+        for position in [third, neighbor].into_iter().chain(support) {
             let mut plan =
                 actual.plan_captured_creatures(&batch, &staged, position, true, &clocks)?;
             plan.inner.planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
@@ -10881,6 +11229,111 @@ mod tests {
             retry,
             baseline.try_poll(&batch, &staged, inputs, target, 1)?
         );
+        let complete_region = actual.begin_captured_mixed_postprocessing_region(
+            &batch,
+            &staged,
+            [
+                CapturedPostprocessingSpawn::Planned(&spawn),
+                CapturedPostprocessingSpawn::Planned(&saved_spawn),
+            ]
+            .into_iter()
+            .chain(
+                additional_spawns
+                    .iter()
+                    .map(CapturedPostprocessingSpawn::Planned),
+            ),
+            inputs,
+        )?;
+        let mut complete_stage = actual.run_captured_mixed_postprocessing(
+            &batch,
+            &staged,
+            complete_region,
+            [target],
+            inputs,
+        )?;
+        let mut done = false;
+        for _ in 0..1024 {
+            match complete_stage.try_poll(&batch, &staged, inputs, target, 64)? {
+                native_session::worldgen::PostprocessingAttempt::Progress { complete } => {
+                    if complete {
+                        done = true;
+                        break;
+                    }
+                }
+                native_session::worldgen::PostprocessingAttempt::NeedsChunk(missing) => {
+                    bail!("creature chunk needs unprepared neighbor {missing:?}")
+                }
+            }
+        }
+        assert!(done, "creature chunk postprocessing did not finish");
+        actual.drain_captured_mixed_postprocessing_light(
+            &batch,
+            &staged,
+            &mut complete_stage,
+            inputs,
+        )?;
+        let completed = complete_stage.finish(&batch, &staged, inputs)?;
+        assert!(completed.matches_state(&batch, &staged, inputs));
+        assert!(!completed.matches_state(&batch, &staged, wrong_inputs));
+        assert!(completed.region().chunks.contains(&target));
+        assert!(
+            completed
+                .region()
+                .recorded_entity_candidates(target)
+                .flatten()
+                .context("completed pig candidates missing")?
+                .iter()
+                .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into())))
+        );
+        assert!(
+            actual
+                .resume_captured_mixed_postprocessing(&batch, &staged, &completed, wrong_inputs)
+                .is_err()
+        );
+        let resumed =
+            actual.resume_captured_mixed_postprocessing(&batch, &staged, &completed, inputs)?;
+        assert!(resumed.matches_state(&batch, &staged, inputs));
+        assert!(
+            resumed
+                .stage
+                .recorded_entity_candidates(target)
+                .flatten()
+                .is_some()
+        );
+        let sections = actual.captured_mixed_postprocessed_sections(
+            &batch,
+            &staged,
+            &completed,
+            [target],
+            inputs,
+        )?;
+        assert!(sections.matches_state(&completed, &batch, &staged, inputs));
+        assert!(sections.sections().contains_key(&target));
+        assert!(
+            actual
+                .captured_mixed_postprocessed_sections(
+                    &batch,
+                    &staged,
+                    &completed,
+                    [second],
+                    inputs
+                )
+                .is_err()
+        );
+        let components = actual.captured_mixed_postprocessed_components(
+            &batch, &staged, &completed, &sections, inputs,
+        )?;
+        assert!(components.matches_state(&completed, &batch, &staged, inputs));
+        assert!(!components.matches_state(&completed, &batch, &staged, wrong_inputs));
+        let (chunks, _, _, _) = components.outputs();
+        assert!(
+            chunks[&target]
+                .entity_records
+                .as_ref()
+                .is_some_and(|records| records
+                    .iter()
+                    .any(|record| record.get("id") == Some(&Tag::String("minecraft:pig".into()))))
+        );
         if matches!(
             retry,
             native_session::worldgen::PostprocessingAttempt::Progress { .. }
@@ -10919,6 +11372,9 @@ mod tests {
         staged.completed_creature_spawns.remove(&target);
         staged.completed_creature_spawns.remove(&third);
         staged.completed_creature_spawns.remove(&neighbor);
+        for position in support {
+            staged.completed_creature_spawns.remove(&position);
+        }
         assert!(!spawn.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
         assert!(!proof.matches_state(&batch, &staged, true, &clocks, Some(changed_border)));
         assert!(!saved_spawn.matches_state(&batch, &staged, true, &clocks, None));

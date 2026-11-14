@@ -26,6 +26,9 @@ pub struct SavedFallingBlock {
     pub time: i32,
     pub drop_item: bool,
     pub cancel_drop: bool,
+    /// `None` leaves the Java block-tag-dependent default unresolved.
+    pub hurt_entities: Option<bool>,
+    pub fall_damage: crate::falling_block::FallingDamage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -757,6 +760,9 @@ pub fn draft(original: &NamedTag, state: FallingSaveState) -> Result<FallingBloc
         "Time",
         "DropItem",
         "CancelDrop",
+        "HurtEntities",
+        "FallHurtAmount",
+        "FallHurtMax",
     ] {
         ensure!(
             fields.iter().filter(|(name, _)| name.matches(key)).count() <= 1,
@@ -777,11 +783,7 @@ pub fn draft(original: &NamedTag, state: FallingSaveState) -> Result<FallingBloc
         "unsupported falling block entity data"
     );
     ensure!(
-        !original
-            .value
-            .get("HurtEntities")
-            .and_then(player_data::numeric_byte)
-            .is_some_and(|value| value != 0),
+        !saved.hurt_entities.unwrap_or(false),
         "fall damage is not simulated"
     );
     for key in ["Pos", "Motion"] {
@@ -895,6 +897,15 @@ pub fn read(entity: &Tag) -> Result<Option<SavedFallingBlock>> {
     if id.namespace != "minecraft" || id.path != "falling_block" {
         return Ok(None);
     }
+    let Tag::Compound(fields) = entity else {
+        unreachable!("compound checked above")
+    };
+    for key in ["HurtEntities", "FallHurtAmount", "FallHurtMax"] {
+        ensure!(
+            fields.iter().filter(|(name, _)| name.matches(key)).count() <= 1,
+            "duplicate {key} fields cannot be simulated safely"
+        );
+    }
     let named = NamedTag {
         name: "".into(),
         value: entity.clone(),
@@ -967,6 +978,20 @@ pub fn read(entity: &Tag) -> Result<Option<SavedFallingBlock>> {
             .unwrap_or(0),
         drop_item: flag("DropItem", true),
         cancel_drop: flag("CancelDrop", false),
+        hurt_entities: entity
+            .get("HurtEntities")
+            .and_then(player_data::numeric_byte)
+            .map(|value| value != 0),
+        fall_damage: crate::falling_block::FallingDamage {
+            per_distance: entity
+                .get("FallHurtAmount")
+                .and_then(player_data::numeric_float)
+                .unwrap_or(0.0),
+            maximum: entity
+                .get("FallHurtMax")
+                .and_then(player_data::numeric_int)
+                .unwrap_or(40),
+        },
     }))
 }
 
@@ -986,6 +1011,61 @@ mod tests {
                 },
             ),
         ])
+    }
+
+    #[test]
+    fn falling_damage_metadata_is_read_without_authorizing_damage_simulation() {
+        let mut entity = base();
+        let saved = read(&entity).unwrap().unwrap();
+        assert_eq!(saved.hurt_entities, None);
+        assert_eq!(saved.fall_damage.per_distance, 0.0);
+        assert_eq!(saved.fall_damage.maximum, 40);
+        let Tag::Compound(fields) = &mut entity else {
+            unreachable!()
+        };
+        fields.extend([
+            ("HurtEntities".into(), Tag::Byte(1)),
+            ("FallHurtAmount".into(), Tag::Float(7.5)),
+            ("FallHurtMax".into(), Tag::Int(25)),
+        ]);
+        let saved = read(&entity).unwrap().unwrap();
+        assert_eq!(saved.hurt_entities, Some(true));
+        assert_eq!(saved.fall_damage.per_distance, 7.5);
+        assert_eq!(saved.fall_damage.maximum, 25);
+        assert_eq!(saved.fall_damage.amount(3.0), Some(15));
+        let original = NamedTag {
+            name: "".into(),
+            value: entity,
+        };
+        assert!(
+            draft(
+                &original,
+                FallingSaveState {
+                    position: saved.position,
+                    velocity: saved.velocity,
+                    fall_distance: saved.fall_distance,
+                    on_ground: saved.on_ground,
+                    no_gravity: saved.no_gravity,
+                    time: saved.time,
+                    drop_item: saved.drop_item,
+                    cancel_drop: saved.cancel_drop,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_falling_damage_fields_are_rejected() {
+        for name in ["HurtEntities", "FallHurtAmount", "FallHurtMax"] {
+            let mut entity = base();
+            let Tag::Compound(fields) = &mut entity else {
+                unreachable!()
+            };
+            fields.push((name.into(), Tag::Byte(0)));
+            fields.push((name.into(), Tag::Byte(1)));
+            assert!(read(&entity).is_err(), "{name}");
+        }
     }
 
     #[test]

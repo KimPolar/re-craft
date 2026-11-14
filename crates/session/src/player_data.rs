@@ -69,7 +69,7 @@ pub(crate) fn numeric_int(tag: &Tag) -> Option<i32> {
     })
 }
 
-fn numeric_float(tag: &Tag) -> Option<f32> {
+pub(crate) fn numeric_float(tag: &Tag) -> Option<f32> {
     Some(match tag {
         Tag::Byte(value) => f32::from(*value),
         Tag::Short(value) => f32::from(*value),

@@ -12653,10 +12653,7 @@ impl LoadedSession {
                 if !saved.block.properties.is_empty()
                     || entity.get("TileEntityData").is_some()
                     || entity.get("Passengers").is_some()
-                    || entity
-                        .get("HurtEntities")
-                        .and_then(crate::player_data::numeric_byte)
-                        .is_some_and(|v| v != 0)
+                    || saved.hurt_entities.unwrap_or(false)
                 {
                     self.stream_errors.push(format!(
                         "unsupported saved falling block in chunk {}, {}",

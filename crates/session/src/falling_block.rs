@@ -101,6 +101,37 @@ pub enum FallingKind {
     Gravel,
 }
 
+/// FallingBlockEntity's saved damage parameters. The caller must separately
+/// check whether the entity is configured to hurt entities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FallingDamage {
+    pub per_distance: f32,
+    pub maximum: i32,
+}
+
+impl FallingDamage {
+    /// Java configures only the tip of a falling stalactite. Coordinates are
+    /// absolute block positions and `top_y` must not be below `tip_y`.
+    pub fn stalactite(top_y: i32, tip_y: i32) -> Option<Self> {
+        let length = top_y.checked_sub(tip_y)?.checked_add(1)?;
+        (length > 0).then_some(Self {
+            per_distance: length.max(6) as f32,
+            maximum: 40,
+        })
+    }
+
+    /// `None` means Java does not call `hurt`; `Some(0)` still calls it with
+    /// zero damage. Float multiplication is deliberately performed in f32.
+    pub fn amount(self, fall_distance: f64) -> Option<i32> {
+        let steps = (fall_distance - 1.0).ceil() as i32;
+        if steps < 0 {
+            return None;
+        }
+        let damage = ((steps as f32) * self.per_distance).floor() as i32;
+        Some(damage.min(self.maximum))
+    }
+}
+
 impl FallingKind {
     pub fn id(self) -> &'static str {
         match self {
@@ -228,6 +259,98 @@ mod tests {
     use super::*;
     use glam::{IVec3, Vec3};
     use native_world::collision::Aabb;
+
+    #[test]
+    fn stalactite_damage_uses_height_threshold_rounding_and_cap() {
+        let short = FallingDamage::stalactite(20, 19).unwrap();
+        assert_eq!(short.per_distance, 6.0);
+        assert_eq!(short.amount(0.0), None);
+        assert_eq!(short.amount(0.01), Some(0));
+        assert_eq!(short.amount(1.0), Some(0));
+        assert_eq!(short.amount(1.000001), Some(6));
+        assert_eq!(short.amount(2.0), Some(6));
+        assert_eq!(short.amount(2.000001), Some(12));
+        assert_eq!(short.amount(100.0), Some(40));
+        assert_eq!(
+            FallingDamage::stalactite(20, 14).unwrap().amount(1.1),
+            Some(7)
+        );
+        assert!(FallingDamage::stalactite(19, 20).is_none());
+        assert!(FallingDamage::stalactite(i32::MAX, i32::MIN).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn stalactite_damage_matches_java_falling_entity() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(metadata["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let source = temp.path().join("FallingStalactiteDamageOracle.java");
+        let output = temp.path().join("damage.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FallingStalactiteDamageOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FallingStalactiteDamageOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 192);
+        for row in rows {
+            let length = row["length"].as_i64().unwrap() as i32;
+            let distance = row["distance"].as_f64().unwrap();
+            let damage = FallingDamage::stalactite(100, 101 - length)
+                .unwrap()
+                .amount(distance);
+            assert_eq!(damage.is_some(), row["calls"].as_i64() == Some(1), "{row}");
+            if let Some(damage) = damage {
+                assert_eq!(
+                    damage as f32,
+                    row["amount"].as_f64().unwrap() as f32,
+                    "{row}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn inside_effect_is_applied_after_collision_before_drag() {

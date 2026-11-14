@@ -1751,6 +1751,21 @@ fn saved_falling_fields_match_java_entity() {
             row["cancel"].as_bool().unwrap(),
             "case {index}"
         );
+        assert_eq!(
+            saved.hurt_entities.unwrap_or(false),
+            row["hurtEntities"].as_bool().unwrap(),
+            "case {index}"
+        );
+        assert_eq!(
+            saved.fall_damage.per_distance,
+            row["fallHurtAmount"].as_f64().unwrap() as f32,
+            "case {index}"
+        );
+        assert_eq!(
+            saved.fall_damage.maximum as i64,
+            row["fallHurtMax"].as_i64().unwrap(),
+            "case {index}"
+        );
         assert_eq!(saved.block.name, row["block"].as_str().unwrap());
         let properties: std::collections::BTreeMap<String, String> =
             serde_json::from_value(row["properties"].clone()).unwrap();
@@ -1765,7 +1780,7 @@ fn saved_falling_fields_match_java_entity() {
     let Tag::Compound(fields) = &mut original.value else {
         unreachable!()
     };
-    for key in ["DropItem", "CancelDrop"] {
+    for key in ["DropItem", "CancelDrop", "HurtEntities"] {
         fields
             .iter_mut()
             .find(|(name, _)| name.matches(key))

@@ -29,6 +29,9 @@ public class SavedFallingOracle {
     for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registry)) pending.apply();
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var unsafe=(sun.misc.Unsafe)f.get(null);
     var cancelled=FallingBlockEntity.class.getDeclaredField("cancelDrop"); cancelled.setAccessible(true);
+    var hurts=FallingBlockEntity.class.getDeclaredField("hurtEntities"); hurts.setAccessible(true);
+    var damage=FallingBlockEntity.class.getDeclaredField("fallDamagePerDistance"); damage.setAccessible(true);
+    var maximum=FallingBlockEntity.class.getDeclaredField("fallDamageMax"); maximum.setAccessible(true);
     Tag[] values={IntTag.valueOf(42), LongTag.valueOf(4294967297L), FloatTag.valueOf(-1.25f), DoubleTag.valueOf(8.75), StringTag.valueOf("invalid")};
     var result=new JsonArray();
     for(int i=0;i<values.length;i++) {
@@ -38,9 +41,11 @@ public class SavedFallingOracle {
       var state=i==4 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.TOP) : i%2==0 ? Blocks.SAND.defaultBlockState() : Blocks.RED_SAND.defaultBlockState();
       tag.put("BlockState",BlockState.CODEC.encodeStart(RegistryOps.create(NbtOps.INSTANCE,registry),state).getOrThrow());
       tag.put("Time",values[i]); tag.put("DropItem",values[i]); tag.put("CancelDrop",values[i]); tag.putBoolean("NoGravity",true); tag.putLong("unknown",17L);
+      tag.put("HurtEntities",values[i]); tag.put("FallHurtAmount",values[(i+1)%values.length]); tag.put("FallHurtMax",values[(i+2)%values.length]);
       var e=(Falling)unsafe.allocateInstance(Falling.class); e.loadExtra(TagValueInput.create(ProblemReporter.DISCARDING,registry,tag));
       var row=new JsonObject(); row.addProperty("time",e.time); row.addProperty("drop",e.dropItem); row.addProperty("cancel",cancelled.getBoolean(e));
       row.addProperty("block",BuiltInRegistries.BLOCK.getKey(e.getBlockState().getBlock()).toString());
+      row.addProperty("hurtEntities",hurts.getBoolean(e)); row.addProperty("fallHurtAmount",damage.getFloat(e)); row.addProperty("fallHurtMax",maximum.getInt(e));
       var properties=new JsonObject(); e.getBlockState().getValues().forEach(v -> properties.addProperty(v.property().getName(),v.valueName()));
       row.add("properties",properties); result.add(row);
       NbtIo.write(tag,Path.of(args[0],"falling-"+i+".nbt"));

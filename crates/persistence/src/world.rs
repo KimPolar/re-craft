@@ -331,6 +331,44 @@ impl GenerationSourceSnapshot {
     }
 }
 
+/// Disk documents captured together for preparing a session save. This does
+/// not prove that the session tracked every simulated effect or authorize a
+/// playable-world write.
+pub struct SessionSaveSources {
+    level: Arc<NamedTag>,
+    player_uuid: Option<[i32; 4]>,
+    player: Option<NamedTag>,
+    clocks: Option<NamedTag>,
+    chunks: GenerationSourceSnapshot,
+    stamp: crate::save::WorldReadStamp,
+}
+
+impl SessionSaveSources {
+    pub fn level(&self) -> &NamedTag {
+        &self.level
+    }
+
+    pub fn player_uuid(&self) -> Option<[i32; 4]> {
+        self.player_uuid
+    }
+
+    pub fn player(&self) -> Option<&NamedTag> {
+        self.player.as_ref()
+    }
+
+    pub fn clocks(&self) -> Option<&NamedTag> {
+        self.clocks.as_ref()
+    }
+
+    pub fn chunks(&self) -> &GenerationSourceSnapshot {
+        &self.chunks
+    }
+
+    pub fn stamp(&self) -> &crate::save::WorldReadStamp {
+        &self.stamp
+    }
+}
+
 /// Disk inputs captured under one exclusive native writer lease. The caller
 /// must still capture packs, unsaved session state and every required chunk.
 pub struct GenerationInputSnapshot {
@@ -1222,6 +1260,55 @@ impl WorldReader {
 
     pub fn session_guard(&self) -> Option<crate::save::WorldSessionGuard> {
         self.session_guard.clone()
+    }
+
+    /// Capture current level, player, clocks and selected region entries under
+    /// one native writer lease. The caller must select every relevant chunk and
+    /// separately coordinate the live simulation and its unsupported effects.
+    pub fn capture_session_save_sources(
+        &mut self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<SessionSaveSources> {
+        let session = self
+            .session_guard
+            .clone()
+            .context("session save capture requires a locked world")?;
+        let stamp = session.read_stamp()?;
+        let lease = session.acquire_capture()?;
+        ensure!(
+            stamp.is_current(),
+            "world changed before session save capture"
+        );
+
+        // WorldReader retains level.dat from when it was opened. Reopen its
+        // metadata under the lease so the player identity is current too.
+        let fresh = Self::open_inner(&self.root, self.dimension.clone(), false)?;
+        let player_uuid = fresh.singleplayer_uuid_words()?;
+        let player = fresh.read_player()?;
+        let clocks = fresh.world_clocks_document()?;
+        let level = Arc::clone(&fresh.level);
+        let positions: Vec<_> = positions.into_iter().collect();
+        let chunks = if positions.is_empty() {
+            GenerationSourceSnapshot {
+                session: lease.session(),
+                dimension: self.dimension.clone(),
+                chunks: BTreeMap::new(),
+            }
+        } else {
+            self.capture_generation_sources_in(&lease, positions)?
+        };
+        ensure!(
+            stamp.is_current(),
+            "world changed during session save capture"
+        );
+        Ok(SessionSaveSources {
+            level,
+            player_uuid,
+            player,
+            clocks,
+            chunks,
+            stamp,
+        })
     }
 
     /// Read selected terrain, entity and POI inputs under the world's session

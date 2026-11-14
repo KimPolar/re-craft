@@ -1188,7 +1188,11 @@ fn prepare_world_with_session(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
-        session.require_saved_chunk_sources()?;
+        session.bind_saved_world_session(
+            reader
+                .session_guard()
+                .context("playable world requires a session lock")?,
+        )?;
         let mut new_player_uuid = None;
         if let Some(seed) = world_seed {
             match reader.random_sequences() {

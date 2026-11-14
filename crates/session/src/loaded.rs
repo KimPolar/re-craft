@@ -910,6 +910,7 @@ pub struct LoadedSession {
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
     require_saved_chunk_sources: bool,
+    saved_world_session: Option<native_persistence::save::WorldSessionGuard>,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     placed_chests: BTreeSet<(i32, i32, i32)>,
@@ -4262,6 +4263,163 @@ impl LoadedSession {
         )
     }
 
+    /// Assemble the tracked session changes from a single locked disk capture.
+    /// This is still a partial plan: callers must prove complete simulation
+    /// coverage and prevent further ticks before authorizing a world write.
+    pub fn draft_captured_partial_save(
+        &self,
+        sources: &native_persistence::world::SessionSaveSources,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+        resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+        timestamp: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        use anyhow::{Context, ensure};
+        let session = self
+            .saved_world_session
+            .as_ref()
+            .context("loaded session has no bound world lock")?;
+        ensure!(
+            sources.stamp().belongs_to_session(session),
+            "save sources belong to another world session"
+        );
+        let _lease = sources.stamp().lock_current()?;
+        ensure!(
+            sources.chunks().dimension()
+                == &native_persistence::world::DimensionId::parse(&self.world.dimension)?,
+            "save sources belong to another dimension"
+        );
+        ensure!(
+            self.incoming.is_empty()
+                && self.pending_window.is_none()
+                && self.pending_respawn_window.is_none(),
+            "streaming updates have not reached the session"
+        );
+        if let Some(level) = &self.level_time_source {
+            ensure!(
+                native_persistence::nbt::fingerprint(level)?
+                    == native_persistence::nbt::fingerprint(sources.level())?,
+                "level source changed since loading"
+            );
+        }
+        let player = match &self.new_player_source {
+            Some((_, player)) => {
+                ensure!(
+                    sources.player_uuid().is_none() && sources.player().is_none(),
+                    "world already has a singleplayer identity"
+                );
+                player
+            }
+            None => {
+                let uuid = sources
+                    .player_uuid()
+                    .context("saved player identity is missing")?;
+                ensure!(
+                    self.player_uuid == Some(uuid),
+                    "saved player identity changed"
+                );
+                sources.player().context("saved player source is missing")?
+            }
+        };
+        let captured = sources.chunks().chunks();
+        let mut terrain = BTreeMap::new();
+        for position in self.dirty_chunk_positions() {
+            let key = native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let original = captured
+                .get(&key)
+                .context("dirty terrain source was not captured")?
+                .terrain
+                .as_ref()
+                .context("dirty terrain source is missing")?;
+            terrain.insert(position, original.document.as_ref());
+        }
+        let partial = self.draft_player_terrain_entities_clocks_and_poi_from(
+            player,
+            &terrain,
+            sources.clocks(),
+            tags,
+            air_and_fluid,
+            resolve_saved_state,
+            validate_state,
+            validate_poi_type,
+        )?;
+        for (&position, draft) in &partial.poi {
+            let key = native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let captured_poi = captured
+                .get(&key)
+                .context("POI source was not captured")?
+                .poi
+                .as_ref()
+                .map(|poi| poi.document.as_ref());
+            let same = match (draft.source(), captured_poi) {
+                (None, None) => true,
+                (Some(before), Some(current)) => {
+                    native_persistence::nbt::fingerprint(before)?
+                        == native_persistence::nbt::fingerprint(current)?
+                }
+                _ => false,
+            };
+            ensure!(same, "POI source changed since loading");
+        }
+        let mut entity_sources = BTreeMap::new();
+        for &position in partial.session.entity_chunks.keys() {
+            let key = native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            let chunk = captured
+                .get(&key)
+                .context("tracked entity source was not captured")?;
+            entity_sources.insert(
+                position,
+                chunk
+                    .entities
+                    .as_ref()
+                    .map(|entity| entity.document.as_ref()),
+            );
+        }
+        let mut plan = match (&self.new_player_source, sources.clocks()) {
+            (Some(_), Some(clock)) => {
+                partial.into_new_player_save_plan(&entity_sources, clock, timestamp)?
+            }
+            (Some(_), None) => {
+                partial.into_new_player_save_plan_with_missing_clocks(&entity_sources, timestamp)?
+            }
+            (None, Some(clock)) => partial.into_save_plan(
+                sources
+                    .player_uuid()
+                    .context("saved player identity is missing")?,
+                player,
+                &entity_sources,
+                clock,
+                timestamp,
+            )?,
+            (None, None) => partial.into_save_plan_with_missing_clocks(
+                sources
+                    .player_uuid()
+                    .context("saved player identity is missing")?,
+                player,
+                &entity_sources,
+                timestamp,
+            )?,
+        };
+        plan.add_generation_sources(sources.chunks())?;
+        ensure!(sources.stamp().is_current(), "save sources became stale");
+        Ok(plan)
+    }
+
     fn draft_player_terrain_entities_clocks_and_poi_from(
         &self,
         player: &native_persistence::nbt::NamedTag,
@@ -5748,6 +5906,20 @@ impl LoadedSession {
             "terrain source tracking must start before the first tick"
         );
         self.require_saved_chunk_sources = true;
+        Ok(())
+    }
+
+    /// Bind disk captures to the same world lock as this loaded session.
+    pub fn bind_saved_world_session(
+        &mut self,
+        session: native_persistence::save::WorldSessionGuard,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.saved_world_session.is_none(),
+            "world session must be bound once before the first tick"
+        );
+        self.require_saved_chunk_sources()?;
+        self.saved_world_session = Some(session);
         Ok(())
     }
 
@@ -7643,6 +7815,7 @@ impl LoadedSession {
             snapshot,
             unsupported_states,
             require_saved_chunk_sources: false,
+            saved_world_session: None,
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
             placed_chests: BTreeSet::new(),
@@ -10430,6 +10603,24 @@ impl LoadedSession {
         &self,
     ) -> anyhow::Result<BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>>
     {
+        self.draft_existing_entity_chunks(&self.tracked_entity_chunk_positions()?)
+    }
+
+    /// Positions needed by the currently tracked partial save. Other
+    /// simulation and read-only dependencies still require separate coverage.
+    pub fn partial_save_source_positions(
+        &self,
+    ) -> anyhow::Result<BTreeSet<native_persistence::world::ChunkPos>> {
+        let mut positions = self.dirty_chunk_positions();
+        positions.extend(self.dirty_poi_chunk_positions());
+        positions.extend(self.tracked_entity_chunk_positions()?);
+        Ok(positions
+            .into_iter()
+            .map(|pos| native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+            .collect())
+    }
+
+    fn tracked_entity_chunk_positions(&self) -> anyhow::Result<BTreeSet<ChunkPos>> {
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
@@ -10466,7 +10657,7 @@ impl LoadedSession {
                 });
             }
         }
-        self.draft_existing_entity_chunks(&positions)
+        Ok(positions)
     }
 
     /// Prepare a group of known entity chunks including transfers into empty
@@ -58308,6 +58499,12 @@ pub(crate) mod tests {
             .unwrap();
         session.update(TICK);
         assert!(!session.has_unsaved_chunk_changes(home));
+        assert!(session.partial_save_source_positions().unwrap().contains(
+            &native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            }
+        ));
         session.queue_chunk_window(remote, 0);
         session.update(TICK);
         assert!(!session.world.chunks.contains_key(&home));
@@ -58843,6 +59040,124 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn captured_existing_player_save_rejects_stale_level() {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::{
+            nbt::{self, NamedTag, Tag},
+            world::{DimensionId, WorldReader},
+        };
+        use std::io::Write;
+
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/session-save-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("existing-world-")
+            .tempdir_in(parent)
+            .unwrap();
+        let gzip = |path: &std::path::Path, tag: &NamedTag| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut out = GzEncoder::new(Vec::new(), Compression::default());
+            out.write_all(&nbt::write(tag).unwrap()).unwrap();
+            std::fs::write(path, out.finish().unwrap()).unwrap();
+        };
+        let uuid = [0, 0, 0, 1];
+        let level = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Time".into(), Tag::Long(41)),
+                    ("singleplayer_uuid".into(), Tag::IntArray(uuid.to_vec())),
+                ]),
+            )]),
+        });
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let level_path = root.path().join("level.dat");
+        gzip(&level_path, &level);
+        gzip(
+            &root
+                .path()
+                .join("players/data/00000000-0000-0000-0000-000000000001.dat"),
+            &player,
+        );
+        gzip(&root.path().join("data/minecraft/world_clocks.dat"), &clock);
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut unlocked = WorldReader::open(root.path(), dimension.clone()).unwrap();
+        assert!(unlocked.capture_session_save_sources([]).is_err());
+        drop(unlocked);
+        let mut reader = WorldReader::open_for_session(root.path(), dimension).unwrap();
+        let guard = reader.session_guard().unwrap();
+        let mut session = session();
+        session.bind_saved_world_session(guard.clone()).unwrap();
+        session.set_player_uuid(Some(uuid));
+        session.restore_saved_player_inventory(&player).unwrap();
+        session.set_initial_game_time(41).unwrap();
+        session
+            .capture_level_time_source(Arc::clone(&level))
+            .unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+
+        let assemble = |sources: &native_persistence::world::SessionSaveSources| {
+            session.draft_captured_partial_save(
+                sources,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+                1,
+            )
+        };
+        let captured = reader.capture_session_save_sources([]).unwrap();
+        assert!(session.partial_save_source_positions().unwrap().is_empty());
+        assert_eq!(captured.player_uuid(), Some(uuid));
+        assert!(captured.player().is_some() && captured.clocks().is_some());
+        let stale = assemble(&captured).unwrap();
+        let mut changed_level = (*level).clone();
+        let Tag::Compound(root_fields) = &mut changed_level.value else {
+            panic!("level root missing")
+        };
+        let Some((_, Tag::Compound(fields))) = root_fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Data"))
+        else {
+            panic!("level data missing")
+        };
+        fields.push(("unknown".into(), Tag::Int(7)));
+        gzip(&level_path, &changed_level);
+        let before = std::fs::read(&level_path).unwrap();
+        let mut writer = guard.acquire_write().unwrap();
+        assert!(writer.write_plan(stale, |_, _| Ok(())).is_err());
+        assert_eq!(std::fs::read(&level_path).unwrap(), before);
+        drop(writer);
+        let changed = reader.capture_session_save_sources([]).unwrap();
+        assert!(
+            assemble(&changed)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("level source changed since loading")
+        );
+    }
+
+    #[test]
     fn new_player_partial_save_commits_level_terrain_poi_and_clocks_together() {
         use flate2::{
             Compression,
@@ -58889,6 +59204,13 @@ pub(crate) mod tests {
         gzip(&root.path().join("level.dat"), &level);
 
         let mut session = session();
+        let mut capture_reader =
+            WorldReader::open_for_session(root.path(), DimensionId::parse("overworld").unwrap())
+                .unwrap();
+        let world_lock = capture_reader.session_guard().unwrap();
+        session
+            .bind_saved_world_session(world_lock.clone())
+            .unwrap();
         session.set_new_player_last_death().unwrap();
         let uuid = session.initialize_new_player().unwrap();
         session.set_initial_game_time(41).unwrap();
@@ -58910,8 +59232,10 @@ pub(crate) mod tests {
         session
             .set_initial_entity_chunk(home, SavedEntityData::Empty)
             .unwrap();
-        session.update(TICK);
         let source = fixture_chunk_document(home);
+        Arc::make_mut(&mut session.world)
+            .remember_saved_chunk_source(home, nbt::fingerprint(&source).unwrap());
+        session.update(TICK);
         let chunk_nbt = nbt::write(&source).unwrap();
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&chunk_nbt).unwrap();
@@ -59021,13 +59345,55 @@ pub(crate) mod tests {
             .unwrap()
             .into_new_player_save_plan_with_missing_clocks(&entity_sources, 1)
             .unwrap();
-        let plan = draft
-            .into_new_player_save_plan_with_missing_clocks(&entity_sources, 1)
+        let missing = capture_reader.capture_session_save_sources([]).unwrap();
+        let assemble = |sources: &native_persistence::world::SessionSaveSources| {
+            session.draft_captured_partial_save(
+                sources,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+                resolve,
+                validate,
+                |_| Ok(()),
+                1,
+            )
+        };
+        assert!(assemble(&missing).is_err());
+        let positions = session.partial_save_source_positions().unwrap();
+        assert_eq!(
+            positions,
+            BTreeSet::from([native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            }])
+        );
+        let captured = capture_reader
+            .capture_session_save_sources(positions)
             .unwrap();
+        let other_world = tempfile::Builder::new()
+            .prefix("other-world-")
+            .tempdir_in(root.path().parent().unwrap())
+            .unwrap();
+        gzip(&other_world.path().join("level.dat"), &level);
+        let mut other_reader = WorldReader::open_for_session(
+            other_world.path(),
+            DimensionId::parse("overworld").unwrap(),
+        )
+        .unwrap();
+        let other_sources = other_reader.capture_session_save_sources([]).unwrap();
+        assert!(
+            assemble(&other_sources)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("another world session")
+        );
+        let plan = assemble(&captured).unwrap();
+        drop(draft);
         assert_eq!(plan.chunk_count(), 1);
         assert_eq!(plan.poi_chunk_count(), 1);
         assert!(plan.has_level_time());
-        let mut writer = native_persistence::save::WorldWriteGuard::acquire(root.path()).unwrap();
+        let mut writer = world_lock.acquire_write().unwrap();
+        assert!(assemble(&captured).is_err());
         let result = writer
             .write_plan(plan, |_, change| {
                 anyhow::ensure!(

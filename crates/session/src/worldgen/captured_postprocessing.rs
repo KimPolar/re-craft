@@ -329,6 +329,42 @@ impl CarvedTerrainWorld {
             .collect()
     }
 
+    /// Reconstruct missing POI sidecars from a sealed captured result. The
+    /// caller must independently establish that storage and live tickets are
+    /// absent and revalidate them before publishing these intermediate drafts.
+    pub fn captured_postprocessed_missing_poi_snapshot(
+        &self,
+        completed: &super::PostprocessedGeneratedRegion,
+        registry: &GeneratedBlockRegistry,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, Option<native_persistence::nbt::NamedTag>>> {
+        self.validate_captured_postprocessing(completed)?;
+        let mut output = BTreeMap::new();
+        for pos in positions {
+            ensure!(
+                completed.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+            ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            let draft = native_persistence::poi::refresh_missing_chunk(
+                native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+                &completed.world,
+                self.min_y,
+                self.height,
+                |state| {
+                    ensure!(
+                        registry.is_canonical_state(&state.name, &state.properties),
+                        "unknown POI block state"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.insert(pos, draft);
+        }
+        ensure!(!output.is_empty(), "no postprocessed chunks selected");
+        Ok(output)
+    }
+
     /// Preview the light after pending postprocessing checks at a caller-chosen
     /// drain boundary. The result and the staged engine remain unchanged.
     pub fn captured_postprocessed_light_snapshot(
@@ -606,10 +642,17 @@ mod tests {
             name: "minecraft:sand".into(),
             properties: BTreeMap::new(),
         });
+        let barrel = world.intern_state(BlockState {
+            name: "minecraft:barrel".into(),
+            properties: registry
+                .default_properties("minecraft:barrel")
+                .context("barrel state is unavailable")?,
+        });
         for pos in [first, second] {
             let mut blocks = Box::new([stone; BLOCK_COUNT]);
             if pos == first {
                 blocks[8 + 8 * 16 + 8 * 256] = sand;
+                blocks[1 + 1 * 16 + 2 * 256] = barrel;
             }
             world.chunks.insert(
                 pos,
@@ -746,6 +789,42 @@ mod tests {
             assert_eq!(block_ticks[0].get("t"), Some(&Tag::Int(2)));
             assert!(matches!(&chunk.fluid_ticks, Tag::List { values, .. } if values.is_empty()));
             assert!(matches!(&chunk.block_entities, Tag::List { values, .. } if values.is_empty()));
+            let poi = terrain.captured_postprocessed_missing_poi_snapshot(
+                &completed,
+                &registry,
+                [first],
+            )?;
+            let document = poi[&first].clone().context("barrel POI missing")?;
+            let decoded = native_persistence::world::SavedPoiChunk::from_document(
+                document,
+                native_persistence::world::ChunkPos { x: 0, z: 0 },
+            )?;
+            assert_eq!(decoded.sections[&0].records.len(), 1);
+            assert_eq!(decoded.sections[&0].records[0].position, [1, 2, 1]);
+            assert!(
+                decoded.sections[&0].records[0]
+                    .type_id
+                    .matches("minecraft:fisherman")
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_missing_poi_snapshot(&completed, &registry, [second])
+                    .is_err()
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_missing_poi_snapshot(
+                        &completed,
+                        &registry,
+                        [first, first]
+                    )
+                    .is_err()
+            );
+            assert!(
+                terrain
+                    .captured_postprocessed_missing_poi_snapshot(&completed, &registry, [])
+                    .is_err()
+            );
             assert!(
                 terrain
                     .captured_postprocessed_chunk_data(&completed, &registry, &ids, [second])
@@ -805,6 +884,13 @@ mod tests {
             );
             let result = resumed.finish()?;
             assert_eq!(result.chunks, BTreeSet::from([first, second]));
+            let resumed_poi = terrain.captured_postprocessed_missing_poi_snapshot(
+                &result,
+                &registry,
+                [first, second],
+            )?;
+            assert_eq!(resumed_poi[&first], poi[&first]);
+            assert!(resumed_poi[&second].is_none());
             assert!(Arc::ptr_eq(
                 completed.snow_tags.as_ref().context("snow tags missing")?,
                 result
@@ -822,6 +908,11 @@ mod tests {
                 vec![second]
             );
             completed.edits.push(BlockPosition { x: 8, y: 8, z: 8 });
+            assert!(
+                terrain
+                    .captured_postprocessed_missing_poi_snapshot(&completed, &registry, [first])
+                    .is_err()
+            );
             assert!(
                 terrain
                     .captured_postprocessed_chunk_data(&completed, &registry, &ids, [first])

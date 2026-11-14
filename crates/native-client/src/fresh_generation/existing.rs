@@ -802,11 +802,14 @@ pub(crate) struct CapturedPostprocessedComponents {
     >,
     structures: BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
     external_structure_sources: BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+    missing_poi: BTreeMap<native_world::loaded::ChunkPos, Option<NamedTag>>,
 }
 
 impl CapturedPostprocessedComponents {
     /// Every returned component must be committed in one transaction after
     /// revalidating source data, live state, packs and entity/POI sidecars.
+    /// The POI map contains only chunks whose captured storage was absent:
+    /// a missing key is unknown, while a present `None` means no POI was found.
     pub fn outputs(
         &self,
     ) -> (
@@ -816,11 +819,13 @@ impl CapturedPostprocessedComponents {
         >,
         &BTreeMap<native_world::loaded::ChunkPos, Option<Tag>>,
         &BTreeMap<native_world::loaded::ChunkPos, ResumedStructureDraft>,
+        &BTreeMap<native_world::loaded::ChunkPos, Option<NamedTag>>,
     ) {
         (
             &self.chunks,
             &self.structures,
             &self.external_structure_sources,
+            &self.missing_poi,
         )
     }
 
@@ -844,6 +849,25 @@ impl CapturedPostprocessedComponents {
                 water_source_conversion,
             )
     }
+}
+
+fn captured_missing_poi_positions(
+    sources: &BTreeMap<
+        native_persistence::world::ChunkPos,
+        native_persistence::world::GenerationChunkSource,
+    >,
+    positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+) -> Result<Vec<native_world::loaded::ChunkPos>> {
+    let mut missing = Vec::new();
+    for pos in positions {
+        let source = sources
+            .get(&native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
+            .context("POI source was not captured")?;
+        if source.poi.is_none() {
+            missing.push(pos);
+        }
+    }
+    Ok(missing)
 }
 
 impl CapturedPostprocessedRegion {
@@ -2409,6 +2433,19 @@ impl PreparedExistingGenerator {
             &assets.block_ids,
             sections.sections.keys().copied(),
         )?;
+        let missing_poi_positions = captured_missing_poi_positions(
+            self.context.inputs().sources().chunks(),
+            sections.sections.keys().copied(),
+        )?;
+        let missing_poi = if missing_poi_positions.is_empty() {
+            BTreeMap::new()
+        } else {
+            batch.terrain.captured_postprocessed_missing_poi_snapshot(
+                &completed.region,
+                &assets.blocks,
+                missing_poi_positions,
+            )?
+        };
         let mut chunks = BTreeMap::new();
         let mut structures = BTreeMap::new();
         for (pos, data) in data {
@@ -2468,6 +2505,7 @@ impl PreparedExistingGenerator {
             chunks,
             structures,
             external_structure_sources,
+            missing_poi,
         })
     }
 
@@ -9731,6 +9769,51 @@ mod tests {
     }
 
     #[test]
+    fn captured_poi_selection_requires_a_captured_absent_sidecar() -> Result<()> {
+        use native_persistence::world::{
+            ChunkPos as SavedPos, GenerationChunkSource, SavedPoiChunk,
+        };
+        use native_world::loaded::ChunkPos;
+
+        let missing = ChunkPos { x: -1, z: 2 };
+        let present = ChunkPos { x: 3, z: -4 };
+        let unknown = ChunkPos { x: 5, z: 6 };
+        let saved = |pos: ChunkPos| SavedPos { x: pos.x, z: pos.z };
+        let sources = BTreeMap::from([
+            (
+                saved(missing),
+                GenerationChunkSource {
+                    terrain: None,
+                    entities: None,
+                    poi: None,
+                },
+            ),
+            (
+                saved(present),
+                GenerationChunkSource {
+                    terrain: None,
+                    entities: None,
+                    poi: Some(SavedPoiChunk {
+                        position: saved(present),
+                        document: Arc::new(NamedTag {
+                            name: "".into(),
+                            value: Tag::Compound(vec![]),
+                        }),
+                        sections: BTreeMap::new(),
+                    }),
+                },
+            ),
+        ]);
+        assert_eq!(
+            captured_missing_poi_positions(&sources, [present, missing])?,
+            [missing]
+        );
+        assert!(captured_missing_poi_positions(&sources, [missing, unknown]).is_err());
+        assert!(captured_missing_poi_positions(&sources, [present])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn postprocessed_output_retains_external_structure_sources() -> Result<()> {
         use native_world::loaded::ChunkPos;
 
@@ -9761,13 +9844,16 @@ mod tests {
             chunks: BTreeMap::new(),
             structures: BTreeMap::from([(first, Some(Tag::Int(1)))]),
             external_structure_sources: external,
+            missing_poi: BTreeMap::from([(first, None)]),
         };
-        let (chunks, structures, pending) = components.outputs();
+        let (chunks, structures, pending, poi) = components.outputs();
         assert!(chunks.is_empty());
         assert_eq!(structures.get(&first), Some(&Some(Tag::Int(1))));
         assert_eq!(pending[&second].document(), &changed);
         assert!(pending[&second].matches_source(&source)?);
         assert!(!pending[&second].matches_source(&changed)?);
+        assert_eq!(poi.get(&first), Some(&None));
+        assert!(!poi.contains_key(&second));
         Ok(())
     }
 

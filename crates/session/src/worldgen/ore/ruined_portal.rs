@@ -383,7 +383,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                         .context("unsupported portal wall support face")?
                 } else if is_air(neighbor)
                     || neighbor.name == "minecraft:iron_chain"
-                    || neighbor.name == "minecraft:lava"
+                    || matches!(neighbor.name.as_str(), "minecraft:water" | "minecraft:lava")
                     || neighbor.name == "minecraft:chest"
                     || native_world::wall::Wall::from_state(neighbor).is_some()
                 {
@@ -569,7 +569,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                         .context("unsupported portal stair or slab support face")?
                 } else if is_air(neighbor)
                     || neighbor.name == "minecraft:iron_chain"
-                    || neighbor.name == "minecraft:lava"
+                    || matches!(neighbor.name.as_str(), "minecraft:water" | "minecraft:lava")
                     || neighbor.name == "minecraft:chest"
                     || native_world::wall::Wall::from_state(neighbor).is_some()
                 {
@@ -1512,6 +1512,173 @@ mod tests {
                 assert_eq!(
                     tick.priority as i64,
                     row["blockPriority"].as_i64().unwrap(),
+                    "{row}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn portal_walls_and_panes_connect_to_liquids_like_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong Minecraft version");
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let source = temp.path().join("PortalLiquidConnectionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/PortalLiquidConnectionOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "javac failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let oracle = temp.path().join("rows.json");
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("PortalLiquidConnectionOracle")
+            .arg(&oracle)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(oracle)?)?;
+        assert_eq!(rows.len(), 46_080);
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let mut wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let pos = [3, 7, 3];
+        for row in rows {
+            let liquid = row["liquid"].as_str().context("liquid missing")?;
+            let mode = row["mode"].as_u64().context("tag mode missing")?;
+            wall_tags.walls = if mode & 1 != 0 {
+                BTreeSet::from([liquid.to_owned()])
+            } else {
+                BTreeSet::new()
+            };
+            wall_tags.post_override = if mode & 2 != 0 {
+                BTreeSet::from([liquid.to_owned()])
+            } else {
+                BTreeSet::new()
+            };
+            let name = row["block"].as_str().context("block missing")?;
+            let is_wall = name != "minecraft:iron_bars";
+            let keys: &[&str] = if is_wall {
+                &["north", "east", "south", "west", "up", "waterlogged"]
+            } else {
+                &["north", "east", "south", "west", "waterlogged"]
+            };
+            let mut properties = BTreeMap::new();
+            for key in keys {
+                properties.insert(
+                    (*key).to_owned(),
+                    row[format!("before_{key}")]
+                        .as_str()
+                        .context("input property missing")?
+                        .to_owned(),
+                );
+            }
+            let state = BlockState {
+                name: name.to_owned(),
+                properties,
+            };
+            let level = row["level"].as_u64().context("liquid level missing")?;
+            let (name, properties) = registry.resolve(
+                &serde_json::json!({"id":liquid,"properties":{"level":level.to_string()}}),
+            )?;
+            let neighbor = BlockState { name, properties };
+            let above_name = row["above"].as_str().context("above block missing")?;
+            let (name, properties) = registry.resolve(&serde_json::json!(above_name))?;
+            let above = BlockState { name, properties };
+            let direction = match row["direction"].as_str().context("direction missing")? {
+                "down" => [0, -1, 0],
+                "up" => [0, 1, 0],
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "west" => [-1, 0, 0],
+                "east" => [1, 0, 0],
+                _ => anyhow::bail!("invalid liquid direction"),
+            };
+            region.set_proto_block([3, 8, 3], &above)?;
+            region.set_proto_block(pos, &state)?;
+            region.world.saved_fluid_ticks.clear();
+            region.fluid_tick_keys.clear();
+            let mut world = PortalTemplateRegion {
+                inner: super::super::jigsaw::JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                },
+                wall_tags: &wall_tags,
+                temporary_jigsaws: BTreeSet::new(),
+            };
+            let actual = world.update_shape(pos, &state, direction, pos, &neighbor)?;
+            assert_eq!(actual.name, state.name, "{row}");
+            for key in keys {
+                assert_eq!(
+                    actual.properties.get(*key).map(String::as_str),
+                    row[format!("after_{key}")].as_str(),
+                    "{row}"
+                );
+            }
+            let ticks = world.inner.region.world.saved_fluid_ticks.get(&chunk(pos));
+            assert_eq!(
+                ticks.map_or(0, Vec::len) as u64,
+                row["ticks"].as_u64().unwrap(),
+                "{row}"
+            );
+            if let Some(ticks) = ticks {
+                let tick = &ticks[0];
+                assert_eq!(tick.fluid, row["tickId"].as_str().unwrap(), "{row}");
+                assert_eq!(tick.position, pos, "{row}");
+                assert_eq!(tick.delay as i64, row["delay"].as_i64().unwrap(), "{row}");
+                assert_eq!(
+                    tick.priority as i64,
+                    row["priority"].as_i64().unwrap(),
                     "{row}"
                 );
             }

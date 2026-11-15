@@ -296,7 +296,9 @@ struct GenerationSectionPlan {
     allocated: BTreeMap<(native_world::loaded::ChunkPos, i32), bool>,
 }
 
-fn generated_state_is_air(
+/// Determine section emptiness for a registered block. Non-air schema details
+/// are intentionally not inferred here; malformed air states remain unknown.
+pub fn generated_state_is_air(
     registry: &native_resources::block_registry::GeneratedBlockRegistry,
     state: &native_world::loaded::BlockState,
 ) -> Option<bool> {

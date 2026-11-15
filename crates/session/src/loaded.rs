@@ -515,7 +515,9 @@ pub struct GenerationEntityGuard {
     chunks: BTreeMap<ChunkPos, Option<SavedEntityData>>,
 }
 
-fn matching_terrain_chunks(
+/// Compare represented terrain, biome and saved-light data across worlds with
+/// different local registries. Entity and other sidecars are not compared.
+pub fn matching_terrain_chunks(
     first: &World,
     a: &native_world::loaded::Chunk,
     second: &World,

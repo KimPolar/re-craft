@@ -445,6 +445,7 @@ impl SavedDecorationContext {
 pub(crate) struct RestoredSavedTerrain {
     identity: Arc<()>,
     world: Arc<native_world::loaded::World>,
+    sources: BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>>,
     biomes:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_session::worldgen::QuartBiomeChunk>>,
     heightmaps: BTreeMap<
@@ -1861,6 +1862,105 @@ impl CapturedTerrainBatch {
         position: native_world::loaded::ChunkPos,
     ) -> bool {
         self.feature_entity_sources.covers(position)
+    }
+
+    /// Import one restored saved chunk and its observed light as one revision.
+    /// The caller must establish the actual load and light-drain order.
+    fn import_saved_chunk_with_queued_light(
+        &mut self,
+        restored: &RestoredSavedTerrain,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+        order: native_session::worldgen::SavedLightLoadOrder,
+        is_air: impl FnMut(&native_world::loaded::BlockState) -> Option<bool>,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+
+        ensure!(
+            Arc::ptr_eq(&self.identity, &restored.identity) && light.matches_batch(self),
+            "saved terrain or light belongs to another capture revision"
+        );
+        ensure!(
+            self.schedule
+                .required(position)
+                .is_some_and(|stage| stage >= GenerationStage::Terrain)
+                && self.schedule.completed(position) == Some(GenerationStage::Biomes),
+            "saved terrain prerequisites are incomplete"
+        );
+        let key = native_persistence::world::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        ensure!(
+            !self.sources.contains_key(&key) && !self.saved_stages.contains_key(&position),
+            "saved terrain chunk was already imported"
+        );
+        let source = restored
+            .sources
+            .get(&key)
+            .context("saved terrain source is missing")?;
+        let chunk = restored
+            .world
+            .chunks
+            .get(&position)
+            .context("saved terrain chunk is missing")?;
+        ensure!(
+            chunk.position == position
+                && chunk.status.as_deref() == Some("minecraft:full")
+                && chunk.block_light_correct,
+            "saved terrain chunk is not light-correct and full"
+        );
+        let expected_biomes = restored
+            .biomes
+            .get(&position)
+            .context("saved biomes are missing")?;
+        let actual_biomes = self
+            .biomes
+            .chunk([position.x, position.z])
+            .context("captured biomes are missing")?;
+        ensure!(
+            expected_biomes.min_y() == actual_biomes.min_y()
+                && expected_biomes.height() == actual_biomes.height()
+                && expected_biomes.values() == actual_biomes.values(),
+            "captured biomes differ from saved terrain"
+        );
+        let heights = restored
+            .heightmaps
+            .get(&position)
+            .context("saved heightmaps are missing")?;
+        let marks = restored
+            .postprocessing
+            .get(&position)
+            .context("saved postprocessing is missing")?;
+        let mut terrain = self.terrain.clone();
+        terrain.insert_saved_chunk(&restored.world, position, heights, marks.as_ref())?;
+        let imported = terrain.snapshot();
+        let imported_chunk = imported
+            .chunks
+            .get(&position)
+            .context("imported saved terrain chunk is missing")?;
+        ensure!(
+            native_session::loaded::matching_terrain_chunks(
+                &restored.world,
+                chunk,
+                &imported,
+                imported_chunk,
+            ),
+            "saved terrain changed during import"
+        );
+        let mut engine = light.engine.clone();
+        engine.load_saved_chunk(&terrain, position, order, is_air)?;
+
+        // restore_imported validates the whole update before mutating the plan.
+        self.schedule
+            .restore_imported([(position, GenerationStage::Terrain)])?;
+        self.terrain = terrain;
+        self.sources.insert(key, Some(Arc::clone(source)));
+        self.saved_stages.insert(position, GenerationStage::Full);
+        self.revision = Arc::new(());
+        light.engine = engine;
+        light.revision = Arc::clone(&self.revision);
+        Ok(())
     }
 }
 
@@ -6953,6 +7053,70 @@ impl PreparedExistingGenerator {
         self.bind_captured_queued_light(&batch.batch, tracker, registered, sky_sources)
     }
 
+    /// Add an observed saved-chunk load to a captured generation revision.
+    /// The caller must account for every light event and verify live changes
+    /// independently before publishing or saving generated terrain.
+    pub fn stream_captured_saved_chunk_with_queued_light(
+        &self,
+        batch: &mut CapturedTerrainBatch,
+        restored: &RestoredSavedTerrain,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+        order: native_session::worldgen::SavedLightLoadOrder,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "terrain belongs to another generation capture"
+        );
+        let key = native_persistence::world::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        let captured = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&key)
+            .and_then(|source| source.terrain.as_ref())
+            .context("saved terrain source was not captured")?;
+        ensure!(
+            captured.data_version == native_persistence::world::TARGET_DATA_VERSION
+                && restored
+                    .sources
+                    .get(&key)
+                    .is_some_and(|source| Arc::ptr_eq(source, &captured.document)),
+            "restored terrain source differs from captured input"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        batch.import_saved_chunk_with_queued_light(restored, light, position, order, |state| {
+            native_session::worldgen::generated_state_is_air(registry, state)
+        })
+    }
+
+    /// Stream the same observed disk load into a detached live-terrain batch.
+    /// Unsaved edits and the live session still need independent verification.
+    pub fn stream_staged_live_saved_chunk_with_queued_light(
+        &self,
+        batch: &mut StagedLiveTerrainBatch,
+        restored: &RestoredSavedTerrain,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+        order: native_session::worldgen::SavedLightLoadOrder,
+    ) -> Result<()> {
+        self.stream_captured_saved_chunk_with_queued_light(
+            &mut batch.batch,
+            restored,
+            light,
+            position,
+            order,
+        )
+    }
+
     /// Register a feature-complete generated chunk in the observed engine.
     pub fn initialize_captured_queued_light(
         &self,
@@ -7119,7 +7283,10 @@ impl PreparedExistingGenerator {
             light.is_none_or(|light| light.matches_batch(batch)),
             "feature light belongs to another terrain revision"
         );
-        ensure!(light.is_none() || queued.is_none(), "lighting modes are mutually exclusive");
+        ensure!(
+            light.is_none() || queued.is_none(),
+            "lighting modes are mutually exclusive"
+        );
         let center = native_world::loaded::ChunkPos {
             x: context.position.x,
             z: context.position.z,
@@ -8297,6 +8464,13 @@ impl PreparedExistingGenerator {
                 .get(&key)
                 .and_then(|source| source.terrain.as_ref())
                 .context("saved terrain source is missing")?;
+            ensure!(
+                restored
+                    .sources
+                    .get(&key)
+                    .is_some_and(|source| Arc::ptr_eq(source, &saved.document)),
+                "restored terrain source differs"
+            );
             let status = saved
                 .status
                 .as_ref()
@@ -9303,6 +9477,7 @@ impl PreparedExistingGenerator {
                     "{}:{}",
                     dimension.namespace, dimension.path
                 ))),
+                sources: BTreeMap::new(),
                 biomes: BTreeMap::new(),
                 heightmaps: BTreeMap::new(),
                 postprocessing: BTreeMap::new(),
@@ -9377,6 +9552,7 @@ impl PreparedExistingGenerator {
                 .context("dimension height overflow")?,
         };
         let mut chunks = BTreeMap::new();
+        let mut restored_sources = BTreeMap::new();
         let mut heightmaps = BTreeMap::new();
         let mut postprocessing = BTreeMap::new();
         for position in requested {
@@ -9419,6 +9595,7 @@ impl PreparedExistingGenerator {
                 "duplicate saved postprocessing field"
             );
             postprocessing.insert(key, decoded);
+            restored_sources.insert(position, Arc::clone(&source.document));
             chunks.insert(position, Arc::new(source.clone()));
         }
         let area = ChunkArea {
@@ -9441,6 +9618,7 @@ impl PreparedExistingGenerator {
         Ok(RestoredSavedTerrain {
             identity: Arc::clone(&self.identity),
             world: Arc::new(world),
+            sources: restored_sources,
             biomes,
             heightmaps,
             postprocessing,
@@ -9514,11 +9692,31 @@ impl PreparedExistingGenerator {
             Arc::ptr_eq(&self.identity, &restored.identity),
             "restored terrain belongs to another capture"
         );
+        ensure!(
+            restored.sources.len()
+                == self
+                    .context
+                    .inputs()
+                    .sources()
+                    .chunks()
+                    .values()
+                    .filter(|source| source.terrain.is_some())
+                    .count(),
+            "restored terrain source set differs"
+        );
         for (pos, source) in self.context.inputs().sources().chunks() {
             let key = native_world::loaded::ChunkPos { x: pos.x, z: pos.z };
             ensure!(
                 source.terrain.is_some() == restored.world.chunks.contains_key(&key),
                 "captured terrain was not fully restored at {key:?}"
+            );
+            ensure!(
+                match (source.terrain.as_ref(), restored.sources.get(pos)) {
+                    (Some(expected), Some(actual)) => Arc::ptr_eq(&expected.document, actual),
+                    (None, None) => true,
+                    _ => false,
+                },
+                "restored terrain source differs at {key:?}"
             );
         }
         Ok(())
@@ -10405,6 +10603,10 @@ fn capture_scheduled_context(
             .map(|(pos, _)| native_persistence::world::ChunkPos { x: pos.x, z: pos.z }),
     )
 }
+
+#[cfg(test)]
+#[path = "existing_saved_light_test.rs"]
+mod saved_light_test;
 
 #[cfg(test)]
 mod tests {
@@ -17440,6 +17642,16 @@ mod tests {
             assert!(narrow.capture_live_terrain(&live, &terrain).is_err());
             let guard = narrow.capture_live_terrain(&live, &narrow_terrain)?;
             live.verify_generation_terrain(&guard)?;
+            let mut mismatched_source = narrow.restore_saved_terrain([position])?;
+            mismatched_source.sources.insert(
+                position,
+                Arc::new((**mismatched_source.sources.get(&position).unwrap()).clone()),
+            );
+            assert!(
+                narrow
+                    .capture_live_terrain(&live, &mismatched_source)
+                    .is_err()
+            );
             assert!(narrow.capture_live_poi(&live).is_err());
             live.set_initial_poi_chunk(key, native_session::loaded::SavedPoiData::Missing)?;
             let poi_guard = narrow.capture_live_poi(&live)?;

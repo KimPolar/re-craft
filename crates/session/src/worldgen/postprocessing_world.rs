@@ -32,6 +32,10 @@ mod kelp_shape_tests;
 #[path = "postprocessing_world_tall_tests.rs"]
 mod tall_shape_tests;
 
+#[cfg(test)]
+#[path = "postprocessing_world_wall_tests.rs"]
+mod wall_shape_tests;
+
 /// Block entities owned by the converted LevelChunk, isolated from the protochunk.
 #[derive(Clone, Default)]
 pub(super) struct ConvertedBlockEntities {
@@ -169,6 +173,7 @@ pub struct GeneratedPostprocessing {
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    wall_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     speleothem_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
@@ -263,6 +268,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    pub(super) wall_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) speleothem_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     pub(super) bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     pub(super) washed_blocks: Option<Arc<BTreeSet<String>>>,
@@ -657,6 +663,7 @@ impl GeneratedPostprocessing {
             leaf_tags: None,
             snow_tags: None,
             fence_tags: None,
+            wall_tags: None,
             speleothem_tags: None,
             bubble_tags: None,
             washed_blocks: None,
@@ -778,6 +785,7 @@ impl GeneratedPostprocessing {
         stage.aquatic_tags = completed.aquatic_tags.clone();
         stage.snow_tags = completed.snow_tags.clone();
         stage.fence_tags = completed.fence_tags.clone();
+        stage.wall_tags = completed.wall_tags.clone();
         stage.speleothem_tags = completed.speleothem_tags.clone();
         stage.bubble_tags = completed.bubble_tags.clone();
         stage.washed_blocks = completed.washed_blocks.clone();
@@ -953,6 +961,13 @@ impl GeneratedPostprocessing {
         tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     ) {
         self.fence_tags = tags;
+    }
+
+    pub(super) fn set_wall_tags(
+        &mut self,
+        tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    ) {
+        self.wall_tags = tags;
     }
 
     pub(super) fn set_speleothem_tags(
@@ -1168,6 +1183,7 @@ impl GeneratedPostprocessing {
             leaf_tags: self.leaf_tags.as_deref(),
             snow_tags: self.snow_tags.as_deref(),
             fence_tags: self.fence_tags.as_deref(),
+            wall_tags: self.wall_tags.as_deref(),
             speleothem_tags: self.speleothem_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
@@ -1264,6 +1280,7 @@ impl GeneratedPostprocessing {
             leaf_tags: self.leaf_tags.as_deref(),
             snow_tags: self.snow_tags.as_deref(),
             fence_tags: self.fence_tags.as_deref(),
+            wall_tags: self.wall_tags.as_deref(),
             speleothem_tags: self.speleothem_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
@@ -1330,6 +1347,7 @@ impl GeneratedPostprocessing {
             leaf_tags: self.leaf_tags,
             snow_tags: self.snow_tags,
             fence_tags: self.fence_tags,
+            wall_tags: self.wall_tags,
             speleothem_tags: self.speleothem_tags,
             bubble_tags: self.bubble_tags,
             washed_blocks: self.washed_blocks,
@@ -1367,6 +1385,7 @@ struct GeneratedBlockView<'a> {
     leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     snow_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     fence_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    wall_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     speleothem_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     washed_blocks: Option<&'a BTreeSet<String>>,
@@ -1855,21 +1874,7 @@ fn bonus_falling_shape_schedules(state: &BlockState) -> bool {
     ) && state.properties.is_empty()
 }
 
-pub(crate) fn fence_connection(
-    tags: &native_resources::ore_feature::OreBlockTags,
-    state: &BlockState,
-    neighbor: &BlockState,
-    direction: [i32; 3],
-) -> Result<bool> {
-    use native_resources::packs::ResourceId;
-    let fences = ResourceId::parse("minecraft:fences")?;
-    let wooden = ResourceId::parse("minecraft:wooden_fences")?;
-    let shulkers = ResourceId::parse("minecraft:shulker_boxes")?;
-    if tags.contains(&fences, &neighbor.name)?
-        && tags.contains(&wooden, &neighbor.name)? == tags.contains(&wooden, &state.name)?
-    {
-        return Ok(true);
-    }
+fn fence_gate_connection(neighbor: &BlockState, direction: [i32; 3]) -> Result<Option<bool>> {
     let gate = neighbor
         .name
         .strip_prefix("minecraft:")
@@ -1896,7 +1901,28 @@ pub(crate) fn fence_connection(
             Some("north" | "south") => false,
             _ => anyhow::bail!("invalid fence gate facing"),
         };
-        return Ok(gate_x != (direction[0] != 0));
+        return Ok(Some(gate_x != (direction[0] != 0)));
+    }
+    Ok(None)
+}
+
+pub(crate) fn fence_connection(
+    tags: &native_resources::ore_feature::OreBlockTags,
+    state: &BlockState,
+    neighbor: &BlockState,
+    direction: [i32; 3],
+) -> Result<bool> {
+    use native_resources::packs::ResourceId;
+    let fences = ResourceId::parse("minecraft:fences")?;
+    let wooden = ResourceId::parse("minecraft:wooden_fences")?;
+    let shulkers = ResourceId::parse("minecraft:shulker_boxes")?;
+    if tags.contains(&fences, &neighbor.name)?
+        && tags.contains(&wooden, &neighbor.name)? == tags.contains(&wooden, &state.name)?
+    {
+        return Ok(true);
+    }
+    if let Some(connected) = fence_gate_connection(neighbor, direction)? {
+        return Ok(connected);
     }
     if super::ore::generation_rail_state(neighbor) {
         return Ok(false);
@@ -1936,7 +1962,151 @@ pub(crate) fn fence_connection(
         .with_context(|| format!("unsupported fence neighbor support: {}", neighbor.name))
 }
 
+fn wall_connection(
+    tags: &native_resources::ore_feature::OreBlockTags,
+    neighbor: &BlockState,
+    direction: [i32; 3],
+) -> Result<bool> {
+    use native_resources::packs::ResourceId;
+    let wall = native_world::wall::Wall::from_state(neighbor);
+    let pane = native_world::collision::pane_waterlogged(neighbor);
+    let gate = fence_gate_connection(neighbor, direction)?;
+    let liquid = liquid_state(neighbor)?;
+    let shape = native_world::collision::block_shape(neighbor);
+    let except_kind = matches!(
+        neighbor.name.as_str(),
+        "minecraft:barrier"
+            | "minecraft:carved_pumpkin"
+            | "minecraft:jack_o_lantern"
+            | "minecraft:melon"
+            | "minecraft:pumpkin"
+    );
+    let plain_exception = neighbor.properties.is_empty()
+        && matches!(
+            neighbor.name.as_str(),
+            "minecraft:barrier" | "minecraft:melon" | "minecraft:pumpkin"
+        );
+    ensure!(
+        wall.is_some()
+            || pane.is_some()
+            || gate.is_some()
+            || liquid.is_some()
+            || shape.is_some()
+            || plain_exception
+            || (neighbor.properties.is_empty() && inert_generated_full_cube(&neighbor.name)),
+        "unsupported wall neighbor state: {neighbor:?}"
+    );
+    if tags.contains(&ResourceId::parse("minecraft:walls")?, &neighbor.name)? {
+        return Ok(true);
+    }
+    if pane.is_some() {
+        return Ok(true);
+    }
+    if let Some(connected) = gate {
+        return Ok(connected);
+    }
+    if wall.is_some() {
+        return Ok(false);
+    }
+    let except = leaf_distance(neighbor)?.is_some()
+        || except_kind
+        || tags.contains(
+            &ResourceId::parse("minecraft:shulker_boxes")?,
+            &neighbor.name,
+        )?;
+    if except || liquid.is_some() {
+        return Ok(false);
+    }
+    if neighbor.properties.is_empty() && inert_generated_full_cube(&neighbor.name) {
+        return Ok(true);
+    }
+    let face = glam::IVec3::new(-direction[0], -direction[1], -direction[2]);
+    native_world::collision::button_support_face(neighbor, face)
+        .with_context(|| format!("unsupported wall neighbor support: {}", neighbor.name))
+}
+
 impl GeneratedBlockView<'_> {
+    fn update_generated_wall_shape(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        direction: [i32; 3],
+        neighbor: &BlockState,
+    ) -> Result<BlockState> {
+        use native_world::wall::{Above, Side, Wall};
+        let wall = Wall::from_state(state).context("invalid wall state")?;
+        if wall.waterlogged {
+            self.schedule_contained_water(pos)?;
+        }
+        if direction == [0, -1, 0] {
+            return Ok(state.clone());
+        }
+        let changed = match direction {
+            [0, 0, -1] => Some(0),
+            [1, 0, 0] => Some(1),
+            [0, 0, 1] => Some(2),
+            [-1, 0, 0] => Some(3),
+            [0, 1, 0] => None,
+            _ => bail!("invalid wall update direction"),
+        };
+        let tags = self.wall_tags.context("wall connection tags unavailable")?;
+        let mut connected = wall.shape.sides.map(|side| side != Side::None);
+        if let Some(index) = changed {
+            connected[index] = wall_connection(tags, neighbor, direction)?;
+        }
+        let above_pos = [pos[0], pos[1].wrapping_add(1), pos[2]];
+        let above = if changed.is_none() {
+            neighbor.clone()
+        } else {
+            self.read(above_pos)?
+        };
+        let boxes = if supported_speleothem(&above) {
+            native_world::collision::positioned_speleothem_shape(
+                &above,
+                glam::IVec3::from_array(above_pos),
+            )
+            .map(<[_]>::to_vec)
+        } else {
+            native_world::collision::block_shape(&above)
+        }
+        .or_else(|| {
+            (above.properties.is_empty() && inert_generated_full_cube(&above.name)).then(|| {
+                vec![native_world::collision::Aabb {
+                    min: glam::Vec3::ZERO,
+                    max: glam::Vec3::ONE,
+                }]
+            })
+        })
+        .with_context(|| format!("unsupported collision above wall: {above:?}"))?;
+        let post_override = tags.contains(
+            &native_resources::packs::ResourceId::parse("minecraft:wall_post_override")?,
+            &above.name,
+        )?;
+        let top = Above::from_collision(
+            &boxes,
+            Wall::from_state(&above).is_some_and(|value| value.shape.up),
+            post_override,
+        );
+        let shape = native_world::wall::shape(connected, top);
+        let mut next = state.clone();
+        for (name, side) in ["north", "east", "south", "west"]
+            .into_iter()
+            .zip(shape.sides)
+        {
+            next.properties.insert(
+                name.into(),
+                match side {
+                    Side::None => "none",
+                    Side::Low => "low",
+                    Side::Tall => "tall",
+                }
+                .into(),
+            );
+        }
+        next.properties.insert("up".into(), shape.up.to_string());
+        Ok(next)
+    }
+
     fn speleothem_in_direction(&self, state: &BlockState, direction: &str) -> Result<bool> {
         static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
             std::sync::OnceLock::new();
@@ -2047,6 +2217,18 @@ impl GeneratedBlockView<'_> {
         }
         if native_world::collision::fence_waterlogged(state) == Some(false) {
             return Cell::FenceDry;
+        }
+        if let Some(wall) = native_world::wall::Wall::from_state(state) {
+            return if wall.waterlogged {
+                Cell::FenceWater(native_world::fluid::FluidState {
+                    kind: native_world::fluid::FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                })
+            } else {
+                Cell::FenceDry
+            };
         }
         if super::ore::valid_lichen(state) {
             return if state.properties["waterlogged"] == "true" {
@@ -3236,6 +3418,7 @@ impl GeneratedBlockView<'_> {
         let next_slab = self.slab(next);
         let next_stair = self.stair(next);
         let next_fence = native_world::collision::fence_waterlogged(next);
+        let next_wall = native_world::wall::Wall::from_state(next);
         let next_ladder = ladder_state(next);
         let next_lichen =
             super::ore::valid_lichen(next) && next.properties["waterlogged"] == "true";
@@ -3244,6 +3427,7 @@ impl GeneratedBlockView<'_> {
         let contained_source = next_slab.is_some_and(|(_, wet)| wet)
             || next_stair.is_some_and(|(_, wet)| wet)
             || next_fence == Some(true)
+            || next_wall.is_some_and(|wall| wall.waterlogged)
             || next_ladder.is_some_and(|(_, wet)| wet)
             || next_lichen
             || next_speleothem;
@@ -3268,6 +3452,16 @@ impl GeneratedBlockView<'_> {
                 || (native_world::collision::fence_waterlogged(old) == Some(false)
                     && next_fence == Some(true)
                     && old.name == next.name)
+                || (native_world::wall::Wall::from_state(old)
+                    .is_some_and(|wall| !wall.waterlogged)
+                    && next_wall.is_some_and(|wall| wall.waterlogged)
+                    && {
+                        let mut expected = old.clone();
+                        expected
+                            .properties
+                            .insert("waterlogged".into(), "true".into());
+                        *next == expected
+                    })
                 || (ladder_state(old)
                     .is_some_and(|(facing, wet)| !wet && next_ladder == Some((facing, true)))
                     && old.name == next.name)
@@ -3497,6 +3691,14 @@ impl GeneratedBlockView<'_> {
                     self.write_postprocessed_state(p.to_array(), &state, &updated)?;
                     self.update_water_shape_neighbors(p.to_array(), &updated, depth - 1)?;
                 }
+            } else if native_world::wall::Wall::from_state(&state).is_some() {
+                let direction = [-d[0], -d[1], -d[2]];
+                let updated =
+                    self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
+                if updated != state {
+                    self.write_postprocessed_state(p.to_array(), &state, &updated)?;
+                    self.update_water_shape_neighbors(p.to_array(), &updated, depth - 1)?;
+                }
             } else if d == [0, -1, 0] && snowy_fluid_barrier(&state) {
                 let updated =
                     self.update_shape(p.to_array(), &state, [0, 1, 0], target.to_array(), next)?;
@@ -3717,6 +3919,13 @@ impl GeneratedBlockView<'_> {
                     self.update_water_shape_neighbors(neighbor, &updated, depth - 1)?;
                 }
             } else if native_world::collision::fence_waterlogged(&state).is_some() {
+                let next =
+                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
+                if next != state {
+                    self.write_postprocessed_state(neighbor, &state, &next)?;
+                    self.update_water_shape_neighbors(neighbor, &next, depth - 1)?;
+                }
+            } else if native_world::wall::Wall::from_state(&state).is_some() {
                 let next =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, changed)?;
                 if next != state {
@@ -4098,6 +4307,21 @@ impl GeneratedBlockView<'_> {
                     "lichen removal requires light section allocation update"
                 );
             }
+            return self.write_postprocessed_state(pos, &old, next);
+        }
+        if native_world::wall::Wall::from_state(&old).is_some()
+            && native_world::wall::Wall::from_state(next).is_some()
+        {
+            let mut expected = old.clone();
+            for side in ["north", "east", "south", "west", "up"] {
+                expected
+                    .properties
+                    .insert(side.into(), next.properties[side].clone());
+            }
+            ensure!(
+                flags == 276 && *next == expected,
+                "unsupported generated wall write"
+            );
             return self.write_postprocessed_state(pos, &old, next);
         }
         if native_world::collision::fence_waterlogged(&old).is_some()
@@ -4484,6 +4708,9 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if native_world::wall::Wall::from_state(state).is_some() {
+            return self.update_generated_wall_shape(pos, state, direction, neighbor);
+        }
         if super::ore::valid_generated_kelp(state) {
             ensure!(
                 matches!(
@@ -4970,6 +5197,14 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         }
         if let Some(waterlogged) = native_world::collision::fence_waterlogged(state) {
             return Ok(waterlogged.then_some(native_world::fluid::FluidState {
+                kind: native_world::fluid::FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            }));
+        }
+        if let Some(wall) = native_world::wall::Wall::from_state(state) {
+            return Ok(wall.waterlogged.then_some(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
                 amount: 8,
                 source: true,
@@ -9331,6 +9566,14 @@ mod tests {
                 if path == "data/minecraft/tags/block/shulker_boxes.json" {
                     return Ok(Some(br#"{"values":[]}"#.to_vec()));
                 }
+                if path == "data/minecraft/tags/block/walls.json" {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:stone_brick_wall"]}"#.to_vec(),
+                    ));
+                }
+                if path == "data/minecraft/tags/block/wall_post_override.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
                 if path == "data/minecraft/tags/block/speleothems.json" {
                     return Ok(Some(
                         br#"{"values":["minecraft:sulfur_spike","minecraft:pointed_dripstone"]}"#
@@ -10118,6 +10361,24 @@ mod tests {
                 }
                 world.set_block_id(9, 8, 7, water).unwrap();
             }
+            "wall_on" | "wall_off" | "wall_on_neighbor" => {
+                let wall = world.intern_state(BlockState {
+                    name: "minecraft:stone_brick_wall".into(),
+                    properties: ["north", "east", "south", "west"]
+                        .into_iter()
+                        .map(|key| (key.into(), "none".into()))
+                        .chain([
+                            ("up".into(), "true".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ])
+                        .collect(),
+                });
+                world.set_block_id(9, 8, 8, wall).unwrap();
+                if case == "wall_on_neighbor" {
+                    world.set_block_id(10, 8, 8, wall).unwrap();
+                }
+                world.set_block_id(9, 8, 7, water).unwrap();
+            }
             "ladder_on" | "ladder_off" => {
                 let ladder = world.intern_state(BlockState {
                     name: "minecraft:ladder".into(),
@@ -10420,6 +10681,53 @@ mod tests {
                     world.set_block_id(8, 8, 7, neighbor).unwrap();
                 }
             }
+            case if case.starts_with("marked_wall_") => {
+                let wall = world.intern_state(BlockState {
+                    name: "minecraft:stone_brick_wall".into(),
+                    properties: ["north", "east", "south", "west"]
+                        .into_iter()
+                        .map(|key| {
+                            (
+                                key.into(),
+                                if key == "east" && case == "marked_wall_disconnect" {
+                                    "low"
+                                } else {
+                                    "none"
+                                }
+                                .into(),
+                            )
+                        })
+                        .chain([
+                            ("up".into(), "true".into()),
+                            (
+                                "waterlogged".into(),
+                                (case != "marked_wall_dry").to_string(),
+                            ),
+                        ])
+                        .collect(),
+                });
+                world.set_block_id(8, 8, 8, wall).unwrap();
+                if matches!(case, "marked_wall_side" | "marked_wall_disconnect") {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+                if case == "marked_wall_down" {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                }
+                if case == "marked_wall_stack" {
+                    let top = world.intern_state(BlockState {
+                        name: "minecraft:stone_brick_wall".into(),
+                        properties: ["north", "east", "south", "west"]
+                            .into_iter()
+                            .map(|key| (key.into(), "none".into()))
+                            .chain([
+                                ("up".into(), "true".into()),
+                                ("waterlogged".into(), "false".into()),
+                            ])
+                            .collect(),
+                    });
+                    world.set_block_id(8, 9, 8, top).unwrap();
+                }
+            }
             "marked_lichen_wet"
             | "marked_lichen_side"
             | "marked_lichen_down"
@@ -10624,6 +10932,7 @@ mod tests {
             "oak_stairs",
             "oak_leaves",
             "oak_fence",
+            "stone_brick_wall",
             "ladder",
             "glow_lichen",
             "seagrass",
@@ -10728,6 +11037,20 @@ mod tests {
             native_resources::ore_feature::OreBlockTags::load(&mut Tags, &registry, &fence_tags)
                 .unwrap(),
         )));
+        if case != "marked_wall_missing_wall_tags" {
+            let wall_tags = [
+                "minecraft:walls",
+                "minecraft:wall_post_override",
+                "minecraft:shulker_boxes",
+            ]
+            .into_iter()
+            .map(|id| native_resources::packs::ResourceId::parse(id).unwrap())
+            .collect();
+            stage.set_wall_tags(Some(Arc::new(
+                native_resources::ore_feature::OreBlockTags::load(&mut Tags, &registry, &wall_tags)
+                    .unwrap(),
+            )));
+        }
         if case.starts_with("marked_speleothem_")
             || case.starts_with("speleothem_water_")
             || case.starts_with("speleothem_shape_")
@@ -10871,6 +11194,9 @@ mod tests {
                     | "fence_on"
                     | "fence_off"
                     | "fence_on_neighbor"
+                    | "wall_on"
+                    | "wall_off"
+                    | "wall_on_neighbor"
                     | "ladder_on"
                     | "ladder_off"
                     | "ladder_down_source"
@@ -10888,6 +11214,7 @@ mod tests {
                                 | "slab_bottom_off"
                                 | "stair_bottom_off"
                                 | "fence_off"
+                                | "wall_off"
                                 | "ladder_off"
                                 | "ladder_down_source_off"
                         ),
@@ -11086,6 +11413,15 @@ mod tests {
             assert_eq!(stage.world.block(9, 8, 8), source.block(9, 8, 8));
             assert_eq!(stage.world.block(9, 7, 8), source.block(9, 7, 8));
             assert_eq!(stage.world.block(9, 9, 8), source.block(9, 9, 8));
+            assert!(stage.edits.is_empty());
+            return vec!["rolled back".into()];
+        }
+        if case == "marked_wall_missing_wall_tags" {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            assert!(format!("{error:#}").contains("wall connection tags unavailable"));
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
             assert!(stage.edits.is_empty());
             return vec!["rolled back".into()];
         }
@@ -11449,12 +11785,13 @@ mod tests {
                 | "slab_bottom_off"
                 | "stair_bottom_off"
                 | "fence_off"
+                | "wall_off"
                 | "ladder_off"
                 | "ladder_down_source_off" => Some(false),
                 "dry_lichen_on" | "dry_lichen_down" | "dry_lichen_support" | "convert_on"
                 | "convert_bubble" | "origin_source_on" | "slab_bottom" | "slab_top"
                 | "slab_oak" | "stair_bottom" | "stair_top" | "fence_on" | "fence_on_neighbor"
-                | "ladder_on" | "ladder_down_source" => Some(true),
+                | "wall_on" | "wall_on_neighbor" | "ladder_on" | "ladder_down_source" => Some(true),
                 _ => None,
             }
         );
@@ -11503,6 +11840,16 @@ mod tests {
                     state.properties["east"],
                     state.properties["south"],
                     state.properties["west"]
+                ));
+            }
+            if native_world::wall::Wall::from_state(state).is_some() {
+                trace.push(format!(
+                    "wall {x},{y},{z} {} {} {} {} {}",
+                    state.properties["north"],
+                    state.properties["east"],
+                    state.properties["south"],
+                    state.properties["west"],
+                    state.properties["up"]
                 ));
             }
             if state.name == "minecraft:ladder" {
@@ -11618,6 +11965,22 @@ mod tests {
                 state.properties["east"],
                 state.properties["south"],
                 state.properties["west"],
+                state.properties["waterlogged"]
+            ));
+        }
+        if matches!(case, "wall_on_neighbor" | "marked_wall_stack") {
+            let state = if case == "wall_on_neighbor" {
+                result.world.block(10, 8, 8).unwrap()
+            } else {
+                result.world.block(8, 9, 8).unwrap()
+            };
+            trace.push(format!(
+                "wall_neighbor {} {} {} {} {} {}",
+                state.properties["north"],
+                state.properties["east"],
+                state.properties["south"],
+                state.properties["west"],
+                state.properties["up"],
                 state.properties["waterlogged"]
             ));
         }
@@ -12667,6 +13030,39 @@ mod tests {
             water_spread_trace("tall_live_side_lower_tagged_missing_drop"),
             ["rolled back"]
         );
+    }
+
+    #[test]
+    fn missing_wall_tags_roll_back_postprocessing() {
+        assert_eq!(
+            water_spread_trace("marked_wall_missing_wall_tags"),
+            ["rolled back"]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn walls_match_java_water_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["wall_postprocessing"],
+        );
+        let expected: Vec<_> = [
+            "wall_on",
+            "wall_off",
+            "wall_on_neighbor",
+            "marked_wall_dry",
+            "marked_wall_wet",
+            "marked_wall_side",
+            "marked_wall_down",
+            "marked_wall_disconnect",
+            "marked_wall_stack",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

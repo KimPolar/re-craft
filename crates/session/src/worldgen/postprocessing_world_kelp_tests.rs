@@ -126,6 +126,7 @@ pub(super) fn update_twice(
         leaf_tags: stage.leaf_tags.as_deref(),
         snow_tags: stage.snow_tags.as_deref(),
         fence_tags: stage.fence_tags.as_deref(),
+        wall_tags: stage.wall_tags.as_deref(),
         speleothem_tags: stage.speleothem_tags.as_deref(),
         bubble_tags: stage.bubble_tags.as_deref(),
         washed_blocks: stage.washed_blocks.as_deref(),

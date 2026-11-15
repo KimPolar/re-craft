@@ -37,6 +37,7 @@ struct CapturedPostprocessingTags {
     leaf: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    wall: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed: Option<Arc<BTreeSet<String>>>,
     lava: Option<Arc<BTreeSet<String>>>,
@@ -82,6 +83,14 @@ impl CapturedPostprocessingTags {
                     "minecraft:shulker_boxes",
                 ],
             )?,
+            wall: load_tags(
+                provider,
+                &[
+                    "minecraft:walls",
+                    "minecraft:wall_post_override",
+                    "minecraft:shulker_boxes",
+                ],
+            )?,
             bubble: native_resources::fluid_tags::BubbleColumnTags::load(provider, block_ids)
                 .ok()
                 .map(Arc::new),
@@ -102,6 +111,7 @@ impl CapturedPostprocessingTags {
         stage.set_leaf_tags(self.leaf);
         stage.set_snow_tags(self.snow);
         stage.set_fence_tags(self.fence);
+        stage.set_wall_tags(self.wall);
         stage.set_bubble_tags(self.bubble);
         stage.set_fluid_tags(self.washed, self.lava);
         stage.set_water_fluid_tags(self.water);

@@ -1156,10 +1156,11 @@ where
                 .is_canonical_state(&old.name, &old.properties)
                 && self.marker.registry.has_block_entity(&old.name) == Some(false)
                 && (disk_safe_solid(&old.name).is_some()
+                    || (old.name == "minecraft:seagrass" && old.properties.is_empty())
                     || super::super::ocean_ruin::ocean_template_static_full(&old).is_ok())
                 && !region.monster_entities.contains_key(&position)
                 && !region.bee_nests.contains_key(&position),
-            "unsupported ruin template replacement source"
+            "unsupported ruin template replacement source at {position:?}: {old:?}"
         );
         region.set_proto_block(position, state)?;
         Ok(true)
@@ -1966,6 +1967,11 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn region_places_ocean_ruin_piece_and_discards_failed_attempt() -> Result<()> {
+        check_ocean_ruin_region(false)?;
+        check_ocean_ruin_region(true)
+    }
+
+    fn check_ocean_ruin_region(seagrass: bool) -> Result<()> {
         use super::super::super::{GeneratedEntityRecord, ocean_ruin::PreparedPiece};
         use native_persistence::structure_template::TemplateBlock;
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1978,6 +1984,17 @@ mod tests {
         let ice = OreBlockTags::load(&mut IceTag(false), &ids, &BTreeSet::from([ice_id]))?;
         let motion = HeightmapTags::load(&mut resources, &ids)?;
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        if seagrass {
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut setup = terrain.decoration_region(&tags, &motion, writable)?;
+            let state = BlockState {
+                name: "minecraft:seagrass".into(),
+                properties: BTreeMap::new(),
+            };
+            setup.set_proto_block([1, 8, 1], &state)?;
+            setup.set_proto_block([2, 8, 1], &state)?;
+            setup.finish()?;
+        }
         let mut palette: Vec<_> = [
             "stone_bricks",
             "stone_brick_stairs",
@@ -2097,7 +2114,7 @@ mod tests {
                     .iter()
                     .any(|t| t.position == [3, 8, 1] && t.block == "minecraft:suspicious_sand"))
         );
-        let actual = java_ruin_region_output(&game)?;
+        let actual = java_ruin_region_output(&game, seagrass)?;
         let mut expected_lines = Vec::new();
         for p in [[1, 8, 1], [2, 8, 1], [2, 8, 2], [3, 8, 1]] {
             let state = region.read(p)?;
@@ -2208,7 +2225,7 @@ mod tests {
         Ok(())
     }
 
-    fn java_ruin_region_output(game: &std::path::Path) -> Result<Vec<String>> {
+    fn java_ruin_region_output(game: &std::path::Path, seagrass: bool) -> Result<Vec<String>> {
         use std::{path::PathBuf, process::Command};
         let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
@@ -2249,6 +2266,7 @@ mod tests {
             .arg("-cp")
             .arg(cp)
             .arg("OceanRuinRegionOracle")
+            .arg(if seagrass { "seagrass" } else { "dry" })
             .output()?;
         ensure!(
             output.status.success(),

@@ -37,6 +37,16 @@ public class OceanRuinRegionOracle {
         ((List<StructureTemplate.Palette>)palettes.get(template)).add(ctor.newInstance(infos));
         var size = StructureTemplate.class.getDeclaredField("size"); size.setAccessible(true); size.set(template, new Vec3i(4,1,2));
         var states = new HashMap<BlockPos, BlockState>();
+        if (args.length > 0 && args[0].equals("seagrass")) {
+            var seagrass = Blocks.SEAGRASS.defaultBlockState();
+            var fluid = seagrass.getFluidState();
+            if (seagrass.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(seagrass)
+                    || seagrass.getPostProcessPos(null, BlockPos.ZERO) != null
+                    || fluid.getType() != net.minecraft.world.level.material.Fluids.WATER || !fluid.isSource())
+                throw new AssertionError("unexpected seagrass replacement effects");
+            states.put(new BlockPos(1,8,1), seagrass);
+            states.put(new BlockPos(2,8,1), seagrass);
+        }
         var blockTicks = new LinkedHashSet<String>();
         var fluidTicks = new LinkedHashSet<String>();
         RandomSource random = new LegacyRandomSource(42);

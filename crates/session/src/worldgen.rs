@@ -839,6 +839,25 @@ pub struct QueuedGenerationLightEngine {
 }
 
 impl QueuedGenerationLightEngine {
+    /// Bind a fully observed revision using the active generated block registry.
+    pub fn new_with_registry(
+        terrain: &CarvedTerrainWorld,
+        tracker: native_world::generation_light::QueuedSectionLightTracker,
+        registered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
+        has_skylight: bool,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Self> {
+        Self::new(
+            terrain,
+            tracker,
+            registered,
+            sky_sources,
+            has_skylight,
+            |state| generated_state_is_air(registry, state),
+        )
+    }
+
     /// Bind an observed light engine to the corresponding terrain revision.
     /// Registered section occupancy is checked; the caller still establishes
     /// the queue, activation, source-height and empty-chunk histories.

@@ -951,6 +951,7 @@ impl Drop for MissingGenerationTerrainWorker {
 /// features, lighting, play or saving until the remaining state is bound.
 pub(crate) struct StagedMissingTerrain {
     batch: crate::fresh_generation::existing::StagedLiveTerrainBatch,
+    queued_light: Option<crate::fresh_generation::existing::CapturedQueuedLight>,
     generator: crate::fresh_generation::existing::PreparedExistingGenerator,
     restored: crate::fresh_generation::existing::RestoredSavedTerrain,
     evaluator: native_resources::density::DensityEvaluator,
@@ -999,6 +1000,34 @@ impl StagedMissingTerrain {
 
     pub fn feature_order(&self) -> &[ChunkPos] {
         self.batch.feature_order()
+    }
+
+    /// The caller must supply a continuously observed light-engine revision.
+    /// The live terrain guard still has to match before and after feature work.
+    pub fn bind_observed_light(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        tracker: native_world::generation_light::QueuedSectionLightTracker,
+        registered: impl IntoIterator<Item = ChunkPos>,
+        sky_sources: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.is_current(streamer, session),
+            "staged terrain is stale"
+        );
+        anyhow::ensure!(
+            self.queued_light.is_none(),
+            "observed light is already bound"
+        );
+        let light = self.generator.bind_staged_live_queued_light(
+            &self.batch,
+            tracker,
+            registered,
+            sky_sources,
+        )?;
+        self.queued_light = Some(light);
+        Ok(())
     }
 }
 
@@ -1065,6 +1094,7 @@ impl MissingGenerationStagedAssemblyWorker {
                     )?;
                     Ok(StagedMissingTerrain {
                         batch,
+                        queued_light: None,
                         generator,
                         restored,
                         evaluator,
@@ -1165,8 +1195,8 @@ pub(crate) struct MissingGenerationStagedFeatureWorker {
 }
 
 impl MissingGenerationStagedFeatureWorker {
-    /// A feature that needs light is rejected until the exact visible light
-    /// engine revision can be captured; no guessed brightness is supplied.
+    /// A feature that needs light is rejected unless an observed engine was
+    /// bound to the same terrain revision; no brightness is guessed.
     pub fn start(
         terrain: StagedMissingTerrain,
         streamer: &ChunkStreamer,
@@ -1197,9 +1227,18 @@ impl MissingGenerationStagedFeatureWorker {
                         terrain.observed.stamp.is_current(),
                         "staged terrain is stale"
                     );
-                    terrain
-                        .generator
-                        .run_staged_live_features(&mut terrain.batch, position)
+                    match terrain.queued_light.as_mut() {
+                        Some(light) => terrain
+                            .generator
+                            .run_staged_live_features_with_queued_light(
+                                &mut terrain.batch,
+                                position,
+                                light,
+                            ),
+                        None => terrain
+                            .generator
+                            .run_staged_live_features(&mut terrain.batch, position),
+                    }
                 })();
                 let outcome = match result {
                     Ok(placements) => StagedMissingFeatureResult::Completed {

@@ -1841,6 +1841,29 @@ impl GenerationSchedule {
         Ok(result)
     }
 
+    /// Complete a structure and feature pass against an observed light engine.
+    pub fn run_features_with_structure_plan_and_queued_light(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        engine: &mut super::QueuedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let result =
+            prepared.execute_structures_with_queued_light(terrain, structures, engine, registry)?;
+        self.complete(center, Features)?;
+        Ok(result)
+    }
+
     /// Publish FEATURES only after the complete structure and feature pass succeeds.
     pub(super) fn run_features_with_structures(
         &mut self,
@@ -1984,6 +2007,19 @@ impl GenerationSchedule {
         );
         engine.initialize_chunk(terrain, center, is_air)?;
         self.complete(center, InitializeLight)
+    }
+
+    /// Register a generated chunk using the same block registry as its terrain.
+    pub fn run_queued_light_initialization_with_registry(
+        &mut self,
+        terrain: &super::CarvedTerrainWorld,
+        center: ChunkPos,
+        engine: &mut super::QueuedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        self.run_queued_light_initialization(terrain, center, engine, |state| {
+            super::generated_state_is_air(registry, state)
+        })
     }
 
     /// Advance LIGHT within a frozen, fully initialized generation batch.

@@ -528,6 +528,31 @@ impl CapturedFeatureLight {
     }
 }
 
+/// A caller-observed saved or live light revision for this captured batch.
+/// Binding it does not establish that the caller observed every engine event.
+pub(crate) struct CapturedQueuedLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    engine: native_session::worldgen::QueuedGenerationLightEngine,
+}
+
+impl CapturedQueuedLight {
+    pub fn matches_batch(&self, batch: &CapturedTerrainBatch) -> bool {
+        Arc::ptr_eq(&self.identity, &batch.identity) && Arc::ptr_eq(&self.revision, &batch.revision)
+    }
+
+    pub fn snapshot(
+        &self,
+        batch: &CapturedTerrainBatch,
+    ) -> Result<&native_world::generation_light::VisibleLightSnapshot> {
+        ensure!(
+            self.matches_batch(batch),
+            "light belongs to another terrain revision"
+        );
+        Ok(self.engine.tracker().snapshot())
+    }
+}
+
 /// Fresh section registrations bound to a single mixed terrain revision.
 pub(crate) struct CapturedInitialLight {
     identity: Arc<()>,
@@ -6318,14 +6343,17 @@ impl PreparedExistingGenerator {
         context: &SavedDecorationContext,
         action: impl FnOnce(&native_session::worldgen::PreparedDecoration<'_, '_>) -> Result<T>,
     ) -> Result<T> {
-        self.with_saved_prepared_decoration_inner(context, false, action)
+        self.with_saved_prepared_decoration_inner(context, false, |prepared, _| action(prepared))
     }
 
     fn with_saved_prepared_decoration_inner<T>(
         &mut self,
         context: &SavedDecorationContext,
         needs_mineshaft: bool,
-        action: impl FnOnce(&native_session::worldgen::PreparedDecoration<'_, '_>) -> Result<T>,
+        action: impl FnOnce(
+            &native_session::worldgen::PreparedDecoration<'_, '_>,
+            &native_resources::block_registry::GeneratedBlockRegistry,
+        ) -> Result<T>,
     ) -> Result<T> {
         let plan = context.plan(self)?;
         self.ensure_terrain_assets()?;
@@ -6341,7 +6369,7 @@ impl PreparedExistingGenerator {
             &mut resolve,
             needs_mineshaft,
         )?;
-        action(&prepared)
+        action(&prepared, &assets.blocks)
     }
 
     /// Resolve referenced starts in registry and saved fastutil order. The
@@ -6880,6 +6908,97 @@ impl PreparedExistingGenerator {
         })
     }
 
+    /// Bind a complete, caller-observed engine history to this exact terrain.
+    /// The caller must prove the queue, registrations, active chunks and sky
+    /// sources were observed continuously; saved arrays alone are insufficient.
+    pub fn bind_captured_queued_light(
+        &self,
+        batch: &CapturedTerrainBatch,
+        tracker: native_world::generation_light::QueuedSectionLightTracker,
+        registered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
+    ) -> Result<CapturedQueuedLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity),
+            "terrain belongs to another generation capture"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let engine = native_session::worldgen::QueuedGenerationLightEngine::new_with_registry(
+            &batch.terrain,
+            tracker,
+            registered,
+            sky_sources,
+            self.lighting.has_skylight,
+            registry,
+        )?;
+        Ok(CapturedQueuedLight {
+            identity: Arc::clone(&batch.identity),
+            revision: Arc::clone(&batch.revision),
+            engine,
+        })
+    }
+
+    /// Bind an observed engine to a detached live-terrain batch.
+    pub fn bind_staged_live_queued_light(
+        &self,
+        batch: &StagedLiveTerrainBatch,
+        tracker: native_world::generation_light::QueuedSectionLightTracker,
+        registered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
+    ) -> Result<CapturedQueuedLight> {
+        self.bind_captured_queued_light(&batch.batch, tracker, registered, sky_sources)
+    }
+
+    /// Register a feature-complete generated chunk in the observed engine.
+    pub fn initialize_captured_queued_light(
+        &self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity) && light.matches_batch(batch),
+            "light belongs to another terrain revision"
+        );
+        ensure!(
+            batch.feature_entity_sources.completed.contains(&position),
+            "light chunk has not completed features"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        batch
+            .schedule
+            .run_queued_light_initialization_with_registry(
+                &batch.terrain,
+                position,
+                &mut light.engine,
+                registry,
+            )
+    }
+
+    /// Advance a ready generated chunk without discarding observed light.
+    pub fn propagate_captured_queued_light(
+        &self,
+        batch: &mut CapturedTerrainBatch,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &batch.identity) && light.matches_batch(batch),
+            "light belongs to another terrain revision"
+        );
+        batch
+            .schedule
+            .run_queued_light(&batch.terrain, position, &mut light.engine)
+    }
+
     /// Run FEATURES for a mixed captured batch, including supported saved
     /// buried-treasure references. Generated starts remain unsupported.
     /// A light-dependent feature fails until an appropriate light view exists.
@@ -6889,7 +7008,7 @@ impl PreparedExistingGenerator {
         batch: &mut CapturedTerrainBatch,
         context: &SavedDecorationContext,
     ) -> Result<Vec<bool>> {
-        self.run_captured_features_inner(batch, context, None, None)
+        self.run_captured_features_inner(batch, context, None, None, None)
     }
 
     /// Run a feature pass on the detached live terrain without inventing a
@@ -6913,6 +7032,7 @@ impl PreparedExistingGenerator {
             &context,
             None,
             Some(&mut batch.mineshaft_starts),
+            None,
         )?;
         batch.feature_order.push(position);
         Ok(placements)
@@ -6926,7 +7046,59 @@ impl PreparedExistingGenerator {
         context: &SavedDecorationContext,
         light: &CapturedFeatureLight,
     ) -> Result<Vec<bool>> {
-        self.run_captured_features_inner(batch, context, Some(light), None)
+        self.run_captured_features_inner(batch, context, Some(light), None, None)
+    }
+
+    /// Run the captured pass and its ordered light updates atomically.
+    pub fn run_captured_features_with_queued_light(
+        &mut self,
+        batch: &mut CapturedTerrainBatch,
+        context: &SavedDecorationContext,
+        light: &mut CapturedQueuedLight,
+    ) -> Result<Vec<bool>> {
+        ensure!(
+            light.matches_batch(batch),
+            "feature light belongs to another terrain revision"
+        );
+        let mut engine = light.engine.clone();
+        let result =
+            self.run_captured_features_inner(batch, context, None, None, Some(&mut engine))?;
+        light.engine = engine;
+        light.revision = Arc::clone(&batch.revision);
+        Ok(result)
+    }
+
+    /// Run a live-captured pass without discarding the observed light history.
+    pub fn run_staged_live_features_with_queued_light(
+        &mut self,
+        batch: &mut StagedLiveTerrainBatch,
+        position: native_world::loaded::ChunkPos,
+        light: &mut CapturedQueuedLight,
+    ) -> Result<Vec<bool>> {
+        batch.require_ready_features(position)?;
+        ensure!(
+            light.matches_batch(&batch.batch),
+            "feature light belongs to another terrain revision"
+        );
+        let context = self.prepare_captured_decoration(
+            &batch.batch,
+            native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+        )?;
+        let mut engine = light.engine.clone();
+        let result = self.run_captured_features_inner(
+            &mut batch.batch,
+            &context,
+            None,
+            Some(&mut batch.mineshaft_starts),
+            Some(&mut engine),
+        )?;
+        light.engine = engine;
+        light.revision = Arc::clone(&batch.batch.revision);
+        batch.feature_order.push(position);
+        Ok(result)
     }
 
     fn run_captured_features_inner(
@@ -6935,6 +7107,7 @@ impl PreparedExistingGenerator {
         context: &SavedDecorationContext,
         light: Option<&CapturedFeatureLight>,
         mut previous_mineshafts: Option<&mut BTreeMap<SavedStructureKey, ResumedMineshaftStart>>,
+        mut queued: Option<&mut native_session::worldgen::QueuedGenerationLightEngine>,
     ) -> Result<Vec<bool>> {
         use native_session::worldgen::schedule::GenerationStage;
         ensure!(
@@ -6946,6 +7119,7 @@ impl PreparedExistingGenerator {
             light.is_none_or(|light| light.matches_batch(batch)),
             "feature light belongs to another terrain revision"
         );
+        ensure!(light.is_none() || queued.is_none(), "lighting modes are mutually exclusive");
         let center = native_world::loaded::ChunkPos {
             x: context.position.x,
             z: context.position.z,
@@ -7047,71 +7221,101 @@ impl PreparedExistingGenerator {
             .as_ref()
             .is_some_and(|plan| !plan.mineshafts.is_empty());
         let result = priming.and_then(|()| {
-            self.with_saved_prepared_decoration_inner(context, needs_mineshaft, |prepared| {
-                if let Some(structures) = &structures {
-                    if needs_mineshaft {
-                        let planned = structures.planned_mixed()?;
-                        let mut placement =
-                            native_session::worldgen::MixedMineshaftPlacementContext {
-                                other: UnavailableOceanPlacement,
-                                blocking_biomes: prepared
-                                    .mineshaft_blocking_biomes()
-                                    .context("mineshaft biome tags are missing")?,
-                                uuid_factory: |_: [f64; 3]| -> Result<Option<[i32; 4]>> {
-                                    bail!("mineshaft minecart UUID source is not bound")
-                                },
+            self.with_saved_prepared_decoration_inner(
+                context,
+                needs_mineshaft,
+                |prepared, registry| {
+                    if let Some(structures) = &structures {
+                        if needs_mineshaft {
+                            let planned = structures.planned_mixed()?;
+                            let mut placement =
+                                native_session::worldgen::MixedMineshaftPlacementContext {
+                                    other: UnavailableOceanPlacement,
+                                    blocking_biomes: prepared
+                                        .mineshaft_blocking_biomes()
+                                        .context("mineshaft biome tags are missing")?,
+                                    uuid_factory: |_: [f64; 3]| -> Result<Option<[i32; 4]>> {
+                                        bail!("mineshaft minecart UUID source is not bound")
+                                    },
+                                };
+                            let (features, updates) = match (light, queued.as_deref_mut()) {
+                                (Some(light), None) => prepared.execute_mixed_with_visible_light(
+                                    &mut batch.terrain,
+                                    &planned,
+                                    &mut placement,
+                                    &light.light,
+                                )?,
+                                (None, Some(engine)) => prepared.execute_mixed_with_queued_light(
+                                    &mut batch.terrain,
+                                    &planned,
+                                    &mut placement,
+                                    engine,
+                                    registry,
+                                )?,
+                                (None, None) => prepared.execute_with_mixed_structure_plan(
+                                    &mut batch.terrain,
+                                    &planned,
+                                    &mut placement,
+                                )?,
+                                (Some(_), Some(_)) => unreachable!("lighting modes are exclusive"),
                             };
-                        let (features, updates) = match light {
-                            Some(light) => prepared.execute_mixed_with_visible_light(
-                                &mut batch.terrain,
-                                &planned,
-                                &mut placement,
-                                &light.light,
-                            )?,
-                            None => prepared.execute_with_mixed_structure_plan(
-                                &mut batch.terrain,
-                                &planned,
-                                &mut placement,
-                            )?,
-                        };
-                        batch.schedule.complete(center, GenerationStage::Features)?;
-                        return Ok((features, SavedStructureUpdates::Mixed(updates)));
-                    }
-                    let planned = structures.planned()?;
-                    let (features, updates) = match light {
-                        Some(light) => batch
-                            .schedule
-                            .run_features_with_structure_plan_and_visible_light(
+                            batch.schedule.complete(center, GenerationStage::Features)?;
+                            return Ok((features, SavedStructureUpdates::Mixed(updates)));
+                        }
+                        let planned = structures.planned()?;
+                        let (features, updates) = match (light, queued.as_deref_mut()) {
+                            (Some(light), None) => batch
+                                .schedule
+                                .run_features_with_structure_plan_and_visible_light(
+                                    &mut batch.terrain,
+                                    prepared,
+                                    &planned,
+                                    &light.light,
+                                )?,
+                            (None, Some(engine)) => batch
+                                .schedule
+                                .run_features_with_structure_plan_and_queued_light(
+                                    &mut batch.terrain,
+                                    prepared,
+                                    &planned,
+                                    engine,
+                                    registry,
+                                )?,
+                            (None, None) => batch.schedule.run_features_with_structure_plan(
                                 &mut batch.terrain,
                                 prepared,
                                 &planned,
+                            )?,
+                            (Some(_), Some(_)) => unreachable!("lighting modes are exclusive"),
+                        };
+                        Ok((features, SavedStructureUpdates::Simple(updates)))
+                    } else {
+                        let features = match (light, queued.as_deref_mut()) {
+                            (Some(light), None) => batch.schedule.run_features_with_visible_light(
+                                &mut batch.terrain,
+                                prepared,
+                                false,
                                 &light.light,
                             )?,
-                        None => batch.schedule.run_features_with_structure_plan(
-                            &mut batch.terrain,
-                            prepared,
-                            &planned,
-                        )?,
-                    };
-                    Ok((features, SavedStructureUpdates::Simple(updates)))
-                } else {
-                    let features = match light {
-                        Some(light) => batch.schedule.run_features_with_visible_light(
-                            &mut batch.terrain,
-                            prepared,
-                            false,
-                            &light.light,
-                        )?,
-                        None => batch.schedule.run_features(
-                            &mut batch.terrain,
-                            prepared,
-                            false,
-                            None,
-                        )?,
-                    };
-                    Ok((features, SavedStructureUpdates::Simple(Vec::new())))
-                }
-            })
+                            (None, Some(engine)) => batch.schedule.run_features_with_queued_light(
+                                &mut batch.terrain,
+                                prepared,
+                                false,
+                                engine,
+                                registry,
+                            )?,
+                            (None, None) => batch.schedule.run_features(
+                                &mut batch.terrain,
+                                prepared,
+                                false,
+                                None,
+                            )?,
+                            (Some(_), Some(_)) => unreachable!("lighting modes are exclusive"),
+                        };
+                        Ok((features, SavedStructureUpdates::Simple(Vec::new())))
+                    }
+                },
+            )
         });
         let (result, updates) = match result {
             Ok(result) => result,
@@ -12546,6 +12750,7 @@ mod tests {
                     &mine_context,
                     None,
                     Some(&mut starts),
+                    None,
                 )
                 .unwrap_err();
             assert!(format!("{error:#}").contains("raw brightness unavailable"));
@@ -12563,6 +12768,7 @@ mod tests {
                 &mine_context,
                 None,
                 Some(&mut starts),
+                None,
             )?;
             actual.generate_structures = false;
             assert!(placed.is_empty());
@@ -12586,6 +12792,157 @@ mod tests {
             assert!(Arc::ptr_eq(&starts[&key].source, &source));
             assert_eq!(starts[&key].original, original);
             assert_eq!(starts[&key].references, 2);
+            assert!(Arc::ptr_eq(&world, &batch.terrain().snapshot()));
+        }
+        {
+            use native_world::{
+                block_light::LightBounds,
+                generation_light::{LightChannel, QueuedLightEvent, QueuedSectionLightTracker},
+            };
+            let mut copied_biomes = actual.generator.biome_neighborhood()?;
+            for (position, _) in batch.schedule.requirements() {
+                if let Some(biome) = batch.biomes.chunk([position.x, position.z]) {
+                    copied_biomes.insert(Arc::clone(biome))?;
+                }
+            }
+            let copied = CapturedTerrainBatch {
+                identity: Arc::clone(&batch.identity),
+                schedule: batch.schedule.clone(),
+                biomes: copied_biomes,
+                terrain: batch.terrain.clone(),
+                sources: batch.sources.clone(),
+                saved_stages: batch.saved_stages.clone(),
+                generated_references: BTreeMap::new(),
+                generated_starts: batch.generated_starts.clone(),
+                treasure_starts: batch.treasure_starts.clone(),
+                feature_entity_sources: ResumedFeatureEntitySources::default(),
+                revision: Arc::clone(&batch.revision),
+            };
+            let mut staged = StagedLiveTerrainBatch {
+                batch: copied,
+                feature_order: Vec::new(),
+                mineshaft_starts: BTreeMap::new(),
+            };
+            let bounds = LightBounds::new(lighting.min_y, lighting.min_y + lighting.height)
+                .context("test light bounds unavailable")?;
+            let section_y = lighting.min_y.div_euclid(16);
+            let mut tracker = QueuedSectionLightTracker::fresh(true, true, [])
+                .context("test light tracker unavailable")?;
+            tracker
+                .cover_chunk_halo(second)
+                .context("test halo unavailable")?;
+            let registry = &actual
+                .terrain_assets
+                .as_ref()
+                .context("terrain registry missing")?
+                .blocks;
+            let mut events = vec![
+                QueuedLightEvent::Queue {
+                    channel: LightChannel::Block,
+                    position: second,
+                    section_y,
+                    bytes: Some(Arc::new([0x33; 2048])),
+                },
+                QueuedLightEvent::Queue {
+                    channel: LightChannel::Sky,
+                    position: target,
+                    section_y,
+                    bytes: Some(Arc::new([0xff; 2048])),
+                },
+            ];
+            events.extend(
+                QueuedSectionLightTracker::initialization_events(
+                    &staged.batch.terrain.snapshot(),
+                    second,
+                    bounds,
+                    |state| {
+                        if !registry.is_registered(&state.name) {
+                            return None;
+                        }
+                        let air = matches!(
+                            state.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        );
+                        (!air || state.properties.is_empty()).then_some(air)
+                    },
+                )
+                .context("test section registration unavailable")?,
+            );
+            tracker
+                .apply_events(&events)
+                .context("test light events failed")?;
+            let sources: Arc<[i32; 256]> = Arc::from(
+                native_world::sky_light::generated_chunk_sky_sources(
+                    &staged.batch.terrain.snapshot(),
+                    bounds,
+                    second,
+                )
+                .context("test sky sources unavailable")?,
+            );
+            assert!(
+                actual
+                    .bind_staged_live_queued_light(
+                        &staged,
+                        tracker.clone(),
+                        [second],
+                        BTreeMap::new(),
+                    )
+                    .is_err()
+            );
+            let mut observed = actual.bind_staged_live_queued_light(
+                &staged,
+                tracker,
+                [second],
+                BTreeMap::from([(second, sources)]),
+            )?;
+            assert!(observed.matches_batch(&staged.batch));
+            let saved_light = observed
+                .engine
+                .tracker()
+                .data_layer(LightChannel::Block, second, section_y)
+                .context("test saved light column missing")?
+                .context("test saved light missing")?;
+            assert_eq!(saved_light.bytes()[0], 0x33);
+            assert_eq!(
+                actual.run_staged_live_features_with_queued_light(
+                    &mut staged,
+                    target,
+                    &mut observed
+                )?,
+                [true]
+            );
+            assert_eq!(
+                staged.completed_stage(target),
+                Some(GenerationStage::Features)
+            );
+            assert_eq!(staged.feature_order(), &[target]);
+            assert_eq!(
+                staged
+                    .snapshot()
+                    .block(marker[0], marker[1], marker[2])
+                    .unwrap()
+                    .name,
+                "minecraft:melon"
+            );
+            assert!(observed.matches_batch(&staged.batch));
+            assert!(!observed.matches_batch(&batch));
+            let saved_light = observed
+                .engine
+                .tracker()
+                .data_layer(LightChannel::Block, second, section_y)
+                .context("test saved light column missing")?
+                .context("test saved light missing")?;
+            assert_eq!(saved_light.bytes()[0], 0x33);
+            let before = staged.snapshot();
+            assert!(
+                actual
+                    .run_staged_live_features_with_queued_light(&mut staged, target, &mut observed)
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&before, &staged.snapshot()));
+            assert_eq!(staged.feature_order(), &[target]);
+            assert!(observed.snapshot(&staged.batch).is_ok());
+            assert!(observed.snapshot(&batch).is_err());
             assert!(Arc::ptr_eq(&world, &batch.terrain().snapshot()));
         }
         let mut staged_batch = StagedLiveTerrainBatch {

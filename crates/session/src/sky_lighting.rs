@@ -411,41 +411,87 @@ fn extend_required_chunks(required: &mut BTreeSet<ChunkPos>, position: BlockPosi
     }
 }
 
-/// Group edits conservatively by 32-block cells. Sky propagation uses at most
-/// a 15-block horizontal halo, including saved-layer restoration. Nonadjacent
-/// cells cannot share a touched light section or propagation boundary. Joining
-/// adjacent cells may combine independent work but never separates dependent
-/// edits. Within each group the original callback order is retained.
+/// Horizontal chunks read or written while processing edits in one chunk.
+/// The bounds include the 15-block propagation boundary. Restoring an omitted
+/// layer can also inspect block sections one chunk beyond these bounds.
+struct LightEditBucket {
+    indices: Vec<usize>,
+    min_x: i64,
+    max_x: i64,
+    min_z: i64,
+    max_z: i64,
+}
+
+impl LightEditBucket {
+    fn contains_with_halo(&self, pos: ChunkPos) -> bool {
+        let x = i64::from(pos.x);
+        let z = i64::from(pos.z);
+        (self.min_x - 1..=self.max_x + 1).contains(&x)
+            && (self.min_z - 1..=self.max_z + 1).contains(&z)
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.min_x <= other.max_x
+            && other.min_x <= self.max_x
+            && self.min_z <= other.max_z
+            && other.min_z <= self.max_z
+    }
+}
+
+/// Group edits whose propagation or saved-layer restoration may interact.
+/// A bucket includes all edits in one chunk; its bounding rectangle can merge
+/// extra work but cannot split dependent edits. Candidate buckets are indexed
+/// by chunk, and each group retains the original callback order.
 fn independent_edit_groups(edits: &[Edit]) -> Vec<Vec<usize>> {
-    let cell = |edit: &Edit| {
-        (
-            edit.position.x.div_euclid(32),
-            edit.position.z.div_euclid(32),
-        )
-    };
-    let mut remaining = BTreeMap::<(i32, i32), Vec<usize>>::new();
+    let mut remaining = BTreeMap::<ChunkPos, LightEditBucket>::new();
     for (index, edit) in edits.iter().enumerate() {
-        remaining.entry(cell(edit)).or_default().push(index);
+        let p = edit.position;
+        let x = i64::from(p.x);
+        let z = i64::from(p.z);
+        let (min_x, max_x) = ((x - 15).div_euclid(16), (x + 15).div_euclid(16));
+        let (min_z, max_z) = ((z - 15).div_euclid(16), (z + 15).div_euclid(16));
+        let bucket = remaining
+            .entry(p.chunk())
+            .or_insert_with(|| LightEditBucket {
+                indices: Vec::new(),
+                min_x,
+                max_x,
+                min_z,
+                max_z,
+            });
+        bucket.indices.push(index);
+        bucket.min_x = bucket.min_x.min(min_x);
+        bucket.max_x = bucket.max_x.max(max_x);
+        bucket.min_z = bucket.min_z.min(min_z);
+        bucket.max_z = bucket.max_z.max(max_z);
     }
     let mut groups = Vec::new();
     for edit in edits {
-        let first = cell(edit);
-        let Some(mut group) = remaining.remove(&first) else {
+        let first = edit.position.chunk();
+        let Some(bucket) = remaining.remove(&first) else {
             continue;
         };
-        let mut queue = vec![first];
-        while let Some((x, z)) = queue.pop() {
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    let Some(next) = x.checked_add(dx).zip(z.checked_add(dz)) else {
+        let mut group = Vec::new();
+        let mut queue = vec![(first, bucket)];
+        while let Some((position, bucket)) = queue.pop() {
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    let Some((x, z)) = position.x.checked_add(dx).zip(position.z.checked_add(dz))
+                    else {
                         continue;
                     };
-                    if let Some(indices) = remaining.remove(&next) {
-                        group.extend(indices);
-                        queue.push(next);
+                    let next = ChunkPos { x, z };
+                    let related = remaining.get(&next).is_some_and(|other| {
+                        bucket.overlaps(other)
+                            || bucket.contains_with_halo(next)
+                            || other.contains_with_halo(position)
+                    });
+                    if related {
+                        queue.push((next, remaining.remove(&next).expect("checked bucket")));
                     }
                 }
             }
+            group.extend(bucket.indices);
         }
         group.sort_unstable();
         groups.push(group);
@@ -1727,6 +1773,134 @@ mod tests {
     }
 
     #[test]
+    fn light_groups_follow_chunk_reads_and_preserve_edit_order() {
+        let make = |x, z| Edit {
+            position: BlockPosition { x, y: 15, z },
+            old: None,
+            new: BlockStateId(0),
+        };
+        // These edits share adjacent 32-block cells, but neither can read or
+        // modify the other's light or allocation inputs.
+        assert_eq!(
+            independent_edit_groups(&[make(0, 15), make(63, 15)]),
+            vec![vec![0], vec![1]]
+        );
+        assert_eq!(
+            independent_edit_groups(&[make(-1, 15), make(32, 15)]),
+            vec![vec![0], vec![1]]
+        );
+        // This pair writes different chunks, but one block is in the other's
+        // allocation halo. Keep them together even if light values are clear.
+        assert_eq!(
+            independent_edit_groups(&[make(0, 15), make(46, 15)]),
+            vec![vec![0, 1]]
+        );
+        // A middle edit connects otherwise independent endpoints.
+        assert_eq!(
+            independent_edit_groups(&[make(63, 15), make(0, 15), make(31, 15)]),
+            vec![vec![0, 1, 2]]
+        );
+        assert_eq!(
+            independent_edit_groups(&[make(i32::MIN, i32::MIN), make(i32::MAX, i32::MAX)]),
+            vec![vec![0], vec![1]]
+        );
+    }
+
+    #[test]
+    fn light_group_index_matches_chunk_dependencies_at_boundaries() {
+        let coordinates = [
+            -65, -48, -33, -32, -17, -16, -1, 0, 1, 15, 16, 31, 32, 47, 63, 64,
+        ];
+        let mut points = Vec::new();
+        for &x in &coordinates {
+            for &z in &coordinates {
+                let position = BlockPosition { x, y: 15, z };
+                let mut writes = BTreeSet::new();
+                for x in (i64::from(x) - 15).div_euclid(16)..=(i64::from(x) + 15).div_euclid(16) {
+                    for z in (i64::from(z) - 15).div_euclid(16)..=(i64::from(z) + 15).div_euclid(16)
+                    {
+                        writes.insert(ChunkPos {
+                            x: i32::try_from(x).unwrap(),
+                            z: i32::try_from(z).unwrap(),
+                        });
+                    }
+                }
+                let reads: BTreeSet<_> = writes
+                    .iter()
+                    .flat_map(|pos| {
+                        (-1..=1).flat_map(move |dx| {
+                            (-1..=1).map(move |dz| ChunkPos {
+                                x: pos.x + dx,
+                                z: pos.z + dz,
+                            })
+                        })
+                    })
+                    .collect();
+                points.push((position, writes, reads));
+            }
+        }
+        for (i, (first, first_writes, first_reads)) in points.iter().enumerate() {
+            for (second, second_writes, second_reads) in points.iter().skip(i + 1) {
+                let related = !first_writes.is_disjoint(second_writes)
+                    || first_reads.contains(&second.chunk())
+                    || second_reads.contains(&first.chunk());
+                let edit = |position| Edit {
+                    position,
+                    old: None,
+                    new: BlockStateId(0),
+                };
+                let groups = independent_edit_groups(&[edit(*first), edit(*second)]);
+                assert_eq!(groups.len() == 1, related, "{first:?}, {second:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_chunk_does_not_block_a_separate_nearby_light_group() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        for x in 3..=6 {
+            for z in -1..=2 {
+                let mut chunk = world.chunks[&ChunkPos { x: 0, z }].as_ref().clone();
+                chunk.position = ChunkPos { x, z };
+                Arc::make_mut(&mut world)
+                    .chunks
+                    .insert(chunk.position, Arc::new(chunk));
+            }
+        }
+        let first = BlockPosition { x: 0, y: 15, z: 15 };
+        let second = BlockPosition { x: 63, ..first };
+        let mut expected = Arc::clone(&world);
+        let mut baseline = SkyLighting::default();
+        baseline.set_enabled(true);
+        edit(&mut baseline, &mut expected, second, state("stone", &[]));
+        edit(&mut baseline, &mut expected, first, state("stone", &[]));
+        finish(&mut baseline, &mut expected, bounds);
+        assert!(baseline.settled());
+
+        let missing = ChunkPos { x: 4, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        assert!(finish(&mut sky, &mut world, bounds).contains(&first.chunk()));
+        assert_eq!(sky.pending.len(), 1);
+        assert_eq!(sky.pending[0].position, second);
+        assert_eq!(world.light(first.x, first.y - 1, first.z, true), Some(14));
+
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for (pos, expected) in &expected.chunks {
+            for (y, section) in &expected.sections {
+                assert_eq!(world.chunks[pos].sections[y].sky_light, section.sky_light);
+            }
+        }
+    }
+
+    #[test]
     fn worker_updates_parked_and_resident_chunks_and_retries_a_move() {
         let bounds = LightBounds::new(0, 32).unwrap();
         let first = BlockPosition {
@@ -2432,6 +2606,53 @@ mod tests {
                 }
             }
         }
+
+        // The distant edit cannot affect Java's comparison grid. Compare the
+        // completed group while another waits for a missing chunk.
+        let independent = [serde_json::json!({"x":0,"y":15,"z":15,"state":"stone","defer":false})];
+        std::fs::write(&input, serde_json::to_vec(&independent).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 1);
+        let mut world = fixture();
+        for x in 3..=6 {
+            for z in -1..=2 {
+                let mut chunk = world.chunks[&ChunkPos { x: 0, z }].as_ref().clone();
+                chunk.position = ChunkPos { x, z };
+                Arc::make_mut(&mut world)
+                    .chunks
+                    .insert(chunk.position, Arc::new(chunk));
+            }
+        }
+        let missing = ChunkPos { x: 4, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let first = BlockPosition { x: 0, y: 15, z: 15 };
+        let second = BlockPosition { x: 63, ..first };
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        assert!(finish(&mut sky, &mut world, bounds).contains(&first.chunk()));
+        assert_eq!(sky.pending.len(), 1);
+        assert_eq!(sky.pending[0].position, second);
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(world.light(x, y, z, true).unwrap(), expected[0][index]);
+                }
+            }
+        }
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
     }
 
     #[test]

@@ -42,6 +42,11 @@ pub(super) trait OceanFeatureRunner {
         false
     }
 
+    /// Whether a successful ocean-ruin pass records its generated entities.
+    fn records_ocean_ruin_entities(&self) -> bool {
+        false
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
@@ -163,6 +168,10 @@ where
     C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
     W: super::ocean_ruin::DrownedMarkerContext,
 {
+    fn records_ocean_ruin_entities(&self) -> bool {
+        true
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
@@ -258,6 +267,10 @@ where
         true
     }
 
+    fn records_ocean_ruin_entities(&self) -> bool {
+        true
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
@@ -311,6 +324,10 @@ where
     }
 
     fn records_mineshaft_entities(&self) -> bool {
+        true
+    }
+
+    fn records_ocean_ruin_entities(&self) -> bool {
         true
     }
 
@@ -375,6 +392,10 @@ where
 
     fn records_mineshaft_entities(&self) -> bool {
         self.uuid_factory.is_some()
+    }
+
+    fn records_ocean_ruin_entities(&self) -> bool {
+        true
     }
 
     fn execute(
@@ -790,6 +811,10 @@ where
 
     fn records_mineshaft_entities(&self) -> bool {
         self.uuid_factory.is_some()
+    }
+
+    fn records_ocean_ruin_entities(&self) -> bool {
+        true
     }
 
     fn execute(

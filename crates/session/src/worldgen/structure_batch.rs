@@ -761,6 +761,13 @@ impl PreparedStructureStages {
                             && start.chunk == [source.x, source.z]
                             && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
                     }
+                    if let Some(start) = self.ocean_starts.get(&source).and_then(|starts| starts.get(id)) {
+                        return self.starts.contains_key(&source)
+                            && simple.is_none() && jigsaw.is_none() && mineshaft.is_none()
+                            && start.chunk == [source.x, source.z]
+                            && !start.pieces.is_empty() && start.saved_piece_tags().is_ok()
+                            && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
+                    }
                     if let Some(start) = mineshaft {
                         return simple.is_none()
                             && jigsaw.is_none()

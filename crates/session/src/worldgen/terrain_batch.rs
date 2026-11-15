@@ -5350,6 +5350,9 @@ impl FreshTerrainBatch {
                         } else {
                             BTreeSet::new()
                         };
+                        let records_ocean_ruin = ocean_runner
+                            .as_ref()
+                            .is_some_and(|runner| runner.records_ocean_ruin_entities());
                         let recorded_templates: BTreeSet<_> = planned
                             .iter()
                             .flat_map(|entry| {
@@ -5362,6 +5365,9 @@ impl FreshTerrainBatch {
                                         // A successful shipwreck pass records every supported
                                         // in-clip entity and rejects unsupported ones.
                                         super::structure_batch::PlannedStructureStart::Shipwreck(start) => start.chunk,
+                                        // Markers create recorded drowned (including supported
+                                        // mounts); nonempty template entities fail closed.
+                                        super::structure_batch::PlannedStructureStart::OceanRuin(start) if records_ocean_ruin => start.chunk,
                                         _ => return None,
                                     };
                                     let key = (
@@ -5371,7 +5377,7 @@ impl FreshTerrainBatch {
                                             z: chunk[1],
                                         },
                                     );
-                                    (matches!(start, super::structure_batch::PlannedStructureStart::RuinedPortal(_) | super::structure_batch::PlannedStructureStart::Shipwreck(_))
+                                    (matches!(start, super::structure_batch::PlannedStructureStart::RuinedPortal(_) | super::structure_batch::PlannedStructureStart::Shipwreck(_) | super::structure_batch::PlannedStructureStart::OceanRuin(_))
                                         || entity_free_jigsaws.contains(&key)).then_some(key)
                                 })
                             })
@@ -7403,6 +7409,131 @@ mod entity_source_tests {
         assert!(!covered(&structures, &recorded));
         structures.jigsaw_starts.clear();
         assert!(!covered(&structures, &recorded));
+    }
+
+    #[test]
+    fn ocean_ruin_entity_evidence_requires_recorded_matching_starts() -> Result<()> {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::ocean_ruin::{Piece, Rotation, Temperature};
+
+        struct Registry;
+        impl ResourceProvider for Registry {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/ruin.json")
+                    .then(|| br#"{"step":"surface_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:ruin")?])
+            }
+        }
+
+        let registry = StructureDecorationSchedule::load(&mut Registry)?;
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:ruin")?;
+        let key = (id.clone(), source);
+        let start = super::super::ocean_ruin::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 1, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            temperature: Temperature::Warm,
+            pieces: vec![super::super::ocean_ruin::PreparedPiece {
+                selection: Piece {
+                    template: "minecraft:underwater_ruin/warm_1".into(),
+                    position: [12, 1, 2],
+                    rotation: Rotation::None,
+                    integrity: 0.8,
+                    large: false,
+                },
+                template: Arc::new(StructureTemplate {
+                    document: NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![]),
+                    },
+                    data_version: Some(5023),
+                    size: [9, 6, 9],
+                    palettes: vec![],
+                    blocks: vec![],
+                    entities: vec![],
+                }),
+                bounds: BoundingBox::new([12, 1, 2], [20, 6, 10]).unwrap(),
+            }],
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let mut structures = PreparedStructureStages::default();
+        structures.starts.insert(source, BTreeMap::new());
+        structures
+            .ocean_starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        let mut recorded = BTreeMap::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos { x, z };
+                let refs = collect_ordered_structure_references(pos, |candidate| {
+                    Ok(if candidate == source {
+                        vec![bounds.clone()]
+                    } else {
+                        vec![]
+                    })
+                })?;
+                if !refs.membership().is_empty() {
+                    recorded.insert(pos, BTreeSet::from([key.clone()]));
+                }
+                structures.references.insert(pos, refs);
+            }
+        }
+        let covered = |structures: &PreparedStructureStages, recorded: &BTreeMap<_, _>| {
+            structure_entities_are_accounted_for(
+                structures,
+                &registry,
+                source,
+                |_| true,
+                &BTreeSet::new(),
+                recorded,
+                &BTreeMap::new(),
+            )
+        };
+        assert!(recorded.contains_key(&ChunkPos { x: 1, z: 0 }));
+        assert!(covered(&structures, &recorded));
+        let original = recorded
+            .remove(&source)
+            .context("source evidence missing")?;
+        assert!(!covered(&structures, &recorded));
+        recorded.insert(source, original);
+        assert!(!structure_entities_are_accounted_for(
+            &structures,
+            &registry,
+            source,
+            |pos| pos != source,
+            &BTreeSet::new(),
+            &recorded,
+            &BTreeMap::new(),
+        ));
+        let start = structures
+            .ocean_starts
+            .get_mut(&source)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap();
+        start.chunk = [1, 0];
+        assert!(!covered(&structures, &recorded));
+        let start = structures
+            .ocean_starts
+            .get_mut(&source)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap();
+        start.chunk = [0, 0];
+        start.pieces.clear();
+        assert!(!covered(&structures, &recorded));
+        Ok(())
     }
 
     #[test]

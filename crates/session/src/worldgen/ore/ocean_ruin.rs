@@ -2250,6 +2250,38 @@ mod tests {
         assert_eq!(terrain.snapshot().block(3, 8, 1), before.block(3, 8, 1));
         assert_eq!(terrain.snapshot().block(1, 9, 1), before.block(1, 9, 1));
 
+        let before_entities = Arc::clone(&terrain.generated_entities);
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut entity_piece = piece.clone();
+        Arc::make_mut(&mut entity_piece.template)
+            .entities
+            .push(Tag::Compound(vec![]));
+        let before_piece = entity_piece.selection.clone();
+        let mut before_random = random.clone();
+        let error = region
+            .place_ocean_ruin_piece(
+                &mut entity_piece,
+                &ice,
+                &water,
+                &bubbles,
+                &registry,
+                Temperature::Warm,
+                63,
+                clip,
+                &mut random,
+                &mut no_spawn,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ocean ruin template entities are unsupported"));
+        assert_eq!(entity_piece.selection, before_piece);
+        assert_eq!(random.next_long(), before_random.next_long());
+        assert!(region.finish().is_err());
+        assert_eq!(terrain.snapshot().block(3, 8, 1), before.block(3, 8, 1));
+        assert_eq!(terrain.generated_entities, before_entities);
+        assert_eq!(terrain.snapshot().saved_block_ticks, before.saved_block_ticks);
+        assert_eq!(terrain.snapshot().saved_fluid_ticks, before.saved_fluid_ticks);
+
         let (mut wet_terrain, wet_tags, _, _) = super::super::tests::fixture();
         let world = Arc::make_mut(&mut wet_terrain.world);
         let water_id = world.intern_state(BlockState {

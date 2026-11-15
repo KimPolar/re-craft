@@ -10,6 +10,11 @@ import net.minecraft.world.level.block.state.properties.IntegerProperty;
 import java.util.Set;
 
 public class TreeGroundSolidityOracle {
+  static final Set<String> PORTAL_SOLIDS = Set.of(
+    "stone","stone_bricks","mossy_stone_bricks","cracked_stone_bricks","chiseled_stone_bricks",
+    "cobblestone","mossy_cobblestone","obsidian","crying_obsidian","gold_block","netherrack",
+    "magma_block","blackstone","polished_blackstone","polished_blackstone_bricks",
+    "cracked_polished_blackstone_bricks","chiseled_polished_blackstone");
   static final Set<String> PLANTS = Set.of(
     "short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet",
     "red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower",
@@ -27,7 +32,8 @@ public class TreeGroundSolidityOracle {
       var state=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name)).defaultBlockState();
       if((name.equals("air") || name.equals("cave_air") || name.equals("void_air")) && state.useShapeForLightOcclusion())throw new AssertionError("air unexpectedly uses shape occlusion: "+name);
       out.printf("S %s %s %s%n",name,state.isSolidRender(),state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,Direction.UP));
-      if(name.equals("smooth_basalt") || name.equals("amethyst_block") || name.equals("budding_amethyst")) {
+      if(PORTAL_SOLIDS.contains(name) && state.getValues().findAny().isPresent())throw new AssertionError("portal solid has properties: "+name);
+      if(PORTAL_SOLIDS.contains(name) || name.equals("smooth_basalt") || name.equals("amethyst_block") || name.equals("budding_amethyst")) {
         out.printf("F %s",name);
         for(var direction:Direction.values()) out.printf(" %s",state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
         out.println();

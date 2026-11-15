@@ -4946,7 +4946,7 @@ fn generated_raw_ore_block(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
-    if generated_raw_ore_block(state)? {
+    if generated_raw_ore_block(state)? || ruined_portal::portal_full(state) {
         return Ok(true);
     }
     if generation_non_sturdy_structure(state) {
@@ -4986,7 +4986,7 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
-    if generated_raw_ore_block(state)? {
+    if generated_raw_ore_block(state)? || ruined_portal::portal_full(state) {
         return Ok(true);
     }
     if generation_non_sturdy_structure(state) {
@@ -9040,6 +9040,29 @@ mod tests {
     }
 
     #[test]
+    fn generated_portal_solids_support_vegetation() {
+        for name in ["obsidian", "crying_obsidian", "gold_block", "stone_bricks"] {
+            let block = state(name);
+            assert!(tree_solid_render(&block).unwrap(), "{name}");
+            for direction in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ] {
+                assert!(generation_face_sturdy(&block, direction).unwrap(), "{name}");
+            }
+            let mut invalid = block;
+            invalid
+                .properties
+                .insert("unexpected".into(), "true".into());
+            assert!(tree_sturdy_up(&invalid).is_err(), "{name}");
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tree_ground_solid_and_support_match_java() {
         use std::{path::PathBuf, process::Command};
@@ -9050,6 +9073,19 @@ mod tests {
             "water",
             "lava",
             "stone",
+            "stone_bricks",
+            "mossy_stone_bricks",
+            "cracked_stone_bricks",
+            "chiseled_stone_bricks",
+            "cobblestone",
+            "mossy_cobblestone",
+            "obsidian",
+            "crying_obsidian",
+            "gold_block",
+            "polished_blackstone",
+            "polished_blackstone_bricks",
+            "cracked_polished_blackstone_bricks",
+            "chiseled_polished_blackstone",
             "deepslate",
             "netherrack",
             "basalt",
@@ -9296,10 +9332,12 @@ mod tests {
                     tree_sturdy_up(&block).unwrap()
                 )
             );
-            if matches!(
-                name,
-                "smooth_basalt" | "amethyst_block" | "budding_amethyst"
-            ) {
+            if ruined_portal::portal_full(&block)
+                || matches!(
+                    name,
+                    "smooth_basalt" | "amethyst_block" | "budding_amethyst"
+                )
+            {
                 let expected = text
                     .lines()
                     .find(|line| line.starts_with(&format!("F {name} ")))

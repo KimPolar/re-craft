@@ -965,6 +965,14 @@ impl QueuedGenerationLightEngine {
     }
 
     fn validate_terrain(&self, terrain: &CarvedTerrainWorld) -> Result<()> {
+        self.validate_terrain_with_arrival(terrain, None)
+    }
+
+    fn validate_terrain_with_arrival(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        arriving: Option<native_world::loaded::ChunkPos>,
+    ) -> Result<()> {
         ensure!(
             terrain.seed == self.seed
                 && terrain.min_y == self.min_y
@@ -983,13 +991,14 @@ impl QueuedGenerationLightEngine {
                 "registered light chunk changed at {position:?}"
             );
         }
-        StagedGenerationLightEngine::validate_active_world_parts(
+        StagedGenerationLightEngine::validate_active_world_parts_with_arrival(
             Some(&self.observed_world),
             self.tracker.active_chunks(),
             self.min_y,
             self.height,
             &terrain.world,
             true,
+            arriving,
         )?;
         Ok(())
     }
@@ -1029,7 +1038,10 @@ impl QueuedGenerationLightEngine {
         Ok(())
     }
 
-    /// Load one saved chunk at the caller-observed drain boundaries. Other
+    /// Load one saved chunk at the caller-observed drain boundaries. If the
+    /// chunk was absent, its arrival may change an active chunk's input halo;
+    /// the caller must have observed the arrival and every preceding light
+    /// task, with no pending block checks at these drain boundaries. Other
     /// operations in those drains must already be accounted for; all three
     /// steps commit together only after the activation callback has drained.
     /// This does not infer streaming order or authorize a live-world save.
@@ -1045,7 +1057,7 @@ impl QueuedGenerationLightEngine {
             generation_light::{QueuedLightEvent, QueuedSectionLightTracker},
         };
 
-        self.validate_terrain(terrain)?;
+        self.validate_terrain_with_arrival(terrain, Some(position))?;
         ensure!(
             !self.registered.contains_key(&position),
             "saved light chunk is already registered"
@@ -1410,6 +1422,26 @@ impl StagedGenerationLightEngine {
         world: &native_world::loaded::World,
         check_stored_light: bool,
     ) -> Result<()> {
+        Self::validate_active_world_parts_with_arrival(
+            frozen,
+            active,
+            min_y,
+            height,
+            world,
+            check_stored_light,
+            None,
+        )
+    }
+
+    fn validate_active_world_parts_with_arrival(
+        frozen: Option<&Arc<native_world::loaded::World>>,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+        min_y: i32,
+        height: i32,
+        world: &native_world::loaded::World,
+        check_stored_light: bool,
+        arriving: Option<native_world::loaded::ChunkPos>,
+    ) -> Result<()> {
         if let Some(frozen) = frozen {
             if !std::ptr::eq(frozen.as_ref(), world) {
                 for active in active {
@@ -1430,6 +1462,7 @@ impl StagedGenerationLightEngine {
                                                 )?)
                                     }
                                     (None, None) => true,
+                                    (None, Some(_)) if arriving == Some(neighbor) => true,
                                     _ => false,
                                 };
                             ensure!(unchanged, "active light neighborhood changed");
@@ -4951,6 +4984,127 @@ mod queued_saved_light_test;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn queued_saved_chunk_arrival_accepts_only_the_observed_neighbor() {
+        use native_world::{
+            generation_light::QueuedSectionLightTracker,
+            loaded::{BLOCK_COUNT, BlockState, Chunk, ChunkPos, LIGHT_BYTES, Section, World},
+        };
+
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let north = ChunkPos { x: 0, z: -1 };
+        let is_air = |state: &BlockState| match state.name.as_str() {
+            "minecraft:air" => Some(true),
+            "minecraft:stone" => Some(false),
+            _ => None,
+        };
+        for has_sky in [false, true] {
+            for order in [
+                SavedLightLoadOrder::SeparateDrains,
+                SavedLightLoadOrder::SameDrain,
+            ] {
+                let mut world = World::new("minecraft:overworld");
+                let air = world.intern_state(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: BTreeMap::new(),
+                });
+                let stone = world.intern_state(BlockState {
+                    name: "minecraft:stone".into(),
+                    properties: BTreeMap::new(),
+                });
+                let mut sections = BTreeMap::new();
+                for y in 0..2 {
+                    let mut blocks = Box::new([air; BLOCK_COUNT]);
+                    if y == 0 {
+                        blocks[256] = stone;
+                    }
+                    sections.insert(
+                        y,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: (y == 0).then(|| Box::new([0x33; LIGHT_BYTES])),
+                            sky_light: (has_sky && y == 0).then(|| Box::new([0xff; LIGHT_BYTES])),
+                        }),
+                    );
+                }
+                world.chunks.insert(
+                    center,
+                    Arc::new(Chunk {
+                        position: center,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+                let terrain = CarvedTerrainWorld::new(MaterializedTerrain {
+                    world,
+                    position: center,
+                    seed: 42,
+                    min_y: 0,
+                    height: 32,
+                    postprocessing: Arc::from([]),
+                    noise_postprocessing: None,
+                    surface_postprocessing: None,
+                    carver_postprocessing: None,
+                });
+                let tracker = QueuedSectionLightTracker::fresh(true, has_sky, []).unwrap();
+                let mut engine = QueuedGenerationLightEngine::new(
+                    &terrain,
+                    tracker,
+                    [],
+                    BTreeMap::new(),
+                    has_sky,
+                    is_air,
+                )
+                .unwrap();
+                engine
+                    .load_saved_chunk(&terrain, center, order, is_air)
+                    .unwrap();
+                assert!(engine.tracker().active_chunks().contains(&center));
+
+                let mut arrived = terrain.clone();
+                let world = Arc::make_mut(&mut arrived.world);
+                let mut chunk = world.chunks[&center].as_ref().clone();
+                chunk.position = east;
+                world.chunks.insert(east, Arc::new(chunk));
+                assert!(engine.validate_terrain(&arrived).is_err());
+
+                let mut unobserved = arrived.clone();
+                let world = Arc::make_mut(&mut unobserved.world);
+                let mut chunk = world.chunks[&center].as_ref().clone();
+                chunk.position = north;
+                world.chunks.insert(north, Arc::new(chunk));
+                let before = engine.tracker().snapshot().clone();
+                assert!(
+                    engine
+                        .load_saved_chunk(&unobserved, east, order, is_air)
+                        .is_err()
+                );
+                assert_eq!(
+                    before.same_complete_column(engine.tracker().snapshot(), center),
+                    Some(true)
+                );
+                assert!(!engine.registered.contains_key(&east));
+                assert!(!engine.tracker().active_chunks().contains(&east));
+
+                engine
+                    .load_saved_chunk(&arrived, east, order, is_air)
+                    .unwrap();
+                assert!(engine.tracker().active_chunks().contains(&east));
+                assert!(engine.registered.contains_key(&east));
+                assert_eq!(engine.sky_sources.contains_key(&east), has_sky);
+                engine.validate_terrain(&arrived).unwrap();
+                assert!(
+                    engine
+                        .load_saved_chunk(&arrived, east, order, is_air)
+                        .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn queued_schedule_lights_generated_chunk_next_to_saved_chunks() {

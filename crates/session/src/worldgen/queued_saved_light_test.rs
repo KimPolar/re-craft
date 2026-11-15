@@ -72,7 +72,7 @@ fn fixture(has_sky: bool) -> CarvedTerrainWorld {
 fn is_air(state: &BlockState) -> Option<bool> {
     match state.name.as_str() {
         "minecraft:air" => Some(true),
-        "minecraft:torch" => Some(false),
+        "minecraft:torch" | "minecraft:stone" => Some(false),
         _ => None,
     }
 }
@@ -146,6 +146,59 @@ fn compare_capture<'a>(
     assert_eq!(seen.len(), expected_count, "{name}: extra Rust layer");
 }
 
+fn run_java_oracle(main: &str, sources: &[(&str, &str)], input: Option<&str>) -> String {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+        .or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+        .join("bin");
+    let version = game.join("versions/26.3");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for library in manifest["libraries"].as_array().unwrap() {
+        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let classpath = std::env::join_paths(paths).unwrap();
+    let mut compiler = Command::new(java.join("javac.exe"));
+    compiler.arg("-cp").arg(&classpath);
+    for (name, source) in sources {
+        let path = temp.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        compiler.arg(path);
+    }
+    let compiled = compiler.output().unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let mut command = Command::new(java.join("java.exe"));
+    command.arg("-cp").arg(&classpath).arg(main);
+    if let Some(input) = input {
+        let path = temp.path().join("events.txt");
+        std::fs::write(&path, input).unwrap();
+        command.arg(path);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
 fn saved_light_streaming_matches_java_for_observed_drains() {
@@ -177,61 +230,14 @@ fn saved_light_streaming_matches_java_for_observed_drains() {
             .unwrap();
         }
     }
-    let game = std::env::var_os("MINECRAFT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
-    let java = std::env::var_os("MINECRAFT_JAVA_HOME")
-        .or_else(|| std::env::var_os("JAVA_HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
-            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
-        .join("bin");
-    let version = game.join("versions/26.3");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
-    for library in manifest["libraries"].as_array().unwrap() {
-        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
-            let path = game.join("libraries").join(path);
-            if path.is_file() {
-                paths.push(path);
-            }
-        }
-    }
-    let classpath = std::env::join_paths(paths).unwrap();
-    let source = temp.path().join("QueuedSectionLightOracle.java");
-    std::fs::write(
-        &source,
-        include_str!("../../../world/tests/java/QueuedSectionLightOracle.java"),
-    )
-    .unwrap();
-    let compiled = Command::new(java.join("javac.exe"))
-        .arg("-cp")
-        .arg(&classpath)
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(
-        compiled.status.success(),
-        "{}",
-        String::from_utf8_lossy(&compiled.stderr)
+    let output = run_java_oracle(
+        "QueuedSectionLightOracle",
+        &[(
+            "QueuedSectionLightOracle.java",
+            include_str!("../../../world/tests/java/QueuedSectionLightOracle.java"),
+        )],
+        Some(&script),
     );
-    let input = temp.path().join("events.txt");
-    std::fs::write(&input, script).unwrap();
-    let output = Command::new(java.join("java.exe"))
-        .arg("-cp")
-        .arg(&classpath)
-        .arg("QueuedSectionLightOracle")
-        .arg(input)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let output = String::from_utf8(output.stdout).unwrap();
     let mut lines = output
         .lines()
         .filter(|line| line.starts_with("H ") || line.starts_with("L "))
@@ -260,6 +266,129 @@ fn saved_light_streaming_matches_java_for_observed_drains() {
             .load_saved_chunk(&terrain, position, order, is_air)
             .unwrap();
         compare_capture(&mut lines, &format!("{index}_reloaded"), engine.tracker());
+    }
+    assert!(lines.next().is_none());
+}
+
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
+fn saved_neighbor_arrival_matches_java_with_active_sky_sources() {
+    let output = run_java_oracle(
+        "StreamedSavedLightOracle",
+        &[
+            (
+                "QueuedSectionLightOracle.java",
+                include_str!("../../../world/tests/java/QueuedSectionLightOracle.java"),
+            ),
+            (
+                "SavedLiveLightOracle.java",
+                include_str!("../../../world/tests/java/SavedLiveLightOracle.java"),
+            ),
+            (
+                "StreamedSavedLightOracle.java",
+                include_str!("../../tests/java/StreamedSavedLightOracle.java"),
+            ),
+        ],
+        None,
+    );
+    let mut lines = output
+        .lines()
+        .filter(|line| line.starts_with("H ") || line.starts_with("L "))
+        .peekable();
+    let cases = [
+        (true, SavedLightLoadOrder::SeparateDrains),
+        (true, SavedLightLoadOrder::SameDrain),
+        (false, SavedLightLoadOrder::SeparateDrains),
+        (false, SavedLightLoadOrder::SameDrain),
+    ];
+    let center = ChunkPos { x: 0, z: 0 };
+    let east = ChunkPos { x: 1, z: 0 };
+    for (index, (has_sky, order)) in cases.into_iter().enumerate() {
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let stone = world.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        });
+        for position in [center, east] {
+            let mut sections = BTreeMap::new();
+            for y in 0..2 {
+                let mut blocks = Box::new([air; BLOCK_COUNT]);
+                if y == 0 {
+                    blocks[256] = stone;
+                }
+                sections.insert(
+                    y,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: (y == 0).then(|| {
+                            Box::new(std::array::from_fn(|i| {
+                                if position == center {
+                                    (i as u8).wrapping_mul(37).wrapping_add(11)
+                                } else {
+                                    (i as u8).wrapping_mul(19).wrapping_add(7)
+                                }
+                            }))
+                        }),
+                        sky_light: (has_sky && y == 0).then(|| Box::new([0xff; LIGHT_BYTES])),
+                    }),
+                );
+            }
+            sections.insert(
+                2,
+                Arc::new(Section {
+                    blocks: None,
+                    biomes: None,
+                    block_light: Some(Box::new(std::array::from_fn(|i| {
+                        (i as u8).wrapping_mul(19).wrapping_add(7)
+                    }))),
+                    sky_light: None,
+                }),
+            );
+            world.chunks.insert(
+                position,
+                Arc::new(Chunk {
+                    position,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: true,
+                    sections,
+                }),
+            );
+        }
+        let full = CarvedTerrainWorld::new(MaterializedTerrain {
+            world,
+            position: center,
+            seed: 42,
+            min_y: 0,
+            height: 32,
+            postprocessing: Arc::from([]),
+            noise_postprocessing: None,
+            surface_postprocessing: None,
+            carver_postprocessing: None,
+        });
+        let mut before = full.clone();
+        Arc::make_mut(&mut before.world).chunks.remove(&east);
+        let covered = (-2..=2).flat_map(|x| (-2..=2).map(move |z| ChunkPos { x, z }));
+        let tracker = QueuedSectionLightTracker::fresh(true, has_sky, covered).unwrap();
+        let mut engine = QueuedGenerationLightEngine::new(
+            &before,
+            tracker,
+            [],
+            BTreeMap::new(),
+            has_sky,
+            is_air,
+        )
+        .unwrap();
+        engine
+            .load_saved_chunk(&before, center, order, is_air)
+            .unwrap();
+        compare_capture(&mut lines, &format!("{index}_before"), engine.tracker());
+        engine.load_saved_chunk(&full, east, order, is_air).unwrap();
+        compare_capture(&mut lines, &format!("{index}_after"), engine.tracker());
     }
     assert!(lines.next().is_none());
 }

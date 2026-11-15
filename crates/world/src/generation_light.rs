@@ -14,6 +14,9 @@ use std::{
     sync::Arc,
 };
 
+mod queued;
+pub use queued::{LightChannel, QueuedLightEvent, QueuedSectionLightTracker, StoredLightLayer};
+
 /// Nibble-packed visible layers indexed by absolute section Y.
 pub type VisibleLayers = BTreeMap<i32, Arc<[u8; LIGHT_BYTES]>>;
 
@@ -445,12 +448,16 @@ impl SectionLightTracker {
     /// Failure leaves this tracker and previous snapshots unchanged.
     pub fn apply_statuses(&mut self, changes: &[(ChunkPos, i32, bool)]) -> Option<()> {
         let mut draft = self.clone();
-        draft.apply_statuses_inner(changes)?;
+        let removed = draft.apply_statuses_inner(changes)?;
+        draft.remove_pending_sections(removed)?;
         *self = draft;
         Some(())
     }
 
-    fn apply_statuses_inner(&mut self, changes: &[(ChunkPos, i32, bool)]) -> Option<()> {
+    fn apply_statuses_inner(
+        &mut self,
+        changes: &[(ChunkPos, i32, bool)],
+    ) -> Option<BTreeSet<(ChunkPos, i32)>> {
         let mut removed = BTreeSet::new();
         for &(position, y, nonempty) in changes {
             let neighborhood = section_neighborhood(position, y)?;
@@ -485,6 +492,10 @@ impl SectionLightTracker {
                 }
             }
         }
+        Some(removed)
+    }
+
+    fn remove_pending_sections(&mut self, removed: BTreeSet<(ChunkPos, i32)>) -> Option<()> {
         for (position, y) in removed {
             let column = self.visible.columns.get_mut(&position)?;
             column.block.remove(&y);
@@ -494,7 +505,8 @@ impl SectionLightTracker {
     }
 
     /// Drain ordered section callbacks and block checks as one transaction.
-    /// Section storage is updated first, matching the Java light engine.
+    /// Status callbacks update section storage first. Sections pending removal
+    /// remain available to block checks until Java drains the storage.
     pub fn apply_changes(
         &mut self,
         world: &World,
@@ -509,8 +521,9 @@ impl SectionLightTracker {
             return None;
         }
         let mut draft = self.clone();
-        draft.apply_statuses_inner(statuses)?;
+        let removed = draft.apply_statuses_inner(statuses)?;
         draft.apply_checks(world, bounds, positions, sky_sources)?;
+        draft.remove_pending_sections(removed)?;
         *self = draft;
         Some(())
     }

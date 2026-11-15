@@ -112,6 +112,72 @@ impl QueuedSectionLightTracker {
         self.tracker.snapshot()
     }
 
+    /// Extend a continuously observed engine's coverage as streaming moves.
+    /// All earlier events must have gone through this tracker: its event API
+    /// cannot modify or allocate an uncovered column. Existing columns and
+    /// previously published snapshots remain unchanged on failure.
+    pub fn cover_columns(&mut self, columns: impl IntoIterator<Item = ChunkPos>) -> Option<()> {
+        let mut added = BTreeSet::new();
+        for position in columns {
+            self.valid_position(position, 0)?;
+            added.insert(position);
+        }
+        for position in added {
+            self.tracker.visible.columns.entry(position).or_default();
+        }
+        Some(())
+    }
+
+    /// Include all columns a section-status callback for this chunk may touch.
+    pub fn cover_chunk_halo(&mut self, position: ChunkPos) -> Option<()> {
+        self.cover_columns(
+            section_neighborhood(position, 0)?
+                .into_iter()
+                .map(|(position, _)| position),
+        )
+    }
+
+    /// Evict a column only when it has no active, retained, queued, allocated
+    /// or registered state. This keeps empty streaming margins from growing
+    /// indefinitely without forgetting anything that can affect later loads.
+    pub fn forget_empty_columns(&mut self, columns: impl IntoIterator<Item = ChunkPos>) -> usize {
+        let mut removed = 0;
+        for position in columns {
+            let Some(column) = self.tracker.visible.columns.get(&position) else {
+                continue;
+            };
+            if !column.block.is_empty()
+                || !column.sky.is_empty()
+                || self.tracker.active.contains(&position)
+                || self.retained.contains(&position)
+                || self
+                    .tracker
+                    .data_sections
+                    .range((position, i32::MIN)..=(position, i32::MAX))
+                    .next()
+                    .is_some()
+                || self
+                    .tracker
+                    .references
+                    .range((position, i32::MIN)..=(position, i32::MAX))
+                    .next()
+                    .is_some()
+                || [LightChannel::Block, LightChannel::Sky]
+                    .into_iter()
+                    .any(|channel| {
+                        let range = (channel, position, i32::MIN)..=(channel, position, i32::MAX);
+                        self.queued.range(range.clone()).next().is_some()
+                            || self.forms.range(range).next().is_some()
+                    })
+            {
+                continue;
+            }
+            self.tracker.visible.columns.remove(&position);
+            removed += 1;
+        }
+        removed
+    }
+
     /// An allocated layer in the published storage, excluding queued layers.
     /// Outer `None` means the column or coordinate is unknown.
     pub fn visible_layer(
@@ -279,8 +345,61 @@ impl QueuedSectionLightTracker {
         draft
             .tracker
             .apply_checks(world, bounds, positions, sky_sources)?;
+        draft.mark_materialized(&before)?;
+        for (channel, position, y) in aliases {
+            let layer = draft.visible_layer(channel, position, y)??;
+            *draft.queued.get_mut(&(channel, position, y))? = layer;
+        }
+        draft.drain(removed)?;
+        *self = draft;
+        Some(())
+    }
+
+    /// Run `propagateLightSources` for one generated chunk against the
+    /// current saved/visible revision. The caller supplies the actual current
+    /// source heights and a fully drained engine; queued, unallocated saved
+    /// layers remain queued. Missing inputs reject both channels atomically.
+    pub fn propagate_chunk(
+        &mut self,
+        world: &World,
+        bounds: LightBounds,
+        position: ChunkPos,
+        sky_sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    ) -> Option<()> {
+        self.valid_position(position, 0)?;
+        self.tracker.visible.columns.get(&position)?;
+        if world.chunks.get(&position)?.position != position {
+            return None;
+        }
+        let mut draft = self.clone();
+        let before = draft.tracker.visible.clone();
+        let after_block = if draft.enabled(LightChannel::Block) {
+            crate::generation_block_light::activate_generated_block_light(
+                world, bounds, &before, position,
+            )?
+        } else {
+            before.clone()
+        };
+        draft.tracker.visible = if draft.enabled(LightChannel::Sky) {
+            crate::generation_sky_light::activate_generated_sky_light(
+                world,
+                bounds,
+                &after_block,
+                position,
+                sky_sources,
+            )?
+        } else {
+            after_block
+        };
+        draft.mark_materialized(&before)?;
+        draft.tracker.active.insert(position);
+        *self = draft;
+        Some(())
+    }
+
+    fn mark_materialized(&mut self, before: &VisibleLightSnapshot) -> Option<()> {
         for (&position, old_column) in &before.columns {
-            let column = draft.tracker.visible.columns.get(&position)?;
+            let column = self.tracker.visible.columns.get(&position)?;
             for (channel, old, new) in [
                 (LightChannel::Block, &old_column.block, &column.block),
                 (LightChannel::Sky, &old_column.sky, &column.sky),
@@ -290,17 +409,11 @@ impl QueuedSectionLightTracker {
                 }
                 for (&y, previous) in old {
                     if !Arc::ptr_eq(previous, new.get(&y)?) {
-                        *draft.forms.get_mut(&(channel, position, y))? = None;
+                        *self.forms.get_mut(&(channel, position, y))? = None;
                     }
                 }
             }
         }
-        for (channel, position, y) in aliases {
-            let layer = draft.visible_layer(channel, position, y)??;
-            *draft.queued.get_mut(&(channel, position, y))? = layer;
-        }
-        draft.drain(removed)?;
-        *self = draft;
         Some(())
     }
 
@@ -980,6 +1093,55 @@ mod tests {
             Some(true)
         );
         assert!(!tracker.tracker.is_data_section(center(), 1));
+        assert!(
+            tracker
+                .propagate_chunk(&world, bounds, center(), &BTreeMap::new())
+                .is_none()
+        );
+        assert_eq!(
+            previous.same_complete_column(tracker.snapshot(), center()),
+            Some(true)
+        );
+        assert!(!tracker.tracker.active.contains(&center()));
+    }
+
+    #[test]
+    fn streaming_coverage_preserves_state_and_only_evicts_empty_columns() {
+        let mut tracker = QueuedSectionLightTracker::fresh(true, true, []).unwrap();
+        tracker.cover_chunk_halo(center()).unwrap();
+        let before = tracker.snapshot().clone();
+        let far = ChunkPos { x: 5, z: 0 };
+        assert!(
+            tracker
+                .cover_columns([far, ChunkPos { x: i32::MAX, z: 0 }])
+                .is_none()
+        );
+        assert!(tracker.visible_layer(LightChannel::Block, far, 0).is_none());
+        assert_eq!(
+            before.same_complete_column(tracker.snapshot(), center()),
+            Some(true)
+        );
+        tracker.apply_events(&[status(0, true)]).unwrap();
+        let halo: Vec<_> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| ChunkPos { x, z }))
+            .collect();
+        assert_eq!(tracker.forget_empty_columns(halo.iter().copied()), 0);
+        tracker.apply_events(&[status(0, false)]).unwrap();
+        tracker
+            .apply_events(&[queue(LightChannel::Block, 3, 1)])
+            .unwrap();
+        assert_eq!(tracker.forget_empty_columns(halo.iter().copied()), 8);
+        assert!(
+            tracker
+                .data_layer(LightChannel::Block, center(), 3)
+                .unwrap()
+                .is_some()
+        );
+        tracker.cover_chunk_halo(center()).unwrap();
+        tracker
+            .apply_events(&[queue(LightChannel::Block, 3, -1)])
+            .unwrap();
+        assert_eq!(tracker.forget_empty_columns(halo), 9);
     }
 
     #[test]
@@ -1461,6 +1623,21 @@ C no_sky
                 ])
                 .unwrap();
             compare_capture(&mut lines, "7", &tracker);
+            world
+                .set_block_id(position[0], position[1], position[2], torch)
+                .unwrap();
+            if has_sky {
+                let height = sources[&center()][8 + 8 * 16];
+                let mut column =
+                    crate::sky_light::SkyColumn::from_lowest_source(bounds, 8, 8, height).unwrap();
+                column.update(&world, position[1]).unwrap();
+                Arc::make_mut(sources.get_mut(&center()).unwrap())[8 + 8 * 16] =
+                    column.lowest_source_y();
+            }
+            tracker
+                .propagate_chunk(&world, bounds, center(), &sources)
+                .unwrap();
+            compare_capture(&mut lines, "8", &tracker);
             assert!(lines.next().is_none());
         }
     }

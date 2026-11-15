@@ -66,5 +66,10 @@ public class QueuedLiveLightOracle extends SavedLiveLightOracle {
         engine.setLightEnabled(new ChunkPos(-1, 0), true);
         engine.runLightUpdates();
         QueuedSectionLightOracle.capture(engine, true, sky, "7");
+        world.blocks.put(pos, Blocks.TORCH.defaultBlockState());
+        world.chunks.get(new ChunkPos(0, 0)).sources.update(world.chunks.get(new ChunkPos(0, 0)), 8, 20, 8);
+        engine.propagateLightSources(new ChunkPos(0, 0));
+        engine.runLightUpdates();
+        QueuedSectionLightOracle.capture(engine, true, sky, "8");
     }
 }

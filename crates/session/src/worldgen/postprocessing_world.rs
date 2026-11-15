@@ -61,6 +61,35 @@ fn materialize_pending_block_entity(
     }
 }
 
+/// Reproduce the lossless saved form for supported non-placeholder entities.
+/// A loot chest must keep its table and seed until Java would unpack the loot.
+fn materialize_saved_block_entity(
+    pos: [i32; 3],
+    state: BlockState,
+    original: &native_persistence::nbt::Tag,
+) -> Result<native_persistence::nbt::Tag> {
+    use native_persistence::nbt::Tag;
+    if state.name == "minecraft:chest" && original.get("LootTable").is_some() {
+        let Some(Tag::String(table)) = original.get("LootTable") else {
+            bail!("invalid saved chest loot table")
+        };
+        let table = String::from_utf16(&table.0).context("invalid saved chest loot table")?;
+        let seed = match original.get("LootTableSeed") {
+            None => 0,
+            Some(Tag::Long(seed)) => *seed,
+            _ => bail!("invalid saved chest loot seed"),
+        };
+        return Ok(super::GeneratedLootChest::new(
+            pos,
+            native_resources::structure_start::HorizontalDirection::North,
+            &table,
+            seed,
+        )?
+        .block_entity());
+    }
+    materialize_pending_block_entity(pos, state)
+}
+
 impl ConvertedBlockEntities {
     /// Restore the saved FULL chunk's actual insertion histories. Only records
     /// whose complete contents can be reproduced are admitted here.
@@ -147,15 +176,16 @@ impl ConvertedBlockEntities {
                     "invalid saved chest state"
                 );
             }
-            let expected = materialize_pending_block_entity(pos, state.clone())?;
             let dummy = matches!(tag.get("id"), Some(Tag::String(id)) if id.matches("DUMMY"));
             if dummy {
+                materialize_pending_block_entity(pos, state.clone())?;
                 ensure!(packed, "unpacked DUMMY block entity");
                 let Tag::Compound(fields) = &tag else {
                     unreachable!()
                 };
                 ensure!(fields.len() == 4, "unsupported DUMMY block entity data");
             } else {
+                let expected = materialize_saved_block_entity(pos, state.clone(), &tag)?;
                 ensure!(
                     crate::inventory::equal_tag(&tag, &expected),
                     "unsupported saved block entity contents"
@@ -182,12 +212,17 @@ impl ConvertedBlockEntities {
             .records
             .get(&pos)
             .context("pending block entity is missing")?;
-        let entity = materialize_pending_block_entity(pos, state)?;
-        ensure!(
-            matches!(original.get("id"), Some(Tag::String(id)) if id.matches("DUMMY"))
-                || crate::inventory::equal_tag(original, &entity),
-            "pending block entity no longer matches its block"
-        );
+        let dummy = matches!(original.get("id"), Some(Tag::String(id)) if id.matches("DUMMY"));
+        let entity = if dummy {
+            materialize_pending_block_entity(pos, state)?
+        } else {
+            let entity = materialize_saved_block_entity(pos, state, original)?;
+            ensure!(
+                crate::inventory::equal_tag(original, &entity),
+                "pending block entity no longer matches its block"
+            );
+            entity
+        };
         self.pending.remove(pos);
         self.records.insert(pos, entity);
         self.live.insert(pos);

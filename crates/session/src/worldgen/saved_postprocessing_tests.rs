@@ -260,6 +260,14 @@ fn entity_fixture() -> Result<(ChunkArea, BTreeSet<String>)> {
                 },
             )?
             .block_entity()
+        } else if i % 4 == 0 {
+            super::super::GeneratedLootChest::new(
+                pos,
+                native_resources::structure_start::HorizontalDirection::North,
+                "minecraft:chests/buried_treasure",
+                -(i as i64),
+            )?
+            .block_entity()
         } else {
             super::super::GeneratedEmptyChest {
                 position: pos,
@@ -367,8 +375,8 @@ fn deferred_entity_output(area: &ChunkArea, ids: &BTreeSet<String>) -> Result<(T
 }
 
 #[test]
-fn saved_full_postprocessing_restores_default_block_entities_without_mutating_source() -> Result<()>
-{
+fn saved_full_postprocessing_restores_supported_block_entities_without_mutating_source()
+-> Result<()> {
     let (area, ids) = entity_fixture()?;
     let Tag::List { values, .. } = entity_output(&area, &ids)? else {
         unreachable!()
@@ -408,8 +416,40 @@ fn deferred_saved_entities_can_be_captured_then_postprocessed() -> Result<()> {
 }
 
 #[test]
+fn saved_loot_chests_keep_table_and_seed_during_promotion() -> Result<()> {
+    let (area, ids) = entity_fixture()?;
+    let (deferred, after) = deferred_entity_output(&area, &ids)?;
+    for data in [deferred, after, entity_output(&area, &ids)?] {
+        let Tag::List { values, .. } = data else {
+            unreachable!()
+        };
+        for index in [0, 8, 12, 20] {
+            let chest = values
+                .iter()
+                .find(|tag| {
+                    tag.get("x") == Some(&Tag::Int(index % 16))
+                        && tag.get("y") == Some(&Tag::Int(8))
+                        && tag.get("z") == Some(&Tag::Int(index / 16))
+                })
+                .unwrap();
+            assert_eq!(
+                chest.get("LootTable"),
+                Some(&Tag::String("minecraft:chests/buried_treasure".into()))
+            );
+            assert!(chest.get("Items").is_none());
+            assert_eq!(
+                chest.get("LootTableSeed"),
+                (index != 0).then_some(&Tag::Long(-(index as i64)))
+            );
+            assert_eq!(chest.get("keepPacked"), Some(&Tag::Byte(0)));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn saved_full_postprocessing_rejects_ambiguous_or_unpreservable_entities() -> Result<()> {
-    for case in 0..6 {
+    for case in 0..10 {
         let (mut area, ids) = entity_fixture()?;
         let chunk = Arc::make_mut(area.chunks.get_mut(&area.center).unwrap());
         let document = Arc::make_mut(&mut chunk.document);
@@ -467,6 +507,44 @@ fn saved_full_postprocessing_rejects_ambiguous_or_unpreservable_entities() -> Re
                     .find(|(name, _)| name.matches("countdown"))
                     .unwrap()
                     .1 = Tag::Int(10);
+            }
+            6 => {
+                let Tag::Compound(fields) = &mut values[8] else {
+                    unreachable!()
+                };
+                fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("LootTableSeed"))
+                    .unwrap()
+                    .1 = Tag::Int(-8);
+            }
+            7 => {
+                let Tag::Compound(fields) = &mut values[0] else {
+                    unreachable!()
+                };
+                fields.push(("LootTableSeed".into(), Tag::Long(0)));
+            }
+            8 => {
+                let Tag::Compound(fields) = &mut values[0] else {
+                    unreachable!()
+                };
+                fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("LootTable"))
+                    .unwrap()
+                    .1 = Tag::String("INVALID TABLE".into());
+            }
+            9 => {
+                let Tag::Compound(fields) = &mut values[0] else {
+                    unreachable!()
+                };
+                fields.push((
+                    "Items".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ));
             }
             _ => unreachable!(),
         }

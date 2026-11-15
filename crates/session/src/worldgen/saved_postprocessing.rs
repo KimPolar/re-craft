@@ -49,9 +49,10 @@ pub struct SavedPostprocessingInputs<'a> {
 }
 
 /// Restore an isolated postprocessing stage from original FULL chunk data.
-/// Saved tick entries remain pending during callbacks. Only reproducible default
-/// chest and potent sulfur entities are admitted; active upgrade data and other
-/// entity contents are rejected. This does not authorize a live commit or save.
+/// Saved tick entries remain pending during callbacks. Reproducible default
+/// chests, chests with deferred loot, and default potent sulfur entities are
+/// admitted. Active upgrade data and other entity contents are rejected. This
+/// does not authorize a live commit or save.
 pub fn begin_saved_postprocessing(
     provider: &mut impl ResourceProvider,
     input: SavedPostprocessingInputs<'_>,

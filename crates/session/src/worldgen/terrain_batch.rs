@@ -5174,12 +5174,25 @@ impl FreshTerrainBatch {
                     .map(|structures| structures.has_mineshaft_reference(pos))
                     .transpose()?
                     .unwrap_or(false);
-                let (jigsaws, entity_free_jigsaws) = if let Some(structures) = &self.structures {
+                let (jigsaws, entity_free_jigsaws, needs_structure_edges) = if let Some(structures) =
+                    &self.structures
+                {
                     let registry = config
                         .structures
                         .as_ref()
                         .context("structure decoration registry is missing")?;
                     let planned = structures.mixed_decoration_plan_with_portals(pos, registry)?;
+                    let needs_structure_edges = planned.iter().any(|entry| {
+                        entry.starts.iter().any(|start| {
+                            matches!(
+                                start,
+                                super::structure_batch::PlannedStructureStart::OceanRuin(_)
+                                    | super::structure_batch::PlannedStructureStart::Jigsaw(_)
+                                    | super::structure_batch::PlannedStructureStart::RuinedPortal(_)
+                                    | super::structure_batch::PlannedStructureStart::Shipwreck(_)
+                            )
+                        })
+                    });
                     if planned.iter().any(|entry| {
                         entry.starts.iter().any(|start| {
                             matches!(
@@ -5206,12 +5219,13 @@ impl FreshTerrainBatch {
                                 registry,
                             )?),
                             safe,
+                            needs_structure_edges,
                         )
                     } else {
-                        (None, BTreeSet::new())
+                        (None, BTreeSet::new(), needs_structure_edges)
                     }
                 } else {
-                    (None, BTreeSet::new())
+                    (None, BTreeSet::new(), false)
                 };
                 let jigsaw_features = jigsaws
                     .as_ref()
@@ -5222,6 +5236,7 @@ impl FreshTerrainBatch {
                     &config.block_registry,
                     resolve,
                     needs_mineshaft,
+                    needs_structure_edges,
                     &jigsaw_features,
                     self.light_registry.as_ref(),
                 )?;

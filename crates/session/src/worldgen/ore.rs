@@ -59,6 +59,8 @@ mod jigsaw;
 #[cfg(test)]
 mod kelp_tests;
 #[cfg(test)]
+mod seagrass_edge_tests;
+#[cfg(test)]
 mod magma_aquatic_tests;
 #[cfg(test)]
 mod magma_wood_tests;
@@ -1374,6 +1376,7 @@ impl ConfiguredDecoration {
                 let mut tags = v.required_tags();
                 tags.insert(ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap());
                 tags.insert(ResourceId::parse("minecraft:snow").unwrap());
+                tags.insert(seagrass_forbidden_tag().clone());
                 tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_azalea").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
@@ -1673,6 +1676,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             block_registry,
             resolve,
             needs_mineshaft,
+            false,
             &[],
             None,
         )
@@ -1684,6 +1688,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         block_registry: &BTreeSet<String>,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
         needs_mineshaft: bool,
+        needs_structure_edges: bool,
         jigsaw_features: &[&PlacedDecorationFeature],
         template_registry: Option<&'p native_resources::block_registry::GeneratedBlockRegistry>,
     ) -> Result<Self> {
@@ -1767,6 +1772,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         };
         if needs_mineshaft {
             required.insert(ResourceId::parse("minecraft:unstable_bottom_center")?);
+        }
+        if needs_structure_edges {
+            required.insert(seagrass_forbidden_tag().clone());
         }
         let tags = OreBlockTags::load(provider, block_registry, &required)?;
         let mineshaft_biomes = needs_mineshaft
@@ -4729,6 +4737,11 @@ fn tree_decay_tag() -> &'static ResourceId {
     TAG.get_or_init(|| ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap())
 }
 
+fn seagrass_forbidden_tag() -> &'static ResourceId {
+    static TAG: OnceLock<ResourceId> = OnceLock::new();
+    TAG.get_or_init(|| ResourceId::parse("minecraft:cannot_support_seagrass").unwrap())
+}
+
 fn tree_vegetation_tag(dry: bool) -> &'static ResourceId {
     static NORMAL: OnceLock<ResourceId> = OnceLock::new();
     static DRY: OnceLock<ResourceId> = OnceLock::new();
@@ -6463,6 +6476,22 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                     properties: BTreeMap::new(),
                 });
             }
+        } else if state.name == "minecraft:seagrass" {
+            ensure!(state.properties.is_empty(), "invalid seagrass state");
+            let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            let supported = generation_face_sturdy(&below, [0, 1, 0])?
+                && !self.tags.contains(seagrass_forbidden_tag(), &below.name)?;
+            if !supported {
+                return Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: BTreeMap::new(),
+                });
+            }
+            SpringWorld::schedule_spring_tick(
+                self,
+                pos,
+                &ResourceId::parse("minecraft:water")?,
+            )?;
         } else if let Some(kind) = tree_edge_plant(state)? {
             if matches!(kind, SimplePlantKind::Double) {
                 let half = state.properties["half"].as_str();
@@ -8973,6 +9002,9 @@ mod tests {
                     Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore"]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" => {
+                    Some(br#"{"values":[]}"#.to_vec())
+                }
+                "data/minecraft/tags/block/cannot_support_seagrass.json" => {
                     Some(br#"{"values":[]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/air.json" => Some(

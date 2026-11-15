@@ -1610,6 +1610,7 @@ pub struct LoadedSession {
     random_tick_revision: Option<u64>,
     random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, RandomTickCounts)>,
     active_random_tick_sections: Vec<(ChunkPos, i8, RandomTickCounts)>,
+    random_tick_chunk_order: Option<Arc<[ChunkPos]>>,
     gameplay_sky_level: Option<Arc<native_resources::sky_light::SkyLevel>>,
     gameplay_sky_darken: Option<u8>,
     flight_speed: f32,
@@ -2393,6 +2394,17 @@ struct RandomTickCounts {
     crops: usize,
     crop_positions: Arc<[usize]>,
     spreading_soil: usize,
+}
+
+impl RandomTickCounts {
+    fn active(&self) -> bool {
+        self.lit_ores > 0
+            || !self.snow.is_empty()
+            || self.has_farmland
+            || self.crops > 0
+            || self.spreading_soil > 0
+            || !self.leaves.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3306,6 +3318,28 @@ impl LoadedSession {
 
     pub fn set_random_tick_speed(&mut self, speed: u32) {
         self.random_tick_speed = speed;
+    }
+
+    /// Install the Java simulation order for chunks whose ticking futures the
+    /// caller has confirmed ready. Incomplete ticket propagation is rejected
+    /// without replacing the previous order.
+    pub fn set_simulation_random_tick_chunks(
+        &mut self,
+        tracker: &crate::simulation_chunks::SimulationChunks,
+        ready: &BTreeSet<ChunkPos>,
+    ) -> bool {
+        if tracker.has_pending_updates() {
+            return false;
+        }
+        let order: Arc<[ChunkPos]> = tracker
+            .entity_ticking_order()
+            .filter(|position| ready.contains(position))
+            .collect();
+        if self.random_tick_chunk_order.as_deref() != Some(order.as_ref()) {
+            self.random_tick_chunk_order = Some(order);
+            self.random_tick_revision = None;
+        }
+        true
     }
 
     /// Install the active dimension's sky-light timeline for simulation.
@@ -8782,6 +8816,7 @@ impl LoadedSession {
             random_tick_revision: None,
             random_tick_sections: BTreeMap::new(),
             active_random_tick_sections: Vec::new(),
+            random_tick_chunk_order: None,
             gameplay_sky_level: None,
             gameplay_sky_darken: None,
             flight_speed: 0.05,
@@ -16303,19 +16338,25 @@ impl LoadedSession {
         }
         self.random_tick_sections
             .retain(|key, _| present.contains(key));
-        self.active_random_tick_sections = self
-            .random_tick_sections
-            .iter()
-            .filter_map(|(&(chunk, section), (_, active))| {
-                (active.lit_ores > 0
-                    || !active.snow.is_empty()
-                    || active.has_farmland
-                    || active.crops > 0
-                    || active.spreading_soil > 0
-                    || !active.leaves.is_empty())
-                .then_some((chunk, section, active.clone()))
-            })
-            .collect();
+        let mut active_sections = Vec::new();
+        let mut append = |(&(chunk, section), (_, active)): (
+            &(ChunkPos, i8),
+            &(std::sync::Weak<Section>, RandomTickCounts),
+        )| {
+            if active.active() {
+                active_sections.push((chunk, section, active.clone()));
+            }
+        };
+        if let Some(order) = &self.random_tick_chunk_order {
+            for &chunk in order.iter() {
+                self.random_tick_sections
+                    .range((chunk, i8::MIN)..=(chunk, i8::MAX))
+                    .for_each(&mut append);
+            }
+        } else {
+            self.random_tick_sections.iter().for_each(&mut append);
+        }
+        self.active_random_tick_sections = active_sections;
         self.random_tick_revision = Some(self.revision);
     }
 
@@ -76317,6 +76358,99 @@ pub(crate) mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn simulation_chunk_order_controls_random_tick_sampling() {
+        let mut session = session();
+        let center = session.player_chunk().unwrap();
+        let mut tracker = crate::simulation_chunks::SimulationChunks::default();
+        tracker.add_ticket(center, 1, 26);
+        assert!(!session.set_simulation_random_tick_chunks(&tracker, &BTreeSet::new()));
+        tracker.run_updates();
+        let nearby: Vec<_> = tracker
+            .entity_ticking_order()
+            .filter(|pos| {
+                (pos.x - center.x).abs() <= 1 && (pos.z - center.z).abs() <= 1
+            })
+            .collect();
+        let (first, second) = nearby
+            .iter()
+            .enumerate()
+            .find_map(|(i, &first)| {
+                nearby[i + 1..]
+                    .iter()
+                    .copied()
+                    .find(|second| first > *second)
+                    .map(|second| (first, second))
+            })
+            .expect("fixture needs a non-coordinate simulation order");
+        let excluded = *nearby
+            .iter()
+            .find(|position| **position != first && **position != second)
+            .unwrap();
+        let ore = session.intern_block(state("minecraft:redstone_ore", &[("lit", "true")]));
+        let world = Arc::make_mut(&mut session.world);
+        world.chunks.clear();
+        for position in [first, second, excluded] {
+            world.chunks.insert(
+                position,
+                Arc::new(Chunk {
+                    position,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(Box::new([ore; BLOCK_COUNT])),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+        }
+        session.revision += 1;
+        session.set_random_tick_speed(1);
+        assert!(session.set_simulation_random_tick_chunks(
+            &tracker,
+            &BTreeSet::from([first, second])
+        ));
+        let mut expected = native_core::random::BlockRandomPosition::new(123);
+        let first_offset = expected.next_section_offset();
+        let second_offset = expected.next_section_offset();
+        assert_ne!(first_offset, second_offset);
+        session.random_block_position = native_core::random::BlockRandomPosition::new(123);
+        session.advance_random_block_ticks();
+        let lit_at = |chunk: ChunkPos, offset: [i32; 3]| {
+            session
+                .world
+                .block(
+                    chunk.x * 16 + offset[0],
+                    offset[1],
+                    chunk.z * 16 + offset[2],
+                )
+                .and_then(redstone_ore_lit)
+        };
+        assert_eq!(lit_at(first, first_offset), Some(false));
+        assert_eq!(lit_at(first, second_offset), Some(true));
+        assert_eq!(lit_at(second, second_offset), Some(false));
+        assert_eq!(lit_at(second, first_offset), Some(true));
+        assert_eq!(lit_at(excluded, first_offset), Some(true));
+
+        assert!(session.set_simulation_random_tick_chunks(&tracker, &BTreeSet::from([excluded])));
+        session.refresh_random_tick_sections();
+        assert_eq!(session.active_random_tick_sections.len(), 1);
+        assert_eq!(session.active_random_tick_sections[0].0, excluded);
+
+        tracker.add_ticket(center, 2, 20);
+        assert!(!session.set_simulation_random_tick_chunks(
+            &tracker,
+            &BTreeSet::from([first, second])
+        ));
+        session.refresh_random_tick_sections();
+        assert_eq!(session.active_random_tick_sections[0].0, excluded);
     }
 
     #[test]

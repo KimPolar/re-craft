@@ -424,7 +424,8 @@ public class FreshGameRulesOracle {
         if(root.getIntOr("DataVersion", 0)!=5023) throw new AssertionError("version");
         var map=GameRuleMap.CODEC.parse(NbtOps.INSTANCE, root.get("data")).getOrThrow();
         var rules=new GameRules(FeatureFlags.DEFAULT_FLAGS, map);
-        if(rules.get(GameRules.SPAWN_MOBS) || rules.get(GameRules.ADVANCE_TIME)
+        if(rules.get(GameRules.SPAWN_MOBS) || rules.get(GameRules.SPECTATORS_GENERATE_CHUNKS)
+            || rules.get(GameRules.ADVANCE_TIME)
             || rules.get(GameRules.ADVANCE_WEATHER) || rules.get(GameRules.WATER_SOURCE_CONVERSION)
             || !rules.get(GameRules.LAVA_SOURCE_CONVERSION) || rules.get(GameRules.BLOCK_DROPS)
             || rules.get(GameRules.ENTITY_DROPS) || rules.get(GameRules.NATURAL_HEALTH_REGENERATION)
@@ -449,6 +450,7 @@ public class FreshGameRulesOracle {
         random_tick_speed: 9,
         fire_spread_radius_around_player: -1,
         spawn_mobs: false,
+        spectators_generate_chunks: false,
         advance_time: false,
         advance_weather: false,
         water_source_conversion: false,

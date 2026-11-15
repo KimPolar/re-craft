@@ -75,6 +75,12 @@ impl TicketKind {
         )
     }
 
+    /// Java's player simulation ticket keeps a dimension active but does not
+    /// supply a loading level. The other built-in ticket types do.
+    pub fn loads(self) -> bool {
+        self != Self::PlayerSimulation
+    }
+
     pub fn timeout(self) -> Option<i64> {
         match self {
             Self::PlayerSpawn => Some(20),

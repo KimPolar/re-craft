@@ -29,6 +29,10 @@ mod sulfur_tests;
 #[path = "loaded_activation_tests.rs"]
 mod activation_tests;
 
+#[cfg(test)]
+#[path = "loaded_simulation_tests.rs"]
+mod simulation_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -1447,6 +1451,12 @@ enum WeatherTickLevel {
     Background(native_core::random::LegacyRandom),
 }
 
+struct PlayerSimulationState {
+    player: crate::simulation_player::PlayerSimulation,
+    spectators_generate_chunks: bool,
+    view_distance: u32,
+}
+
 pub struct LoadedSession {
     generation_identity: Arc<()>,
     world: Arc<World>,
@@ -1625,6 +1635,8 @@ pub struct LoadedSession {
     random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, RandomTickCounts)>,
     active_random_tick_sections: Vec<(ChunkPos, i8, RandomTickCounts)>,
     random_tick_chunk_order: Option<Arc<[ChunkPos]>>,
+    player_simulation: Option<PlayerSimulationState>,
+    simulation_dependencies: Arc<BTreeSet<ChunkPos>>,
     gameplay_sky_level: Option<Arc<native_resources::sky_light::SkyLevel>>,
     gameplay_sky_darken: Option<u8>,
     flight_speed: f32,
@@ -3374,6 +3386,115 @@ impl LoadedSession {
         anyhow::ensure!(radius >= -1, "fire spread radius must be at least -1");
         self.fire_spread_radius_around_player = radius;
         Ok(())
+    }
+
+    /// Attach tickets captured under this world's lock before the first tick.
+    /// The graph drives chunk prefetch; ticking futures and timed expiration
+    /// are not yet connected to this experimental session.
+    pub fn install_player_simulation(
+        &mut self,
+        captured: &native_persistence::world::CapturedChunkTickets,
+        distance: u32,
+        view_distance: u32,
+        spectators_generate_chunks: bool,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        anyhow::ensure!(
+            self.tick == 0
+                && self.accumulated == Duration::ZERO
+                && self.player_simulation.is_none(),
+            "player simulation must be installed once before the first tick"
+        );
+        let guard = self
+            .saved_world_session
+            .as_ref()
+            .context("world session is not bound")?;
+        let dimension = native_persistence::world::DimensionId::parse(&self.world.dimension)?;
+        let tickets = crate::simulation_tickets::SimulationTickets::from_capture(
+            captured,
+            guard,
+            &dimension,
+        )?;
+        let section = self
+            .player_section()
+            .context("player section is outside the supported range")?;
+        let mut player = crate::simulation_player::PlayerSimulation::new(tickets, distance);
+        player.observe_player(
+            section,
+            self.game_mode == GameMode::Spectator,
+            spectators_generate_chunks,
+        );
+        player.run_updates();
+        let view_distance = view_distance.clamp(2, 32);
+        let dependencies = Self::simulation_full_dependencies(&player, view_distance);
+        self.player_simulation = Some(PlayerSimulationState {
+            player,
+            spectators_generate_chunks,
+            view_distance,
+        });
+        self.simulation_dependencies = Arc::new(dependencies);
+        Ok(())
+    }
+
+    fn simulation_full_dependencies(
+        player: &crate::simulation_player::PlayerSimulation,
+        view_distance: u32,
+    ) -> BTreeSet<ChunkPos> {
+        player
+            .full_tick_dependencies(view_distance)
+            .expect("simulation graph was updated")
+    }
+
+    /// FULL-neighbor requests only; these positions are not necessarily ready
+    /// for ticking and can include chunks outside the render window.
+    pub fn simulation_dependencies(&self) -> &Arc<BTreeSet<ChunkPos>> {
+        &self.simulation_dependencies
+    }
+
+    /// Update the loading window independently of the simulation distance.
+    pub fn set_simulation_view_distance(&mut self, distance: u32) {
+        let Some(state) = &mut self.player_simulation else {
+            return;
+        };
+        let distance = distance.clamp(2, 32);
+        if state.view_distance != distance {
+            state.view_distance = distance;
+            let dependencies = Self::simulation_full_dependencies(&state.player, distance);
+            if self.simulation_dependencies.as_ref() != &dependencies {
+                self.simulation_dependencies = Arc::new(dependencies);
+            }
+        }
+    }
+
+    /// Called on fixed-tick boundaries, including after a mode transition.
+    fn update_player_simulation(&mut self) {
+        let section = self.player_section();
+        let Some(state) = &mut self.player_simulation else {
+            return;
+        };
+        let previous_loading_center = state.player.player_loading_center();
+        if let Some(section) = section {
+            state.player.observe_player(
+                section,
+                self.game_mode == GameMode::Spectator,
+                state.spectators_generate_chunks,
+            );
+        } else {
+            state.player.remove_player();
+        }
+        let changed = state.player.tracker().has_pending_updates();
+        if changed {
+            state.player.run_updates();
+        }
+        if changed || previous_loading_center != state.player.player_loading_center() {
+            let dependencies = Self::simulation_full_dependencies(
+                &state.player,
+                state.view_distance,
+            );
+            if self.simulation_dependencies.as_ref() != &dependencies {
+                self.simulation_dependencies = Arc::new(dependencies);
+            }
+        }
     }
 
     /// Install the Java simulation order for chunks whose ticking futures the
@@ -5328,6 +5449,7 @@ impl LoadedSession {
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
         self.validate_saved_chunk_preparation()?;
+        self.validate_simulation_ticket_progress()?;
         let mode_trace = self.game_mode_trace;
         if let Some(trace) = mode_trace {
             anyhow::ensure!(
@@ -6805,6 +6927,21 @@ impl LoadedSession {
         Ok(())
     }
 
+    fn validate_simulation_ticket_progress(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (self.tick == 0 && !self.advancing_tick)
+                || self.player_simulation.as_ref().is_none_or(|state| {
+                    state
+                        .player
+                        .tickets()
+                        .tickets()
+                        .all(|ticket| ticket.kind.timeout().is_none())
+                }),
+            "timed chunk tickets have not been advanced for saving or generation"
+        );
+        Ok(())
+    }
+
     /// Bind disk captures to the same world lock as this loaded session.
     pub fn bind_saved_world_session(
         &mut self,
@@ -6934,6 +7071,7 @@ impl LoadedSession {
 
     fn validate_generation_block_readiness(&self) -> anyhow::Result<()> {
         self.validate_saved_chunk_preparation()?;
+        self.validate_simulation_ticket_progress()?;
         anyhow::ensure!(
             !self.unresolved_lichen_shape
                 && !self.unresolved_fence_shape
@@ -8954,6 +9092,8 @@ impl LoadedSession {
             random_tick_sections: BTreeMap::new(),
             active_random_tick_sections: Vec::new(),
             random_tick_chunk_order: None,
+            player_simulation: None,
+            simulation_dependencies: Arc::new(BTreeSet::new()),
             gameplay_sky_level: None,
             gameplay_sky_darken: None,
             flight_speed: 0.05,
@@ -12097,6 +12237,7 @@ impl LoadedSession {
     pub fn draft_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
         use anyhow::{Context, ensure};
         self.validate_saved_chunk_preparation()?;
+        self.validate_simulation_ticket_progress()?;
         ensure!(
             !self.unresolved_bubble_tick,
             "bubble column effects are not yet fully tracked for saving"
@@ -12680,6 +12821,16 @@ impl LoadedSession {
         Some(ChunkPos {
             x: x.div_euclid(16),
             z: z.div_euclid(16),
+        })
+    }
+
+    fn player_section(&self) -> Option<crate::simulation_player::PlayerSection> {
+        let chunk = self.player_chunk()?;
+        let y = i64::from(self.origin.y).checked_add(self.motion.position.y.floor() as i64)?;
+        Some(crate::simulation_player::PlayerSection {
+            x: chunk.x,
+            y: i32::try_from(y).ok()?.div_euclid(16),
+            z: chunk.z,
         })
     }
 
@@ -13576,6 +13727,7 @@ impl LoadedSession {
         let mut sky_inputs_changed = false;
         let required_shapes = self.required_shape_update_chunks();
         let required_sky = self.sky_lighting.required_chunks();
+        let required_simulation = Arc::clone(&self.simulation_dependencies);
         if let Some(window) = self.pending_respawn_window.take()
             && self.respawn_window != window
         {
@@ -13658,6 +13810,7 @@ impl LoadedSession {
                         .expect("resident chunk was checked");
                     if unsaved.contains(&pos)
                         || required_sky.contains(&pos)
+                        || required_simulation.contains(&pos)
                         || self
                             .respawn_window
                             .is_some_and(|extra| within_window(pos, extra))
@@ -13740,6 +13893,7 @@ impl LoadedSession {
                 !self.has_unsaved_chunk_changes(*pos)
                     && !required_shapes.contains(pos)
                     && !required_sky.contains(pos)
+                    && !required_simulation.contains(pos)
                     && !self
                         .respawn_window
                         .is_some_and(|window| within_window(*pos, window))
@@ -13812,6 +13966,7 @@ impl LoadedSession {
                 && !respawn
                 && !required_shapes.contains(&pos)
                 && !required_sky.contains(&pos)
+                && !required_simulation.contains(&pos)
             {
                 continue;
             }
@@ -26429,6 +26584,7 @@ impl GameSession for LoadedSession {
         while self.accumulated >= TICK && processed < MAX_TICKS_PER_UPDATE {
             self.accumulated -= TICK;
             self.advance_tick();
+            self.update_player_simulation();
             self.chest_lids.tick(self.inventory.menu());
             crate::collect_pickup_sounds(
                 &mut self.pickup_sounds,

@@ -14,7 +14,8 @@ public class NewGameRulesOracle {
             var data = NbtIo.read(Path.of(args[i])).get("data");
             var rules = GameRuleMap.CODEC.parse(NbtOps.INSTANCE, data).getOrThrow();
             boolean defaults = i == 0;
-            if (rules.size() != 15 || rules.get(GameRules.SPAWN_MOBS) != defaults ||
+            if (rules.size() != 16 || rules.get(GameRules.SPAWN_MOBS) != defaults ||
+                rules.get(GameRules.SPECTATORS_GENERATE_CHUNKS) != defaults ||
                 rules.get(GameRules.ADVANCE_TIME) != defaults ||
                 rules.get(GameRules.ADVANCE_WEATHER) != defaults ||
                 rules.get(GameRules.WATER_SOURCE_CONVERSION) != defaults ||

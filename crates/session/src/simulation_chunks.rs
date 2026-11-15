@@ -322,6 +322,14 @@ impl SimulationChunks {
             .filter_map(|(key, level)| (level <= ENTITY_TICKING_LEVEL).then(|| unpack(key)))
     }
 
+    /// Block-ticking candidates include the level-32 ring, which can run
+    /// scheduled ticks even though it does not run the random chunk tick.
+    pub fn block_ticking_order(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.levels
+            .iter()
+            .filter_map(|(key, level)| (level <= BLOCK_TICKING_LEVEL).then(|| unpack(key)))
+    }
+
     /// Missing FULL chunks in the 3×3 dependency area around each entity-
     /// ticking candidate. Java also requires the center's postprocessing and
     /// ticking future to finish; this list alone does not prove readiness.

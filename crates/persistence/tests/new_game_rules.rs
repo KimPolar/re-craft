@@ -17,6 +17,7 @@ fn initial_game_rules_match_java_codec() -> Result<()> {
         random_tick_speed: 17,
         fire_spread_radius_around_player: -1,
         spawn_mobs: false,
+        spectators_generate_chunks: false,
         advance_time: false,
         advance_weather: false,
         water_source_conversion: false,

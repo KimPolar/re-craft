@@ -84,6 +84,9 @@ pub struct ChunkStreamer {
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
     shape_required: BTreeSet<ChunkPos>,
     light_required: BTreeSet<ChunkPos>,
+    simulation_required: Arc<BTreeSet<ChunkPos>>,
+    simulation_targets: Vec<ChunkPos>,
+    simulation_settled_prefix: usize,
     _world_guard: Option<native_persistence::save::WorldSessionGuard>,
     observed_epoch: Option<u64>,
     generation_owner: Arc<()>,
@@ -2654,6 +2657,7 @@ pub(crate) fn light_worker_test_fixture(
     streamer.respawn = session.requested_respawn_window();
     streamer.shape_required = session.required_shape_update_chunks();
     streamer.light_required = session.missing_sky_chunks().clone();
+    streamer.simulation_required = Arc::clone(session.simulation_dependencies());
     streamer.targets = vec![target];
     streamer.missing.insert(target);
     streamer.observed_epoch = Some(stamp.epoch());
@@ -2697,6 +2701,7 @@ fn select_generation_targets(
     shape_required: &BTreeSet<ChunkPos>,
     light_required: &BTreeSet<ChunkPos>,
     targets: &[ChunkPos],
+    simulation_required: &BTreeSet<ChunkPos>,
     limit: usize,
     mut eligible: impl FnMut(ChunkPos) -> bool,
 ) -> Vec<ChunkPos> {
@@ -2705,6 +2710,7 @@ fn select_generation_targets(
         .iter()
         .chain(light_required.iter())
         .chain(targets.iter())
+        .chain(simulation_required.iter())
         .copied()
         .filter(|pos| eligible(*pos) && seen.insert(*pos))
         .take(limit)
@@ -2713,8 +2719,8 @@ fn select_generation_targets(
 
 impl ChunkStreamer {
     /// Prioritize absent chunks needed by deferred shape or sky-light updates,
-    /// followed by the active streaming order. Return no snapshot if the world
-    /// or session moved since `service` last refreshed the cache.
+    /// then the active streaming order and simulation dependencies. Return no
+    /// snapshot if the world or session moved since the last service call.
     pub(crate) fn missing_generation_targets(
         &self,
         session: &LoadedSession,
@@ -2728,6 +2734,7 @@ impl ChunkStreamer {
             || self.respawn != session.requested_respawn_window()
             || self.shape_required != session.required_shape_update_chunks()
             || &self.light_required != session.missing_sky_chunks()
+            || self.simulation_required.as_ref() != session.simulation_dependencies().as_ref()
         {
             return None;
         }
@@ -2736,6 +2743,7 @@ impl ChunkStreamer {
             &self.shape_required,
             &self.light_required,
             &self.targets,
+            &self.simulation_required,
             limit,
             |pos| {
                 self.missing.contains(&pos)
@@ -2918,6 +2926,9 @@ impl ChunkStreamer {
             entity_retry: BTreeMap::new(),
             shape_required: BTreeSet::new(),
             light_required: BTreeSet::new(),
+            simulation_required: Arc::new(BTreeSet::new()),
+            simulation_targets: Vec::new(),
+            simulation_settled_prefix: 0,
             _world_guard: None,
             observed_epoch: None,
             generation_owner: Arc::new(()),
@@ -2926,6 +2937,7 @@ impl ChunkStreamer {
     }
 
     pub fn service(&mut self, session: &mut LoadedSession) -> Result<()> {
+        session.set_simulation_view_distance(self.radius);
         let active_stamp = match &self._world_guard {
             Some(guard) => match guard.read_stamp() {
                 Ok(stamp) => Some(stamp),
@@ -2965,24 +2977,51 @@ impl ChunkStreamer {
         };
         let shape_required = session.required_shape_update_chunks();
         let light_required = session.missing_sky_chunks();
-        if self.shape_required != shape_required || &self.light_required != light_required {
+        let simulation_changed =
+            !Arc::ptr_eq(&self.simulation_required, session.simulation_dependencies());
+        if simulation_changed {
+            self.simulation_required = Arc::clone(session.simulation_dependencies());
+        }
+        if windows_changed || simulation_changed {
+            self.simulation_settled_prefix = 0;
+            self.simulation_targets = self
+                .simulation_required
+                .iter()
+                .copied()
+                .filter(|pos| !windows.contains(*pos))
+                .collect();
+            self.simulation_targets.sort_by_key(|pos| {
+                let dx = (i64::from(pos.x) - i64::from(center.x)).abs();
+                let dz = (i64::from(pos.z) - i64::from(center.z)).abs();
+                (dx.max(dz), dx * dx + dz * dz, pos.z, pos.x)
+            });
+        }
+        if self.shape_required != shape_required
+            || &self.light_required != light_required
+            || simulation_changed
+        {
             self.shape_required = shape_required;
             self.light_required = light_required.clone();
             self.awaiting_competing_attachment.retain(|pos| {
                 windows.contains(*pos)
                     || self.shape_required.contains(pos)
                     || self.light_required.contains(pos)
+                    || self.simulation_required.contains(pos)
             });
             self.missing.retain(|pos| {
                 windows.contains(*pos)
                     || self.shape_required.contains(pos)
                     || self.light_required.contains(pos)
+                    || self.simulation_required.contains(pos)
             });
             self.failed.retain(|pos, _| {
                 windows.contains(*pos)
                     || self.shape_required.contains(pos)
                     || self.light_required.contains(pos)
+                    || self.simulation_required.contains(pos)
             });
+            self.entity_retry
+                .retain(|pos, _| windows.contains(*pos) || self.simulation_required.contains(pos));
         }
         if windows_changed {
             self.settled_prefix = 0;
@@ -3006,17 +3045,21 @@ impl ChunkStreamer {
                 windows.contains(*pos)
                     || self.shape_required.contains(pos)
                     || self.light_required.contains(pos)
+                    || self.simulation_required.contains(pos)
             });
             self.awaiting_competing_attachment.retain(|pos| {
                 windows.contains(*pos)
                     || self.shape_required.contains(pos)
                     || self.light_required.contains(pos)
+                    || self.simulation_required.contains(pos)
             });
-            self.entity_retry.retain(|pos, _| windows.contains(*pos));
+            self.entity_retry
+                .retain(|pos, _| windows.contains(*pos) || self.simulation_required.contains(pos));
             self.failed.retain(|pos, _| {
                 windows.contains(*pos)
                     || self.shape_required.contains(pos)
                     || self.light_required.contains(pos)
+                    || self.simulation_required.contains(pos)
             });
             for &pos in &self.targets {
                 if matches!(
@@ -3071,7 +3114,8 @@ impl ChunkStreamer {
                     if response.stale
                         || (!windows.contains(response.pos)
                             && !self.shape_required.contains(&response.pos)
-                            && !self.light_required.contains(&response.pos))
+                            && !self.light_required.contains(&response.pos)
+                            && !self.simulation_required.contains(&response.pos))
                         || response
                             .stamp
                             .as_ref()
@@ -3176,6 +3220,7 @@ impl ChunkStreamer {
             if !windows.contains(pos)
                 && !self.shape_required.contains(&pos)
                 && !self.light_required.contains(&pos)
+                && !self.simulation_required.contains(&pos)
             {
                 continue;
             }
@@ -3299,6 +3344,63 @@ impl ChunkStreamer {
                     Err(TrySendError::Disconnected(_)) => {
                         anyhow::bail!("chunk reader stopped unexpectedly")
                     }
+                }
+            }
+        }
+        // Prefetch simulation dependencies outside the render/respawn windows
+        // after visible targets. They stay parked until actual ticking-future
+        // preparation is implemented; loading them alone does not make them tick.
+        if stale_received || competing_settled_any {
+            self.simulation_settled_prefix = 0;
+        }
+        while let Some(&pos) = self.simulation_targets.get(self.simulation_settled_prefix) {
+            if !self.missing.contains(&pos)
+                && !self.failed.contains_key(&pos)
+                && !session.has_resident_or_parked_chunk(pos)
+            {
+                break;
+            }
+            self.simulation_settled_prefix += 1;
+        }
+        let simulation_start = if retry_due {
+            0
+        } else {
+            self.simulation_settled_prefix
+        };
+        for &pos in &self.simulation_targets[simulation_start..] {
+            let retry = self
+                .entity_retry
+                .get(&pos)
+                .is_some_and(|(at, _)| *at <= now);
+            let terrain_retry = self
+                .failed
+                .get(&pos)
+                .is_some_and(|(at, _)| *at <= now);
+            if self.missing.contains(&pos)
+                || (self.failed.contains_key(&pos) && !terrain_retry)
+                || self.pending.contains(&pos)
+                || self.awaiting_attachment.contains(&pos)
+                || (session.has_chunk_or_pending(pos) && !retry)
+            {
+                continue;
+            }
+            match self
+                .requests
+                .as_ref()
+                .context("chunk reader is closed")?
+                .try_send(Request {
+                    pos,
+                    entities_only: retry && session.has_chunk_or_pending(pos),
+                    priority_required: true,
+                    stamp: active_stamp.clone(),
+                })
+            {
+                Ok(()) => {
+                    self.pending.insert(pos);
+                }
+                Err(TrySendError::Full(_)) => break,
+                Err(TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("chunk reader stopped unexpectedly")
                 }
             }
         }
@@ -3460,15 +3562,101 @@ mod tests {
         let shape = BTreeSet::from([a, b]);
         let light = BTreeSet::from([b, d]);
         let window = [c, a, d, b];
+        let extra = ChunkPos { x: 40, z: -6 };
+        let simulation = BTreeSet::from([a, extra]);
         assert_eq!(
-            select_generation_targets(&shape, &light, &window, 3, |_| true),
+            select_generation_targets(&shape, &light, &window, &BTreeSet::new(), 3, |_| true),
             vec![a, b, d]
         );
         assert_eq!(
-            select_generation_targets(&shape, &light, &window, 9, |pos| pos != b),
+            select_generation_targets(&shape, &light, &window, &BTreeSet::new(), 9, |pos| pos != b),
             vec![a, d, c]
         );
-        assert!(select_generation_targets(&shape, &light, &window, 0, |_| true).is_empty());
+        assert!(
+            select_generation_targets(&shape, &light, &window, &BTreeSet::new(), 0, |_| true)
+                .is_empty()
+        );
+        assert_eq!(
+            select_generation_targets(&shape, &light, &window, &simulation, 9, |_| true),
+            vec![a, b, d, c, extra]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn simulation_dependencies_are_streamed_outside_render_window_and_released() {
+        let (_dir, reader) = locked_world_fixture();
+        let captured = reader.capture_chunk_tickets().unwrap();
+        let guard = reader.session_guard().unwrap();
+        let home = ChunkPos { x: 0, z: 0 };
+        let halo = ChunkPos { x: 2, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.bind_saved_world_session(guard).unwrap();
+        session.install_player_simulation(&captured, 1, 1, false).unwrap();
+        assert!(session.simulation_dependencies().contains(&halo));
+        let mut streamer =
+            ChunkStreamer::with_source(1, BTreeSet::new(), |pos| Ok(Some(chunk_world(pos))))
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if session.has_resident_or_parked_chunk(halo) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "simulation dependency was not streamed"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .chunks
+                .contains_key(&halo)
+        );
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if !streamer.simulation_targets.is_empty()
+                && streamer.simulation_settled_prefix == streamer.simulation_targets.len()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "simulation dependencies did not settle");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let settled = streamer.simulation_settled_prefix;
+        streamer.service(&mut session).unwrap();
+        assert_eq!(streamer.simulation_settled_prefix, settled);
+        session.set_game_mode(native_session::GameMode::Spectator);
+        session.update(Duration::from_millis(50));
+        assert!(!session.simulation_dependencies().contains(&halo));
+        session.update(Duration::from_millis(50));
+        assert!(!session.has_resident_or_parked_chunk(halo));
+        streamer.service(&mut session).unwrap();
+        assert!(!streamer.simulation_required.contains(&halo));
     }
 
     #[cfg(windows)]

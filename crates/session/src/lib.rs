@@ -68,6 +68,7 @@ pub mod saved_orb;
 pub mod saved_sculk;
 pub mod sculk_sensor;
 pub mod simulation_chunks;
+pub mod simulation_player;
 pub mod simulation_tickets;
 mod sky_lighting;
 mod slab_mining;

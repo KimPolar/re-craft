@@ -1524,6 +1524,10 @@ fn prepare_world_with_session(
             .and_then(player_inventory::saved_game_mode)
             .unwrap_or(default_mode);
         session.set_game_mode(mode);
+        let saved_tickets = reader
+            .capture_chunk_tickets()
+            .context("cannot capture saved simulation tickets")?;
+        session.install_player_simulation(&saved_tickets, 12, radius, rules.spectators_generate_chunks)?;
         if matches!(
             mode,
             native_session::GameMode::Spectator | native_session::GameMode::Creative

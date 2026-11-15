@@ -932,6 +932,7 @@ pub struct FluidGameRules {
     pub random_tick_speed: i32,
     pub fire_spread_radius_around_player: i32,
     pub spawn_mobs: bool,
+    pub spectators_generate_chunks: bool,
     pub advance_time: bool,
     pub advance_weather: bool,
     pub water_source_conversion: bool,
@@ -952,6 +953,7 @@ impl Default for FluidGameRules {
             random_tick_speed: 3,
             fire_spread_radius_around_player: 128,
             spawn_mobs: true,
+            spectators_generate_chunks: true,
             advance_time: true,
             advance_weather: true,
             water_source_conversion: true,
@@ -987,6 +989,7 @@ impl FluidGameRules {
         let mut values = Vec::new();
         for (name, value) in [
             ("spawn_mobs", self.spawn_mobs),
+            ("spectators_generate_chunks", self.spectators_generate_chunks),
             ("advance_time", self.advance_time),
             ("advance_weather", self.advance_weather),
             ("water_source_conversion", self.water_source_conversion),
@@ -2297,6 +2300,7 @@ impl WorldReader {
             random_tick_speed,
             fire_spread_radius_around_player,
             spawn_mobs: read("spawn_mobs", true)?,
+            spectators_generate_chunks: read("spectators_generate_chunks", true)?,
             advance_time: read("advance_time", true)?,
             advance_weather: read("advance_weather", true)?,
             water_source_conversion: read("water_source_conversion", true)?,
@@ -3791,6 +3795,7 @@ mod tests {
                     "data".into(),
                     Tag::Compound(vec![
                         ("minecraft:spawn_mobs".into(), Tag::Byte(0)),
+                        ("minecraft:spectators_generate_chunks".into(), Tag::Byte(0)),
                         ("minecraft:water_source_conversion".into(), Tag::Byte(0)),
                         ("minecraft:lava_source_conversion".into(), Tag::Byte(1)),
                         ("minecraft:block_drops".into(), Tag::Byte(0)),
@@ -3821,6 +3826,7 @@ mod tests {
                     random_tick_speed: 9,
                     fire_spread_radius_around_player: -1,
                     spawn_mobs: false,
+                    spectators_generate_chunks: false,
                     advance_time: false,
                     advance_weather: false,
                     water_source_conversion: false,

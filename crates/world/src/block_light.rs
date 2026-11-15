@@ -638,6 +638,11 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             boolean("snowy")?;
             (15, 0)
         }
+        "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
+            if state.properties.len() == 1 && bounded("dusted", 3).is_some() =>
+        {
+            (15, 0)
+        }
         "minecraft:mangrove_roots" if state.properties.len() == 1 => {
             boolean("waterlogged")?;
             (1, 0)
@@ -914,6 +919,8 @@ pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool
                 | "minecraft:dirt"
                 | "minecraft:sand"
                 | "minecraft:gravel"
+                | "minecraft:suspicious_sand"
+                | "minecraft:suspicious_gravel"
                 | "minecraft:iron_chain"
         ) || crate::collision::full_glass(state)
     }
@@ -1475,6 +1482,28 @@ mod tests {
             assert_eq!(properties(&block), Some((15, emission)), "{name}");
             block.properties.insert("unexpected".into(), "true".into());
             assert_eq!(properties(&block), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn brushable_light_states_match_sand_and_reject_invalid_properties() {
+        let sand = state("sand", None);
+        for name in ["suspicious_sand", "suspicious_gravel"] {
+            let mut brushable = state(name, None);
+            assert_eq!(properties(&brushable), None);
+            for dusted in 0..=3 {
+                brushable
+                    .properties
+                    .insert("dusted".into(), dusted.to_string());
+                assert_eq!(properties(&brushable), Some((15, 0)));
+                assert_eq!(same_light_behavior(&sand, &brushable), Some(true));
+                assert_eq!(skips_light_check_for_edit(&sand, &brushable), Some(true));
+            }
+            brushable.properties.insert("dusted".into(), "4".into());
+            assert_eq!(properties(&brushable), None);
+            brushable.properties.insert("dusted".into(), "0".into());
+            brushable.properties.insert("extra".into(), "true".into());
+            assert_eq!(properties(&brushable), None);
         }
     }
 
@@ -2835,6 +2864,8 @@ mod tests {
             "lava",
             "gravel",
             "sand",
+            "suspicious_sand",
+            "suspicious_gravel",
             "red_sand",
             "bedrock",
             "obsidian",

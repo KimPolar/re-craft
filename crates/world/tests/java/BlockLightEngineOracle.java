@@ -40,6 +40,8 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
         return switch (name) {
             case "air" -> Blocks.AIR.defaultBlockState();
             case "stone" -> Blocks.STONE.defaultBlockState();
+            case "suspicious_sand" -> Blocks.SUSPICIOUS_SAND.defaultBlockState();
+            case "suspicious_gravel" -> Blocks.SUSPICIOUS_GRAVEL.defaultBlockState();
             case "crying_obsidian" -> Blocks.CRYING_OBSIDIAN.defaultBlockState();
             case "mossy_stone_bricks" -> Blocks.MOSSY_STONE_BRICKS.defaultBlockState();
             case "bee_nest" -> Blocks.BEE_NEST.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH);

@@ -50,6 +50,8 @@ public class GeneratedSkyLightOracle implements LightChunkGetter, BlockGetter {
     static BlockState state(String name) {
         return switch(name) {
             case "stone" -> Blocks.STONE.defaultBlockState();
+            case "suspicious_sand" -> Blocks.SUSPICIOUS_SAND.defaultBlockState();
+            case "suspicious_gravel" -> Blocks.SUSPICIOUS_GRAVEL.defaultBlockState();
             case "water" -> Blocks.WATER.defaultBlockState();
             case "glass" -> Blocks.GLASS.defaultBlockState();
             case "slab_bottom" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.BOTTOM);

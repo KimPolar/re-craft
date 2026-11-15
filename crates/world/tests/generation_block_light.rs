@@ -20,6 +20,8 @@ fn state(name: &str) -> BlockState {
     let (block, properties) = match name {
         "air" => ("air", vec![]),
         "stone" => ("stone", vec![]),
+        "suspicious_sand" => ("suspicious_sand", vec![("dusted", "0")]),
+        "suspicious_gravel" => ("suspicious_gravel", vec![("dusted", "0")]),
         "crying_obsidian" => ("crying_obsidian", vec![]),
         "mossy_stone_bricks" => ("mossy_stone_bricks", vec![]),
         "bee_nest" => (
@@ -136,6 +138,8 @@ fn generated_sky_light_matches_java_initial_engine() {
         (16, 19, 8, "glass"),
         (0, 8, 0, "stone"),
         (15, 2, 15, "stone"),
+        (5, 18, 4, "suspicious_gravel"),
+        (5, 18, 6, "suspicious_sand"),
     ] {
         add(x, y, z, name);
     }
@@ -832,6 +836,8 @@ fn generated_block_light_matches_java_from_complete_halo() {
         (9, 16, 8, "small_bud"),
         (12, 8, 10, "crying_obsidian"),
         (13, 8, 10, "mossy_stone_bricks"),
+        (0, 8, 8, "suspicious_gravel"),
+        (8, 16, 9, "suspicious_sand"),
         (1, 8, 8, "stone"),
         (2, 8, 8, "bee_nest"),
         (3, 8, 8, "beehive"),

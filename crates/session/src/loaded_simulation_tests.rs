@@ -182,3 +182,60 @@ fn player_ticket_changes_are_independent_of_frame_intervals() {
     };
     assert_eq!(order(&fixed), order(&fine));
 }
+
+#[test]
+fn live_spawn_selection_uses_absolute_position_and_tracks_masked_player_moves() {
+    use crate::simulation_player::PlayerSimulation;
+    use crate::simulation_tickets::SimulationTickets;
+    use native_persistence::chunk_tickets::TicketKind;
+
+    let mut session = super::tests::session();
+    session.origin = IVec3::new(160, 0, -160);
+    session.motion.position = DVec3::new(8.0, 2.0, 8.0);
+    session.set_game_mode(GameMode::Survival);
+    let home = session.player_chunk().unwrap();
+    let near = ChunkPos {
+        x: home.x + 1,
+        z: home.z,
+    };
+    let boundary = ChunkPos {
+        x: home.x + 8,
+        z: home.z,
+    };
+    let ready = BTreeSet::from([home, near, boundary]);
+    assert!(session.collect_spawning_chunks(&ready).is_none());
+    let mut tickets = SimulationTickets::default();
+    tickets.add_ticket(home, TicketKind::Forced, 0);
+    let mut player = PlayerSimulation::new(tickets, 12);
+    player.observe_player(session.player_section().unwrap(), false, true);
+    player.run_updates();
+    session.player_simulation = Some(PlayerSimulationState {
+        player,
+        spectators_generate_chunks: true,
+        view_distance: 12,
+    });
+    assert_eq!(
+        session
+            .collect_spawning_chunks(&ready)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([home, near])
+    );
+    session.set_game_mode(GameMode::Spectator);
+    assert!(session.collect_spawning_chunks(&ready).unwrap().is_empty());
+    session.set_game_mode(GameMode::Survival);
+    session.motion.position.x += 16.0;
+    session.update_player_simulation();
+    let state = session.player_simulation.as_ref().unwrap();
+    assert!(!state.player.has_pending_updates());
+    let candidates: BTreeSet<_> = state.player.natural_spawn_candidates().unwrap().collect();
+    assert!(candidates.contains(&ChunkPos {
+        x: home.x + 9,
+        z: home.z
+    }));
+    assert!(!candidates.contains(&ChunkPos {
+        x: home.x - 8,
+        z: home.z
+    }));
+}

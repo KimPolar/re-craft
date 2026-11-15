@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use native_core::random::LegacyRandom;
 use native_persistence::chunk_tickets::TicketKind;
 use native_world::loaded::ChunkPos;
 
@@ -44,6 +45,9 @@ struct TrackedPlayer {
 #[derive(Clone, Debug)]
 pub struct PlayerSimulation {
     tickets: SimulationTickets,
+    // The natural-spawn tracker has its own player-centered radius and hash
+    // iteration order; forced simulation tickets do not contribute to it.
+    natural_spawn: SimulationChunks,
     distance: u32,
     player: Option<TrackedPlayer>,
 }
@@ -54,6 +58,7 @@ impl PlayerSimulation {
     pub fn new(tickets: SimulationTickets, distance: u32) -> Self {
         Self {
             tickets,
+            natural_spawn: SimulationChunks::default(),
             distance,
             player: None,
         }
@@ -74,6 +79,57 @@ impl PlayerSimulation {
 
     pub fn tracker(&self) -> &SimulationChunks {
         self.tickets.tracker()
+    }
+
+    /// Java's separate eight-chunk player-distance map, before holder and
+    /// spectator-distance filtering. Its order affects the spawning shuffle.
+    /// No order is exposed while this tracker is still propagating.
+    pub fn natural_spawn_candidates(&self) -> Option<impl Iterator<Item = ChunkPos> + '_> {
+        if self.natural_spawn.has_pending_updates() {
+            return None;
+        }
+        Some(self.natural_spawn.block_ticking_order())
+    }
+
+    /// Apply ChunkMap's holder and horizontal player-distance checks. A caller
+    /// must supply actual ticking-future readiness, not merely loaded chunks.
+    pub fn collect_spawning_chunks(
+        &self,
+        player_x: f64,
+        player_z: f64,
+        spectator: bool,
+        mut is_ticking: impl FnMut(ChunkPos) -> bool,
+    ) -> Option<Vec<ChunkPos>> {
+        Some(
+            self.natural_spawn_candidates()?
+                .filter(|&pos| {
+                    if !is_ticking(pos) || spectator {
+                        return false;
+                    }
+                    let center_x = f64::from(pos.x.wrapping_shl(4).wrapping_add(8));
+                    let center_z = f64::from(pos.z.wrapping_shl(4).wrapping_add(8));
+                    let dx = center_x - player_x;
+                    let dz = center_z - player_z;
+                    dx * dx + dz * dz < 16_384.0
+                })
+                .collect(),
+        )
+    }
+
+    /// Shuffle a collected candidate list exactly as Java's Util.shuffle.
+    /// The list comes from a single player's tracker and is at most 289 long.
+    pub fn shuffle_spawning_chunks(chunks: &mut [ChunkPos], random: &mut LegacyRandom) {
+        for end in (1..chunks.len()).rev() {
+            let bound = i32::try_from(end + 1).expect("spawning chunk count fits in i32");
+            let selected = random
+                .next_int_bound(bound)
+                .expect("positive shuffle bound") as usize;
+            chunks.swap(end, selected);
+        }
+    }
+
+    pub fn has_pending_updates(&self) -> bool {
+        self.natural_spawn.has_pending_updates() || self.tracker().has_pending_updates()
     }
 
     pub fn distance(&self) -> u32 {
@@ -170,6 +226,8 @@ impl PlayerSimulation {
                     TicketKind::PlayerSimulation,
                     SimulationChunks::player_ticket_level(self.distance),
                 );
+                self.natural_spawn
+                    .remove_ticket(previous.section.chunk(), 0, 24);
             }
         }
         if !ignored {
@@ -178,6 +236,9 @@ impl PlayerSimulation {
                 TicketKind::PlayerSimulation,
                 SimulationChunks::player_ticket_level(self.distance),
             );
+            // Offsetting the distance by 24 gives levels 24..=32 over the
+            // same radius 0..=8 as FixedPlayerDistanceChunkTracker.
+            self.natural_spawn.add_ticket(section.chunk(), 0, 24);
         }
         self.player = Some(TrackedPlayer { section, ignored });
     }
@@ -191,11 +252,14 @@ impl PlayerSimulation {
                 TicketKind::PlayerSimulation,
                 SimulationChunks::player_ticket_level(self.distance),
             );
+            self.natural_spawn
+                .remove_ticket(previous.section.chunk(), 0, 24);
         }
     }
 
     /// Process graph changes only when the caller reaches a server update.
     pub fn run_updates(&mut self) {
+        self.natural_spawn.run_updates();
         self.tickets.run_updates();
     }
 }

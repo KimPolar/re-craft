@@ -89,6 +89,13 @@ public class PlayerSimulationOracle {
             }
         }
         System.out.println(blockLine);
+        var spawnLine = new StringBuilder("SPAWN ").append(round);
+        var candidates = manager.getSpawnCandidateChunks();
+        while (candidates.hasNext()) {
+            var pos = ChunkPos.unpack(candidates.nextLong());
+            spawnLine.append(' ').append(pos.x()).append(',').append(pos.z());
+        }
+        System.out.println(spawnLine);
     }
 
     public static void main(String[] args) throws Exception {
@@ -104,7 +111,7 @@ public class PlayerSimulationOracle {
         store.addTicket(new Ticket(TicketType.FORCED, 31), new ChunkPos(0, 0));
         store.addTicket(new Ticket(TicketType.PORTAL, 30), new ChunkPos(8, -2));
         snapshot(store, manager, -1);
-        for (int round = 0; round < 15; round++) {
+        for (int round = 0; round < 20; round++) {
             switch (round) {
                 case 0, 1 -> observe(manager, player, SectionPos.of(0, 4, 0), false, true);
                 case 2 -> observe(manager, player, SectionPos.of(0, 5, 0), false, true);
@@ -120,6 +127,21 @@ public class PlayerSimulationOracle {
                 case 12 -> observe(manager, player, SectionPos.of(-9, 3, -6), true, true);
                 case 13 -> remove(manager, player);
                 case 14 -> observe(manager, player, SectionPos.of(0, 4, 0), false, true);
+                case 15 -> {
+                    observe(manager, player, SectionPos.of(3, 4, 2), false, true);
+                    observe(manager, player, SectionPos.of(4, 4, 2), false, true);
+                    observe(manager, player, SectionPos.of(-4, 4, -2), false, true);
+                }
+                case 16 -> {
+                    observe(manager, player, SectionPos.of(-4, 6, -2), false, true);
+                    observe(manager, player, SectionPos.of(-4, -2, -2), false, true);
+                }
+                case 17 -> {
+                    observe(manager, player, SectionPos.of(-4, -2, -2), true, false);
+                    observe(manager, player, SectionPos.of(-4, -2, -2), false, true);
+                }
+                case 18 -> observe(manager, player, SectionPos.of(1875000, 0, -1875000), false, true);
+                case 19 -> observe(manager, player, SectionPos.of(0, 4, 0), false, true);
             }
             snapshot(store, manager, round);
         }

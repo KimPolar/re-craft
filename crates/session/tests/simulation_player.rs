@@ -21,6 +21,28 @@ fn saved_forced_tickets_and_player_registration_coexist() {
 }
 
 #[test]
+fn natural_spawn_updates_even_when_a_stronger_forced_ticket_masks_the_player() {
+    let mut tickets = SimulationTickets::default();
+    tickets.add_ticket(ChunkPos { x: 0, z: 0 }, TicketKind::Forced, 0);
+    let mut player = PlayerSimulation::new(tickets, 12);
+    player.run_updates();
+    player.observe_player(PlayerSection { x: 0, y: 4, z: 0 }, false, true);
+    assert!(!player.tracker().has_pending_updates());
+    assert!(player.has_pending_updates());
+    assert!(player.natural_spawn_candidates().is_none());
+    player.run_updates();
+    assert_eq!(player.natural_spawn_candidates().unwrap().count(), 289);
+    player.observe_player(PlayerSection { x: 1, y: 4, z: 0 }, false, true);
+    assert!(!player.tracker().has_pending_updates());
+    assert!(player.has_pending_updates());
+    player.run_updates();
+    let candidates: Vec<_> = player.natural_spawn_candidates().unwrap().collect();
+    assert_eq!(candidates.len(), 289);
+    assert!(candidates.contains(&ChunkPos { x: 9, z: 0 }));
+    assert!(!candidates.contains(&ChunkPos { x: -8, z: 0 }));
+}
+
+#[test]
 #[ignore = "manual timing of simulation ticket movement"]
 fn measure_player_simulation_chunk_movement() {
     use std::time::Instant;
@@ -122,7 +144,7 @@ fn player_simulation_lifecycle_matches_java_26_3() {
     let mut player = PlayerSimulation::new(store, 12);
     let mut expected = Vec::new();
     append_snapshot(&mut player, -1, &mut expected);
-    for round in 0..15 {
+    for round in 0..20 {
         let section = |x, y, z| PlayerSection { x, y, z };
         match round {
             0 | 1 => player.observe_player(section(0, 4, 0), false, true),
@@ -141,6 +163,21 @@ fn player_simulation_lifecycle_matches_java_26_3() {
             12 => player.observe_player(section(-9, 3, -6), true, true),
             13 => player.remove_player(),
             14 => player.observe_player(section(0, 4, 0), false, true),
+            15 => {
+                player.observe_player(section(3, 4, 2), false, true);
+                player.observe_player(section(4, 4, 2), false, true);
+                player.observe_player(section(-4, 4, -2), false, true);
+            }
+            16 => {
+                player.observe_player(section(-4, 6, -2), false, true);
+                player.observe_player(section(-4, -2, -2), false, true);
+            }
+            17 => {
+                player.observe_player(section(-4, -2, -2), true, false);
+                player.observe_player(section(-4, -2, -2), false, true);
+            }
+            18 => player.observe_player(section(1875000, 0, -1875000), false, true),
+            19 => player.observe_player(section(0, 4, 0), false, true),
             _ => unreachable!(),
         }
         append_snapshot(&mut player, round, &mut expected);
@@ -149,8 +186,85 @@ fn player_simulation_lifecycle_matches_java_26_3() {
         .lines()
         .map(|line| line.split_once("[STDOUT]: ").map_or(line, |(_, line)| line))
         .filter(|line| {
-            line.starts_with("ACTIVE ") || line.starts_with("TICK ") || line.starts_with("BLOCK ")
+            line.starts_with("ACTIVE ")
+                || line.starts_with("TICK ")
+                || line.starts_with("BLOCK ")
+                || line.starts_with("SPAWN ")
         })
+        .collect();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        if *actual != expected {
+            let actual: Vec<_> = actual.split_whitespace().collect();
+            let expected: Vec<_> = expected.split_whitespace().collect();
+            let index = actual
+                .iter()
+                .zip(&expected)
+                .position(|(a, b)| a != b)
+                .unwrap_or(actual.len().min(expected.len()));
+            panic!(
+                "{} {} differs at {}: Java {:?}, Rust {:?}; lengths {} and {}",
+                actual.first().unwrap_or(&""),
+                actual.get(1).unwrap_or(&""),
+                index,
+                actual.get(index),
+                expected.get(index),
+                actual.len(),
+                expected.len()
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn spawning_collection_and_shuffle_match_java_26_3() {
+    let stdout = run_java_oracle(
+        "SpawnChunkOracle",
+        include_str!("java/SpawnChunkOracle.java"),
+    );
+    let cases = [
+        (0, 0, 8.0, 8.0, false, true, 0),
+        (-1, -1, -0.5, -15.5, false, true, 123456789),
+        (3, -4, 63.999, -63.999, false, true, -1),
+        (0, 0, 8.0, 8.0, true, true, 42),
+        (0, 0, 8.0, 8.0, true, false, 42),
+        (1875000, -1875000, 30000008.0, -29999992.0, false, true, 1),
+    ];
+    let mut expected = Vec::new();
+    for (index, (x, z, px, pz, spectator, spectator_loads, seed)) in cases.into_iter().enumerate() {
+        let mut player = PlayerSimulation::new(SimulationTickets::default(), 12);
+        player.observe_player(PlayerSection { x, y: 4, z }, spectator, spectator_loads);
+        player.run_updates();
+        let mut chunks = player
+            .collect_spawning_chunks(px, pz, spectator, |pos| {
+                pos.x
+                    .wrapping_mul(31)
+                    .wrapping_add(pos.z.wrapping_mul(17))
+                    .wrapping_add(index as i32)
+                    .rem_euclid(7)
+                    >= 3
+            })
+            .unwrap();
+        let mut collected = format!("COLLECT {index}");
+        for pos in &chunks {
+            collected.push_str(&format!(" {},{}", pos.x, pos.z));
+        }
+        expected.push(collected);
+        let mut random = native_core::random::LegacyRandom::new(seed);
+        PlayerSimulation::shuffle_spawning_chunks(&mut chunks, &mut random);
+        let mut shuffled = format!("SHUFFLE {index}");
+        for pos in &chunks {
+            shuffled.push_str(&format!(" {},{}", pos.x, pos.z));
+        }
+        shuffled.push_str(&format!(" next={}", random.next_int()));
+        expected.push(shuffled);
+    }
+    let actual: Vec<_> = stdout
+        .lines()
+        .map(|line| line.split_once("[STDOUT]: ").map_or(line, |(_, line)| line))
+        .filter(|line| line.starts_with("COLLECT ") || line.starts_with("SHUFFLE "))
         .collect();
     assert_eq!(actual.len(), expected.len());
     for (actual, expected) in actual.iter().zip(&expected) {
@@ -283,4 +397,9 @@ fn append_snapshot(player: &mut PlayerSimulation, round: i32, output: &mut Vec<S
         ));
     }
     output.push(block_order);
+    let mut spawn = format!("SPAWN {round}");
+    for pos in player.natural_spawn_candidates().unwrap() {
+        spawn.push_str(&format!(" {},{}", pos.x, pos.z));
+    }
+    output.push(spawn);
 }

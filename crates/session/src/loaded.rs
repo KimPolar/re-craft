@@ -3451,6 +3451,20 @@ impl LoadedSession {
         &self.simulation_dependencies
     }
 
+    /// Collect spawning candidates using a caller's confirmed ticking futures.
+    /// This does not establish holder readiness or run spawning by itself.
+    pub fn collect_spawning_chunks(&self, ready: &BTreeSet<ChunkPos>) -> Option<Vec<ChunkPos>> {
+        let simulation = self.player_simulation.as_ref()?;
+        let x = f64::from(self.origin.x) + self.motion.position.x;
+        let z = f64::from(self.origin.z) + self.motion.position.z;
+        simulation.player.collect_spawning_chunks(
+            x,
+            z,
+            self.game_mode == GameMode::Spectator,
+            |pos| ready.contains(&pos),
+        )
+    }
+
     /// Update the loading window independently of the simulation distance.
     pub fn set_simulation_view_distance(&mut self, distance: u32) {
         let Some(state) = &mut self.player_simulation else {
@@ -3483,7 +3497,7 @@ impl LoadedSession {
             state.player.remove_player();
         }
         let changed = state.player.tracker().has_pending_updates();
-        if changed {
+        if state.player.has_pending_updates() {
             state.player.run_updates();
         }
         if changed || previous_loading_center != state.player.player_loading_center() {

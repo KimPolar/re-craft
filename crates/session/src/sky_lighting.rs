@@ -1,6 +1,6 @@
 //! Background sky-light work over immutable session snapshots.
 use native_world::{
-    block_light::LightBounds,
+    block_light::{LightBounds, skips_light_check_for_edit},
     loaded::{BlockPosition, BlockStateId, Chunk, ChunkPos, Section, World},
     sky_light::{SkyColumn, SkySourceScanner, same_sky_behavior, sky_change_for_edit},
     sky_propagation::{SkyChange, relight_changes},
@@ -167,9 +167,9 @@ impl SkyLighting {
         self.invalidate();
     }
 
-    /// An isolated edit with unchanged sky behavior can often update its
-    /// already-known source immediately without launching a worker. Still
-    /// retain it if Java's boundary rules actually changed the source.
+    /// An isolated edit with unchanged sky behavior can often be completed
+    /// without a worker. Java updates the source only if it queues a check;
+    /// otherwise its previously calculated height must be retained.
     pub(crate) fn discard_trivial(&mut self, world: &World, position: BlockPosition) {
         if self.worker.is_some() || self.pending.len() != 1 {
             return;
@@ -187,7 +187,11 @@ impl SkyLighting {
         let Some(mut column) = self.sources.get(&(position.x, position.z)).copied() else {
             return;
         };
-        if column.update(world, position.y) == Some(false) {
+        let skips_check = edit
+            .old
+            .and_then(|old| world.state(old))
+            .and_then(|old| skips_light_check_for_edit(old, new));
+        if skips_check == Some(true) || column.update(world, position.y) == Some(false) {
             self.sources.insert((position.x, position.z), column);
             self.pending.clear();
             Arc::make_mut(&mut self.required_chunks).clear();
@@ -655,6 +659,11 @@ fn unchanged_light_proof(
     let mut scanner = SkySourceScanner::with_chunk_overrides(world, bounds, originals);
     for edit in edits {
         let p = edit.position;
+        let old = world.state(edit.old?)?;
+        let new = world.state(edit.new)?;
+        if skips_light_check_for_edit(old, new) == Some(true) {
+            continue;
+        }
         let mut column = sources
             .get(&(p.x, p.z))
             .copied()
@@ -823,13 +832,18 @@ fn compute(
         if observed_block_id(&work, p, missing)? != old {
             return None;
         }
-        let affects_sky = sky_change_for_edit(work.state(old), work.state(edit.new)?);
+        let old_state = work.state(old)?;
+        let new_state = work.state(edit.new)?;
+        let affects_sky = sky_change_for_edit(Some(old_state), new_state);
+        let skips_check = skips_light_check_for_edit(old_state, new_state) == Some(true);
         let mut column =
             observed_source_for(&mut sources, &mut scanner, &historical, p.x, p.z, missing)?;
         initial_columns.entry((p.x, p.z)).or_insert(column);
         let previous_source = column.lowest_source_y();
         work.set_block_id(p.x, p.y, p.z, edit.new).ok()?;
-        column.update(&work, p.y)?;
+        if !skips_check {
+            column.update(&work, p.y)?;
+        }
         let current_source = column.lowest_source_y();
         sources.insert((p.x, p.z), column);
         if previous_source != current_source || affects_sky {
@@ -1266,6 +1280,167 @@ mod tests {
         sky.advance(&mut world, Some(bounds));
         assert!(sky.worker.is_none());
     }
+
+    #[test]
+    fn unchecked_glass_writes_preserve_the_existing_sky_source() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let setup = || {
+            let mut world = fixture();
+            let slab = Arc::make_mut(&mut world).intern_state(state(
+                "stone_slab",
+                &[("type", "bottom"), ("waterlogged", "false")],
+            ));
+            Arc::make_mut(&mut world)
+                .set_block_id(8, 16, 8, slab)
+                .unwrap();
+            let source = SkyColumn::load(&world, bounds, 8, 8).unwrap();
+            assert_eq!(source.lowest_source_y(), i32::MIN);
+            let mut sky = SkyLighting::default();
+            sky.set_enabled(true);
+            sky.sources.insert((8, 8), source);
+            (world, sky)
+        };
+        let witness = BlockPosition { x: 1, y: 5, z: 1 };
+        let target = BlockPosition { x: 8, y: 15, z: 8 };
+
+        // The witness represents an earlier unchecked write. The source was
+        // initialized before it, while the lower section contained only air.
+        let (mut world, mut sky) = setup();
+        let glass = Arc::make_mut(&mut world).intern_state(state("glass", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(witness.x, witness.y, witness.z, glass)
+            .unwrap();
+        let original = Arc::clone(&world.chunks[&target.chunk()]);
+        sky.record(
+            target,
+            world.block_id(target.x, target.y, target.z),
+            glass,
+            &original,
+        );
+        Arc::make_mut(&mut world)
+            .set_block_id(target.x, target.y, target.z, glass)
+            .unwrap();
+        let mut forced = sky.sources[&(8, 8)];
+        assert_eq!(forced.update(&world, target.y), Some(true));
+        assert!(sky.light_unchanged(&world, Some(bounds)));
+        sky.discard_trivial(&world, target);
+        assert!(sky.settled());
+        assert_eq!(sky.sources[&(8, 8)].lowest_source_y(), i32::MIN);
+
+        // Also exercise ordered replay when both writes are pending together.
+        let (mut world, mut sky) = setup();
+        edit(&mut sky, &mut world, witness, state("glass", &[]));
+        edit(&mut sky, &mut world, target, state("glass", &[]));
+        assert_eq!(sky.pending.len(), 2);
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        assert_eq!(sky.sources[&(8, 8)].lowest_source_y(), i32::MIN);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn unchecked_live_sky_sources_match_java_chunk() {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("GeneratedSkySourcesReplayOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedSkySourcesReplayOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let java = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("GeneratedSkySourcesReplayOracle")
+            .output()
+            .unwrap();
+        assert!(
+            java.status.success(),
+            "{}",
+            String::from_utf8_lossy(&java.stderr)
+        );
+        let output = String::from_utf8(java.stdout).unwrap();
+        let observed: Vec<i32> = output
+            .lines()
+            .find(|line| line.starts_with("N "))
+            .unwrap()
+            .split_whitespace()
+            .skip(1)
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0], observed[1]);
+        assert_ne!(
+            observed[1], observed[2],
+            "forced updates must change the Java source"
+        );
+
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let slab = Arc::make_mut(&mut world).intern_state(state(
+            "stone_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        ));
+        Arc::make_mut(&mut world)
+            .set_block_id(8, 16, 8, slab)
+            .unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let source = SkyColumn::load(&world, bounds, 8, 8).unwrap();
+        assert_eq!(source.lowest_source_y(), observed[0]);
+        sky.sources.insert((8, 8), source);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 1, y: 5, z: 1 },
+            state("glass", &[]),
+        );
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 8, y: 15, z: 8 },
+            state("glass", &[]),
+        );
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        assert_eq!(sky.sources[&(8, 8)].lowest_source_y(), observed[1]);
+    }
+
     #[test]
     fn sky_neutral_edit_keeps_work_when_java_source_boundary_changes() {
         let bounds = LightBounds::new(0, 32).unwrap();

@@ -29,6 +29,18 @@ public class GeneratedSkySourcesReplayOracle {
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        int glassCount = 0;
+        for (var block : net.minecraft.core.registries.BuiltInRegistries.BLOCK) {
+            var name = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(block).toString();
+            if (name.equals("minecraft:glass") || name.endsWith("_stained_glass")) {
+                glassCount++;
+                var glassState = block.defaultBlockState();
+                if (glassState.getValues().count() != 0
+                    || LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(), glassState))
+                    throw new AssertionError("glass unexpectedly requested a light check: " + name);
+            }
+        }
+        if (glassCount != 17) throw new AssertionError("unexpected glass registry count: " + glassCount);
         var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
         field.setAccessible(true);
         var chunk = (FakeChunk)((sun.misc.Unsafe)field.get(null)).allocateInstance(FakeChunk.class);
@@ -69,5 +81,27 @@ public class GeneratedSkySourcesReplayOracle {
         checkedRescan.fillFrom(chunk);
         OUT.println("C " + initial + " " + checked.getLowestSourceY(15, 15) + " "
             + checkedRescan.getLowestSourceY(15, 15));
+
+        for (int i = 0; i < 2; i++) {
+            var blocks = new PalettedContainer<>(Blocks.AIR.defaultBlockState(),
+                Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY));
+            chunk.sections[i] = new LevelChunkSection(blocks, null);
+        }
+        chunk.sections[1].setBlockState(8, 0, 8, slab);
+        var neutral = new ChunkSkyLightSources(chunk);
+        neutral.fillFrom(chunk);
+        var forced = new ChunkSkyLightSources(chunk);
+        forced.fillFrom(chunk);
+        int neutralBefore = neutral.getLowestSourceY(8, 8);
+        var glass = Blocks.GLASS.defaultBlockState();
+        previous = chunk.sections[0].setBlockState(1, 5, 1, glass);
+        if (LightEngine.hasDifferentLightProperties(previous, glass))
+            throw new AssertionError("first glass unexpectedly requested a light check");
+        previous = chunk.sections[0].setBlockState(8, 15, 8, glass);
+        if (LightEngine.hasDifferentLightProperties(previous, glass))
+            throw new AssertionError("second glass unexpectedly requested a light check");
+        forced.update(chunk, 8, 15, 8);
+        OUT.println("N " + neutralBefore + " " + neutral.getLowestSourceY(8, 8) + " "
+            + forced.getLowestSourceY(8, 8));
     }
 }

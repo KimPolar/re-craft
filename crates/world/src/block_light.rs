@@ -883,7 +883,7 @@ pub fn same_light_behavior(a: &BlockState, b: &BlockState) -> Option<bool> {
     Some(light_properties(a)? == light_properties(b)?)
 }
 
-/// Whether Java's ProtoChunk can skip checkBlock for a supported state pair.
+/// Whether Java's chunk can skip checkBlock for a supported state pair.
 /// Both blocks must have Java's useShapeForLightOcclusion flag disabled; the
 /// whitelist is compared with the installed 26.3 registry in tests.
 pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool> {
@@ -906,7 +906,7 @@ pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool
                 | "minecraft:sand"
                 | "minecraft:gravel"
                 | "minecraft:iron_chain"
-        )
+        ) || crate::collision::full_glass(state)
     }
     if !known_without_shape(a) || !known_without_shape(b) {
         return None;
@@ -2216,6 +2216,32 @@ mod tests {
             None
         );
         let air = state("air", None);
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            let glass = state(&format!("{color}_stained_glass"), None);
+            assert_eq!(skips_light_check_for_edit(&air, &glass), Some(true));
+        }
+        let mut invalid_glass = state("glass", None);
+        invalid_glass
+            .properties
+            .insert("invalid".into(), "true".into());
+        assert_eq!(skips_light_check_for_edit(&air, &invalid_glass), None);
         let mut vine = state("cave_vines_plant", None);
         vine.properties.insert("berries".into(), "false".into());
         assert_eq!(skips_light_check_for_edit(&air, &vine), Some(true));

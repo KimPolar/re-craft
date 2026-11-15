@@ -9400,6 +9400,7 @@ mod tests {
                 }
             }
             case if case.starts_with("kelp_noop_")
+                || case.starts_with("kelp_flow_")
                 || case == "kelp_change"
                 || case == "kelp_invalid" =>
             {
@@ -9409,6 +9410,7 @@ mod tests {
                     ("26", "below")
                 } else {
                     case.strip_prefix("kelp_noop_")
+                        .or_else(|| case.strip_prefix("kelp_flow_"))
                         .unwrap()
                         .split_once('_')
                         .unwrap()
@@ -9433,6 +9435,13 @@ mod tests {
                     _ => panic!("invalid kelp fixture direction"),
                 };
                 world.set_block_id(x, y, z, plant).unwrap();
+                if case.starts_with("kelp_flow_") {
+                    let flowing = world.intern_state(BlockState {
+                        name: "minecraft:water".into(),
+                        properties: BTreeMap::from([("level".into(), "1".into())]),
+                    });
+                    world.set_block_id(8, 8, 8, flowing).unwrap();
+                }
                 if case == "kelp_change" {
                     world.set_block_id(9, 8, 8, air).unwrap();
                 }
@@ -11956,6 +11965,11 @@ mod tests {
         for kind in std::iter::once("body".to_owned()).chain((0..=25).map(|age| age.to_string())) {
             for side in ["below", "north", "south", "west", "east"] {
                 expected.extend(water_spread_trace(&format!("kelp_noop_{kind}_{side}")));
+            }
+        }
+        for kind in std::iter::once("body".to_owned()).chain((0..=25).map(|age| age.to_string())) {
+            for side in ["north", "south", "west", "east"] {
+                expected.extend(water_spread_trace(&format!("kelp_flow_{kind}_{side}")));
             }
         }
         assert_eq!(actual, expected);

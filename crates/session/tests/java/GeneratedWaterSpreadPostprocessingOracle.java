@@ -233,6 +233,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             for(int age=0;age<=25;age++)kinds.add(Integer.toString(age));
             for(var kind:kinds)for(var side:List.of("below","north","south","west","east"))
                 scenarios.add("kelp_noop_"+kind+"_"+side);
+            for(var kind:kinds)for(var side:List.of("north","south","west","east"))
+                scenarios.add("kelp_flow_"+kind+"_"+side);
         }
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("building_barriers")){
@@ -559,13 +561,15 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     if(scenario.startsWith("origin_source_"))blocks.put(pos.north(),Blocks.WATER.defaultBlockState());
                 }
             }
-            if(scenario.startsWith("kelp_noop_")) {
-                var parts=scenario.substring("kelp_noop_".length()).split("_");
+            if(scenario.startsWith("kelp_noop_") || scenario.startsWith("kelp_flow_")) {
+                boolean flow=scenario.startsWith("kelp_flow_");
+                var parts=scenario.substring((flow?"kelp_flow_":"kelp_noop_").length()).split("_");
                 var plant=parts[0].equals("body")?Blocks.KELP_PLANT.defaultBlockState():
                     Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,Integer.parseInt(parts[0]));
                 var plantPos=switch(parts[1]){case "below" -> pos.below();case "north" -> pos.north();case "south" -> pos.south();case "west" -> pos.west();case "east" -> pos.east();default -> throw new AssertionError(parts[1]);};
                 if(!plant.getFluidState().isSource() || plant.isSolid() || plant.canOcclude() || !plant.getCollisionShape(level,plantPos).isEmpty())throw new AssertionError("unsupported kelp fluid shape: "+plant);
                 blocks.put(plantPos,plant);
+                if(flow)blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1));
             }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());

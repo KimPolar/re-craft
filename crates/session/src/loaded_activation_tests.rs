@@ -6,16 +6,26 @@ use native_persistence::{
 use native_world::loaded::{SavedBlockEntities, SavedChunkActivation};
 
 fn streamed_chunk(pos: ChunkPos, post: Tag) -> World {
+    streamed_chunk_with_ticks(pos, post, vec![])
+}
+
+fn streamed_chunk_with_ticks(
+    pos: ChunkPos,
+    post: Tag,
+    ticks: Vec<(native_persistence::nbt::JavaString, Tag)>,
+) -> World {
     let saved_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+    let mut fields = vec![
+        ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+        ("xPos".into(), Tag::Int(pos.x)),
+        ("zPos".into(), Tag::Int(pos.z)),
+        ("Status".into(), Tag::String("minecraft:full".into())),
+        ("PostProcessing".into(), post),
+    ];
+    fields.extend(ticks);
     let document = NamedTag {
         name: "".into(),
-        value: Tag::Compound(vec![
-            ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
-            ("xPos".into(), Tag::Int(pos.x)),
-            ("zPos".into(), Tag::Int(pos.z)),
-            ("Status".into(), Tag::String("minecraft:full".into())),
-            ("PostProcessing".into(), post),
-        ]),
+        value: Tag::Compound(fields),
     };
     let area = ChunkArea {
         center: saved_pos,
@@ -34,6 +44,34 @@ fn streamed_chunk(pos: ChunkPos, post: Tag) -> World {
     };
     area.materialize(&DimensionId::parse("overworld").unwrap())
         .unwrap()
+}
+
+fn captured_ticks(world: &World, pos: ChunkPos) -> SavedChunkActivation {
+    let blocks = world
+        .saved_block_ticks
+        .get(&pos)
+        .map_or(&[][..], Vec::as_slice);
+    let fluids = world
+        .saved_fluid_ticks
+        .get(&pos)
+        .map_or(&[][..], Vec::as_slice);
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            (
+                "block_ticks".into(),
+                native_persistence::generated_ticks::encode_level_block_ticks(pos, blocks, |_| {
+                    true
+                })
+                .unwrap(),
+            ),
+            (
+                "fluid_ticks".into(),
+                native_persistence::generated_ticks::encode_level_fluid_ticks(pos, fluids).unwrap(),
+            ),
+        ]),
+    };
+    SavedChunkActivation::Encoded(native_persistence::nbt::write(&document).unwrap().into())
 }
 
 #[test]
@@ -129,6 +167,96 @@ fn streamed_pending_work_blocks_save_even_after_clean_chunk_is_evicted() {
 }
 
 #[test]
+fn streamed_unsupported_or_dropped_ticks_block_the_session_save() {
+    for (field, malformed) in [("block_ticks", false), ("fluid_ticks", true)] {
+        let mut session = super::tests::session();
+        let home = session.player_chunk().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let world = Arc::make_mut(&mut session.world);
+        world.remember_saved_chunk_source_with_activation(
+            home,
+            [1; 32],
+            SavedChunkActivation::Empty,
+        );
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        session.require_saved_chunk_sources().unwrap();
+        session.queue_chunk_window(home, 1);
+        session.update(TICK);
+        assert!(session.saved_chunk_preparation_verified(home));
+
+        let mut fields = vec![
+            (
+                "i".into(),
+                Tag::String(
+                    if malformed {
+                        "minecraft:water"
+                    } else {
+                        "minecraft:observer"
+                    }
+                    .into(),
+                ),
+            ),
+            ("x".into(), Tag::Int(neighbor.x * 16)),
+            ("y".into(), Tag::Int(1)),
+            ("z".into(), Tag::Int(neighbor.z * 16)),
+            ("p".into(), Tag::Int(0)),
+        ];
+        if !malformed {
+            fields.push(("t".into(), Tag::Int(0)));
+        }
+        let raw_ticks = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(fields)],
+        };
+        let empty_post = Tag::List {
+            element_type: TagType::End,
+            values: vec![],
+        };
+        let incoming =
+            streamed_chunk_with_ticks(neighbor, empty_post, vec![(field.into(), raw_ticks)]);
+        if malformed {
+            assert!(!incoming.saved_fluid_ticks.contains_key(&neighbor));
+        } else {
+            assert_eq!(incoming.saved_block_ticks[&neighbor].len(), 1);
+        }
+        session.queue_streamed_chunk(
+            neighbor,
+            Some(incoming),
+            Some(SavedEntityData::Empty),
+            Some(SavedPoiData::Missing),
+            None,
+            None,
+        );
+        session.update(TICK);
+        assert!(!session.saved_chunk_preparation_verified(neighbor));
+        assert!(session.saved_chunk_preparation_verified(home));
+        let error = session
+            .validate_saved_chunk_preparation()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(if malformed {
+                "fluid ticks"
+            } else {
+                "block ticks"
+            }),
+            "{error}"
+        );
+        assert!(session.draft_block_ticks(home).is_err());
+
+        session.queue_chunk_window(home, 0);
+        session.update(TICK);
+        assert!(!session.world.chunks.contains_key(&neighbor));
+        assert!(session.validate_saved_chunk_preparation().is_err());
+    }
+}
+
+#[test]
 fn uncaptured_preparation_is_rejected_only_after_a_tick() {
     let mut session = super::tests::session();
     let home = session.player_chunk().unwrap();
@@ -202,11 +330,9 @@ fn pending_saved_preparation_defers_ticks_without_stopping_other_chunks() {
             native_persistence::nbt::write(&document).unwrap().into(),
         );
         world.remember_saved_chunk_source_with_activation(pending, [1; 32], activation);
-        world.remember_saved_chunk_source_with_activation(
-            home,
-            [2; 32],
-            SavedChunkActivation::Empty,
-        );
+        let home_ticks = captured_ticks(&world, home);
+        let pending_ticks = captured_ticks(&world, pending);
+        world.remember_saved_chunk_source_with_activation(home, [2; 32], home_ticks);
         let mut session =
             LoadedSession::new(world, template.origin, template.bounds, template.player).unwrap();
         session.set_initial_game_time(42).unwrap();
@@ -257,7 +383,7 @@ fn pending_saved_preparation_defers_ticks_without_stopping_other_chunks() {
         Arc::make_mut(&mut session.world).remember_saved_chunk_source_with_activation(
             pending,
             [3; 32],
-            SavedChunkActivation::Empty,
+            pending_ticks,
         );
         session.inspect_saved_chunk_preparation();
         assert!(session.simulation_allows_block_ticks(pending));

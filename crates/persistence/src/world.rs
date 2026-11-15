@@ -723,12 +723,18 @@ fn saved_chunk_activation_payload(chunk: &Tag) -> native_world::loaded::SavedChu
     };
     let mut postprocessing = false;
     let mut upgrade = false;
+    let mut block_ticks = false;
+    let mut fluid_ticks = false;
     let mut saved = Vec::new();
     for (name, value) in fields {
         let seen = if name.matches("PostProcessing") {
             &mut postprocessing
         } else if name.matches("UpgradeData") {
             &mut upgrade
+        } else if name.matches("block_ticks") {
+            &mut block_ticks
+        } else if name.matches("fluid_ticks") {
+            &mut fluid_ticks
         } else {
             continue;
         };
@@ -2823,6 +2829,21 @@ mod tests {
             }],
         };
         let upgrade = Tag::Compound(vec![("unknown".into(), Tag::Int(7))]);
+        let block_ticks = Tag::List {
+            element_type: crate::nbt::TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("i".into(), Tag::String("minecraft:sand".into())),
+                ("x".into(), Tag::Int(-32)),
+                ("y".into(), Tag::Int(1)),
+                ("z".into(), Tag::Int(48)),
+                ("t".into(), Tag::Int(3)),
+                ("p".into(), Tag::Int(0)),
+            ])],
+        };
+        let fluid_ticks = Tag::List {
+            element_type: crate::nbt::TagType::End,
+            values: vec![],
+        };
         let document = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![
@@ -2833,6 +2854,8 @@ mod tests {
                 ("UpgradeData".into(), upgrade.clone()),
                 ("unrelated".into(), Tag::Int(123)),
                 ("PostProcessing".into(), post.clone()),
+                ("block_ticks".into(), block_ticks.clone()),
+                ("fluid_ticks".into(), fluid_ticks.clone()),
             ]),
         };
         let area = ChunkArea {
@@ -2862,7 +2885,9 @@ mod tests {
             nbt::read(bytes).unwrap().value,
             Tag::Compound(vec![
                 ("UpgradeData".into(), upgrade),
-                ("PostProcessing".into(), post)
+                ("PostProcessing".into(), post),
+                ("block_ticks".into(), block_ticks),
+                ("fluid_ticks".into(), fluid_ticks),
             ])
         );
         assert_eq!(*area.chunks[&position].document, document);
@@ -2875,6 +2900,16 @@ mod tests {
             saved_chunk_activation_payload(&duplicate),
             SavedChunkActivation::Unavailable
         );
+        for field in ["block_ticks", "fluid_ticks"] {
+            let duplicate = Tag::Compound(vec![
+                (field.into(), Tag::Int(0)),
+                (field.into(), Tag::Int(1)),
+            ]);
+            assert_eq!(
+                saved_chunk_activation_payload(&duplicate),
+                SavedChunkActivation::Unavailable
+            );
+        }
         assert_eq!(
             saved_chunk_activation_payload(&Tag::Compound(vec![])),
             SavedChunkActivation::Empty

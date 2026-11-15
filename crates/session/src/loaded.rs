@@ -6954,6 +6954,29 @@ impl LoadedSession {
                     preparation,
                     entities,
                     self.bounds,
+                    crate::saved_chunk_activation::SavedTickInputs {
+                        position: pos,
+                        blocks: self
+                            .world
+                            .saved_block_ticks
+                            .get(&pos)
+                            .map_or(&[], Vec::as_slice),
+                        fluids: self
+                            .world
+                            .saved_fluid_ticks
+                            .get(&pos)
+                            .map_or(&[], Vec::as_slice),
+                        supports_block: |id| {
+                            GeneratedBlockTickKind::from_id(id).is_some()
+                                || matches!(
+                                    id,
+                                    "redstone_lamp"
+                                        | "frosted_ice"
+                                        | "sculk_sensor"
+                                        | "calibrated_sculk_sensor"
+                                )
+                        },
+                    },
                 )?;
                 Ok(fingerprint)
             })();

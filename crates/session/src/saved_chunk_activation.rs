@@ -5,15 +5,27 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail, ensure};
 use native_persistence::nbt::{self, Tag, TagType};
-use native_world::loaded::{SavedBlockEntities, SavedChunkActivation};
+use native_world::loaded::{
+    ChunkPos, SavedBlockEntities, SavedBlockTick, SavedChunkActivation, SavedFluidTick,
+};
 
 use crate::loaded::BuildBounds;
+
+pub(crate) struct SavedTickInputs<'a> {
+    pub position: ChunkPos,
+    pub blocks: &'a [SavedBlockTick],
+    pub fluids: &'a [SavedFluidTick],
+    pub supports_block: fn(&str) -> bool,
+}
 
 pub(crate) fn check_saved_work(
     saved: &SavedChunkActivation,
     entities: &SavedBlockEntities,
     bounds: BuildBounds,
+    ticks: SavedTickInputs<'_>,
 ) -> Result<()> {
+    let mut block_ticks_seen = false;
+    let mut fluid_ticks_seen = false;
     match saved {
         SavedChunkActivation::Empty => {}
         SavedChunkActivation::Unavailable => bail!("chunk preparation data is unavailable"),
@@ -29,12 +41,52 @@ pub(crate) fn check_saved_work(
                     check_postprocessing(&value, bounds)?;
                 } else if name.matches("UpgradeData") {
                     check_upgrade_data(&value, bounds)?;
+                } else if name.matches("block_ticks") {
+                    block_ticks_seen = true;
+                    check_tick_list(
+                        &value,
+                        ticks.position,
+                        ticks.blocks.iter().map(|tick| {
+                            (
+                                tick.block.as_str(),
+                                tick.position,
+                                tick.delay,
+                                tick.priority,
+                            )
+                        }),
+                        ticks.supports_block,
+                    )
+                    .context("saved block ticks cannot be preserved")?;
+                } else if name.matches("fluid_ticks") {
+                    fluid_ticks_seen = true;
+                    check_tick_list(
+                        &value,
+                        ticks.position,
+                        ticks.fluids.iter().map(|tick| {
+                            (
+                                tick.fluid.as_str(),
+                                tick.position,
+                                tick.delay,
+                                tick.priority,
+                            )
+                        }),
+                        supports_fluid_tick,
+                    )
+                    .context("saved fluid ticks cannot be preserved")?;
                 } else {
                     bail!("unrecognized preparation field");
                 }
             }
         }
     }
+    ensure!(
+        block_ticks_seen || ticks.blocks.is_empty(),
+        "saved block ticks were not captured"
+    );
+    ensure!(
+        fluid_ticks_seen || ticks.fluids.is_empty(),
+        "saved fluid ticks were not captured"
+    );
     match entities {
         SavedBlockEntities::Empty => Ok(()),
         SavedBlockEntities::Unavailable => bail!("saved block entities are unavailable"),
@@ -63,6 +115,94 @@ pub(crate) fn check_saved_work(
             Ok(())
         }
     }
+}
+
+fn supports_fluid_tick(id: &str) -> bool {
+    matches!(
+        id,
+        "minecraft:water"
+            | "water"
+            | "minecraft:flowing_water"
+            | "flowing_water"
+            | "minecraft:lava"
+            | "lava"
+            | "minecraft:flowing_lava"
+            | "flowing_lava"
+    )
+}
+
+fn check_tick_list<'a>(
+    tag: &Tag,
+    chunk: ChunkPos,
+    expected: impl ExactSizeIterator<Item = (&'a str, [i32; 3], i32, i32)>,
+    supported: fn(&str) -> bool,
+) -> Result<()> {
+    let Tag::List {
+        element_type,
+        values,
+    } = tag
+    else {
+        bail!("saved tick data is not a list");
+    };
+    ensure!(
+        *element_type == TagType::Compound || (*element_type == TagType::End && values.is_empty()),
+        "saved tick list has an unsupported element type"
+    );
+    ensure!(
+        values.len() == expected.len(),
+        "saved tick list differs from the loaded ticks"
+    );
+    for (entry, (expected_id, expected_position, expected_delay, expected_priority)) in
+        values.iter().zip(expected)
+    {
+        let Tag::Compound(fields) = entry else {
+            bail!("saved tick entry is not a compound");
+        };
+        ensure!(fields.len() == 6, "saved tick entry has unsupported fields");
+        let mut names = BTreeSet::new();
+        for (name, _) in fields {
+            ensure!(names.insert(name.0.clone()), "duplicate saved tick field");
+            ensure!(
+                ["i", "x", "y", "z", "t", "p"]
+                    .iter()
+                    .any(|candidate| name.matches(candidate)),
+                "unrecognized saved tick field"
+            );
+        }
+        let Some(Tag::String(id)) = entry.get("i") else {
+            bail!("saved tick id is missing");
+        };
+        ensure!(
+            id.matches(expected_id),
+            "saved tick id differs from loaded tick"
+        );
+        ensure!(
+            supported(expected_id),
+            "unsupported saved tick {expected_id}"
+        );
+        for (name, expected) in [
+            ("x", expected_position[0]),
+            ("y", expected_position[1]),
+            ("z", expected_position[2]),
+            ("t", expected_delay),
+            ("p", expected_priority),
+        ] {
+            ensure!(
+                entry.get(name).and_then(Tag::as_java_int) == Some(expected),
+                "saved tick {name} differs from loaded tick"
+            );
+        }
+        ensure!(
+            expected_position[0].div_euclid(16) == chunk.x
+                && expected_position[2].div_euclid(16) == chunk.z,
+            "saved tick belongs to another chunk"
+        );
+        ensure!(
+            (-3..=3).contains(&expected_priority),
+            "saved tick priority is unsupported"
+        );
+    }
+    Ok(())
 }
 
 fn check_postprocessing(tag: &Tag, bounds: BuildBounds) -> Result<()> {
@@ -140,6 +280,15 @@ mod tests {
         .into()
     }
 
+    fn no_ticks() -> SavedTickInputs<'static> {
+        SavedTickInputs {
+            position: ChunkPos { x: 0, z: 0 },
+            blocks: &[],
+            fluids: &[],
+            supports_block: |_| false,
+        }
+    }
+
     #[test]
     fn detects_saved_preparation_work_without_claiming_chunk_readiness() {
         let bounds = BuildBounds {
@@ -167,6 +316,7 @@ mod tests {
                 ]))),
                 &SavedBlockEntities::Empty,
                 bounds,
+                no_ticks(),
             )
         };
         let upgrade = Tag::Compound(vec![
@@ -239,7 +389,8 @@ mod tests {
             check_saved_work(
                 &SavedChunkActivation::Unavailable,
                 &SavedBlockEntities::Empty,
-                bounds
+                bounds,
+                no_ticks(),
             )
             .is_err()
         );
@@ -259,6 +410,7 @@ mod tests {
                     values: vec![Tag::Compound(fields)],
                 })),
                 bounds,
+                no_ticks(),
             )
         };
         assert!(check(vec![]).is_ok());
@@ -272,5 +424,86 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_the_complete_original_tick_lists() {
+        let position = ChunkPos { x: -1, z: 1 };
+        let blocks = vec![SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: [-1, 4, 16],
+            delay: -3,
+            priority: 2,
+        }];
+        let fluids = vec![SavedFluidTick {
+            fluid: "minecraft:water".into(),
+            position: [-2, 6, 17],
+            delay: 12,
+            priority: -1,
+        }];
+        let tick = |id: &str, [x, y, z]: [i32; 3], delay, priority| {
+            Tag::Compound(vec![
+                ("i".into(), Tag::String(id.into())),
+                ("x".into(), Tag::Int(x)),
+                ("y".into(), Tag::Int(y)),
+                ("z".into(), Tag::Int(z)),
+                ("t".into(), Tag::Int(delay)),
+                ("p".into(), Tag::Int(priority)),
+            ])
+        };
+        let list = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        let block = tick("minecraft:sand", blocks[0].position, -3, 2);
+        let fluid = tick("minecraft:water", fluids[0].position, 12, -1);
+        let check = |block_data: Option<Tag>, fluid_data: Option<Tag>| {
+            let mut fields = Vec::new();
+            if let Some(data) = block_data {
+                fields.push(("block_ticks".into(), data));
+            }
+            if let Some(data) = fluid_data {
+                fields.push(("fluid_ticks".into(), data));
+            }
+            check_saved_work(
+                &SavedChunkActivation::Encoded(encode(Tag::Compound(fields))),
+                &SavedBlockEntities::Empty,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                SavedTickInputs {
+                    position,
+                    blocks: &blocks,
+                    fluids: &fluids,
+                    supports_block: |id| id == "minecraft:sand",
+                },
+            )
+        };
+        assert!(
+            check(
+                Some(list(vec![block.clone()])),
+                Some(list(vec![fluid.clone()]))
+            )
+            .is_ok()
+        );
+        assert!(check(None, Some(list(vec![fluid.clone()]))).is_err());
+        assert!(check(Some(list(vec![])), Some(list(vec![fluid.clone()]))).is_err());
+
+        let mut extra = block.clone();
+        if let Tag::Compound(fields) = &mut extra {
+            fields.push(("extra".into(), Tag::Int(1)));
+        }
+        assert!(check(Some(list(vec![extra])), Some(list(vec![fluid.clone()]))).is_err());
+        let out_of_range_priority = tick("minecraft:water", fluids[0].position, 12, 4);
+        assert!(
+            check(
+                Some(list(vec![block.clone()])),
+                Some(list(vec![out_of_range_priority]))
+            )
+            .is_err()
+        );
+        let wrong_chunk = tick("minecraft:sand", [0, 4, 16], -3, 2);
+        assert!(check(Some(list(vec![wrong_chunk])), Some(list(vec![fluid]))).is_err());
     }
 }

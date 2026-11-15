@@ -162,8 +162,8 @@ pub enum SavedBlockEntities {
     Unavailable,
 }
 
-/// Original chunk preparation fields. An empty value only means these saved
-/// fields are absent; it does not establish that a chunk is ready to tick.
+/// Original chunk preparation and scheduled tick fields. An empty value only
+/// means these saved fields are absent; it does not establish ticking readiness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SavedChunkActivation {
     Empty,
@@ -236,7 +236,7 @@ impl World {
         );
     }
 
-    /// Retain preparation inputs from the same document as the fingerprint.
+    /// Retain preparation and scheduled tick inputs from the fingerprinted document.
     pub fn remember_saved_chunk_source_with_activation(
         &mut self,
         pos: ChunkPos,

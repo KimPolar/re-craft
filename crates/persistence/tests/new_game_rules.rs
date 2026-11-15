@@ -15,6 +15,7 @@ fn initial_game_rules_match_java_codec() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let custom = FluidGameRules {
         random_tick_speed: 17,
+        fire_spread_radius_around_player: -1,
         spawn_mobs: false,
         advance_time: false,
         advance_weather: false,

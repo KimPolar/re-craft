@@ -431,6 +431,7 @@ public class FreshGameRulesOracle {
             || rules.get(GameRules.FALL_DAMAGE) || !rules.get(GameRules.KEEP_INVENTORY)
             || !rules.get(GameRules.IMMEDIATE_RESPAWN) || rules.get(GameRules.SHOW_DEATH_MESSAGES)
             || rules.get(GameRules.RANDOM_TICK_SPEED)!=9 || rules.get(GameRules.RESPAWN_RADIUS)!=7
+            || rules.get(GameRules.FIRE_SPREAD_RADIUS_AROUND_PLAYER)!=-1
             || !rules.get(GameRules.MOB_GRIEFING)) throw new AssertionError("rules differ");
         System.out.println("RE_CRAFT_FRESH_GAMERULES_OK");
     }
@@ -446,6 +447,7 @@ public class FreshGameRulesOracle {
     );
     let rules = FluidGameRules {
         random_tick_speed: 9,
+        fire_spread_radius_around_player: -1,
         spawn_mobs: false,
         advance_time: false,
         advance_weather: false,

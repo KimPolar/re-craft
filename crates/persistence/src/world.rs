@@ -893,6 +893,7 @@ pub struct DataPackSettings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FluidGameRules {
     pub random_tick_speed: i32,
+    pub fire_spread_radius_around_player: i32,
     pub spawn_mobs: bool,
     pub advance_time: bool,
     pub advance_weather: bool,
@@ -912,6 +913,7 @@ impl Default for FluidGameRules {
     fn default() -> Self {
         Self {
             random_tick_speed: 3,
+            fire_spread_radius_around_player: 128,
             spawn_mobs: true,
             advance_time: true,
             advance_weather: true,
@@ -941,6 +943,10 @@ impl FluidGameRules {
             self.respawn_radius >= 0,
             "respawn_radius must not be negative"
         );
+        ensure!(
+            self.fire_spread_radius_around_player >= -1,
+            "fire_spread_radius_around_player must be at least -1"
+        );
         let mut values = Vec::new();
         for (name, value) in [
             ("spawn_mobs", self.spawn_mobs),
@@ -967,6 +973,10 @@ impl FluidGameRules {
         values.push((
             "minecraft:random_tick_speed".into(),
             Tag::Int(self.random_tick_speed),
+        ));
+        values.push((
+            "minecraft:fire_spread_radius_around_player".into(),
+            Tag::Int(self.fire_spread_radius_around_player),
         ));
         values.push((
             "minecraft:respawn_radius".into(),
@@ -2230,8 +2240,25 @@ impl WorldReader {
                 speed
             }
         };
+        let fire_spread_radius_around_player = match data
+            .get("minecraft:fire_spread_radius_around_player")
+            .or_else(|| data.get("fire_spread_radius_around_player"))
+        {
+            None => 128,
+            Some(value) => {
+                let radius = value
+                    .as_java_int()
+                    .context("fire_spread_radius_around_player must be a number")?;
+                ensure!(
+                    radius >= -1,
+                    "fire_spread_radius_around_player must be at least -1"
+                );
+                radius
+            }
+        };
         Ok(FluidGameRules {
             random_tick_speed,
+            fire_spread_radius_around_player,
             spawn_mobs: read("spawn_mobs", true)?,
             advance_time: read("advance_time", true)?,
             advance_weather: read("advance_weather", true)?,
@@ -3597,6 +3624,41 @@ mod tests {
     }
 
     #[test]
+    fn fire_spread_radius_rejects_invalid_saved_values() {
+        let directory = tempfile::tempdir().unwrap();
+        write_gzip(
+            &directory.path().join("level.dat"),
+            &level(TARGET_DATA_VERSION),
+        );
+        let reader =
+            WorldReader::open(directory.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+        let path = directory.path().join("data/minecraft/game_rules.dat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for value in [Tag::Int(-2), Tag::String("not an integer".into())] {
+            let root = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    (
+                        "data".into(),
+                        Tag::Compound(vec![("fire_spread_radius_around_player".into(), value)]),
+                    ),
+                ]),
+            };
+            write_gzip(&path, &root);
+            assert!(reader.fluid_game_rules().is_err());
+        }
+        assert!(
+            FluidGameRules {
+                fire_spread_radius_around_player: -2,
+                ..Default::default()
+            }
+            .new_world_document()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn source_conversion_rules_use_the_26_3_saved_data_path() {
         let dir = tempfile::tempdir().unwrap();
         write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
@@ -3627,6 +3689,7 @@ mod tests {
                         ("minecraft:show_death_messages".into(), Tag::Byte(0)),
                         ("minecraft:respawn_radius".into(), Tag::Int(7)),
                         ("minecraft:random_tick_speed".into(), Tag::Int(9)),
+                        ("minecraft:fire_spread_radius_around_player".into(), Tag::Int(-1)),
                         ("minecraft:advance_time".into(), Tag::Byte(0)),
                         ("minecraft:advance_weather".into(), Tag::Byte(0)),
                     ]),
@@ -3643,6 +3706,7 @@ mod tests {
                 reader.fluid_game_rules().unwrap(),
                 FluidGameRules {
                     random_tick_speed: 9,
+                    fire_spread_radius_around_player: -1,
                     spawn_mobs: false,
                     advance_time: false,
                     advance_weather: false,

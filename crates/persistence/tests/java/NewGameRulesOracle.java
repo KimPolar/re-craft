@@ -14,7 +14,7 @@ public class NewGameRulesOracle {
             var data = NbtIo.read(Path.of(args[i])).get("data");
             var rules = GameRuleMap.CODEC.parse(NbtOps.INSTANCE, data).getOrThrow();
             boolean defaults = i == 0;
-            if (rules.size() != 14 || rules.get(GameRules.SPAWN_MOBS) != defaults ||
+            if (rules.size() != 15 || rules.get(GameRules.SPAWN_MOBS) != defaults ||
                 rules.get(GameRules.ADVANCE_TIME) != defaults ||
                 rules.get(GameRules.ADVANCE_WEATHER) != defaults ||
                 rules.get(GameRules.WATER_SOURCE_CONVERSION) != defaults ||
@@ -27,6 +27,7 @@ public class NewGameRulesOracle {
                 rules.get(GameRules.IMMEDIATE_RESPAWN) == defaults ||
                 rules.get(GameRules.SHOW_DEATH_MESSAGES) != defaults ||
                 rules.get(GameRules.RANDOM_TICK_SPEED) != (defaults ? 3 : 17) ||
+                rules.get(GameRules.FIRE_SPREAD_RADIUS_AROUND_PLAYER) != (defaults ? 128 : -1) ||
                 rules.get(GameRules.RESPAWN_RADIUS) != (defaults ? 10 : 4)) {
                 throw new AssertionError("Java game rules differ: " + rules);
             }

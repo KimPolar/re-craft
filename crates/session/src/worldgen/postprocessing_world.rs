@@ -2156,6 +2156,10 @@ impl GeneratedBlockView<'_> {
         // Unknown rules must yield the same plan for both possible values.
         // Water's delay is fixed and never samples lava's delay RNG.
         let mut planned = None;
+        // A kelp block contains source water and has an empty collision shape.
+        // It can be consulted while proving that a water tick is a no-op, but
+        // live changes still need the plant's shape callbacks and level RNG.
+        let consulted_kelp = std::cell::Cell::new(false);
         for converts in [false, true] {
             if fluid.kind == FluidKind::Water
                 && self
@@ -2192,6 +2196,20 @@ impl GeneratedBlockView<'_> {
                         Cell::Unknown if fluid.kind == FluidKind::Lava => {
                             self.lava_cell_for_spread(p)
                         }
+                        Cell::Unknown
+                            if fluid.kind == FluidKind::Water
+                                && self.read(p.to_array()).is_ok_and(|state| {
+                                    super::ore::valid_generated_kelp(&state)
+                                }) =>
+                        {
+                            consulted_kelp.set(true);
+                            Cell::OpenWater(native_world::fluid::FluidState {
+                                kind: FluidKind::Water,
+                                amount: 8,
+                                source: true,
+                                falling: false,
+                            })
+                        }
                         cell => cell,
                     },
                     glam::IVec3::from_array(pos),
@@ -2213,6 +2231,10 @@ impl GeneratedBlockView<'_> {
         if planned.is_empty() {
             return Ok(());
         }
+        ensure!(
+            !consulted_kelp.get(),
+            "generated fluid changes need kelp neighbor callbacks"
+        );
         use native_world::fluid_sim::ChangedBlock;
         if fluid.kind == FluidKind::Lava
             && !fluid.source
@@ -9377,6 +9399,44 @@ mod tests {
                     world.set_block_id(8, 7, 8, snowy).unwrap();
                 }
             }
+            case if case.starts_with("kelp_noop_")
+                || case == "kelp_change"
+                || case == "kelp_invalid" =>
+            {
+                let (kind, direction) = if case == "kelp_change" {
+                    ("body", "below")
+                } else if case == "kelp_invalid" {
+                    ("26", "below")
+                } else {
+                    case.strip_prefix("kelp_noop_")
+                        .unwrap()
+                        .split_once('_')
+                        .unwrap()
+                };
+                let plant = world.intern_state(BlockState {
+                    name: format!(
+                        "minecraft:{}",
+                        if kind == "body" { "kelp_plant" } else { "kelp" }
+                    ),
+                    properties: if kind == "body" {
+                        BTreeMap::new()
+                    } else {
+                        BTreeMap::from([("age".into(), kind.into())])
+                    },
+                });
+                let [x, y, z] = match direction {
+                    "below" => [8, 7, 8],
+                    "north" => [8, 8, 7],
+                    "south" => [8, 8, 9],
+                    "west" => [7, 8, 8],
+                    "east" => [9, 8, 8],
+                    _ => panic!("invalid kelp fixture direction"),
+                };
+                world.set_block_id(x, y, z, plant).unwrap();
+                if case == "kelp_change" {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+            }
             "down" | "down_sand" | "down_wet_slab" => {
                 world.set_block_id(8, 7, 8, air).unwrap();
                 if case == "down_sand" {
@@ -10353,6 +10413,22 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
+        if matches!(case, "kelp_change" | "kelp_invalid") {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            let expected = if case == "kelp_change" {
+                "generated fluid changes need kelp neighbor callbacks"
+            } else {
+                "unsupported block state"
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            assert_eq!(stage.world.block(8, 7, 8), source.block(8, 7, 8));
+            assert_eq!(stage.world.block(9, 8, 8), source.block(9, 8, 8));
+            assert!(stage.edits.is_empty());
+            return vec!["rolled back".into()];
+        }
         if case == "bubble_magma_guard" {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let error = stage.try_poll(chunk, 1).unwrap_err();
@@ -11866,6 +11942,29 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn enclosed_water_with_kelp_matches_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["kelp_noop"],
+        );
+        let mut expected = Vec::new();
+        for kind in std::iter::once("body".to_owned()).chain((0..=25).map(|age| age.to_string())) {
+            for side in ["below", "north", "south", "west", "east"] {
+                expected.extend(water_spread_trace(&format!("kelp_noop_{kind}_{side}")));
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn kelp_fluid_changes_and_invalid_states_roll_back() {
+        assert_eq!(water_spread_trace("kelp_change"), ["rolled back"]);
+        assert_eq!(water_spread_trace("kelp_invalid"), ["rolled back"]);
     }
 
     #[test]

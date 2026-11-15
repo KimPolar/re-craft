@@ -4753,7 +4753,7 @@ fn kelp_forbidden_tag() -> &'static ResourceId {
     TAG.get_or_init(|| ResourceId::parse("minecraft:cannot_support_kelp").unwrap())
 }
 
-fn valid_generated_kelp(state: &BlockState) -> bool {
+pub(super) fn valid_generated_kelp(state: &BlockState) -> bool {
     matches!(
         state.name.as_str(),
         "minecraft:kelp" | "minecraft:kelp_plant"

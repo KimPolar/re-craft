@@ -59,6 +59,8 @@ mod chest_edge_tests;
 mod double_plant_tests;
 mod jigsaw;
 #[cfg(test)]
+mod kelp_edge_tests;
+#[cfg(test)]
 mod kelp_tests;
 #[cfg(test)]
 mod seagrass_edge_tests;
@@ -1379,6 +1381,7 @@ impl ConfiguredDecoration {
                 tags.insert(ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap());
                 tags.insert(ResourceId::parse("minecraft:snow").unwrap());
                 tags.insert(seagrass_forbidden_tag().clone());
+                tags.insert(kelp_forbidden_tag().clone());
                 tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_azalea").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
@@ -1777,6 +1780,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         }
         if needs_structure_edges {
             required.insert(seagrass_forbidden_tag().clone());
+            required.insert(kelp_forbidden_tag().clone());
         }
         let tags = OreBlockTags::load(provider, block_registry, &required)?;
         let mineshaft_biomes = needs_mineshaft
@@ -4744,6 +4748,19 @@ fn seagrass_forbidden_tag() -> &'static ResourceId {
     TAG.get_or_init(|| ResourceId::parse("minecraft:cannot_support_seagrass").unwrap())
 }
 
+fn kelp_forbidden_tag() -> &'static ResourceId {
+    static TAG: OnceLock<ResourceId> = OnceLock::new();
+    TAG.get_or_init(|| ResourceId::parse("minecraft:cannot_support_kelp").unwrap())
+}
+
+fn valid_generated_kelp(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:kelp" | "minecraft:kelp_plant"
+    )
+        && native_world::block_light::same_light_behavior(state, state) == Some(true)
+}
+
 fn tree_vegetation_tag(dry: bool) -> &'static ResourceId {
     static NORMAL: OnceLock<ResourceId> = OnceLock::new();
     static DRY: OnceLock<ResourceId> = OnceLock::new();
@@ -5190,6 +5207,110 @@ fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
 }
 
 impl DecorationRegion<'_> {
+    fn schedule_generation_block_tick(&mut self, pos: [i32; 3], block: &str) -> Result<()> {
+        let chunk = chunk(pos);
+        ensure!(
+            self.world.chunks.contains_key(&chunk),
+            "generation block tick chunk is missing"
+        );
+        let keys = self.block_tick_keys.entry(chunk).or_insert_with(|| {
+            self.world
+                .saved_block_ticks
+                .get(&chunk)
+                .into_iter()
+                .flatten()
+                .map(|tick| (tick.position, tick.block.clone()))
+                .collect()
+        });
+        if keys.insert((pos, block.to_owned())) {
+            // ProtoChunkTicks discards the requested delay and stores 0.
+            self.world
+                .saved_block_ticks
+                .entry(chunk)
+                .or_default()
+                .push(SavedBlockTick {
+                    block: block.to_owned(),
+                    position: pos,
+                    delay: 0,
+                    priority: 0,
+                });
+        }
+        Ok(())
+    }
+
+    fn update_generated_kelp_shape(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        direction: [i32; 3],
+        neighbor: &BlockState,
+        random: Option<&mut native_resources::worldgen_region_random::RegionRandom>,
+    ) -> Result<BlockState> {
+        ensure!(valid_generated_kelp(state), "invalid generation kelp state");
+        ensure!(
+            matches!(
+                direction,
+                [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1] | [-1, 0, 0] | [1, 0, 0]
+            ),
+            "invalid kelp edge direction"
+        );
+        let body = state.name == "minecraft:kelp_plant";
+        if direction == [0, -1, 0] {
+            let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            let is_kelp = matches!(
+                below.name.as_str(),
+                "minecraft:kelp" | "minecraft:kelp_plant"
+            );
+            if is_kelp {
+                ensure!(valid_generated_kelp(&below), "invalid kelp support state");
+            }
+            let survives = !self.tags.contains(kelp_forbidden_tag(), &below.name)?
+                && (is_kelp || generation_face_sturdy(&below, [0, 1, 0])?);
+            if !survives {
+                self.schedule_generation_block_tick(pos, &state.name)?;
+            } else if !body {
+                let above = OreWorld::block(self, [pos[0], pos[1].wrapping_add(1), pos[2]])?;
+                if matches!(
+                    above.name.as_str(),
+                    "minecraft:kelp" | "minecraft:kelp_plant"
+                ) {
+                    ensure!(valid_generated_kelp(&above), "invalid kelp above head");
+                    return Ok(BlockState {
+                        name: "minecraft:kelp_plant".into(),
+                        properties: BTreeMap::new(),
+                    });
+                }
+            }
+        }
+        if direction == [0, 1, 0] {
+            let neighbor_is_kelp = matches!(
+                neighbor.name.as_str(),
+                "minecraft:kelp" | "minecraft:kelp_plant"
+            );
+            if neighbor_is_kelp {
+                ensure!(valid_generated_kelp(neighbor), "invalid kelp neighbor");
+            }
+            if body && !neighbor_is_kelp {
+                let age = random
+                    .context("generation region random is needed for kelp conversion")?
+                    .next_int_bound(25)
+                    .context("invalid kelp age bound")?;
+                return Ok(BlockState {
+                    name: "minecraft:kelp".into(),
+                    properties: BTreeMap::from([("age".into(), age.to_string())]),
+                });
+            }
+            if !body && neighbor_is_kelp {
+                return Ok(BlockState {
+                    name: "minecraft:kelp_plant".into(),
+                    properties: BTreeMap::new(),
+                });
+            }
+        }
+        SpringWorld::schedule_spring_tick(self, pos, &ResourceId::parse("minecraft:water")?)?;
+        Ok(state.clone())
+    }
+
     /// Known-shape writes used by supported tree states. Unknown
     /// block-entity, POI or postprocessing effects abort the transaction.
     fn set_tree_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
@@ -5204,6 +5325,7 @@ impl DecorationRegion<'_> {
         let allowed = tree_generated_leaf(state)?
             || tree_generated_log(state)
             || tree_leaf_litter(state)?
+            || (flags == 2 && valid_generated_kelp(state))
             || (flags == 2 && valid_vine(state))
             || (flags == 2 && tree_mushroom_block(state)?)
             || (flags == 2 && tree_grass_block(state))
@@ -5220,6 +5342,12 @@ impl DecorationRegion<'_> {
             return Ok(());
         }
         let old = self.read(pos)?;
+        if valid_generated_kelp(state) {
+            ensure!(
+                valid_generated_kelp(&old),
+                "unsupported tree kelp replacement"
+            );
+        }
         if tree_mushroom_block(state)? {
             ensure!(
                 old.name == state.name && tree_mushroom_block(&old)?,
@@ -5232,6 +5360,7 @@ impl DecorationRegion<'_> {
                 || tree_generated_log(&old)
                 || tree_leaf_litter(&old)?
                 || tree_mushroom_block(&old)?
+                || (valid_generated_kelp(state) && valid_generated_kelp(&old))
                 || valid_vine(&old)
                 || simple_plant_kind(&old).is_ok()
                 || tree_edge_plant(&old)?.is_some(),
@@ -6478,6 +6607,11 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                     properties: BTreeMap::new(),
                 });
             }
+        } else if matches!(
+            state.name.as_str(),
+            "minecraft:kelp" | "minecraft:kelp_plant"
+        ) {
+            return self.update_generated_kelp_shape(pos, state, direction, neighbor, None);
         } else if state.name == "minecraft:seagrass" {
             ensure!(state.properties.is_empty(), "invalid seagrass state");
             let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
@@ -8089,30 +8223,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             // WorldGenTickAccess uses the chunk at the position even if a
             // preceding setBlock was rejected by the feature write radius.
             let block = self.block(pos)?.name;
-            let chunk = chunk(pos);
-            let keys = self.block_tick_keys.entry(chunk).or_insert_with(|| {
-                self.world
-                    .saved_block_ticks
-                    .get(&chunk)
-                    .into_iter()
-                    .flatten()
-                    .map(|tick| (tick.position, tick.block.clone()))
-                    .collect()
-            });
-            if keys.insert((pos, block.clone())) {
-                // ProtoChunkTicks discards the requested delay and stores 0.
-                self.world
-                    .saved_block_ticks
-                    .entry(chunk)
-                    .or_default()
-                    .push(SavedBlockTick {
-                        block,
-                        position: pos,
-                        delay: 0,
-                        priority: 0,
-                    });
-            }
-            Ok(())
+            self.schedule_generation_block_tick(pos, &block)
         })();
         if result.is_err() {
             self.failed = true;
@@ -9039,6 +9150,9 @@ mod tests {
                     Some(br#"{"values":[]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/cannot_support_seagrass.json" => {
+                    Some(br#"{"values":[]}"#.to_vec())
+                }
+                "data/minecraft/tags/block/cannot_support_kelp.json" => {
                     Some(br#"{"values":[]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/air.json" => Some(

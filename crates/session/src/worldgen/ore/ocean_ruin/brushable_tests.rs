@@ -126,6 +126,7 @@ fn generated_brushable_replacement_matches_java() -> Result<()> {
                 },
                 ice_tags: &tags,
                 bubble_fluids: &fluids,
+                shape_random: None,
                 aligned: &aligned,
             };
             piece.place_template_block(pos, &target, None, &mut random)

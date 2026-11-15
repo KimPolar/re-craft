@@ -1126,6 +1126,143 @@ impl Drop for MissingGenerationStagedAssemblyWorker {
     }
 }
 
+/// Feature output based on the staged live blocks. Additional live inputs,
+/// lighting and side effects remain unverified and cannot be published.
+pub(crate) enum StagedMissingFeatureResult {
+    Completed {
+        terrain: StagedMissingTerrain,
+        position: ChunkPos,
+        placements: Vec<bool>,
+    },
+    Failed {
+        terrain: StagedMissingTerrain,
+        error: anyhow::Error,
+    },
+}
+
+pub(crate) struct StagedMissingFeatureStartError {
+    pub terrain: StagedMissingTerrain,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationStagedFeatureWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<StagedMissingFeatureResult>,
+    finished: bool,
+}
+
+impl MissingGenerationStagedFeatureWorker {
+    /// A feature that needs light is rejected until the exact visible light
+    /// engine revision can be captured; no guessed brightness is supplied.
+    pub fn start(
+        terrain: StagedMissingTerrain,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        position: ChunkPos,
+    ) -> std::result::Result<Self, StagedMissingFeatureStartError> {
+        let error = if !terrain.is_current(streamer, session) {
+            Some(anyhow::anyhow!("staged terrain is stale"))
+        } else {
+            terrain.batch.require_ready_features(position).err()
+        };
+        if let Some(error) = error {
+            return Err(StagedMissingFeatureStartError { terrain, error });
+        }
+        let observed = terrain.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            terrain,
+            move |mut terrain| {
+                let result = (|| -> Result<Vec<bool>> {
+                    anyhow::ensure!(
+                        !worker_cancelled.load(Ordering::Acquire),
+                        "staged feature generation cancelled"
+                    );
+                    anyhow::ensure!(
+                        terrain.observed.stamp.is_current(),
+                        "staged terrain is stale"
+                    );
+                    terrain
+                        .generator
+                        .run_staged_live_features(&mut terrain.batch, position)
+                })();
+                let outcome = match result {
+                    Ok(placements) => StagedMissingFeatureResult::Completed {
+                        terrain,
+                        position,
+                        placements,
+                    },
+                    Err(error) => StagedMissingFeatureResult::Failed { terrain, error },
+                };
+                let _ = sender.send(outcome);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-live-features".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(terrain, error)| StagedMissingFeatureStartError {
+            terrain,
+            error: anyhow::Error::new(error).context("cannot start staged feature generation"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<StagedMissingFeatureResult>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("staged feature generation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        let current = match &result {
+            StagedMissingFeatureResult::Completed { terrain, .. }
+            | StagedMissingFeatureResult::Failed { terrain, .. } => {
+                terrain.is_current(streamer, session)
+            }
+        };
+        if self.cancelled.load(Ordering::Acquire)
+            || !self.observed.is_current(streamer, session)
+            || !current
+        {
+            crate::generation_staging::discard_async(result);
+            anyhow::bail!("staged feature generation was cancelled or became stale");
+        }
+        Ok(Some(result))
+    }
+}
+
+impl Drop for MissingGenerationStagedFeatureWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 /// Intermediate data guarded against the captured live terrain, POI and
 /// supported entities. Other live state, disk inputs and later stages still
 /// require validation before attaching or writing anything.

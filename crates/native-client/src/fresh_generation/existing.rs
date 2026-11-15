@@ -149,6 +149,43 @@ fn validate_saved_decoration_references(
 
 type SavedStructureKey = (ResourceId, native_world::loaded::ChunkPos);
 
+/// A mineshaft has no structure-level after-place effect in Java 26.3. Its
+/// pieces can therefore be omitted for this pass only when none intersects
+/// the chunk horizontally. Ignoring Y here is deliberately conservative.
+fn mineshaft_may_touch_chunk(
+    target: native_world::loaded::ChunkPos,
+    pieces: &[native_session::worldgen::saved_structure_starts::RestoredStructurePiece],
+) -> Result<bool> {
+    use native_session::worldgen::saved_structure_starts::RestoredStructurePiece;
+
+    let min_x = target
+        .x
+        .checked_mul(16)
+        .context("structure chunk X overflow")?;
+    let min_z = target
+        .z
+        .checked_mul(16)
+        .context("structure chunk Z overflow")?;
+    let max_x = min_x
+        .checked_add(15)
+        .context("structure chunk X overflow")?;
+    let max_z = min_z
+        .checked_add(15)
+        .context("structure chunk Z overflow")?;
+    let mut touches = false;
+    for piece in pieces {
+        let RestoredStructurePiece::Mineshaft(piece) = piece else {
+            bail!("mineshaft contains another structure piece type");
+        };
+        let bounds = piece.piece.bounds;
+        touches |= bounds.min[0] <= max_x
+            && bounds.max[0] >= min_x
+            && bounds.min[2] <= max_z
+            && bounds.max[2] >= min_z;
+    }
+    Ok(touches)
+}
+
 #[derive(Clone)]
 struct ResumedTreasureStart {
     source: Arc<NamedTag>,
@@ -1737,6 +1774,16 @@ impl StagedLiveTerrainBatch {
         pos: native_world::loaded::ChunkPos,
     ) -> Option<native_session::worldgen::schedule::GenerationStage> {
         self.batch.schedule.completed(pos)
+    }
+
+    pub fn require_ready_features(&self, pos: native_world::loaded::ChunkPos) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        self.batch.require_unfinished_features(pos)?;
+        ensure!(
+            self.batch.schedule.ready(pos, GenerationStage::Features),
+            "features dependencies are incomplete"
+        );
+        Ok(())
     }
 }
 
@@ -6105,13 +6152,14 @@ impl PreparedExistingGenerator {
     ) -> Result<SavedStructurePlan> {
         let references = self.restore_saved_structure_references(target)?;
         validate_saved_decoration_references(&references)?;
-        self.prepare_captured_structure_plan(&world.treasure_starts, &references.references)
+        self.prepare_captured_structure_plan(&world.treasure_starts, &references.references, target)
     }
 
     fn prepare_captured_structure_plan(
         &mut self,
         previous: &BTreeMap<SavedStructureKey, ResumedTreasureStart>,
         references: &native_session::worldgen::structure_references::OrderedStructureReferences,
+        target: native_persistence::world::ChunkPos,
     ) -> Result<SavedStructurePlan> {
         use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
         use native_session::worldgen::saved_structure_starts::{
@@ -6205,8 +6253,35 @@ impl PreparedExistingGenerator {
                     if pieces.is_empty() {
                         continue;
                     }
+                    if pieces
+                        .iter()
+                        .all(|piece| matches!(piece, RestoredStructurePiece::Mineshaft(_)))
+                        && !mineshaft_may_touch_chunk(
+                            native_world::loaded::ChunkPos {
+                                x: target.x,
+                                z: target.z,
+                            },
+                            pieces,
+                        )?
+                    {
+                        continue;
+                    }
                     let [RestoredStructurePiece::BuriedTreasure(bounds)] = pieces.as_slice() else {
-                        bail!("saved structure decoration type is not supported");
+                        let kind = match &pieces[0] {
+                            RestoredStructurePiece::BuriedTreasure(_) => "buried_treasure",
+                            RestoredStructurePiece::SwampHut(_) => "swamp_hut",
+                            RestoredStructurePiece::Mineshaft(_) => "mineshaft",
+                            RestoredStructurePiece::Jigsaw(_) => "jigsaw",
+                            RestoredStructurePiece::RuinedPortal(_) => "ruined_portal",
+                        };
+                        bail!(
+                            "saved structure decoration type is not supported: {}:{} at {},{} ({kind}, {} pieces)",
+                            entry.id.namespace,
+                            entry.id.path,
+                            source.x,
+                            source.z,
+                            pieces.len()
+                        );
                     };
                     ResumedTreasureStart {
                         source: captured,
@@ -6577,6 +6652,25 @@ impl PreparedExistingGenerator {
         self.run_captured_features_inner(batch, context, None)
     }
 
+    /// Run a feature pass on the detached live terrain without inventing a
+    /// light value. Light-dependent features fail and leave the batch intact.
+    /// This intermediate result does not authorize publication or saving.
+    pub fn run_staged_live_features(
+        &mut self,
+        batch: &mut StagedLiveTerrainBatch,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<Vec<bool>> {
+        batch.require_ready_features(position)?;
+        let context = self.prepare_captured_decoration(
+            &batch.batch,
+            native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+        )?;
+        self.run_captured_features(&mut batch.batch, &context)
+    }
+
     /// Run features against a caller-verified initial light revision. Any
     /// successful feature pass invalidates that light for this batch.
     pub fn run_captured_features_with_initial_light(
@@ -6622,7 +6716,11 @@ impl PreparedExistingGenerator {
                 validate_saved_decoration_references(&saved)?;
                 saved.references
             };
-            Some(self.prepare_captured_structure_plan(&batch.treasure_starts, &references)?)
+            Some(self.prepare_captured_structure_plan(
+                &batch.treasure_starts,
+                &references,
+                context.position,
+            )?)
         } else {
             None
         };
@@ -9809,6 +9907,155 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn saved_mineshaft_filter_uses_inclusive_chunk_bounds() -> Result<()> {
+        use native_core::beardifier::BoundingBox;
+        use native_resources::mineshaft::{
+            MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant,
+        };
+        use native_session::worldgen::{
+            SavedMineshaftPiece, saved_structure_starts::RestoredStructurePiece,
+        };
+        use native_world::loaded::ChunkPos;
+
+        let piece = |min, max| -> Result<RestoredStructurePiece> {
+            Ok(RestoredStructurePiece::Mineshaft(SavedMineshaftPiece {
+                piece: MineshaftGraphPiece {
+                    bounds: BoundingBox::new(min, max).map_err(anyhow::Error::msg)?,
+                    direction: None,
+                    depth: 0,
+                    kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+                },
+                variant: MineshaftVariant::Normal,
+                placed_spider: false,
+            }))
+        };
+        let target = ChunkPos { x: -1, z: 2 };
+        let outside = piece([0, 0, 32], [7, 7, 39])?;
+        let touching = piece([-1, 1000, 47], [6, 1007, 54])?;
+        assert!(!mineshaft_may_touch_chunk(target, &[outside])?);
+        assert!(mineshaft_may_touch_chunk(target, &[touching])?);
+        let wrong =
+            RestoredStructurePiece::BuriedTreasure(BoundingBox::new([0, 0, 0], [1, 1, 1]).unwrap());
+        assert!(mineshaft_may_touch_chunk(target, &[wrong]).is_err());
+        assert!(mineshaft_may_touch_chunk(ChunkPos { x: i32::MAX, z: 0 }, &[]).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn saved_mineshaft_filter_matches_java_structure_placement() -> Result<()> {
+        use native_core::beardifier::BoundingBox;
+        use native_resources::mineshaft::{
+            MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant,
+        };
+        use native_session::worldgen::{
+            SavedMineshaftPiece, saved_structure_starts::RestoredStructurePiece,
+        };
+        use native_world::loaded::ChunkPos;
+        use std::process::Command;
+
+        let cases = [
+            ([0, 0, 32], [7, 7, 39]),
+            ([-1, 0, 47], [6, 7, 54]),
+            ([-1, 1000, 47], [6, 1007, 54]),
+            ([-17, 0, 35], [-16, 7, 42]),
+            ([-18, 0, 35], [-17, 7, 42]),
+        ];
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let source = temp.path().join("SavedMineshaftNoopOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/SavedMineshaftNoopOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("SavedMineshaftNoopOracle")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::str::from_utf8(&output.stdout)?;
+        let mut results = BTreeMap::new();
+        for line in output.lines() {
+            let Some((_, row)) = line.split_once("P ") else {
+                continue;
+            };
+            let mut fields = row.split_whitespace();
+            let index: usize = fields.next().context("case index missing")?.parse()?;
+            let calls: usize = fields.next().context("call count missing")?.parse()?;
+            let unchanged: bool = fields.next().context("random state missing")?.parse()?;
+            ensure!(fields.next().is_none(), "extra oracle fields");
+            ensure!(
+                results.insert(index, (calls, unchanged)).is_none(),
+                "duplicate case"
+            );
+        }
+        assert_eq!(results.len(), cases.len());
+        for (index, (min, max)) in cases.into_iter().enumerate() {
+            let piece = RestoredStructurePiece::Mineshaft(SavedMineshaftPiece {
+                piece: MineshaftGraphPiece {
+                    bounds: BoundingBox::new(min, max).map_err(anyhow::Error::msg)?,
+                    direction: None,
+                    depth: 0,
+                    kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+                },
+                variant: MineshaftVariant::Normal,
+                placed_spider: false,
+            });
+            let may_touch = mineshaft_may_touch_chunk(ChunkPos { x: -1, z: 2 }, &[piece])?;
+            let (calls, unchanged) = results[&index];
+            assert_eq!(
+                (calls, unchanged),
+                [(0, true), (1, false), (0, true), (1, false), (0, true)][index]
+            );
+            assert!(may_touch || (calls == 0 && unchanged));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn every_supported_creature_can_pass_the_construction_gate() -> Result<()> {
         use native_resources::{
             density::WorldgenRandom,
@@ -11710,7 +11957,7 @@ mod tests {
                 chunk.world().block(x, y, z).cloned()
             })
             .collect::<Vec<_>>();
-        let mut batch = actual.assemble_captured_terrain(work)?;
+        let batch = actual.assemble_captured_terrain(work)?;
         assert!(Arc::ptr_eq(&actual.identity, &batch.identity));
         assert_eq!(
             batch.schedule().completed(target),
@@ -11743,6 +11990,18 @@ mod tests {
             world.block(marker[0], marker[1], marker[2]).unwrap().name,
             "minecraft:melon"
         );
+        let mut staged_batch = StagedLiveTerrainBatch { batch };
+        assert!(staged_batch.require_ready_features(target).is_ok());
+        let error = actual
+            .run_staged_live_features(&mut staged_batch, target)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("raw brightness unavailable"));
+        assert!(Arc::ptr_eq(&world, &staged_batch.snapshot()));
+        assert_eq!(
+            staged_batch.completed_stage(target),
+            Some(GenerationStage::Terrain)
+        );
+        let mut batch = staged_batch.batch;
         assert!(actual.run_captured_features(&mut batch, &context).is_err());
         assert_eq!(
             batch.schedule().completed(target),

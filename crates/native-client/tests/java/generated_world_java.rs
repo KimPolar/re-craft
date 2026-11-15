@@ -1133,6 +1133,9 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
                     .iter()
                     .map(|(position, _)| *position)
                     .collect();
+                let completed_saved = generated.saved().iter().find_map(|(position, stage)| {
+                    (*stage >= GenerationStage::Features).then_some(*position)
+                });
                 let failure = match crate::chunk_stream::MissingGenerationAssemblyWorker::start(
                     generated, &streamer, session,
                 ) {
@@ -1301,6 +1304,81 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
                 eprintln!(
                     "Generated missing terrain at {target:?}; matched {} Java biome samples",
                     columns.len() * quart_height
+                );
+                let staged = if let Some(position) = completed_saved {
+                    let failure =
+                        match crate::chunk_stream::MissingGenerationStagedFeatureWorker::start(
+                            staged, &streamer, session, position,
+                        ) {
+                            Ok(_) => anyhow::bail!("completed saved features were accepted again"),
+                            Err(failure) => failure,
+                        };
+                    ensure!(
+                        failure
+                            .error
+                            .to_string()
+                            .contains("already completed features"),
+                        "unexpected saved-feature error: {:#}",
+                        failure.error
+                    );
+                    failure.terrain
+                } else {
+                    staged
+                };
+                let before_maps = staged.heightmaps(target)?;
+                let mut features =
+                    crate::chunk_stream::MissingGenerationStagedFeatureWorker::start(
+                        staged, &streamer, session, target,
+                    )
+                    .map_err(|failure| failure.error)?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                let (featured, placements) = loop {
+                    if let Some(result) = features.try_result(&streamer, session)? {
+                        match result {
+                            crate::chunk_stream::StagedMissingFeatureResult::Completed {
+                                terrain,
+                                position,
+                                placements,
+                            } => {
+                                ensure!(position == target, "feature target changed");
+                                break (terrain, placements);
+                            }
+                            crate::chunk_stream::StagedMissingFeatureResult::Failed {
+                                terrain,
+                                error,
+                            } => {
+                                ensure!(
+                                    std::sync::Arc::ptr_eq(&staged_world, &terrain.snapshot()),
+                                    "failed feature pass changed staged terrain"
+                                );
+                                ensure!(
+                                    terrain.completed_stage(target)
+                                        == Some(GenerationStage::Terrain)
+                                        && terrain.heightmaps(target)? == before_maps,
+                                    "failed feature pass changed staged generation state"
+                                );
+                                return Err(error.context("staged live features did not complete"));
+                            }
+                        }
+                    }
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "staged live feature generation timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                ensure!(
+                    featured.completed_stage(target) == Some(GenerationStage::Features),
+                    "target did not reach the feature stage"
+                );
+                ensure!(
+                    !placements.is_empty(),
+                    "feature plan was unexpectedly empty"
+                );
+                eprintln!(
+                    "Ran {} staged feature placements for {target:?}; {} reported success",
+                    placements.len(),
+                    placements.iter().filter(|placed| **placed).count()
                 );
                 return Ok(());
             }

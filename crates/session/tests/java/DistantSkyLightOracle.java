@@ -22,7 +22,8 @@ public class DistantSkyLightOracle {
                     out.writeByte(listener.getLightValue(new BlockPos(x, y, z)));
     }
 
-    static void run(DataOutputStream out, boolean emptyTarget) throws Exception {
+    static void run(DataOutputStream out, boolean emptyTarget, int editX, int editY, int editZ,
+                    boolean water, boolean roof) throws Exception {
         var world = new SavedLiveLightOracle();
         for (int x = -2; x <= 4; x++) for (int z = -2; z <= 3; z++) {
             var chunk = world.new TestChunk(x, z);
@@ -34,6 +35,15 @@ public class DistantSkyLightOracle {
                 chunk.sources.update(chunk, 15, y, 15);
             }
         }
+        if (roof) {
+            for (int x = -2; x <= 4; x++) for (int z = -2; z <= 3; z++) {
+                var chunk = world.chunks.get(new ChunkPos(x, z));
+                for (int localX = 0; localX < 16; localX++) for (int localZ = 0; localZ < 16; localZ++) {
+                    world.blocks.put(new BlockPos(x * 16 + localX, editY, z * 16 + localZ), Blocks.STONE.defaultBlockState());
+                    chunk.sources.update(chunk, localX, editY, localZ);
+                }
+            }
+        }
         var engine = new LevelLightEngine(world, false, true);
         for (int x = -2; x <= 4; x++) for (int z = -2; z <= 3; z++)
             for (int sectionY = 0; sectionY <= 1; sectionY++)
@@ -43,18 +53,19 @@ public class DistantSkyLightOracle {
         for (int x = -2; x <= 4; x++) for (int z = -2; z <= 3; z++)
             engine.propagateLightSources(new ChunkPos(x, z));
         SavedLiveLightOracle.drain(engine);
-        var center = SectionPos.of(0, 0, 0);
+        var position = new BlockPos(editX, editY, editZ);
+        var center = SectionPos.of(position);
         var listener = engine.getLayerListener(LightLayer.SKY);
         if (emptyTarget && listener.getDataLayerData(center) != null)
             throw new IllegalStateException("target light section must initially be unallocated");
         capture(out, engine);
 
-        var position = new BlockPos(0, 15, 0);
-        var chunk = world.chunks.get(new ChunkPos(0, 0));
+        var chunk = world.chunks.get(new ChunkPos(Math.floorDiv(editX, 16), Math.floorDiv(editZ, 16)));
         for (boolean placing : new boolean[]{true, false}) {
-            world.blocks.put(position, placing ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState());
-            if (emptyTarget) engine.updateSectionStatus(SectionPos.of(0, 0, 0), !placing);
-            chunk.sources.update(chunk, 0, 15, 0);
+            boolean solid = roof ? !placing : placing;
+            world.blocks.put(position, solid ? (water ? Blocks.WATER.defaultBlockState() : Blocks.STONE.defaultBlockState()) : Blocks.AIR.defaultBlockState());
+            if (emptyTarget) engine.updateSectionStatus(center, !placing);
+            chunk.sources.update(chunk, Math.floorMod(editX, 16), editY, Math.floorMod(editZ, 16));
             engine.checkBlock(position);
             SavedLiveLightOracle.drain(engine);
             if (emptyTarget && placing && listener.getDataLayerData(center) == null)
@@ -67,8 +78,15 @@ public class DistantSkyLightOracle {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         try (var out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(Path.of(args[0]))))) {
-            run(out, false);
-            run(out, true);
+            run(out, false, 0, 15, 0, false, false);
+            run(out, true, 0, 15, 0, false, false);
+            run(out, false, 15, 0, -1, false, false);
+            run(out, false, -1, 24, 0, true, false);
+            run(out, true, 0, 24, 0, false, false);
+            run(out, false, 16, 8, 15, true, false);
+            run(out, false, 0, 0, 0, false, false);
+            run(out, false, 0, 16, 0, false, true);
+            run(out, false, -1, 8, 0, false, true);
         }
     }
 }

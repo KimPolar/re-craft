@@ -33551,6 +33551,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spreading_soil_reuses_distant_sky_but_rejects_nearby_edits() {
+        for (edit_x, expected, unresolved) in [
+            (0, "minecraft:grass_block", false),
+            (1, "minecraft:dirt", true),
+        ] {
+            let mut session = spreading_test_session(Some(15.0));
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            assert!(session.set_with_notify(IVec3::new(edit_x, 5, 0), stone, false));
+            assert!(!session.sky_lighting.settled());
+            assert!(session.random_tick_spreading_soil_at(IVec3::new(8, 8, 8)).is_some());
+            let target = session.origin + IVec3::new(9, 7, 9);
+            assert_eq!(
+                session.world.block(target.x, target.y, target.z).unwrap().name,
+                expected
+            );
+            assert_eq!(session.unresolved_spreading_soil_tick, unresolved);
+        }
+    }
+
+    #[test]
     fn spreading_soil_participates_in_the_section_random_tick() {
         let seed = (0..10_000)
             .find(|seed| {

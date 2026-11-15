@@ -112,17 +112,35 @@ impl SkyLighting {
     pub(crate) fn capability(&self) -> Option<bool> {
         self.configured.then_some(self.enabled)
     }
-    /// Pending edits cannot affect sky light outside their propagation and
-    /// section-allocation chunk halo. Missing light data is still checked by
-    /// the caller; unknown dimension bounds cannot establish this proof.
+    /// Whether pending edits can affect the light value at this position.
+    /// Missing light data is still checked by the caller; unknown dimension
+    /// bounds cannot establish the proof.
     pub(crate) fn is_current_at(
         &self,
         position: BlockPosition,
         bounds: Option<LightBounds>,
     ) -> bool {
-        self.enabled
-            && (self.pending.is_empty()
-                || (bounds.is_some() && !self.required_chunks.contains(&position.chunk())))
+        if !self.enabled {
+            return false;
+        }
+        if self.pending.is_empty() {
+            return true;
+        }
+        if bounds.is_none() {
+            return false;
+        }
+        if !self.required_chunks.contains(&position.chunk()) {
+            return true;
+        }
+        // An edit can change its own column's direct sky arbitrarily far
+        // below it. Horizontal propagation and upward propagation both lose
+        // at least one light level per block. A source can start one block
+        // above the edit, so retain an extra block of margin for upward light.
+        self.pending.iter().all(|edit| {
+            let horizontal = (i64::from(position.x) - i64::from(edit.position.x)).abs()
+                + (i64::from(position.z) - i64::from(edit.position.z)).abs();
+            horizontal > 15 || i64::from(position.y) > i64::from(edit.position.y) + 16
+        })
     }
 
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
@@ -1126,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn distant_sky_light_is_current_only_outside_all_edit_halos() {
+    fn pending_sky_light_is_current_outside_each_edit_reach() {
         let bounds = LightBounds::new(0, 32).unwrap();
         let mut world = fixture();
         let mut sky = SkyLighting::default();
@@ -1137,11 +1155,20 @@ mod tests {
         edit(&mut sky, &mut world, near, state("stone", &[]));
         assert!(!sky.light_unchanged(&world, Some(bounds)));
         assert!(!sky.is_current_at(near, Some(bounds)));
-        assert!(!sky.is_current_at(BlockPosition { x: 31, ..distant }, Some(bounds)));
+        assert!(!sky.is_current_at(BlockPosition { x: 15, ..near }, Some(bounds)));
+        assert!(sky.is_current_at(BlockPosition { x: 16, ..near }, Some(bounds)));
+        assert!(!sky.is_current_at(BlockPosition { x: 7, z: 8, ..near }, Some(bounds)));
+        assert!(sky.is_current_at(BlockPosition { x: 8, z: 8, ..near }, Some(bounds)));
+        assert!(sky.is_current_at(BlockPosition { x: -16, ..near }, Some(bounds)));
+        assert!(!sky.is_current_at(BlockPosition { y: 31, ..near }, Some(bounds)));
+        assert!(sky.is_current_at(BlockPosition { y: 32, ..near }, Some(bounds)));
+        assert!(!sky.is_current_at(BlockPosition { y: -16, ..near }, Some(bounds)));
+        assert!(sky.is_current_at(BlockPosition { x: 31, ..distant }, Some(bounds)));
         assert!(sky.is_current_at(distant, Some(bounds)));
         assert!(!sky.is_current_at(distant, None));
         edit(&mut sky, &mut world, distant, state("stone", &[]));
         assert!(!sky.is_current_at(distant, Some(bounds)));
+        assert!(!sky.is_current_at(BlockPosition { x: 31, ..distant }, Some(bounds)));
         assert!(sky.is_current_at(BlockPosition { x: -33, ..near }, Some(bounds)));
         sky.set_enabled(false);
         assert!(!sky.is_current_at(BlockPosition { x: -33, ..near }, Some(bounds)));
@@ -1217,18 +1244,43 @@ mod tests {
         const Z: usize = 96;
         const Y: usize = 34;
         const GRID: usize = X * Z * Y;
-        assert_eq!(data.len(), GRID * 6);
-        let mut world = fixture();
-        let mut sky = SkyLighting::default();
-        sky.set_enabled(true);
-        edit(
-            &mut sky,
-            &mut world,
-            BlockPosition { x: 0, y: 15, z: 0 },
-            state("stone", &[]),
-        );
+        let scenarios = [
+            (BlockPosition { x: 0, y: 15, z: 0 }, false, false),
+            (BlockPosition { x: 0, y: 15, z: 0 }, false, false),
+            (BlockPosition { x: 15, y: 0, z: -1 }, false, false),
+            (BlockPosition { x: -1, y: 24, z: 0 }, true, false),
+            (BlockPosition { x: 0, y: 24, z: 0 }, false, false),
+            (BlockPosition { x: 16, y: 8, z: 15 }, true, false),
+            (BlockPosition { x: 0, y: 0, z: 0 }, false, false),
+            (BlockPosition { x: 0, y: 16, z: 0 }, false, true),
+            (BlockPosition { x: -1, y: 8, z: 0 }, false, true),
+        ];
+        assert_eq!(data.len(), GRID * 3 * scenarios.len());
         let bounds = Some(LightBounds::new(0, 32).unwrap());
-        for scenario in 0..2 {
+        let mut inside_halo = 0;
+        let mut directly_above = 0;
+        for (scenario, (position, water, roof)) in scenarios.into_iter().enumerate() {
+            let mut world = fixture();
+            let mut sky = SkyLighting::default();
+            sky.set_enabled(true);
+            if roof {
+                let stone = Arc::make_mut(&mut world).intern_state(state("stone", &[]));
+                Arc::make_mut(&mut world)
+                    .set_block_id(position.x, position.y, position.z, stone)
+                    .unwrap();
+            }
+            edit(
+                &mut sky,
+                &mut world,
+                position,
+                if roof {
+                    state("air", &[])
+                } else if water {
+                    state("water", &[("level", "0")])
+                } else {
+                    state("stone", &[])
+                },
+            );
             let first = &data[scenario * GRID * 3..][..GRID];
             let second = &data[(scenario * 3 + 1) * GRID..][..GRID];
             let third = &data[(scenario * 3 + 2) * GRID..][..GRID];
@@ -1240,7 +1292,8 @@ mod tests {
                 let x = (index % X) as i32 - 32;
                 let z = (index / X % Z) as i32 - 32;
                 let y = (index / (X * Z)) as i32 - 1;
-                if sky.is_current_at(BlockPosition { x, y, z }, bounds) {
+                let query = BlockPosition { x, y, z };
+                if sky.is_current_at(query, bounds) {
                     assert_eq!(
                         before, placed,
                         "placement changed distant sky at {x},{y},{z}"
@@ -1250,6 +1303,12 @@ mod tests {
                         "removal changed distant sky at {x},{y},{z}"
                     );
                     distant_positions += 1;
+                    if sky.required_chunks.contains(&query.chunk()) {
+                        inside_halo += 1;
+                        if x == position.x && z == position.z && y > position.y + 16 {
+                            directly_above += 1;
+                        }
+                    }
                 } else {
                     near_changes[0] += usize::from(before != placed);
                     near_changes[1] += usize::from(placed != removed);
@@ -1259,7 +1318,35 @@ mod tests {
                 distant_positions > 0 && near_changes.iter().all(|&count| count > 0),
                 "scenario {scenario} did not exercise distant and changed light"
             );
+            if roof {
+                let index = ((position.y as usize) * Z + (position.z + 32) as usize) * X
+                    + (position.x + 14 + 32) as usize;
+                assert_ne!(
+                    first[index], second[index],
+                    "roof did not exercise a 14-block propagation"
+                );
+                assert!(!sky.is_current_at(
+                    BlockPosition {
+                        x: position.x + 14,
+                        y: position.y - 1,
+                        z: position.z
+                    },
+                    bounds,
+                ));
+                assert!(sky.is_current_at(
+                    BlockPosition {
+                        x: position.x + 16,
+                        y: position.y - 1,
+                        z: position.z
+                    },
+                    bounds,
+                ));
+            }
         }
+        assert!(inside_halo > 0 && directly_above > 0);
+        eprintln!(
+            "Java sky checks accepted {inside_halo} positions inside the original chunk halo, including {directly_above} directly above edits"
+        );
     }
 
     #[test]

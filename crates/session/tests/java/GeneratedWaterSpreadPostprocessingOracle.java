@@ -23,6 +23,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.block.state.properties.Half;
+import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.material.*;
@@ -227,14 +228,15 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("dry_lichen"))for(var state:Blocks.GLOW_LICHEN.getStateDefinition().getPossibleStates())
             if(state.isSolid() || state.canOcclude())throw new AssertionError("lichen has a solid or occluding state: "+state);
         if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
-        if(args.length>0 && args[0].equals("kelp_noop")) {
+        if(args.length>0 && args[0].equals("aquatic_noop")) {
             scenarios.clear();
             var kinds=new ArrayList<String>();kinds.add("body");
             for(int age=0;age<=25;age++)kinds.add(Integer.toString(age));
+            kinds.addAll(List.of("short","lower","upper"));
             for(var kind:kinds)for(var side:List.of("below","north","south","west","east"))
-                scenarios.add("kelp_noop_"+kind+"_"+side);
+                scenarios.add("aquatic_noop_"+kind+"_"+side);
             for(var kind:kinds)for(var side:List.of("north","south","west","east"))
-                scenarios.add("kelp_flow_"+kind+"_"+side);
+                scenarios.add("aquatic_flow_"+kind+"_"+side);
         }
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("building_barriers")){
@@ -561,11 +563,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     if(scenario.startsWith("origin_source_"))blocks.put(pos.north(),Blocks.WATER.defaultBlockState());
                 }
             }
-            if(scenario.startsWith("kelp_noop_") || scenario.startsWith("kelp_flow_")) {
-                boolean flow=scenario.startsWith("kelp_flow_");
-                var parts=scenario.substring((flow?"kelp_flow_":"kelp_noop_").length()).split("_");
-                var plant=parts[0].equals("body")?Blocks.KELP_PLANT.defaultBlockState():
-                    Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,Integer.parseInt(parts[0]));
+            if(scenario.startsWith("aquatic_noop_") || scenario.startsWith("aquatic_flow_")) {
+                boolean flow=scenario.startsWith("aquatic_flow_");
+                var parts=scenario.substring((flow?"aquatic_flow_":"aquatic_noop_").length()).split("_");
+                var plant=switch(parts[0]){
+                    case "body" -> Blocks.KELP_PLANT.defaultBlockState();
+                    case "short" -> Blocks.SEAGRASS.defaultBlockState();
+                    case "lower" -> Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF,DoubleBlockHalf.LOWER);
+                    case "upper" -> Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF,DoubleBlockHalf.UPPER);
+                    default -> Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,Integer.parseInt(parts[0]));
+                };
                 var plantPos=switch(parts[1]){case "below" -> pos.below();case "north" -> pos.north();case "south" -> pos.south();case "west" -> pos.west();case "east" -> pos.east();default -> throw new AssertionError(parts[1]);};
                 if(!plant.getFluidState().isSource() || plant.isSolid() || plant.canOcclude() || !plant.getCollisionShape(level,plantPos).isEmpty())throw new AssertionError("unsupported kelp fluid shape: "+plant);
                 blocks.put(plantPos,plant);

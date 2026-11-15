@@ -22,6 +22,8 @@ use serde_json::Value;
 
 use crate::mesh_worker::MeshJob;
 
+pub(crate) mod initial_extension;
+
 #[cfg(all(test, target_os = "windows"))]
 #[path = "../tests/java/generated_world_java.rs"]
 mod generated_world_java;
@@ -1931,6 +1933,7 @@ impl GenerationWorker {
                     ceiling_spawn_height,
                     border,
                     player,
+                    &BTreeSet::new(),
                     cancelled,
                     progress,
                 )?
@@ -2226,6 +2229,7 @@ impl GenerationWorker {
                 ceiling_spawn_height,
                 border,
                 player,
+                &BTreeSet::new(),
                 cancelled,
                 progress,
             )?
@@ -3409,6 +3413,7 @@ fn complete_player_spawn<P, C, R, M, K>(
     ceiling_spawn_height: Option<i32>,
     border: native_session::respawn::RespawnBorder,
     options: InitialPlayerSpawnOptions,
+    additional_targets: &BTreeSet<ChunkPos>,
     cancelled: &AtomicBool,
     progress: &Mutex<GenerationProgress>,
 ) -> Result<Option<GenerationReady>>
@@ -3565,6 +3570,22 @@ where
                                 );
                                 break next;
                             }
+                            if let Some(next) = additional_targets
+                                .iter()
+                                .copied()
+                                .find(|pos| !processed.region.chunks.contains(pos))
+                            {
+                                ensure!(
+                                    !targets.contains(&next),
+                                    "requested initial target is not postprocessed"
+                                );
+                                break next;
+                            }
+                        } else {
+                            ensure!(
+                                additional_targets.is_empty(),
+                                "additional targets require postprocessing"
+                            );
                         }
                         ready.player_spawn = Some(pos);
                         return Ok(Some(ready));
@@ -7810,6 +7831,7 @@ mod tests {
                 random_seed,
                 saved_border: None,
             },
+            &BTreeSet::new(),
             &AtomicBool::new(false),
             &progress,
         )?
@@ -7907,6 +7929,7 @@ mod tests {
                     random_seed: 1,
                     saved_border: Some(saved_border),
                 },
+                &BTreeSet::new(),
                 &AtomicBool::new(false),
                 &progress,
             )?

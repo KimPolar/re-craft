@@ -1,13 +1,15 @@
 //! Nonblocking connection between initial generation and private world staging.
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use native_persistence::world::SavedWorldBorder;
+use native_world::loaded::ChunkPos;
 
 use crate::{
     generation_staging::{
         InitialWorldStagingWorker, StagedWorld, StagingProgress, StagingResult, StagingStartError,
     },
+    generation_worker::initial_extension::InitialExtensionResources,
     generation_worker::{GenerationProgress, GenerationReady, GenerationResult, GenerationWorker},
     world_creation::FrozenWorldCreation,
 };
@@ -155,13 +157,45 @@ pub struct InitialWorldPipeline {
     state: State,
     options: InitialWorldOptions,
     structures: bool,
+    extension: Option<(BTreeSet<ChunkPos>, InitialExtensionResources)>,
     cancelled: bool,
 }
 
 impl InitialWorldPipeline {
     /// Freeze settings before this call. The returned stage is never published.
     pub fn start(frozen: FrozenWorldCreation, options: InitialWorldOptions) -> Result<Self> {
+        Self::start_with_additional_targets(frozen, options, BTreeSet::new())
+    }
+
+    /// Complete explicit additional chunks while the original generation
+    /// context is still available. The resulting stage is still private.
+    pub(crate) fn start_with_additional_targets(
+        frozen: FrozenWorldCreation,
+        options: InitialWorldOptions,
+        targets: BTreeSet<ChunkPos>,
+    ) -> Result<Self> {
         let structures = frozen.generation.structures_enabled;
+        let extension = if targets.is_empty() {
+            None
+        } else {
+            ensure!(
+                structures,
+                "additional initial chunks require structure-aware generation"
+            );
+            Some((
+                targets,
+                InitialExtensionResources {
+                    minecraft_dir: frozen.generation.minecraft_dir.clone(),
+                    preset: frozen.generation.preset.clone(),
+                    dimension: frozen.generation.dimension.clone(),
+                    selection: frozen
+                        .generation
+                        .data_packs
+                        .as_ref()
+                        .map(|(_, selection)| selection.clone()),
+                },
+            ))
+        };
         let worker = GenerationWorker::start_frozen_initial_world(
             frozen,
             options.border,
@@ -174,6 +208,7 @@ impl InitialWorldPipeline {
             state: State::Generating(worker),
             options,
             structures,
+            extension,
             cancelled: false,
         })
     }
@@ -228,6 +263,26 @@ impl InitialWorldPipeline {
             State::Generating(worker) => match worker.try_result() {
                 Ok(None) => None,
                 Ok(Some(GenerationResult::Ready(generation))) if !self.cancelled => {
+                    if let Some((targets, resources)) = self.extension.take() {
+                        return match GenerationWorker::extend_postprocessed_initial(
+                            generation,
+                            targets,
+                            self.options.player_random_seed,
+                            resources,
+                        ) {
+                            Ok(worker) => {
+                                self.state = State::Generating(worker);
+                                None
+                            }
+                            Err(error) => {
+                                self.state = State::Finished;
+                                Some(InitialWorldResult::Failed {
+                                    error: error.context("cannot start initial world extension"),
+                                    generation: None,
+                                })
+                            }
+                        };
+                    }
                     match InitialWorldStagingWorker::start_recoverable(
                         generation,
                         self.options.staging_parent.clone(),
@@ -363,6 +418,117 @@ mod tests {
         Ok(())
     }
 
+    /// Compare a staged overworld chunk's unzoomed quart biomes with the
+    /// installed Java generator, independently of the Rust generation draft.
+    fn compare_staged_biomes_with_java(
+        game: &std::path::Path,
+        parent: &std::path::Path,
+        seed: i64,
+        target: ChunkPos,
+        chunk: &native_persistence::world::LoadedChunk,
+    ) -> Result<()> {
+        use std::process::Command;
+
+        let oracle = tempfile::tempdir_in(parent)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong Minecraft version");
+        let mut paths = vec![version.join("26.3.jar"), oracle.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = oracle.path().join("GeneratedMissingBiomeOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedMissingBiomeOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java biome oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let compared = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(classpath)
+            .arg("GeneratedMissingBiomeOracle")
+            .args([seed.to_string(), target.x.to_string(), target.z.to_string()])
+            .output()?;
+        ensure!(
+            compared.status.success(),
+            "Java biome oracle failed: {} {}",
+            String::from_utf8_lossy(&compared.stdout),
+            String::from_utf8_lossy(&compared.stderr)
+        );
+        let output = std::str::from_utf8(&compared.stdout)?;
+        let header = output
+            .lines()
+            .find_map(|line| line.strip_prefix("V "))
+            .context("Java biome height is missing")?;
+        let mut bounds = header.split_whitespace();
+        let min_y: i32 = bounds
+            .next()
+            .context("minimum biome height missing")?
+            .parse()?;
+        let height: i32 = bounds.next().context("biome height missing")?.parse()?;
+        ensure!(
+            height > 0 && height % 4 == 0 && bounds.next().is_none(),
+            "invalid Java biome height"
+        );
+        let origin_x = target.x.checked_mul(16).context("biome X overflow")?;
+        let origin_z = target.z.checked_mul(16).context("biome Z overflow")?;
+        let mut columns = BTreeSet::new();
+        for row in output.lines().filter_map(|line| line.strip_prefix("B ")) {
+            let mut fields = row.split_whitespace();
+            let x: i32 = fields.next().context("biome X is missing")?.parse()?;
+            let z: i32 = fields.next().context("biome Z is missing")?.parse()?;
+            ensure!(
+                (0..4).contains(&x) && (0..4).contains(&z) && columns.insert((x, z)),
+                "invalid biome column"
+            );
+            for y in 0..height / 4 {
+                let expected = fields.next().context("Java biome value is missing")?;
+                let actual = chunk
+                    .biome(origin_x + x * 4, min_y + y * 4, origin_z + z * 4)
+                    .context("staged biome value is missing")?;
+                ensure!(
+                    actual.matches(expected),
+                    "staged biome differs at local quart ({x}, {y}, {z})"
+                );
+            }
+            ensure!(fields.next().is_none(), "extra Java biome values");
+        }
+        ensure!(columns.len() == 16, "Java biome columns are incomplete");
+        eprintln!(
+            "Compared {} staged biome samples with Java for {target:?}",
+            16 * height / 4
+        );
+        Ok(())
+    }
+
     #[test]
     fn rejects_inconsistent_settings_before_starting_generation() -> Result<()> {
         let parent = tempfile::tempdir()?;
@@ -373,6 +539,24 @@ mod tests {
             .err()
             .context("inconsistent settings were accepted")?;
         assert!(format!("{error:#}").contains("session seed differs"));
+        assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unstructured_extension_before_starting_generation() -> Result<()> {
+        let parent = tempfile::tempdir()?;
+        let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
+        settings.generate_structures = false;
+        let frozen = settings.freeze(parent.path().to_path_buf(), None);
+        let error = InitialWorldPipeline::start_with_additional_targets(
+            frozen,
+            options(parent.path().to_path_buf()),
+            BTreeSet::from([ChunkPos { x: 28, z: 24 }]),
+        )
+        .err()
+        .context("unstructured extension was accepted")?;
+        assert!(format!("{error:#}").contains("structure-aware generation"));
         assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
         Ok(())
     }
@@ -488,22 +672,49 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
     fn structured_seed_one_reaches_initial_world_stage() -> Result<()> {
-        structured_seed_reaches_initial_world_stage(1, false)
+        structured_seed_reaches_initial_world_stage(1, false, BTreeSet::new(), false)
     }
 
     #[test]
     #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
     fn structured_seed_negative_one_reaches_initial_world_stage() -> Result<()> {
-        structured_seed_reaches_initial_world_stage(-1, false)
+        structured_seed_reaches_initial_world_stage(-1, false, BTreeSet::new(), false)
     }
 
     #[test]
     #[ignore = "requires Minecraft 26.3 and complete generated-world play-save dependencies"]
     fn generated_world_ticked_player_save_checks_dependencies() -> Result<()> {
-        structured_seed_reaches_initial_world_stage(-1, true)
+        structured_seed_reaches_initial_world_stage(-1, true, BTreeSet::new(), false)
     }
 
-    fn structured_seed_reaches_initial_world_stage(seed: i64, play_save: bool) -> Result<()> {
+    #[test]
+    #[ignore = "requires Minecraft 26.3, Java 25 and additional structured chunk generation"]
+    fn generated_world_extends_requested_neighbor_before_staging() -> Result<()> {
+        structured_seed_reaches_initial_world_stage(
+            -1,
+            false,
+            BTreeSet::from([ChunkPos { x: 28, z: 24 }]),
+            false,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3, Java 25 and complete bubble-column save tracking"]
+    fn generated_world_with_extended_neighbor_saves_after_play() -> Result<()> {
+        structured_seed_reaches_initial_world_stage(
+            -1,
+            true,
+            BTreeSet::from([ChunkPos { x: 28, z: 24 }]),
+            true,
+        )
+    }
+
+    fn structured_seed_reaches_initial_world_stage(
+        seed: i64,
+        play_save: bool,
+        required_targets: BTreeSet<ChunkPos>,
+        require_save: bool,
+    ) -> Result<()> {
         let game = match std::env::var_os("MINECRAFT_DIR") {
             Some(path) => PathBuf::from(path),
             None => native_resources::default_minecraft_dir()?,
@@ -520,9 +731,10 @@ mod tests {
         let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
         settings.seed = crate::chat_input::ChatInput::field(&seed.to_string());
         settings.generate_structures = true;
-        let mut pipeline = InitialWorldPipeline::start(
+        let mut pipeline = InitialWorldPipeline::start_with_additional_targets(
             settings.freeze(game.clone(), None),
             options(parent.path().to_path_buf()),
+            required_targets.clone(),
         )?;
         match wait(&mut pipeline) {
             InitialWorldResult::Ready {
@@ -564,6 +776,17 @@ mod tests {
                     .as_ref()
                     .context("postprocessed generation missing")?;
                 assert!(!processed.chunks.is_empty());
+                for target in &required_targets {
+                    assert!(
+                        processed.region.chunks.contains(target),
+                        "requested chunk {target:?} was not postprocessed"
+                    );
+                    let chunk = reader
+                        .read_chunk(target.x, target.z)?
+                        .context("requested chunk was not saved")?;
+                    assert!(chunk.is_full(), "requested chunk {target:?} is not full");
+                    compare_staged_biomes_with_java(&game, parent.path(), seed, *target, &chunk)?;
+                }
                 let mut structure_starts = 0_usize;
                 let mut structure_references = 0_usize;
                 for (position, expected) in &processed.chunks {
@@ -737,7 +960,14 @@ mod tests {
                     native_persistence::save::WorldWriteGuard::acquire(&published_path).is_err()
                 );
                 if play_save {
-                    roundtrip_ticked_player(&published_path, &game, session_lock, *reopened)?;
+                    roundtrip_ticked_player(
+                        &published_path,
+                        &game,
+                        session_lock,
+                        *reopened,
+                        &required_targets,
+                        require_save,
+                    )?;
                 } else {
                     drop(reopened);
                 }
@@ -758,6 +988,8 @@ mod tests {
         game: &std::path::Path,
         lock: native_persistence::save::WorldSessionGuard,
         prepared: crate::PreparedPlayWorld,
+        required_targets: &BTreeSet<ChunkPos>,
+        require_save: bool,
     ) -> Result<()> {
         use native_persistence::world::{DimensionId, WorldReader};
         use native_session::{GameSession, PlayerCommand};
@@ -786,10 +1018,15 @@ mod tests {
         session.update(Duration::from_millis(50));
         let deadline = Instant::now() + Duration::from_secs(10);
         let unavailable = loop {
-            let waiting: Vec<_> = session.pending_fence_update_chunks().collect();
-            if waiting.is_empty() {
+            let required = session.required_shape_update_chunks();
+            if required.is_empty() {
                 break Vec::new();
             }
+            let waiting: Vec<_> = required
+                .iter()
+                .copied()
+                .filter(|pos| !session.has_resident_or_parked_chunk(*pos))
+                .collect();
             let mut absent = Vec::new();
             for position in &waiting {
                 if !reader
@@ -799,12 +1036,12 @@ mod tests {
                     absent.push(*position);
                 }
             }
-            if absent.len() == waiting.len() {
+            if !waiting.is_empty() && absent.len() == waiting.len() {
                 break absent;
             }
             ensure!(
                 Instant::now() < deadline,
-                "saved fence neighbors did not attach: {waiting:?}"
+                "saved shape-update neighbors did not settle: {required:?}"
             );
             streamer.service(&mut session)?;
             session.update(Duration::from_millis(50));
@@ -882,11 +1119,24 @@ mod tests {
             1,
         );
         if !unavailable.is_empty() {
+            ensure!(
+                unavailable
+                    .iter()
+                    .all(|pos| !required_targets.contains(pos)),
+                "requested shape dependency remained unavailable: {unavailable:?}"
+            );
             let error = plan
                 .err()
-                .context("save accepted missing fence dependencies")?;
+                .context("save accepted missing shape dependencies")?;
+            let message = format!("{error:#}");
             ensure!(
-                format!("{error:#}").contains("fence shape updates"),
+                [
+                    "fence shape updates",
+                    "lichen shape updates",
+                    "stair shape updates"
+                ]
+                .iter()
+                .any(|kind| message.contains(kind)),
                 "save rejected for an unexpected reason: {error:#}"
             );
             assert_eq!(std::fs::read(world_path.join("level.dat"))?, initial_level);
@@ -894,7 +1144,11 @@ mod tests {
                 native_persistence::nbt::write(&reader.read_player()?.context("player missing")?)?,
                 initial_player
             );
-            eprintln!("Save correctly refused for ungenerated fence dependencies: {unavailable:?}");
+            eprintln!("Save correctly refused for ungenerated shape dependencies: {unavailable:?}");
+            ensure!(
+                !require_save,
+                "play-save requires complete shape dependencies"
+            );
             return Ok(());
         }
         let plan = plan.context("cannot draft the ticked generated session")?;

@@ -171,5 +171,152 @@ fn generated_brushable_replacement_matches_java() -> Result<()> {
     }
     assert_eq!(checked, 8);
     assert_eq!(rejected, 8);
+
+    let mut checked_archaeology = 0;
+    let mut rejected_archaeology = 0;
+    for line in java.lines().filter_map(|line| line.strip_prefix("A ")) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        ensure!(fields.len() == 8, "invalid Java result {line}");
+        let (source_name, source_properties) = registry.resolve(&serde_json::json!(fields[0]))?;
+        let source = BlockState {
+            name: source_name,
+            properties: source_properties,
+        };
+        let (target_name, target_properties) = registry.resolve(&serde_json::json!(fields[1]))?;
+        let target = BlockState {
+            name: target_name,
+            properties: target_properties,
+        };
+        let pending: bool = fields[2].parse()?;
+        let replacement = |state: BlockState, seed| ArchaeologyReplacement {
+            state,
+            nbt: Tag::Compound(vec![
+                (
+                    "LootTable".into(),
+                    Tag::String("minecraft:archaeology/ocean_ruin_warm".into()),
+                ),
+                ("LootTableSeed".into(), Tag::Long(seed)),
+            ]),
+        };
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let pos = [8, 8, 8];
+        let other = [9, 8, 8];
+        if pending {
+            region.set_proto_block(pos, &source)?;
+        } else {
+            region.place_ocean_ruin_archaeology_block(
+                pos,
+                &replacement(source.clone(), 73),
+                &registry,
+            )?;
+        }
+        region.place_ocean_ruin_archaeology_block(
+            other,
+            &replacement(source.clone(), 73),
+            &registry,
+        )?;
+        SimpleBlockWorld::schedule_simple_tick(&mut region, pos)?;
+        let (chest_name, chest_properties) =
+            registry.resolve(&serde_json::json!("minecraft:chest"))?;
+        let chest = BlockState {
+            name: chest_name,
+            properties: chest_properties,
+        };
+        for x in 0..12 {
+            let pending_position = [x, 6, 0];
+            region.set_proto_block(pending_position, &chest)?;
+            Arc::make_mut(&mut region.monster_entities).insert(
+                pending_position,
+                Some(
+                    super::super::super::GeneratedMonsterRoomEntity::PendingChest {
+                        position: pending_position,
+                        state: chest.clone(),
+                    },
+                ),
+            );
+            Arc::make_mut(region.pending_order.entry(center).or_default()).insert(pending_position);
+        }
+        let result = region.place_ocean_ruin_archaeology_block(
+            pos,
+            &replacement(target.clone(), 79),
+            &registry,
+        );
+        if pending {
+            assert!(
+                result.is_err(),
+                "unrecorded brushable must not be discarded: {line}"
+            );
+            assert!(region.finish().is_err(), "{line}");
+            rejected_archaeology += 1;
+            continue;
+        }
+        result?;
+        assert_eq!(region.read(pos)?, target, "{line}");
+        assert!(region.monster_entities.contains_key(&pos), "{line}");
+        assert!(region.monster_entities.contains_key(&other), "{line}");
+        let order = region
+            .entity_order
+            .get(&center)
+            .context("entity order missing")?
+            .saving_order()?;
+        assert!(order.contains(&pos) && order.contains(&other), "{line}");
+        let ticks = region
+            .world
+            .saved_block_ticks
+            .get(&center)
+            .context("saved tick missing")?;
+        assert_eq!(ticks.len(), fields[3].parse::<usize>()?, "{line}");
+        assert_eq!(ticks[0].block, source.name, "{line}");
+        assert_eq!(ticks[0].position, pos, "{line}");
+        assert_eq!(ticks[0].delay, fields[4].parse::<i32>()?, "{line}");
+        assert_eq!(ticks[0].priority, fields[5].parse::<i32>()?, "{line}");
+        assert!(region.poi_changes.is_empty(), "{line}");
+        let pending_order = region
+            .pending_order
+            .get(&center)
+            .context("pending entity order missing")?
+            .positions()?
+            .into_iter()
+            .map(|p| format!("{},{},{}", p[0], p[1], p[2]))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(pending_order, fields[7], "{line}");
+        region.finish()?;
+        let Tag::List { values, .. } = terrain.generated_block_entity_data(center, &registry)?
+        else {
+            bail!("missing generated block entity list")
+        };
+        assert_eq!(values.len(), 14, "{line}");
+        let updated = values
+            .iter()
+            .find(|entity| {
+                entity.get("x") == Some(&Tag::Int(pos[0]))
+                    && entity.get("z") == Some(&Tag::Int(pos[2]))
+            })
+            .context("new entity missing")?;
+        assert_eq!(
+            updated.get("LootTableSeed"),
+            Some(&Tag::Long(fields[6].parse()?)),
+            "{line}"
+        );
+        let retained = values
+            .iter()
+            .find(|entity| {
+                entity.get("x") == Some(&Tag::Int(other[0]))
+                    && entity.get("z") == Some(&Tag::Int(other[2]))
+            })
+            .context("other entity missing")?;
+        assert_eq!(
+            retained.get("LootTableSeed"),
+            Some(&Tag::Long(73)),
+            "{line}"
+        );
+        checked_archaeology += 1;
+    }
+    assert_eq!(checked_archaeology, 4);
+    assert_eq!(rejected_archaeology, 4);
     Ok(())
 }

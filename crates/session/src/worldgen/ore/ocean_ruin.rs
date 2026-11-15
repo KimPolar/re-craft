@@ -341,6 +341,24 @@ impl DecorationRegion<'_> {
         Ok(())
     }
 
+    fn matches_generated_brushable(&self, position: [i32; 3], state: &BlockState) -> bool {
+        matches!(
+            self.monster_entities.get(&position),
+            Some(Some(super::super::GeneratedMonsterRoomEntity::Brushable(entity)))
+                if entity.position == position && entity.state == *state
+        )
+    }
+
+    fn remove_generated_brushable(&mut self, position: [i32; 3]) {
+        Arc::make_mut(&mut self.monster_entities).remove(&position);
+        if let Some(order) = self.entity_order.get_mut(&chunk(position)) {
+            Arc::make_mut(order).remove(position);
+        }
+        if let Some(pending) = self.pending_order.get_mut(&chunk(position)) {
+            Arc::make_mut(pending).remove(position);
+        }
+    }
+
     fn place_ocean_ruin_archaeology_inner(
         &mut self,
         position: [i32; 3],
@@ -358,13 +376,18 @@ impl DecorationRegion<'_> {
             "invalid archaeology block registry state"
         );
         let old = self.read(position)?;
+        let old_brushable = self.matches_generated_brushable(position, &old);
         ensure!(
             registry.is_canonical_state(&old.name, &old.properties)
-                && registry.has_block_entity(&old.name) == Some(false)
-                && !self.monster_entities.contains_key(&position)
+                && ((registry.has_block_entity(&old.name) == Some(false)
+                    && !self.monster_entities.contains_key(&position))
+                    || (registry.has_block_entity(&old.name) == Some(true) && old_brushable))
                 && !self.bee_nests.contains_key(&position),
-            "unsupported archaeology replacement source"
+            "unsupported archaeology replacement source at {position:?}: {old:?}"
         );
+        if old_brushable {
+            self.remove_generated_brushable(position);
+        }
         // StructureTemplate writes a barrier first whenever processed NBT is
         // present, then writes the final state and resolves its block entity.
         self.set_proto_block(
@@ -375,6 +398,11 @@ impl DecorationRegion<'_> {
             },
         )?;
         self.set_proto_block(position, &brushable.state)?;
+        // WorldGenRegion installs a DUMMY protochunk entry before the
+        // template resolves and loads the materialized block entity.
+        let pending = Arc::make_mut(self.pending_order.entry(chunk(position)).or_default());
+        pending.insert(position);
+        pending.remove(position);
         Arc::make_mut(&mut self.monster_entities).insert(
             position,
             Some(super::super::GeneratedMonsterRoomEntity::Brushable(
@@ -1153,11 +1181,7 @@ where
             "unsupported ruin template block"
         );
         let old = region.read(position)?;
-        let brushable = matches!(
-            region.monster_entities.get(&position),
-            Some(Some(super::super::GeneratedMonsterRoomEntity::Brushable(entity)))
-                if entity.position == position && entity.state == old
-        );
+        let brushable = region.matches_generated_brushable(position, &old);
         ensure!(
             self.marker
                 .registry
@@ -1173,13 +1197,7 @@ where
             "unsupported ruin template replacement source at {position:?}: {old:?}"
         );
         if brushable {
-            Arc::make_mut(&mut region.monster_entities).remove(&position);
-            if let Some(order) = region.entity_order.get_mut(&chunk(position)) {
-                Arc::make_mut(order).remove(position);
-            }
-            if let Some(pending) = region.pending_order.get_mut(&chunk(position)) {
-                Arc::make_mut(pending).remove(position);
-            }
+            region.remove_generated_brushable(position);
         }
         region.set_proto_block(position, state)?;
         Ok(true)

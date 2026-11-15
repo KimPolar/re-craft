@@ -789,6 +789,19 @@ pub struct FrozenPartialSave {
     positions: BTreeSet<native_persistence::world::ChunkPos>,
 }
 
+/// Light work still needed before the frozen session can form a save draft.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PartialSaveLighting {
+    pub pending_block_changes: usize,
+    pub sky_pending: bool,
+}
+
+impl PartialSaveLighting {
+    pub fn is_settled(self) -> bool {
+        self.pending_block_changes == 0 && !self.sky_pending
+    }
+}
+
 struct DeferredSaveStreaming {
     window: Option<(ChunkPos, u32)>,
     respawn_window: Option<Option<(ChunkPos, u32)>>,
@@ -832,6 +845,30 @@ impl FrozenPartialSave {
             .saved_world_session
             .as_ref()
             .is_some_and(|session| stamp.belongs_to_session(session))
+    }
+
+    /// Advance already queued lighting without running a simulation tick or
+    /// accepting streamed results. A caller must resume and supply missing
+    /// chunks if the light work cannot complete from the frozen inputs.
+    /// Block-light groups can take work, so poll away from a window thread.
+    pub fn poll_lighting(&mut self) -> PartialSaveLighting {
+        let revision = self.session.revision;
+        self.session.advance_pending_lighting();
+        if self.session.revision != revision {
+            let snapshot = Arc::make_mut(&mut self.session.snapshot);
+            snapshot.world = SessionWorld::Loaded(Arc::clone(&self.session.world));
+            snapshot.world_revision = self.session.revision;
+            self.positions.extend(
+                self.session
+                    .dirty_chunk_positions()
+                    .into_iter()
+                    .map(|pos| native_persistence::world::ChunkPos { x: pos.x, z: pos.z }),
+            );
+        }
+        PartialSaveLighting {
+            pending_block_changes: self.session.pending_light.len(),
+            sky_pending: !self.session.sky_lighting.settled(),
+        }
     }
 
     /// Restore queued controls and streamed results if the save is cancelled
@@ -18072,6 +18109,27 @@ impl LoadedSession {
         }
     }
 
+    fn advance_pending_lighting(&mut self) {
+        let sky_bounds =
+            native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
+        let sky_changed = self.sky_lighting.advance_with_parked(
+            &mut self.world,
+            &mut self.parked_chunks,
+            sky_bounds,
+        );
+        let sky_originals = self.sky_lighting.take_applied_originals();
+        for (pos, chunk) in sky_originals {
+            if sky_changed.contains(&pos) {
+                self.original_light_chunks.entry(pos).or_insert(chunk);
+            }
+        }
+        if !sky_changed.is_empty() {
+            self.dirty_chunks.extend(sky_changed);
+            self.revision += 1;
+        }
+        self.retry_pending_light();
+    }
+
     fn set(&mut self, relative: IVec3, id: BlockStateId) -> bool {
         self.set_with_notify(relative, id, true)
     }
@@ -23521,24 +23579,7 @@ impl LoadedSession {
         self.refresh_movement_speed();
         let camera_speed = self.movement_speed(camera_sprinting);
         self.apply_streaming();
-        let sky_bounds =
-            native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
-        let sky_changed = self.sky_lighting.advance_with_parked(
-            &mut self.world,
-            &mut self.parked_chunks,
-            sky_bounds,
-        );
-        let sky_originals = self.sky_lighting.take_applied_originals();
-        for (pos, chunk) in sky_originals {
-            if sky_changed.contains(&pos) {
-                self.original_light_chunks.entry(pos).or_insert(chunk);
-            }
-        }
-        if !sky_changed.is_empty() {
-            self.dirty_chunks.extend(sky_changed);
-            self.revision += 1;
-        }
-        self.retry_pending_light();
+        self.advance_pending_lighting();
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
         self.advance_fluid_ticks();
@@ -31334,6 +31375,169 @@ pub(crate) mod tests {
         assert_eq!(resumed.snapshot().tick, before.tick + 1);
         assert_eq!(resumed.snapshot().inventory.selected(), 4);
         assert!(resumed.commands.is_empty());
+    }
+
+    #[test]
+    fn frozen_save_finishes_light_without_advancing_gameplay() {
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        let home = session.player_chunk().unwrap();
+        let air = session.states[0];
+        let world = Arc::make_mut(&mut session.world);
+        let mut base = world.chunks[&home].as_ref().clone();
+        base.block_light_correct = true;
+        let section = Arc::make_mut(base.sections.get_mut(&0).unwrap());
+        section.block_light = Some(Box::new([0; LIGHT_BYTES]));
+        section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        base.sections.insert(
+            1,
+            Arc::new(Section {
+                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                biomes: None,
+                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+            }),
+        );
+        for y in [-1, 2] {
+            base.sections.insert(
+                y,
+                Arc::new(Section {
+                    blocks: None,
+                    biomes: None,
+                    block_light: Some(Box::new([0; LIGHT_BYTES])),
+                    sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+                }),
+            );
+        }
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let position = ChunkPos {
+                    x: home.x + dx,
+                    z: home.z + dz,
+                };
+                let mut chunk = base.clone();
+                chunk.position = position;
+                world.chunks.insert(position, Arc::new(chunk));
+            }
+        }
+        session.set_has_skylight(true).unwrap();
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(8, 5, 8), water, false));
+        assert!(!session.sky_lighting.settled());
+        let snapshot = Arc::make_mut(&mut session.snapshot);
+        snapshot.world = SessionWorld::Loaded(Arc::clone(&session.world));
+        snapshot.world_revision = session.revision;
+        let before = session.snapshot();
+        let origin = session.origin;
+        let before_light =
+            before
+                .world
+                .loaded()
+                .unwrap()
+                .light(origin.x + 8, 4, origin.z + 8, true);
+        assert_eq!(before_light, Some(15));
+        session.submit_command(PlayerCommand::StopUse);
+        let mut frozen = session.freeze_partial_save().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let progress = frozen.poll_lighting();
+            if progress.is_settled() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lighting did not settle: {progress:?}, missing={:?}",
+                frozen.session().missing_sky_chunks()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let after = frozen.session().snapshot();
+        assert_eq!(after.tick, before.tick);
+        assert_eq!(after.game_time, before.game_time);
+        assert!(after.world_revision > before.world_revision);
+        assert_eq!(
+            before
+                .world
+                .loaded()
+                .unwrap()
+                .light(origin.x + 8, 4, origin.z + 8, true),
+            before_light
+        );
+        assert!(
+            after
+                .world
+                .loaded()
+                .unwrap()
+                .light(origin.x + 8, 4, origin.z + 8, true)
+                .unwrap()
+                < 15
+        );
+        for position in frozen.session().dirty_chunk_positions() {
+            assert!(
+                frozen
+                    .source_positions()
+                    .contains(&native_persistence::world::ChunkPos {
+                        x: position.x,
+                        z: position.z
+                    })
+            );
+        }
+        let resumed = frozen.resume();
+        assert!(matches!(
+            resumed.commands.front(),
+            Some(PlayerCommand::StopUse)
+        ));
+    }
+
+    #[test]
+    fn frozen_save_keeps_missing_light_dependencies_pending() {
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        let home = session.player_chunk().unwrap();
+        let air = session.states[0];
+        let world = Arc::make_mut(&mut session.world);
+        let chunk = Arc::make_mut(world.chunks.get_mut(&home).unwrap());
+        chunk.block_light_correct = true;
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.block_light = Some(Box::new([0; LIGHT_BYTES]));
+        section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        for y in [-1, 1, 2] {
+            chunk.sections.insert(
+                y,
+                Arc::new(Section {
+                    blocks: (y == 1).then(|| Box::new([air; BLOCK_COUNT])),
+                    biomes: None,
+                    block_light: Some(Box::new([0; LIGHT_BYTES])),
+                    sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+                }),
+            );
+        }
+        session.set_has_skylight(true).unwrap();
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(8, 5, 8), water, false));
+        let tick = session.snapshot().tick;
+        session.submit_command(PlayerCommand::StopUse);
+        let mut frozen = session.freeze_partial_save().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let progress = frozen.poll_lighting();
+            assert!(
+                progress.sky_pending,
+                "missing neighbors cannot settle sky light"
+            );
+            if !frozen.session().missing_sky_chunks().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing sky dependencies were not reported"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let resumed = frozen.resume();
+        assert_eq!(resumed.snapshot().tick, tick);
+        assert!(matches!(
+            resumed.commands.front(),
+            Some(PlayerCommand::StopUse)
+        ));
     }
 
     #[test]

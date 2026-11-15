@@ -488,16 +488,22 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
     fn structured_seed_one_reaches_initial_world_stage() -> Result<()> {
-        structured_seed_reaches_initial_world_stage(1)
+        structured_seed_reaches_initial_world_stage(1, false)
     }
 
     #[test]
     #[ignore = "requires Minecraft 26.3; structured world generation is incomplete"]
     fn structured_seed_negative_one_reaches_initial_world_stage() -> Result<()> {
-        structured_seed_reaches_initial_world_stage(-1)
+        structured_seed_reaches_initial_world_stage(-1, false)
     }
 
-    fn structured_seed_reaches_initial_world_stage(seed: i64) -> Result<()> {
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and complete generated-world play-save dependencies"]
+    fn generated_world_ticked_player_save_checks_dependencies() -> Result<()> {
+        structured_seed_reaches_initial_world_stage(-1, true)
+    }
+
+    fn structured_seed_reaches_initial_world_stage(seed: i64, play_save: bool) -> Result<()> {
         let game = match std::env::var_os("MINECRAFT_DIR") {
             Some(path) => PathBuf::from(path),
             None => native_resources::default_minecraft_dir()?,
@@ -725,17 +731,220 @@ mod tests {
                 let reopened_position =
                     reopened_snapshot.origin.as_vec3() + reopened_snapshot.player.position;
                 assert!((before_position - reopened_position).length() < 0.0001);
+                let session_lock = published.session().clone();
                 drop(published);
                 assert!(
                     native_persistence::save::WorldWriteGuard::acquire(&published_path).is_err()
                 );
-                drop(reopened);
+                if play_save {
+                    roundtrip_ticked_player(&published_path, &game, session_lock, *reopened)?;
+                } else {
+                    drop(reopened);
+                }
             }
             InitialWorldResult::Failed { error, .. } => return Err(error),
             InitialWorldResult::Cancelled { .. } => {
                 anyhow::bail!("initial generation was cancelled")
             }
         }
+        Ok(())
+    }
+
+    /// Exercise a real generated world's prepared session and partial save
+    /// transaction in a private test directory. This does not authorize saving
+    /// arbitrary gameplay: only the fields checked below are covered.
+    fn roundtrip_ticked_player(
+        world_path: &std::path::Path,
+        game: &std::path::Path,
+        lock: native_persistence::save::WorldSessionGuard,
+        prepared: crate::PreparedPlayWorld,
+    ) -> Result<()> {
+        use native_persistence::world::{DimensionId, WorldReader};
+        use native_session::{GameSession, PlayerCommand};
+        use native_world::{fluid::FluidState, loaded::BlockState};
+
+        let crate::PreparedPlayWorld {
+            mut session,
+            mut resources,
+            mut streamer,
+            ..
+        } = prepared;
+        let mut reader = WorldReader::open_with_session(
+            world_path,
+            DimensionId::parse("overworld")?,
+            lock.clone(),
+        )?;
+        let initial_level = std::fs::read(world_path.join("level.dat"))?;
+        let initial_player = native_persistence::nbt::write(
+            &reader.read_player()?.context("initial player missing")?,
+        )?;
+        session.set_random_tick_speed(0);
+        session.submit_command(PlayerCommand::Look {
+            yaw: 17.0,
+            pitch: -6.0,
+        });
+        session.update(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let unavailable = loop {
+            let waiting: Vec<_> = session.pending_fence_update_chunks().collect();
+            if waiting.is_empty() {
+                break Vec::new();
+            }
+            let mut absent = Vec::new();
+            for position in &waiting {
+                if !reader
+                    .read_chunk(position.x, position.z)?
+                    .is_some_and(|chunk| chunk.is_full())
+                {
+                    absent.push(*position);
+                }
+            }
+            if absent.len() == waiting.len() {
+                break absent;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "saved fence neighbors did not attach: {waiting:?}"
+            );
+            streamer.service(&mut session)?;
+            session.update(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(streamer);
+        let expected = session.snapshot();
+        let mut frozen = session
+            .freeze_partial_save()
+            .map_err(|error| error.into_parts().1)
+            .context("cannot freeze the ticked generated session")?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let lighting = frozen.poll_lighting();
+            if lighting.is_settled() {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "frozen light did not settle: {lighting:?}, missing sky chunks: {:?}",
+                frozen.session().missing_sky_chunks()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sources =
+            reader.capture_session_save_sources(frozen.source_positions().iter().copied())?;
+        let ids = resources.vanilla_block_ids()?;
+        let tags = native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &ids)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let resolve = |saved: &native_persistence::palette::BlockState| -> Result<BlockState> {
+            let name = String::from_utf16(&saved.name.0)?;
+            let mut supplied = std::collections::BTreeMap::new();
+            for (key, value) in &saved.properties {
+                ensure!(
+                    supplied
+                        .insert(String::from_utf16(&key.0)?, String::from_utf16(&value.0)?)
+                        .is_none(),
+                    "duplicate block property"
+                );
+            }
+            let (name, properties) =
+                registry.resolve(&serde_json::json!({"id": name, "properties": supplied}))?;
+            ensure!(
+                supplied
+                    .iter()
+                    .all(|(key, value)| properties.get(key) == Some(value)),
+                "unsupported saved block property"
+            );
+            Ok(BlockState { name, properties })
+        };
+        let plan = frozen.session().draft_captured_partial_save(
+            &sources,
+            &tags,
+            |saved| {
+                let state = resolve(saved)?;
+                Ok((
+                    matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ),
+                    FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some(),
+                ))
+            },
+            &resolve,
+            |state| {
+                ensure!(
+                    registry.is_canonical_state(&state.name, &state.properties),
+                    "unsupported block state"
+                );
+                Ok(())
+            },
+            |_| anyhow::bail!("unexpected POI change in player round trip"),
+            1,
+        );
+        if !unavailable.is_empty() {
+            let error = plan
+                .err()
+                .context("save accepted missing fence dependencies")?;
+            ensure!(
+                format!("{error:#}").contains("fence shape updates"),
+                "save rejected for an unexpected reason: {error:#}"
+            );
+            assert_eq!(std::fs::read(world_path.join("level.dat"))?, initial_level);
+            assert_eq!(
+                native_persistence::nbt::write(&reader.read_player()?.context("player missing")?)?,
+                initial_player
+            );
+            eprintln!("Save correctly refused for ungenerated fence dependencies: {unavailable:?}");
+            return Ok(());
+        }
+        let plan = plan.context("cannot draft the ticked generated session")?;
+        drop(reader);
+        let mut writer = lock.acquire_write()?;
+        writer.write_plan(plan, |_, _| {
+            anyhow::bail!("unexpected block edit in player round trip")
+        })?;
+        drop(writer);
+        let reader = WorldReader::open_with_session(
+            world_path,
+            DimensionId::parse("overworld")?,
+            lock.clone(),
+        )?;
+        let player = reader.read_player()?.context("saved player missing")?;
+        let camera = crate::saved_camera(&player)?.context("saved player camera missing")?;
+        assert_eq!(camera.yaw, expected.player.yaw);
+        assert_eq!(camera.pitch, expected.player.pitch);
+        assert_eq!(reader.game_time()?, expected.game_time as i64);
+        drop(reader);
+        drop(frozen);
+        let reopened = crate::prepare_world_with_session(
+            world_path,
+            game,
+            &[],
+            crate::ViewOptions {
+                dimension: None,
+                chunk: None,
+                radius: 1,
+                smoke_test: false,
+                block_report: None,
+                play: true,
+                video: crate::menu_settings::VideoSettings::default(),
+            },
+            None,
+            Some(lock),
+        )?;
+        let crate::PreparedWorld::Play(reopened) = reopened else {
+            anyhow::bail!("saved generated world did not reopen as a play session");
+        };
+        let actual = reopened.session.snapshot();
+        assert_eq!(actual.player.yaw, expected.player.yaw);
+        assert_eq!(actual.player.pitch, expected.player.pitch);
+        assert_eq!(actual.game_time, expected.game_time);
+        let expected_pos = expected.origin.as_vec3() + expected.player.position;
+        let actual_pos = actual.origin.as_vec3() + actual.player.position;
+        ensure!(
+            (expected_pos - actual_pos).length() < 0.0001,
+            "saved player position changed"
+        );
         Ok(())
     }
 

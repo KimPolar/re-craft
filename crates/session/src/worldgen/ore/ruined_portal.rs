@@ -375,6 +375,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     || (neighbor.name == "minecraft:iron_bars"
                         && native_world::collision::pane_waterlogged(neighbor).is_some())
                     || portal_full(neighbor)
+                    || generated_ore_state(neighbor)?
                 {
                     true
                 } else if native_world::collision::slab_stair_solid(neighbor).is_some() {
@@ -557,6 +558,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     "invalid portal neighbor state"
                 );
                 let connected = if portal_full(neighbor)
+                    || generated_ore_state(neighbor)?
                     || native_world::collision::jigsaw_state(neighbor)
                     || self.wall_tags.walls.contains(&neighbor.name)
                     || (neighbor.name == "minecraft:iron_bars"
@@ -586,6 +588,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
         ensure!(
             portal_full(state)
                 || is_air(state)
+                || generated_ore_state(state)?
                 || (state.name == "minecraft:dirt" && state.properties.is_empty()),
             "unsupported portal edge update: {state:?}"
         );
@@ -1322,6 +1325,63 @@ mod tests {
             falling_count += 1;
         }
         assert_eq!(falling_count, 72);
+        world.inner.region.set_proto_block([3, 8, 3], &air)?;
+        let mut ore_count = 0;
+        for line in output.lines().filter(|line| line.starts_with("ORE ")) {
+            let values: Vec<_> = line.split_whitespace().collect();
+            ensure!(values.len() == 8, "invalid ore edge oracle");
+            let spec = if values[2] == "-" {
+                serde_json::json!(values[1])
+            } else {
+                serde_json::json!({"id":values[1],"properties":{"lit":values[2]}})
+            };
+            let (name, properties) = registry.resolve(&spec)?;
+            let state = BlockState { name, properties };
+            let (name, properties) = registry.resolve(&serde_json::json!(values[4]))?;
+            let neighbor = BlockState { name, properties };
+            let direction = match values[3] {
+                "down" => [0, -1, 0],
+                "up" => [0, 1, 0],
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "west" => [-1, 0, 0],
+                "east" => [1, 0, 0],
+                _ => anyhow::bail!("invalid ore edge direction"),
+            };
+            world.inner.region.world.saved_block_ticks.clear();
+            world.inner.region.world.saved_fluid_ticks.clear();
+            world.inner.region.block_tick_keys.clear();
+            world.inner.region.fluid_tick_keys.clear();
+            assert_eq!(
+                world.update_shape(pos, &state, direction, pos, &neighbor)?,
+                state,
+                "{line}"
+            );
+            if direction[1] == 0 {
+                let face = values[3];
+                let (name, properties) =
+                    registry.resolve(&serde_json::json!("minecraft:stone_brick_wall"))?;
+                let wall = BlockState { name, properties };
+                let wall = world.update_shape(pos, &wall, direction, pos, &state)?;
+                assert_eq!(wall.properties[face], values[5], "{line}");
+                assert_eq!(wall.properties["up"], values[6], "{line}");
+                let (name, properties) =
+                    registry.resolve(&serde_json::json!("minecraft:iron_bars"))?;
+                let pane = BlockState { name, properties };
+                let pane = world.update_shape(pos, &pane, direction, pos, &state)?;
+                assert_eq!(pane.properties[face], values[7], "{line}");
+            }
+            assert!(
+                world.inner.region.world.saved_block_ticks.is_empty(),
+                "{line}"
+            );
+            assert!(
+                world.inner.region.world.saved_fluid_ticks.is_empty(),
+                "{line}"
+            );
+            ore_count += 1;
+        }
+        assert_eq!(ore_count, 396);
         Ok(())
     }
 

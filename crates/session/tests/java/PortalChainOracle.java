@@ -11,11 +11,15 @@ import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.ServerLevelAccessor;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.RedStoneOreBlock;
+import net.minecraft.world.level.block.WallBlock;
+import net.minecraft.world.level.block.IronBarsBlock;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.ticks.ProtoChunkTicks;
 import net.minecraft.world.ticks.ScheduledTick;
+import net.minecraft.resources.Identifier;
 
 public class PortalChainOracle {
     public static void main(String[] args) {
@@ -95,5 +99,44 @@ public class PortalChainOracle {
                         BuiltInRegistries.BLOCK.getKey(block), direction.getSerializedName(),
                         BuiltInRegistries.BLOCK.getKey(neighbor), delays.get(0), tick.delay(), tick.priority().getValue());
                 }
+        var ores = List.of("coal_ore", "deepslate_coal_ore", "iron_ore", "deepslate_iron_ore",
+            "copper_ore", "deepslate_copper_ore", "gold_ore", "deepslate_gold_ore",
+            "emerald_ore", "deepslate_emerald_ore", "lapis_ore", "deepslate_lapis_ore",
+            "diamond_ore", "deepslate_diamond_ore", "nether_gold_ore", "nether_quartz_ore",
+            "redstone_ore", "deepslate_redstone_ore", "raw_iron_block", "raw_copper_block");
+        for (var name : ores) {
+            var block = BuiltInRegistries.BLOCK.getValue(Identifier.withDefaultNamespace(name));
+            for (int lit = 0; lit < (block instanceof RedStoneOreBlock ? 2 : 1); lit++) {
+                var state = block.defaultBlockState();
+                if (block instanceof RedStoneOreBlock) state = state.setValue(RedStoneOreBlock.LIT, lit != 0);
+                if (!state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
+                        || !state.getFluidState().isEmpty() || state.hasBlockEntity())
+                    throw new AssertionError("unexpected ore properties " + state);
+                for (var direction : Direction.values()) for (var neighbor : List.of(Blocks.AIR, Blocks.WATER, Blocks.MAGMA_BLOCK)) {
+                    if (!state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, direction))
+                        throw new AssertionError("ore face is not sturdy " + state + " " + direction);
+                    ticks.clear();
+                    var random = RandomSource.create(17);
+                    if (state.updateShape(world, world, BlockPos.ZERO, direction, BlockPos.ZERO.relative(direction),
+                            neighbor.defaultBlockState(), random) != state || !ticks.isEmpty())
+                        throw new AssertionError("unexpected ore edge update " + state);
+                    var wall = Blocks.STONE_BRICK_WALL.defaultBlockState();
+                    var bars = Blocks.IRON_BARS.defaultBlockState();
+                    String side = "-", up = "-", pane = "-";
+                    if (direction.getAxis().isHorizontal()) {
+                        var wallResult = wall.updateShape(world, world, BlockPos.ZERO, direction, BlockPos.ZERO.relative(direction), state, random);
+                        var barsResult = bars.updateShape(world, world, BlockPos.ZERO, direction, BlockPos.ZERO.relative(direction), state, random);
+                        side = wallResult.getValue(WallBlock.PROPERTY_BY_DIRECTION.get(direction)).getSerializedName();
+                        up = wallResult.getValue(WallBlock.UP).toString();
+                        pane = barsResult.getValue(IronBarsBlock.PROPERTY_BY_DIRECTION.get(direction)).toString();
+                    }
+                    if (random.nextInt() != RandomSource.create(17).nextInt())
+                        throw new AssertionError("ore edge consumed random values");
+                    System.out.printf("ORE %s %s %s %s %s %s %s%n", BuiltInRegistries.BLOCK.getKey(block),
+                        block instanceof RedStoneOreBlock ? Boolean.toString(lit != 0) : "-",
+                        direction.getSerializedName(), BuiltInRegistries.BLOCK.getKey(neighbor), side, up, pane);
+                }
+            }
+        }
     }
 }

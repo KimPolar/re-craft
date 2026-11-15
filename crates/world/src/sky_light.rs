@@ -51,6 +51,20 @@ impl SkyColumn {
         SkySourceScanner::new(world, bounds).load(x, z)
     }
 
+    /// Restore a source height retained by the same light-engine revision.
+    pub fn from_lowest_source(bounds: LightBounds, x: i32, z: i32, lowest: i32) -> Option<Self> {
+        let range = bounds.build_range();
+        if lowest != UNBOUNDED_SKY_SOURCE && !(range.start..=range.end).contains(&lowest) {
+            return None;
+        }
+        Some(Self {
+            x,
+            z,
+            bounds,
+            lowest,
+        })
+    }
+
     pub fn lowest_source_y(self) -> i32 {
         self.lowest
     }
@@ -59,6 +73,41 @@ impl SkyColumn {
     /// obstruction cannot change the source and does not scan the column.
     /// If required data is missing, the previous value is retained.
     pub fn update(&mut self, world: &World, y: i32) -> Option<bool> {
+        self.update_inner(world, None, y, true)
+    }
+
+    /// Update an already initialized source while the chunk is still a proto
+    /// chunk. The caller must provide the exact generation revision.
+    pub fn update_generated(&mut self, world: &World, y: i32) -> Option<bool> {
+        self.update_inner(world, None, y, false)
+    }
+
+    /// Update against a detached proto-chunk revision while using the given
+    /// world's state registry. The chunk and registry must share ID lineage.
+    pub fn update_generated_in_chunk(
+        &mut self,
+        world: &World,
+        chunk: &Chunk,
+        y: i32,
+    ) -> Option<bool> {
+        if chunk.position
+            != (ChunkPos {
+                x: self.x.div_euclid(16),
+                z: self.z.div_euclid(16),
+            })
+        {
+            return None;
+        }
+        self.update_inner(world, Some(chunk), y, false)
+    }
+
+    fn update_inner(
+        &mut self,
+        world: &World,
+        chunk: Option<&Chunk>,
+        y: i32,
+        require_full: bool,
+    ) -> Option<bool> {
         let range = self.bounds.build_range();
         if !range.contains(&y) {
             return None;
@@ -71,7 +120,12 @@ impl SkyColumn {
         if y.checked_add(1)? < previous {
             return Some(false);
         }
-        let mut reader = ColumnReader::new(world, self.bounds, self.x, self.z, true)?;
+        let mut reader = match chunk {
+            Some(chunk) => {
+                ColumnReader::with_chunk(world, chunk, self.bounds, self.x, self.z, require_full)?
+            }
+            None => ColumnReader::new(world, self.bounds, self.x, self.z, require_full)?,
+        };
         let upper = reader.get(y.checked_add(1)?)?;
         let current = reader.get(y)?;
         if let Some(next) = reader.update_edge(y.checked_add(1)?, previous, upper, current)? {
@@ -563,6 +617,42 @@ mod tests {
                 .load(15, 15)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn restored_generation_source_uses_proto_chunk_updates() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap()).status =
+            Some("minecraft:features".into());
+        let mut source =
+            SkyColumn::from_lowest_source(bounds, 15, 15, UNBOUNDED_SKY_SOURCE).unwrap();
+        assert!(SkyColumn::from_lowest_source(bounds, 15, 15, 33).is_none());
+        put(&mut world, 5, state("stone", &[]));
+        assert_eq!(source.update(&world, 5), None);
+        assert_eq!(source.update_generated(&world, 5), Some(true));
+        assert_eq!(source.lowest_source_y(), 6);
+    }
+
+    #[test]
+    fn generated_source_can_read_a_detached_chunk_revision() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let stone = world.intern_state(state("stone", &[]));
+        let mut detached = world.chunks[&pos].as_ref().clone();
+        let section = Arc::make_mut(detached.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[15 + 15 * 16 + 5 * 256] = stone;
+        let mut source =
+            SkyColumn::from_lowest_source(bounds, 15, 15, UNBOUNDED_SKY_SOURCE).unwrap();
+        assert_eq!(
+            source.update_generated_in_chunk(&world, &detached, 5),
+            Some(true)
+        );
+        assert_eq!(source.lowest_source_y(), 6);
+        assert_eq!(world.block(15, 5, 15).unwrap().name, "minecraft:air");
+        detached.position = ChunkPos { x: 1, z: 0 };
+        assert_eq!(source.update_generated_in_chunk(&world, &detached, 0), None);
     }
 
     #[test]

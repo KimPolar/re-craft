@@ -288,6 +288,14 @@ pub struct FreshGenerationLightTracker {
     zero_layer: Arc<[u8; native_world::loaded::LIGHT_BYTES]>,
 }
 
+/// A transactional update of registered data sections and their allocation
+/// halos. Counts are derived only for affected sections, so the usual
+/// addition-only path does not rescan a large generation batch.
+struct GenerationSectionPlan {
+    sections: BTreeMap<(native_world::loaded::ChunkPos, i32), bool>,
+    allocated: BTreeMap<(native_world::loaded::ChunkPos, i32), bool>,
+}
+
 fn generated_state_is_air(
     registry: &native_resources::block_registry::GeneratedBlockRegistry,
     state: &native_world::loaded::BlockState,
@@ -306,6 +314,95 @@ fn generated_state_is_air(
 }
 
 impl FreshGenerationLightTracker {
+    fn plan_section_statuses(
+        &self,
+        statuses: &[(native_world::loaded::ChunkPos, i32, bool)],
+    ) -> Result<GenerationSectionPlan> {
+        use native_world::loaded::ChunkPos;
+        let mut sections = BTreeMap::new();
+        let mut affected = BTreeSet::new();
+        let mut has_removal = false;
+        for &(position, y, nonempty) in statuses {
+            ensure!(
+                self.registered.contains_key(&position),
+                "section status belongs to an unregistered chunk"
+            );
+            ensure!(
+                (-2_097_151..=2_097_150).contains(&position.x)
+                    && (-2_097_151..=2_097_150).contains(&position.z)
+                    && (-524_287..=524_286).contains(&y),
+                "section status is out of range"
+            );
+            let key = (position, y);
+            let before = sections
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| self.data_sections.contains(&key));
+            ensure!(before != nonempty, "section status history differs");
+            sections.insert(key, nonempty);
+            has_removal |= !nonempty;
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        affected.insert((
+                            ChunkPos {
+                                x: position.x + dx,
+                                z: position.z + dz,
+                            },
+                            y + dy,
+                        ));
+                    }
+                }
+            }
+        }
+        let mut allocated = BTreeMap::new();
+        for (position, y) in affected {
+            let remains = !has_removal
+                || (-1..=1).any(|dz| {
+                    (-1..=1).any(|dx| {
+                        (-1..=1).any(|dy| {
+                            let key = (
+                                ChunkPos {
+                                    x: position.x + dx,
+                                    z: position.z + dz,
+                                },
+                                y + dy,
+                            );
+                            sections
+                                .get(&key)
+                                .copied()
+                                .unwrap_or_else(|| self.data_sections.contains(&key))
+                        })
+                    })
+                });
+            allocated.insert((position, y), remains);
+        }
+        Ok(GenerationSectionPlan {
+            sections,
+            allocated,
+        })
+    }
+
+    fn apply_section_plan(&mut self, plan: GenerationSectionPlan) {
+        for (section, nonempty) in plan.sections {
+            if nonempty {
+                self.data_sections.insert(section);
+            } else {
+                self.data_sections.remove(&section);
+            }
+        }
+        for ((position, y), allocated) in plan.allocated {
+            if allocated {
+                self.allocated.entry(position).or_default().insert(y);
+            } else if let Some(sections) = self.allocated.get_mut(&position) {
+                sections.remove(&y);
+                if sections.is_empty() {
+                    self.allocated.remove(&position);
+                }
+            }
+        }
+    }
+
     /// Start only when the associated Java-equivalent engine is freshly empty.
     pub fn new(terrain: &CarvedTerrainWorld, has_skylight: bool) -> Result<Self> {
         ensure!(!terrain.has_published_light, "light was already published");
@@ -713,8 +810,8 @@ impl FreshGenerationLightTracker {
 /// Generation lighting with monotonically activated source chunks. Most
 /// columns are calculated from the activation inputs; tracked inactive tree
 /// and cave-vine checks preserve their updated columns instead. Activations
-/// overlapping that history use incremental propagation. Section removals,
-/// restored light and live-world edits are not supported here.
+/// overlapping that history use incremental propagation. Restored light and
+/// live-world edits are not supported here.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
     active: BTreeSet<native_world::loaded::ChunkPos>,

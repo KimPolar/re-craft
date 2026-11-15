@@ -19001,9 +19001,11 @@ impl LoadedSession {
         if state.name != "minecraft:bubble_column" {
             return;
         }
-        // Related fluid and block ticks are not yet persisted as a complete unit.
-        self.unresolved_bubble_tick = true;
-        if bubble_column_drag(state).is_none() {
+        if bubble_column_drag(state).is_none()
+            || !self
+                .simulated_fluid(id)
+                .is_some_and(|fluid| fluid.kind == FluidKind::Water && fluid.source)
+        {
             self.unresolved_bubble_tick = true;
             return;
         }
@@ -47562,6 +47564,8 @@ pub(crate) mod tests {
                     stone
                 }
             ));
+            assert!(!session.unresolved_bubble_tick, "{row}");
+            assert_eq!(row["gameEvents"], 0, "{row}");
             let mut blocks: Vec<_> = session
                 .bubble_ticks
                 .iter()

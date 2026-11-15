@@ -23,7 +23,7 @@ import net.minecraft.world.phys.Vec3;
 public class IceBubbleTagOracle {
     static final BlockPos CENTER = new BlockPos(8, 10, 8);
     static class World extends ServerLevel {
-        Map<BlockPos, BlockState> blocks; RandomSource random; boolean bubble; JsonArray blockTicks, fluidTicks; Set<String> pending;
+        Map<BlockPos, BlockState> blocks; RandomSource random; boolean bubble; JsonArray blockTicks, fluidTicks; Set<String> pending; int gameEvents;
         CollectingNeighborUpdater updater; EnvironmentAttributeSystem attributes;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public RandomSource getRandom() { return random; }
@@ -54,7 +54,7 @@ public class IceBubbleTagOracle {
             if(!pending.add("f:"+pos.toShortString()+":"+id)) return;
             var entry=new JsonArray(); entry.add(id); entry.add(pos.getX()); entry.add(pos.getY()); entry.add(pos.getZ()); entry.add(delay); fluidTicks.add(entry);
         }
-        @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) { }
+        @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) { gameEvents++; }
     }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();

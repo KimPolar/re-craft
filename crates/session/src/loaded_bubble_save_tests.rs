@@ -367,6 +367,264 @@ fn bubble_tick_in_a_nonfull_chunk_remains_deferred_without_losing_its_schedule()
     assert_eq!(session.draft_fluid_ticks(home).unwrap(), fluids);
 }
 
+fn shape_fixture() -> (LoadedSession, ChunkPos, NamedTag) {
+    let column = state("minecraft:bubble_column", &[("drag", "true")]);
+    let (mut session, home, _, source) = fixture(column, BubbleTickKind::Column, true);
+    session.bubble_ticks.clear();
+    session.bubble_pending.clear();
+    session.sand_ticks.clear();
+    session.sand_pending.clear();
+    Arc::make_mut(&mut session.world)
+        .saved_block_ticks
+        .insert(home, Vec::new());
+    let mut initial = native_persistence::edit::draft_chunk_blocks(
+        &source,
+        native_persistence::world::ChunkPos {
+            x: home.x,
+            z: home.z,
+        },
+        &[],
+    )
+    .unwrap();
+    initial.replace_block_ticks(&[]).unwrap();
+    (session, home, initial.document().clone())
+}
+
+#[test]
+fn bubble_shape_update_preserves_the_block_and_both_tick_queues() {
+    let (mut session, home, source) = shape_fixture();
+    let relative = IVec3::new(8, 5, 8);
+    let center = session.origin + relative;
+    let above = center + IVec3::Y;
+    let water = state("minecraft:water", &[("level", "0")]);
+    let water_id = session.intern_block(water.clone());
+    assert!(session.set(relative + IVec3::Y, water_id));
+    assert!(!session.unresolved_bubble_tick);
+    let blocks = session.draft_block_ticks(home).unwrap();
+    assert_eq!(
+        blocks,
+        vec![SavedBlockTick {
+            block: "minecraft:bubble_column".into(),
+            position: center.to_array(),
+            delay: 5,
+            priority: 0,
+        }]
+    );
+    let fluids = session.draft_fluid_ticks(home).unwrap();
+    assert_eq!(
+        fluids,
+        [above, center]
+            .into_iter()
+            .map(|position| SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: position.to_array(),
+                delay: 5,
+                priority: 0,
+            })
+            .collect::<Vec<_>>()
+    );
+    let draft = session
+        .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+            home,
+            &source,
+            &bubble_heightmap_tags(),
+            bubble_air_and_fluid,
+        )
+        .unwrap();
+    let mut expected = native_persistence::edit::draft_chunk_blocks(
+        &source,
+        native_persistence::world::ChunkPos {
+            x: home.x,
+            z: home.z,
+        },
+        &[BlockChange {
+            x: above.x,
+            y: above.y,
+            z: above.z,
+            expected: saved(&state("minecraft:air", &[])),
+            replacement: saved(&water),
+        }],
+    )
+    .unwrap();
+    expected.replace_block_ticks(&blocks).unwrap();
+    expected.replace_fluid_ticks(&fluids).unwrap();
+    for field in [
+        "sections",
+        "block_ticks",
+        "fluid_ticks",
+        "unknown_chunk_data",
+    ] {
+        assert_eq!(
+            draft.document().value.get(field),
+            expected.document().value.get(field),
+            "{field}"
+        );
+    }
+    assert!(draft.matches_source(&source).unwrap());
+}
+
+#[test]
+fn bubble_shape_update_blocks_saving_when_its_fluid_or_tags_are_missing() {
+    for missing_tags in [false, true] {
+        let (mut session, home, _) = shape_fixture();
+        let relative = IVec3::new(8, 5, 8);
+        if missing_tags {
+            session.bubble_column_tags = None;
+        } else {
+            let Cell::State(id) = cell(
+                &session.world,
+                session.origin,
+                session.bounds,
+                relative,
+                session.states[0],
+            ) else {
+                panic!("bubble column missing from fixture")
+            };
+            session.fluids[id.0 as usize] = None;
+        }
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set(relative + IVec3::Y, water));
+        assert!(session.unresolved_bubble_tick);
+        assert!(session.draft_block_ticks(home).is_err());
+    }
+}
+
+#[test]
+fn bubble_shape_update_across_chunk_boundary_preserves_both_chunks_ticks() {
+    let (mut session, home, source) = shape_fixture();
+    let neighbor = ChunkPos {
+        x: home.x + 1,
+        z: home.z,
+    };
+    let clean = super::tests::session();
+    let mut neighbor_chunk = (**clean.world.chunks.get(&home).unwrap()).clone();
+    neighbor_chunk.position = neighbor;
+    let world = Arc::make_mut(&mut session.world);
+    world.chunks.insert(neighbor, Arc::new(neighbor_chunk));
+    world.saved_block_ticks.insert(neighbor, Vec::new());
+    world.saved_fluid_ticks.insert(neighbor, Vec::new());
+    session.fluid_chunks_seen.insert(neighbor);
+
+    let bubble_pos = session.origin + IVec3::new(15, 5, 8);
+    let water_pos = bubble_pos + IVec3::X;
+    let bubble = state("minecraft:bubble_column", &[("drag", "true")]);
+    let bubble_id = session.intern_block(bubble.clone());
+    Arc::make_mut(&mut session.world)
+        .set_block_id(bubble_pos.x, bubble_pos.y, bubble_pos.z, bubble_id)
+        .unwrap();
+    let home_source = native_persistence::edit::draft_chunk_blocks(
+        &source,
+        native_persistence::world::ChunkPos {
+            x: home.x,
+            z: home.z,
+        },
+        &[BlockChange {
+            x: bubble_pos.x,
+            y: bubble_pos.y,
+            z: bubble_pos.z,
+            expected: saved(&state("minecraft:air", &[])),
+            replacement: saved(&bubble),
+        }],
+    )
+    .unwrap()
+    .document()
+    .clone();
+    let neighbor_source = fixture_chunk_document(neighbor);
+    let water = state("minecraft:water", &[("level", "0")]);
+    let water_id = session.intern_block(water.clone());
+    assert!(session.set(IVec3::new(16, 5, 8), water_id));
+    assert!(!session.unresolved_bubble_tick);
+    assert!(session.dirty_chunk_positions().contains(&home));
+    assert!(session.dirty_chunk_positions().contains(&neighbor));
+
+    let blocks = session.draft_block_ticks(home).unwrap();
+    assert_eq!(
+        blocks,
+        vec![SavedBlockTick {
+            block: "minecraft:bubble_column".into(),
+            position: bubble_pos.to_array(),
+            delay: 5,
+            priority: 0,
+        }]
+    );
+    let fluid = |position: IVec3| SavedFluidTick {
+        fluid: "minecraft:water".into(),
+        position: position.to_array(),
+        delay: 5,
+        priority: 0,
+    };
+    let home_fluids = session.draft_fluid_ticks(home).unwrap();
+    let neighbor_fluids = session.draft_fluid_ticks(neighbor).unwrap();
+    assert_eq!(home_fluids, vec![fluid(bubble_pos)]);
+    assert_eq!(neighbor_fluids, vec![fluid(water_pos)]);
+    assert!(session.draft_block_ticks(neighbor).unwrap().is_empty());
+
+    let tags = bubble_heightmap_tags();
+    let home_draft = session
+        .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+            home,
+            &home_source,
+            &tags,
+            bubble_air_and_fluid,
+        )
+        .unwrap();
+    let neighbor_draft = session
+        .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+            neighbor,
+            &neighbor_source,
+            &tags,
+            bubble_air_and_fluid,
+        )
+        .unwrap();
+    let mut expected_home = native_persistence::edit::draft_chunk_blocks(
+        &home_source,
+        native_persistence::world::ChunkPos {
+            x: home.x,
+            z: home.z,
+        },
+        &[],
+    )
+    .unwrap();
+    expected_home.replace_block_ticks(&blocks).unwrap();
+    expected_home.replace_fluid_ticks(&home_fluids).unwrap();
+    let mut expected_neighbor = native_persistence::edit::draft_chunk_blocks(
+        &neighbor_source,
+        native_persistence::world::ChunkPos {
+            x: neighbor.x,
+            z: neighbor.z,
+        },
+        &[BlockChange {
+            x: water_pos.x,
+            y: water_pos.y,
+            z: water_pos.z,
+            expected: saved(&state("minecraft:air", &[])),
+            replacement: saved(&water),
+        }],
+    )
+    .unwrap();
+    expected_neighbor.replace_block_ticks(&[]).unwrap();
+    expected_neighbor
+        .replace_fluid_ticks(&neighbor_fluids)
+        .unwrap();
+    for (actual, expected) in [
+        (&home_draft, &expected_home),
+        (&neighbor_draft, &expected_neighbor),
+    ] {
+        for field in [
+            "sections",
+            "block_ticks",
+            "fluid_ticks",
+            "unknown_chunk_data",
+        ] {
+            assert_eq!(
+                actual.document().value.get(field),
+                expected.document().value.get(field),
+                "{field}"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]

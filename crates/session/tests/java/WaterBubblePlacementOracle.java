@@ -27,7 +27,7 @@ public class WaterBubblePlacementOracle {
             BuiltInRegistries.FLUID.prepareTagReload(new TagLoader.LoadResult<>(Registries.FLUID,Map.of(
                 FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
                 FluidTags.BUBBLE_COLUMN_CAN_OCCUPY,waterTagged?List.of(Fluids.WATER.builtInRegistryHolder()):List.of()))).apply();
-            world.blocks=new HashMap<>(); world.random=new LegacyRandomSource(1); world.bubble=false; world.updater=new CollectingNeighborUpdater(world,100000); world.blockTicks=new JsonArray(); world.fluidTicks=new JsonArray(); world.pending=new HashSet<>();
+            world.blocks=new HashMap<>(); world.random=new LegacyRandomSource(1); world.bubble=false; world.updater=new CollectingNeighborUpdater(world,100000); world.blockTicks=new JsonArray(); world.fluidTicks=new JsonArray(); world.pending=new HashSet<>(); world.gameEvents=0;
             var water=Blocks.WATER.defaultBlockState(); var flowing=water.setValue(LiquidBlock.LEVEL,1); var stone=Blocks.STONE.defaultBlockState();
             BlockPos target;
             if(scenario==0 || scenario==4) { target=CENTER; world.blocks.put(CENTER.below(),stone); if(scenario==4) world.blocks.put(CENTER,flowing); }
@@ -37,7 +37,7 @@ public class WaterBubblePlacementOracle {
             else { target=CENTER.east(); world.blocks.put(CENTER.below(),stone); world.blocks.put(CENTER,scenario==3?flowing:water); }
             world.setBlock(target,scenario==6?Blocks.AIR.defaultBlockState():(scenario==0||scenario==4||scenario==7)?water:stone,3,512);
             var row=new JsonObject(); row.addProperty("tags",tags); row.addProperty("water",waterTagged); row.addProperty("scenario",scenario);
-            row.add("blockTicks",world.blockTicks); row.add("fluidTicks",world.fluidTicks); rows.add(row);
+            row.add("blockTicks",world.blockTicks); row.add("fluidTicks",world.fluidTicks); row.addProperty("gameEvents",world.gameEvents); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),rows.toString());
     }

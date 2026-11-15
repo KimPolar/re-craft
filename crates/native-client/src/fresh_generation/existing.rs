@@ -194,10 +194,67 @@ struct ResumedTreasureStart {
     placement: native_resources::structure_start::SimpleStructureStart,
 }
 
+/// The original source and piece state stay attached while several feature
+/// centers are processed. This intermediate state does not authorize a save.
+#[derive(Clone)]
+struct ResumedMineshaftStart {
+    source: Arc<NamedTag>,
+    original: Tag,
+    references: i32,
+    placement: native_session::worldgen::mineshaft::PreparedStart,
+}
+
+fn resume_saved_mineshaft(
+    source: Arc<NamedTag>,
+    original: &Tag,
+    references: i32,
+    chunk: native_world::loaded::ChunkPos,
+    adjustment: native_core::beardifier::TerrainAdjustment,
+    pieces: &[native_session::worldgen::saved_structure_starts::RestoredStructurePiece],
+) -> Result<ResumedMineshaftStart> {
+    use native_session::worldgen::saved_structure_starts::RestoredStructurePiece;
+    let mut saved_pieces = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let RestoredStructurePiece::Mineshaft(piece) = piece else {
+            bail!("mineshaft contains another structure piece type");
+        };
+        saved_pieces.push(piece.clone());
+    }
+    let first = saved_pieces
+        .first()
+        .context("saved mineshaft has no pieces")?;
+    let variant = first.variant;
+    ensure!(
+        saved_pieces.iter().all(|piece| piece.variant == variant),
+        "saved mineshaft piece variants differ"
+    );
+    let placement = native_session::worldgen::mineshaft::PreparedStart {
+        chunk: [chunk.x, chunk.z],
+        // The saved format does not retain the generation point. Piece
+        // placement uses the stored piece bounds instead.
+        generation_point: first.piece.bounds.min,
+        terrain_adjustment: adjustment,
+        variant,
+        pieces: saved_pieces,
+    };
+    Ok(ResumedMineshaftStart {
+        source,
+        original: original.clone(),
+        references,
+        placement,
+    })
+}
+
 struct SavedStructurePlan {
     schedule: Option<Arc<native_resources::structure_decoration::StructureDecorationSchedule>>,
     starts: BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+    mineshafts: BTreeMap<SavedStructureKey, ResumedMineshaftStart>,
     order: Vec<(ResourceId, Vec<SavedStructureKey>)>,
+}
+
+enum SavedStructureUpdates {
+    Simple(Vec<Vec<native_resources::structure_start::SimpleStructureStart>>),
+    Mixed(Vec<Vec<native_session::worldgen::PreparedStructureStart>>),
 }
 
 impl SavedStructurePlan {
@@ -241,6 +298,100 @@ impl SavedStructurePlan {
                     .placement = placement;
             }
         }
+    }
+
+    fn planned_mixed(
+        &self,
+    ) -> Result<Vec<native_session::worldgen::structure_batch::PlannedMixedStructureDecoration<'_>>>
+    {
+        use native_session::worldgen::structure_batch::{
+            PlannedMixedStructureDecoration, PlannedStructureStart,
+        };
+        let mut planned = Vec::with_capacity(self.order.len());
+        for (id, keys) in &self.order {
+            let entry = self
+                .schedule
+                .as_ref()
+                .context("structure schedule is missing")?
+                .steps()
+                .iter()
+                .flatten()
+                .find(|entry| &entry.id == id)
+                .context("structure schedule entry disappeared")?;
+            let mut starts = Vec::with_capacity(keys.len());
+            for key in keys {
+                match (self.starts.get(key), self.mineshafts.get(key)) {
+                    (Some(start), None) => {
+                        starts.push(PlannedStructureStart::Simple(&start.placement));
+                    }
+                    (None, Some(start)) => {
+                        starts.push(PlannedStructureStart::Mineshaft(&start.placement));
+                    }
+                    (None, None) => bail!("planned saved structure start is missing"),
+                    (Some(_), Some(_)) => bail!("saved structure start has conflicting types"),
+                }
+            }
+            planned.push(PlannedMixedStructureDecoration { entry, starts });
+        }
+        Ok(planned)
+    }
+
+    fn apply_mixed_updates(
+        &mut self,
+        updates: Vec<Vec<native_session::worldgen::PreparedStructureStart>>,
+    ) -> Result<()> {
+        use native_session::worldgen::PreparedStructureStart;
+        ensure!(
+            self.order.len() == updates.len(),
+            "structure update count differs"
+        );
+        for ((_, keys), updated) in self.order.iter().zip(&updates) {
+            ensure!(
+                keys.len() == updated.len(),
+                "structure start update count differs"
+            );
+            for (key, value) in keys.iter().zip(updated) {
+                ensure!(
+                    matches!(value, PreparedStructureStart::Simple(_))
+                        && self.starts.contains_key(key)
+                        || matches!(value, PreparedStructureStart::Mineshaft(_))
+                            && self.mineshafts.contains_key(key),
+                    "structure update type differs"
+                );
+            }
+        }
+        for ((_, keys), updated) in self.order.iter().zip(updates) {
+            for (key, value) in keys.iter().zip(updated) {
+                match value {
+                    PreparedStructureStart::Simple(placement) => {
+                        self.starts.get_mut(key).expect("validated start").placement = placement;
+                    }
+                    PreparedStructureStart::Mineshaft(placement) => {
+                        self.mineshafts
+                            .get_mut(key)
+                            .expect("validated start")
+                            .placement = placement;
+                    }
+                    _ => unreachable!("validated structure update"),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct UnavailableOceanPlacement;
+
+impl native_session::worldgen::MixedOceanRuinPlacement for UnavailableOceanPlacement {
+    fn place(
+        &mut self,
+        _: &mut native_session::worldgen::DecorationRegion<'_>,
+        _: &mut native_session::worldgen::ocean_ruin::PreparedStart,
+        _: native_core::beardifier::BoundingBox,
+        _: &mut native_core::random::DecorationRandom,
+    ) -> Result<()> {
+        bail!("saved ocean ruin decoration context is missing")
     }
 }
 
@@ -1747,10 +1898,12 @@ pub(crate) struct LiveGenerationTerrainStageDraft {
     terrain: native_session::loaded::GenerationTerrainStageDraft,
 }
 
-/// Detached generation terrain incorporating captured live blocks. The
-/// retained batch cannot yet be used for features, lighting, play or saving.
+/// Detached generation terrain incorporating captured live blocks. Feature
+/// work remains intermediate; lighting, play and saving still need validation.
 pub(crate) struct StagedLiveTerrainBatch {
     batch: CapturedTerrainBatch,
+    feature_order: Vec<native_world::loaded::ChunkPos>,
+    mineshaft_starts: BTreeMap<SavedStructureKey, ResumedMineshaftStart>,
 }
 
 impl StagedLiveTerrainBatch {
@@ -1784,6 +1937,44 @@ impl StagedLiveTerrainBatch {
             "features dependencies are incomplete"
         );
         Ok(())
+    }
+
+    /// Ready unfinished centers only; the caller must supply and later verify
+    /// the actual Java execution order before results can be published.
+    pub fn ready_features(&self) -> Vec<native_world::loaded::ChunkPos> {
+        use native_session::worldgen::schedule::GenerationStage;
+        self.unfinished_features()
+            .into_iter()
+            .filter(|&position| {
+                self.batch
+                    .schedule
+                    .ready(position, GenerationStage::Features)
+            })
+            .collect()
+    }
+
+    /// Distinguish unfinished centers from an empty ready list when a terrain
+    /// prerequisite is still unavailable. Saved completed centers are not rerun.
+    pub fn unfinished_features(&self) -> Vec<native_world::loaded::ChunkPos> {
+        use native_session::worldgen::schedule::GenerationStage;
+        self.batch
+            .schedule
+            .requirements()
+            .filter_map(|(position, required)| {
+                (required >= GenerationStage::Features
+                    && self.batch.require_unfinished_features(position).is_ok()
+                    && self
+                        .batch
+                        .schedule
+                        .completed(position)
+                        .is_some_and(|stage| stage < GenerationStage::Features))
+                .then_some(position)
+            })
+            .collect()
+    }
+
+    pub fn feature_order(&self) -> &[native_world::loaded::ChunkPos] {
+        &self.feature_order
     }
 }
 
@@ -6127,6 +6318,15 @@ impl PreparedExistingGenerator {
         context: &SavedDecorationContext,
         action: impl FnOnce(&native_session::worldgen::PreparedDecoration<'_, '_>) -> Result<T>,
     ) -> Result<T> {
+        self.with_saved_prepared_decoration_inner(context, false, action)
+    }
+
+    fn with_saved_prepared_decoration_inner<T>(
+        &mut self,
+        context: &SavedDecorationContext,
+        needs_mineshaft: bool,
+        action: impl FnOnce(&native_session::worldgen::PreparedDecoration<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
         let plan = context.plan(self)?;
         self.ensure_terrain_assets()?;
         let assets = self
@@ -6134,11 +6334,12 @@ impl PreparedExistingGenerator {
             .as_ref()
             .expect("terrain assets initialized");
         let mut resolve = |value: &Value| resolve_generated_terrain_state(value, &assets.blocks);
-        let prepared = native_session::worldgen::PreparedDecoration::load(
+        let prepared = native_session::worldgen::PreparedDecoration::load_with_mineshaft(
             &mut self.resources,
             &plan,
             &assets.block_ids,
             &mut resolve,
+            needs_mineshaft,
         )?;
         action(&prepared)
     }
@@ -6152,12 +6353,18 @@ impl PreparedExistingGenerator {
     ) -> Result<SavedStructurePlan> {
         let references = self.restore_saved_structure_references(target)?;
         validate_saved_decoration_references(&references)?;
-        self.prepare_captured_structure_plan(&world.treasure_starts, &references.references, target)
+        self.prepare_captured_structure_plan(
+            &world.treasure_starts,
+            None,
+            &references.references,
+            target,
+        )
     }
 
     fn prepare_captured_structure_plan(
         &mut self,
         previous: &BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+        previous_mineshafts: Option<&BTreeMap<SavedStructureKey, ResumedMineshaftStart>>,
         references: &native_session::worldgen::structure_references::OrderedStructureReferences,
         target: native_persistence::world::ChunkPos,
     ) -> Result<SavedStructurePlan> {
@@ -6169,6 +6376,7 @@ impl PreparedExistingGenerator {
             return Ok(SavedStructurePlan {
                 schedule: None,
                 starts: BTreeMap::new(),
+                mineshafts: BTreeMap::new(),
                 order: Vec::new(),
             });
         }
@@ -6199,6 +6407,7 @@ impl PreparedExistingGenerator {
         );
         let mut loaded = BTreeMap::new();
         let mut starts = BTreeMap::new();
+        let mut mineshafts = BTreeMap::new();
         let mut order = Vec::new();
         for entry in schedule.steps().iter().flatten() {
             let Some(sources) = references.order(&entry.id) else {
@@ -6226,6 +6435,18 @@ impl PreparedExistingGenerator {
                         .context("referenced structure source missing")?
                         .document,
                 );
+                if let Some(value) = previous_mineshafts.and_then(|saved| saved.get(&key)) {
+                    ensure!(
+                        Arc::ptr_eq(&value.source, &captured),
+                        "saved mineshaft source differs"
+                    );
+                    ensure!(
+                        mineshafts.insert(key.clone(), value.clone()).is_none(),
+                        "duplicate saved mineshaft reference"
+                    );
+                    keys.push(key);
+                    continue;
+                }
                 let value = if let Some(value) = previous.get(&key) {
                     ensure!(
                         Arc::ptr_eq(&value.source, &captured),
@@ -6253,18 +6474,36 @@ impl PreparedExistingGenerator {
                     if pieces.is_empty() {
                         continue;
                     }
-                    if pieces
+                    let is_mineshaft = pieces
                         .iter()
-                        .all(|piece| matches!(piece, RestoredStructurePiece::Mineshaft(_)))
-                        && !mineshaft_may_touch_chunk(
+                        .all(|piece| matches!(piece, RestoredStructurePiece::Mineshaft(_)));
+                    if is_mineshaft {
+                        let may_touch = mineshaft_may_touch_chunk(
                             native_world::loaded::ChunkPos {
                                 x: target.x,
                                 z: target.z,
                             },
                             pieces,
-                        )?
-                    {
-                        continue;
+                        )?;
+                        if !may_touch {
+                            continue;
+                        }
+                        if previous_mineshafts.is_some() {
+                            let value = resume_saved_mineshaft(
+                                captured,
+                                original,
+                                *references,
+                                source,
+                                *adjustment,
+                                pieces,
+                            )?;
+                            ensure!(
+                                mineshafts.insert(key.clone(), value).is_none(),
+                                "duplicate saved mineshaft reference"
+                            );
+                            keys.push(key);
+                            continue;
+                        }
                     }
                     let [RestoredStructurePiece::BuriedTreasure(bounds)] = pieces.as_slice() else {
                         let kind = match &pieces[0] {
@@ -6312,6 +6551,7 @@ impl PreparedExistingGenerator {
         Ok(SavedStructurePlan {
             schedule: Some(schedule),
             starts,
+            mineshafts,
             order,
         })
     }
@@ -6649,7 +6889,7 @@ impl PreparedExistingGenerator {
         batch: &mut CapturedTerrainBatch,
         context: &SavedDecorationContext,
     ) -> Result<Vec<bool>> {
-        self.run_captured_features_inner(batch, context, None)
+        self.run_captured_features_inner(batch, context, None, None)
     }
 
     /// Run a feature pass on the detached live terrain without inventing a
@@ -6668,7 +6908,14 @@ impl PreparedExistingGenerator {
                 z: position.z,
             },
         )?;
-        self.run_captured_features(&mut batch.batch, &context)
+        let placements = self.run_captured_features_inner(
+            &mut batch.batch,
+            &context,
+            None,
+            Some(&mut batch.mineshaft_starts),
+        )?;
+        batch.feature_order.push(position);
+        Ok(placements)
     }
 
     /// Run features against a caller-verified initial light revision. Any
@@ -6679,7 +6926,7 @@ impl PreparedExistingGenerator {
         context: &SavedDecorationContext,
         light: &CapturedFeatureLight,
     ) -> Result<Vec<bool>> {
-        self.run_captured_features_inner(batch, context, Some(light))
+        self.run_captured_features_inner(batch, context, Some(light), None)
     }
 
     fn run_captured_features_inner(
@@ -6687,6 +6934,7 @@ impl PreparedExistingGenerator {
         batch: &mut CapturedTerrainBatch,
         context: &SavedDecorationContext,
         light: Option<&CapturedFeatureLight>,
+        mut previous_mineshafts: Option<&mut BTreeMap<SavedStructureKey, ResumedMineshaftStart>>,
     ) -> Result<Vec<bool>> {
         use native_session::worldgen::schedule::GenerationStage;
         ensure!(
@@ -6718,6 +6966,7 @@ impl PreparedExistingGenerator {
             };
             Some(self.prepare_captured_structure_plan(
                 &batch.treasure_starts,
+                previous_mineshafts.as_deref(),
                 &references,
                 context.position,
             )?)
@@ -6794,11 +7043,42 @@ impl PreparedExistingGenerator {
             }
             Ok(())
         })();
+        let needs_mineshaft = structures
+            .as_ref()
+            .is_some_and(|plan| !plan.mineshafts.is_empty());
         let result = priming.and_then(|()| {
-            self.with_saved_prepared_decoration(context, |prepared| {
+            self.with_saved_prepared_decoration_inner(context, needs_mineshaft, |prepared| {
                 if let Some(structures) = &structures {
+                    if needs_mineshaft {
+                        let planned = structures.planned_mixed()?;
+                        let mut placement =
+                            native_session::worldgen::MixedMineshaftPlacementContext {
+                                other: UnavailableOceanPlacement,
+                                blocking_biomes: prepared
+                                    .mineshaft_blocking_biomes()
+                                    .context("mineshaft biome tags are missing")?,
+                                uuid_factory: |_: [f64; 3]| -> Result<Option<[i32; 4]>> {
+                                    bail!("mineshaft minecart UUID source is not bound")
+                                },
+                            };
+                        let (features, updates) = match light {
+                            Some(light) => prepared.execute_mixed_with_visible_light(
+                                &mut batch.terrain,
+                                &planned,
+                                &mut placement,
+                                &light.light,
+                            )?,
+                            None => prepared.execute_with_mixed_structure_plan(
+                                &mut batch.terrain,
+                                &planned,
+                                &mut placement,
+                            )?,
+                        };
+                        batch.schedule.complete(center, GenerationStage::Features)?;
+                        return Ok((features, SavedStructureUpdates::Mixed(updates)));
+                    }
                     let planned = structures.planned()?;
-                    match light {
+                    let (features, updates) = match light {
                         Some(light) => batch
                             .schedule
                             .run_features_with_structure_plan_and_visible_light(
@@ -6806,13 +7086,14 @@ impl PreparedExistingGenerator {
                                 prepared,
                                 &planned,
                                 &light.light,
-                            ),
+                            )?,
                         None => batch.schedule.run_features_with_structure_plan(
                             &mut batch.terrain,
                             prepared,
                             &planned,
-                        ),
-                    }
+                        )?,
+                    };
+                    Ok((features, SavedStructureUpdates::Simple(updates)))
                 } else {
                     let features = match light {
                         Some(light) => batch.schedule.run_features_with_visible_light(
@@ -6828,7 +7109,7 @@ impl PreparedExistingGenerator {
                             None,
                         )?,
                     };
-                    Ok((features, Vec::new()))
+                    Ok((features, SavedStructureUpdates::Simple(Vec::new())))
                 }
             })
         });
@@ -6841,8 +7122,25 @@ impl PreparedExistingGenerator {
             }
         };
         if let Some(structures) = structures.as_mut() {
-            structures.apply_updates(updates);
+            match updates {
+                SavedStructureUpdates::Simple(updates) => structures.apply_updates(updates),
+                SavedStructureUpdates::Mixed(updates) => {
+                    if let Err(error) = structures.apply_mixed_updates(updates) {
+                        batch.terrain = previous_terrain;
+                        batch.schedule = previous_schedule;
+                        return Err(error);
+                    }
+                }
+            }
+            if previous_mineshafts.is_none() && !structures.mineshafts.is_empty() {
+                batch.terrain = previous_terrain;
+                batch.schedule = previous_schedule;
+                bail!("mineshaft state cannot be retained");
+            }
             batch.treasure_starts.append(&mut structures.starts);
+            if let Some(previous) = previous_mineshafts.as_deref_mut() {
+                previous.append(&mut structures.mineshafts);
+            }
         }
         batch.feature_entity_sources.complete(center, entity_free);
         batch.revision = Arc::new(());
@@ -7935,7 +8233,11 @@ impl PreparedExistingGenerator {
             &heightmaps,
             &mut check,
         )?;
-        Ok(StagedLiveTerrainBatch { batch })
+        Ok(StagedLiveTerrainBatch {
+            batch,
+            feature_order: Vec::new(),
+            mineshaft_starts: BTreeMap::new(),
+        })
     }
 
     /// Restore the effective reference sets from one captured saved chunk.
@@ -9938,6 +10240,116 @@ mod tests {
             RestoredStructurePiece::BuriedTreasure(BoundingBox::new([0, 0, 0], [1, 1, 1]).unwrap());
         assert!(mineshaft_may_touch_chunk(target, &[wrong]).is_err());
         assert!(mineshaft_may_touch_chunk(ChunkPos { x: i32::MAX, z: 0 }, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn saved_mineshaft_plan_keeps_source_and_commits_only_valid_updates() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            mineshaft::{MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant},
+            structure_start::{HorizontalDirection, SimpleStructureKind, SimpleStructureStart},
+        };
+        use native_session::worldgen::{
+            PreparedStructureStart, SavedMineshaftPiece,
+            saved_structure_starts::RestoredStructurePiece, structure_batch::PlannedStructureStart,
+        };
+        use native_world::loaded::ChunkPos;
+
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(Some(br#"{"step":"underground_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:mine")?])
+            }
+        }
+
+        let id = ResourceId::parse("example:mine")?;
+        let pos = ChunkPos { x: 0, z: 0 };
+        let key = (id.clone(), pos);
+        let source = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("unrecognized".into(), Tag::Int(7))]),
+        });
+        let original = Tag::Compound(vec![("saved".into(), Tag::Int(17))]);
+        let piece = SavedMineshaftPiece::capture(
+            &MineshaftGraphPiece {
+                bounds: BoundingBox::new([0, 4, 0], [2, 6, 9]).unwrap(),
+                direction: Some(HorizontalDirection::North),
+                depth: 2,
+                kind: MineshaftGraphPieceKind::Corridor {
+                    rails: false,
+                    spiders: true,
+                    sections: 2,
+                },
+            },
+            MineshaftVariant::Normal,
+            false,
+        )?;
+        let saved_piece = RestoredStructurePiece::Mineshaft(piece.clone());
+        let resumed = resume_saved_mineshaft(
+            Arc::clone(&source),
+            &original,
+            3,
+            pos,
+            TerrainAdjustment::None,
+            std::slice::from_ref(&saved_piece),
+        )?;
+        let placement = resumed.placement.clone();
+        let mut different = piece;
+        different.variant = MineshaftVariant::Mesa;
+        assert!(
+            resume_saved_mineshaft(
+                Arc::clone(&source),
+                &original,
+                3,
+                pos,
+                TerrainAdjustment::None,
+                &[saved_piece, RestoredStructurePiece::Mineshaft(different)],
+            )
+            .is_err()
+        );
+        let mut plan = SavedStructurePlan {
+            schedule: Some(Arc::new(
+                native_resources::structure_decoration::StructureDecorationSchedule::load(
+                    &mut Data,
+                )?,
+            )),
+            starts: BTreeMap::new(),
+            mineshafts: BTreeMap::from([(key.clone(), resumed)]),
+            order: vec![(id, vec![key.clone()])],
+        };
+        let mixed = plan.planned_mixed()?;
+        assert!(matches!(
+            mixed[0].starts[0],
+            PlannedStructureStart::Mineshaft(_)
+        ));
+        let wrong = SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [0, 0, 0],
+            orientation: None,
+            bounds: BoundingBox::new([0, 0, 0], [0, 0, 0]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        assert!(
+            plan.apply_mixed_updates(vec![vec![PreparedStructureStart::Simple(wrong)]])
+                .is_err()
+        );
+        assert!(!plan.mineshafts[&key].placement.pieces[0].placed_spider);
+        let mut updated = placement;
+        updated.pieces[0].placed_spider = true;
+        plan.apply_mixed_updates(vec![vec![PreparedStructureStart::Mineshaft(updated)]])?;
+        let actual = &plan.mineshafts[&key];
+        assert!(actual.placement.pieces[0].placed_spider);
+        assert!(Arc::ptr_eq(&actual.source, &source));
+        assert_eq!(actual.original, original);
+        assert_eq!(actual.references, 3);
         Ok(())
     }
 
@@ -11990,7 +12402,197 @@ mod tests {
             world.block(marker[0], marker[1], marker[2]).unwrap().name,
             "minecraft:melon"
         );
-        let mut staged_batch = StagedLiveTerrainBatch { batch };
+        {
+            use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+            use native_resources::{
+                feature_order::FeatureSchedule,
+                mineshaft::{MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant},
+            };
+            use native_session::worldgen::{
+                SavedMineshaftPiece, structure_references::collect_ordered_structure_references,
+            };
+
+            struct TestBiome(bool);
+            impl ResourceProvider for TestBiome {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    if path != "data/minecraft/worldgen/biome/plains.json" {
+                        return Ok(None);
+                    }
+                    let features = if self.0 {
+                        json!([[], [], [], [{
+                            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
+                            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8},
+                                {"type":"minecraft:block_predicate_filter", "predicate":{"type":"minecraft:not", "predicate":{"type":"minecraft:would_survive", "state":"minecraft:brown_mushroom"}}}]
+                        }]])
+                    } else {
+                        json!([])
+                    };
+                    Ok(Some(serde_json::to_vec(&json!({"features": features}))?))
+                }
+            }
+            let mine = ResourceId::parse("minecraft:mineshaft")?;
+            let start = native_session::worldgen::mineshaft::PreparedStart {
+                chunk: [second.x, second.z],
+                generation_point: [target.x * 16 + 2, lighting.min_y + 8, target.z * 16 + 2],
+                terrain_adjustment: TerrainAdjustment::None,
+                variant: MineshaftVariant::Normal,
+                pieces: vec![SavedMineshaftPiece::capture(
+                    &MineshaftGraphPiece {
+                        bounds: BoundingBox::new(
+                            [target.x * 16 + 2, lighting.min_y + 8, target.z * 16 + 2],
+                            [target.x * 16 + 10, lighting.min_y + 13, target.z * 16 + 10],
+                        )
+                        .unwrap(),
+                        direction: None,
+                        depth: 0,
+                        kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+                    },
+                    MineshaftVariant::Normal,
+                    false,
+                )?],
+            };
+            let bounds = start.reference_bounds(mine.clone())?;
+            let references = collect_ordered_structure_references(target, |position| {
+                Ok(if position == second {
+                    vec![bounds.clone()]
+                } else {
+                    Vec::new()
+                })
+            })?;
+            let mut biomes = actual.generator.biome_neighborhood()?;
+            for (position, _) in batch.schedule.requirements() {
+                if let Some(biome) = batch.biomes.chunk([position.x, position.z]) {
+                    biomes.insert(Arc::clone(biome))?;
+                }
+            }
+            let mut mine_batch = CapturedTerrainBatch {
+                identity: Arc::clone(&batch.identity),
+                schedule: batch.schedule.clone(),
+                biomes,
+                terrain: batch.terrain.clone(),
+                sources: batch.sources.clone(),
+                saved_stages: batch.saved_stages.clone(),
+                generated_references: BTreeMap::from([(
+                    target,
+                    CapturedGeneratedReferences {
+                        original: None,
+                        references,
+                    },
+                )]),
+                generated_starts: batch.generated_starts.clone(),
+                treasure_starts: batch.treasure_starts.clone(),
+                feature_entity_sources: ResumedFeatureEntitySources::default(),
+                revision: Arc::clone(&batch.revision),
+            };
+            let mut context_biomes = actual.generator.biome_neighborhood()?;
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let biome = mine_batch
+                        .biomes
+                        .chunk([target.x + dx, target.z + dz])
+                        .context("test biome is missing")?;
+                    context_biomes.insert(Arc::clone(biome))?;
+                }
+            }
+            let plain = ResourceId::parse("minecraft:plains")?;
+            let empty_schedule = Arc::new(FeatureSchedule::load(
+                &mut TestBiome(false),
+                std::slice::from_ref(&plain),
+                &BTreeSet::new(),
+            )?);
+            let light_schedule = Arc::new(FeatureSchedule::load(
+                &mut TestBiome(true),
+                &[plain],
+                &BTreeSet::new(),
+            )?);
+            let mut mine_context = SavedDecorationContext {
+                identity: Arc::clone(&actual.identity),
+                position: saved_target,
+                schedule: light_schedule,
+                biomes: context_biomes,
+            };
+            let source = Arc::clone(
+                mine_batch.sources[&saved_second]
+                    .as_ref()
+                    .context("test source is missing")?,
+            );
+            let original = Tag::Compound(vec![("example:retained".into(), Tag::Int(42))]);
+            let key = (mine, second);
+            let saved_pieces: Vec<_> = start
+                .pieces
+                .iter()
+                .cloned()
+                .map(native_session::worldgen::saved_structure_starts::RestoredStructurePiece::Mineshaft)
+                .collect();
+            let mut starts = BTreeMap::from([(
+                key.clone(),
+                resume_saved_mineshaft(
+                    Arc::clone(&source),
+                    &original,
+                    2,
+                    second,
+                    start.terrain_adjustment,
+                    &saved_pieces,
+                )?,
+            )]);
+            let before = mine_batch.terrain.snapshot();
+            actual.generate_structures = true;
+            let error = actual
+                .run_captured_features_inner(
+                    &mut mine_batch,
+                    &mine_context,
+                    None,
+                    Some(&mut starts),
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("raw brightness unavailable"));
+            assert!(Arc::ptr_eq(&before, &mine_batch.terrain.snapshot()));
+            assert_eq!(
+                mine_batch.schedule.completed(target),
+                Some(GenerationStage::Terrain)
+            );
+            assert!(Arc::ptr_eq(&starts[&key].source, &source));
+            assert_eq!(starts[&key].original, original);
+            assert_eq!(starts[&key].references, 2);
+            mine_context.schedule = empty_schedule;
+            let placed = actual.run_captured_features_inner(
+                &mut mine_batch,
+                &mine_context,
+                None,
+                Some(&mut starts),
+            )?;
+            actual.generate_structures = false;
+            assert!(placed.is_empty());
+            assert_eq!(
+                mine_batch.schedule.completed(target),
+                Some(GenerationStage::Features)
+            );
+            let after = mine_batch.terrain.snapshot();
+            let mut changed = false;
+            for y in lighting.min_y + 8..=lighting.min_y + 13 {
+                for z in target.z * 16 + 2..=target.z * 16 + 10 {
+                    for x in target.x * 16 + 2..=target.x * 16 + 10 {
+                        changed |= before.block(x, y, z) != after.block(x, y, z);
+                    }
+                }
+            }
+            assert!(
+                changed,
+                "intersecting saved mineshaft did not change terrain"
+            );
+            assert!(Arc::ptr_eq(&starts[&key].source, &source));
+            assert_eq!(starts[&key].original, original);
+            assert_eq!(starts[&key].references, 2);
+            assert!(Arc::ptr_eq(&world, &batch.terrain().snapshot()));
+        }
+        let mut staged_batch = StagedLiveTerrainBatch {
+            batch,
+            feature_order: Vec::new(),
+            mineshaft_starts: BTreeMap::new(),
+        };
         assert!(staged_batch.require_ready_features(target).is_ok());
         let error = actual
             .run_staged_live_features(&mut staged_batch, target)
@@ -12001,6 +12603,7 @@ mod tests {
             staged_batch.completed_stage(target),
             Some(GenerationStage::Terrain)
         );
+        assert!(staged_batch.feature_order().is_empty());
         let mut batch = staged_batch.batch;
         assert!(actual.run_captured_features(&mut batch, &context).is_err());
         assert_eq!(

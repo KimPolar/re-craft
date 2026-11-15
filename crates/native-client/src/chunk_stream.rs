@@ -988,6 +988,18 @@ impl StagedMissingTerrain {
     ) -> Option<native_session::worldgen::schedule::GenerationStage> {
         self.batch.completed_stage(position)
     }
+
+    pub fn ready_features(&self) -> Vec<ChunkPos> {
+        self.batch.ready_features()
+    }
+
+    pub fn unfinished_features(&self) -> Vec<ChunkPos> {
+        self.batch.unfinished_features()
+    }
+
+    pub fn feature_order(&self) -> &[ChunkPos] {
+        self.batch.feature_order()
+    }
 }
 
 pub(crate) struct MissingGenerationStagedAssemblyStartError {

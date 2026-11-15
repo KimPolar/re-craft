@@ -1380,6 +1380,66 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
                     placements.len(),
                     placements.iter().filter(|placed| **placed).count()
                 );
+                ensure!(
+                    featured.feature_order() == [target],
+                    "feature order was not retained"
+                );
+                let mut featured = featured;
+                while let Some(position) = featured.ready_features().first().copied() {
+                    let before_world = featured.snapshot();
+                    let before_order = featured.feature_order().to_vec();
+                    let mut worker =
+                        crate::chunk_stream::MissingGenerationStagedFeatureWorker::start(
+                            featured, &streamer, session, position,
+                        )
+                        .map_err(|failure| failure.error)?;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                    featured = loop {
+                        if let Some(result) = worker.try_result(&streamer, session)? {
+                            match result {
+                                crate::chunk_stream::StagedMissingFeatureResult::Completed {
+                                    terrain,
+                                    position: completed,
+                                    ..
+                                } => {
+                                    ensure!(completed == position, "feature target changed");
+                                    ensure!(
+                                        terrain.feature_order().last() == Some(&position),
+                                        "completed feature order was not retained"
+                                    );
+                                    break terrain;
+                                }
+                                crate::chunk_stream::StagedMissingFeatureResult::Failed {
+                                    terrain,
+                                    error,
+                                } => {
+                                    ensure!(
+                                        std::sync::Arc::ptr_eq(&before_world, &terrain.snapshot())
+                                            && terrain.feature_order() == before_order,
+                                        "failed feature pass changed staged terrain or order"
+                                    );
+                                    return Err(error.context(format!(
+                                        "staged neighboring features did not complete at {position:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        ensure!(
+                            std::time::Instant::now() < deadline,
+                            "neighbor feature generation timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    };
+                }
+                ensure!(
+                    featured.unfinished_features().is_empty(),
+                    "feature centers remain blocked: {:?}",
+                    featured.unfinished_features()
+                );
+                eprintln!(
+                    "Prepared {} feature centers in recorded test order",
+                    featured.feature_order().len()
+                );
                 return Ok(());
             }
             let (schedule, generator, restored, observed) =

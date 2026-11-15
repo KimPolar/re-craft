@@ -23417,19 +23417,22 @@ impl LoadedSession {
                 unloaded.push((order, scheduled));
                 continue;
             }
-            if self
+            let is_bubble_column = self
                 .world
                 .state(id)
-                .is_some_and(|state| state.name == "minecraft:bubble_column")
-            {
-                self.unresolved_bubble_tick = true;
-            }
+                .is_some_and(|state| state.name == "minecraft:bubble_column");
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             let Some(fluid) = self.simulated_fluid(id) else {
+                if is_bubble_column {
+                    self.unresolved_bubble_tick = true;
+                }
                 continue;
             };
             if fluid.kind != scheduled.key.kind || fluid.source != scheduled.key.source {
                 continue;
+            }
+            if is_bubble_column {
+                self.unresolved_bubble_tick = true;
             }
             let (retry_wash, result) = {
                 let mut live = SessionFluidTick {

@@ -625,6 +625,170 @@ fn bubble_shape_update_across_chunk_boundary_preserves_both_chunks_ticks() {
     }
 }
 
+#[test]
+fn stale_fluid_ticks_on_a_bubble_column_are_consumed_and_saved() {
+    for drag in ["true", "false"] {
+        let (mut session, home, _, source) = fixture(
+            state("minecraft:bubble_column", &[("drag", drag)]),
+            BubbleTickKind::Column,
+            true,
+        );
+        let center = session.origin + IVec3::new(8, 5, 8);
+        let fluids: Vec<_> = [
+            ("minecraft:flowing_water", 0, -2),
+            ("minecraft:lava", 0, 0),
+            ("minecraft:flowing_lava", 0, 1),
+            ("minecraft:water", 20, -1),
+        ]
+        .into_iter()
+        .map(|(fluid, delay, priority)| SavedFluidTick {
+            fluid: fluid.into(),
+            position: center.to_array(),
+            delay,
+            priority,
+        })
+        .collect();
+        let mut initial = native_persistence::edit::draft_chunk_blocks(
+            &source,
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[],
+        )
+        .unwrap();
+        initial.replace_fluid_ticks(&fluids).unwrap();
+        let source = initial.document().clone();
+        Arc::make_mut(&mut session.world)
+            .saved_fluid_ticks
+            .insert(home, fluids.clone());
+        session.enqueue_saved_fluids(home, &fluids);
+        let before = Arc::clone(&session.world);
+        let random = session.level_random.state();
+        session.advance_fluid_ticks();
+        assert!(Arc::ptr_eq(&before, &session.world));
+        assert_eq!(session.level_random.state(), random);
+        assert!(!session.unresolved_bubble_tick);
+        assert_eq!(session.draft_fluid_ticks(home).unwrap(), fluids[3..]);
+        let draft = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                home,
+                &source,
+                &test_heightmap_tags(),
+                |_| anyhow::bail!("tick-only draft must not rebuild heightmaps"),
+            )
+            .unwrap();
+        let mut expected = native_persistence::edit::draft_chunk_blocks(
+            &source,
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[],
+        )
+        .unwrap();
+        expected.replace_fluid_ticks(&fluids[3..]).unwrap();
+        assert_eq!(
+            draft.document().value.get("fluid_ticks"),
+            expected.document().value.get("fluid_ticks")
+        );
+        assert!(draft.matches_source(&source).unwrap());
+    }
+}
+
+#[test]
+fn stale_bubble_fluid_cannot_be_guessed_when_its_state_is_unavailable() {
+    let (mut session, home, _, _) = fixture(
+        state("minecraft:bubble_column", &[("drag", "true")]),
+        BubbleTickKind::Column,
+        true,
+    );
+    let relative = IVec3::new(8, 5, 8);
+    let Cell::State(id) = cell(
+        &session.world,
+        session.origin,
+        session.bounds,
+        relative,
+        session.states[0],
+    ) else {
+        panic!("bubble column missing from fixture")
+    };
+    session.fluids[id.0 as usize] = None;
+    session.enqueue_saved_fluids(
+        home,
+        &[SavedFluidTick {
+            fluid: "minecraft:flowing_water".into(),
+            position: (session.origin + relative).to_array(),
+            delay: 0,
+            priority: 0,
+        }],
+    );
+    session.advance_fluid_ticks();
+    assert!(session.unresolved_bubble_tick);
+    assert!(session.draft_block_ticks(home).is_err());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn stale_bubble_fluid_ticks_are_skipped_by_java_server() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::{path::PathBuf, process::Command};
+
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let version = game.join("versions/26.3");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+    ensure!(metadata["id"] == "26.3", "wrong Minecraft version");
+    let temp = tempfile::tempdir()?;
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for library in metadata["libraries"]
+        .as_array()
+        .context("libraries missing")?
+    {
+        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let classpath = std::env::join_paths(paths)?;
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+        .join("bin");
+    let oracle = temp.path().join("BubbleStaleFluidTickOracle.java");
+    std::fs::write(
+        &oracle,
+        include_str!("../tests/java/BubbleStaleFluidTickOracle.java"),
+    )?;
+    let compiled = Command::new(java.join("javac.exe"))
+        .arg("-cp")
+        .arg(&classpath)
+        .arg(oracle)
+        .output()?;
+    ensure!(
+        compiled.status.success(),
+        "Java fluid oracle did not compile: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = Command::new(java.join("java.exe"))
+        .arg("-cp")
+        .arg(classpath)
+        .arg("BubbleStaleFluidTickOracle")
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Java fluid comparison failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]

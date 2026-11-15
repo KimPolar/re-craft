@@ -112,6 +112,32 @@ impl QueuedSectionLightTracker {
         self.tracker.snapshot()
     }
 
+    /// The nonempty section callbacks observed by this engine. Empty chunks
+    /// still require separate chunk-registration history from the caller.
+    pub fn data_sections(&self) -> &BTreeSet<(ChunkPos, i32)> {
+        &self.tracker.data_sections
+    }
+
+    pub fn active_chunks(&self) -> &BTreeSet<ChunkPos> {
+        &self.tracker.active
+    }
+
+    /// Whether a covered column has saved data still waiting in either queue.
+    pub fn has_queued_data(&self, position: ChunkPos) -> Option<bool> {
+        self.valid_position(position, 0)?;
+        self.tracker.visible.columns.get(&position)?;
+        Some(
+            [LightChannel::Block, LightChannel::Sky]
+                .into_iter()
+                .any(|channel| {
+                    self.queued
+                        .range((channel, position, i32::MIN)..=(channel, position, i32::MAX))
+                        .next()
+                        .is_some()
+                }),
+        )
+    }
+
     /// Extend a continuously observed engine's coverage as streaming moves.
     /// All earlier events must have gone through this tracker: its event API
     /// cannot modify or allocate an uncovered column. Existing columns and
@@ -370,6 +396,21 @@ impl QueuedSectionLightTracker {
         self.tracker.visible.columns.get(&position)?;
         if world.chunks.get(&position)?.position != position {
             return None;
+        }
+        if self.enabled(LightChannel::Sky) {
+            let build = bounds.build_range();
+            for (dx, dz) in [(0i32, 0i32), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let neighbor = ChunkPos {
+                    x: position.x.checked_add(dx)?,
+                    z: position.z.checked_add(dz)?,
+                };
+                if sky_sources.get(&neighbor)?.iter().any(|&height| {
+                    height != crate::sky_light::UNBOUNDED_SKY_SOURCE
+                        && !(build.start..=build.end).contains(&height)
+                }) {
+                    return None;
+                }
+            }
         }
         let mut draft = self.clone();
         let before = draft.tracker.visible.clone();
@@ -1633,6 +1674,20 @@ C no_sky
                 column.update(&world, position[1]).unwrap();
                 Arc::make_mut(sources.get_mut(&center()).unwrap())[8 + 8 * 16] =
                     column.lowest_source_y();
+            }
+            if has_sky {
+                let previous = tracker.snapshot().clone();
+                let mut invalid = sources.clone();
+                Arc::make_mut(invalid.get_mut(&center()).unwrap())[0] = i32::MAX;
+                assert!(
+                    tracker
+                        .propagate_chunk(&world, bounds, center(), &invalid)
+                        .is_none()
+                );
+                assert_eq!(
+                    previous.same_complete_column(tracker.snapshot(), center()),
+                    Some(true)
+                );
             }
             tracker
                 .propagate_chunk(&world, bounds, center(), &sources)

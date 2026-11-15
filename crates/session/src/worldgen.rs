@@ -822,6 +822,255 @@ pub struct StagedGenerationLightEngine {
     >,
 }
 
+/// A generation engine continuing a fully observed saved/live light revision.
+/// Its caller must provide the complete chunk registration history, including
+/// registered empty chunks, and source heights from that same drained revision.
+/// No pending checks or omitted stream events may precede this tracker.
+#[derive(Clone)]
+pub struct QueuedGenerationLightEngine {
+    dimension: String,
+    seed: i64,
+    min_y: i32,
+    height: i32,
+    has_skylight: bool,
+    tracker: native_world::generation_light::QueuedSectionLightTracker,
+    registered: BTreeMap<native_world::loaded::ChunkPos, Arc<native_world::loaded::Chunk>>,
+    sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
+}
+
+impl QueuedGenerationLightEngine {
+    /// Bind an observed light engine to the corresponding terrain revision.
+    /// Registered section occupancy is checked; the caller still establishes
+    /// the queue, activation, source-height and empty-chunk histories.
+    pub fn new(
+        terrain: &CarvedTerrainWorld,
+        tracker: native_world::generation_light::QueuedSectionLightTracker,
+        registered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
+        has_skylight: bool,
+        is_air: impl FnMut(&native_world::loaded::BlockState) -> Option<bool>,
+    ) -> Result<Self> {
+        use native_world::{
+            block_light::LightBounds, generation_light::initialized_nonempty_sections,
+        };
+
+        ensure!(
+            tracker.snapshot().has_block_channel()
+                && tracker.snapshot().has_sky_channel() == has_skylight,
+            "light channels differ from dimension"
+        );
+        let max_y = terrain
+            .min_y
+            .checked_add(terrain.height)
+            .context("light height overflow")?;
+        LightBounds::new(terrain.min_y, max_y).context("unsupported light height")?;
+        let mut chunks = BTreeMap::new();
+        for position in registered {
+            let chunk = terrain
+                .world
+                .chunks
+                .get(&position)
+                .context("registered light chunk is missing")?;
+            ensure!(
+                chunk.position == position,
+                "registered light chunk position differs"
+            );
+            ensure!(
+                tracker.snapshot().complete_column(position).is_some(),
+                "registered light column is unavailable"
+            );
+            ensure!(
+                chunks.insert(position, Arc::clone(chunk)).is_none(),
+                "duplicate light chunk registration"
+            );
+        }
+        ensure!(
+            tracker
+                .active_chunks()
+                .iter()
+                .all(|pos| chunks.contains_key(pos)),
+            "active light chunk is not registered"
+        );
+        let sections = initialized_nonempty_sections(
+            &terrain.world,
+            terrain.min_y.div_euclid(16)..max_y.div_euclid(16),
+            chunks.keys().copied(),
+            is_air,
+        )
+        .context("registered light sections are incomplete or unsupported")?;
+        ensure!(
+            sections.into_iter().collect::<BTreeSet<_>>() == *tracker.data_sections(),
+            "registered light section history differs"
+        );
+        ensure!(
+            sky_sources.keys().all(|pos| chunks.contains_key(pos)),
+            "sky source chunk is not registered"
+        );
+        ensure!(
+            !has_skylight || sky_sources.len() == chunks.len(),
+            "registered sky source history is incomplete"
+        );
+        ensure!(
+            sky_sources
+                .values()
+                .all(|heights| heights.iter().all(|&height| {
+                    height == native_world::sky_light::UNBOUNDED_SKY_SOURCE
+                        || (terrain.min_y..=max_y).contains(&height)
+                })),
+            "sky source height is invalid"
+        );
+        Ok(Self {
+            dimension: terrain.world.dimension.clone(),
+            seed: terrain.seed,
+            min_y: terrain.min_y,
+            height: terrain.height,
+            has_skylight,
+            tracker,
+            registered: chunks,
+            sky_sources,
+        })
+    }
+
+    pub fn tracker(&self) -> &native_world::generation_light::QueuedSectionLightTracker {
+        &self.tracker
+    }
+
+    fn validate_terrain(&self, terrain: &CarvedTerrainWorld) -> Result<()> {
+        ensure!(
+            terrain.seed == self.seed
+                && terrain.min_y == self.min_y
+                && terrain.height == self.height
+                && terrain.world.dimension == self.dimension,
+            "light terrain differs"
+        );
+        for (position, before) in &self.registered {
+            let now = terrain
+                .world
+                .chunks
+                .get(position)
+                .context("registered light chunk is missing")?;
+            ensure!(
+                Arc::ptr_eq(before, now),
+                "registered light chunk changed at {position:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Register a newly generated feature-complete chunk. Saved chunks need
+    /// their own load and retain events before this engine is constructed.
+    pub fn initialize_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        position: native_world::loaded::ChunkPos,
+        is_air: impl FnMut(&native_world::loaded::BlockState) -> Option<bool>,
+    ) -> Result<()> {
+        use native_world::{block_light::LightBounds, generation_light::QueuedSectionLightTracker};
+
+        self.validate_terrain(terrain)?;
+        ensure!(
+            !self.registered.contains_key(&position),
+            "light chunk is already registered"
+        );
+        ensure!(
+            terrain.completed_decoration.contains(&position),
+            "light initialization requires completed features"
+        );
+        let chunk = terrain
+            .world
+            .chunks
+            .get(&position)
+            .context("generated light chunk is missing")?;
+        ensure!(
+            chunk.position == position
+                && !chunk.block_light_correct
+                && chunk
+                    .sections
+                    .values()
+                    .all(|section| section.block_light.is_none() && section.sky_light.is_none()),
+            "generated light chunk contains saved lighting"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = LightBounds::new(self.min_y, max_y).context("unsupported light bounds")?;
+        let statuses = QueuedSectionLightTracker::initialization_events(
+            &terrain.world,
+            position,
+            bounds,
+            is_air,
+        )
+        .context("generated light sections are incomplete or unsupported")?;
+        let sources = if self.has_skylight {
+            Some(
+                native_world::sky_light::generated_chunk_sky_sources(
+                    &terrain.world,
+                    bounds,
+                    position,
+                )
+                .context("generated sky sources are incomplete or unsupported")?,
+            )
+        } else {
+            None
+        };
+        let mut tracker = self.tracker.clone();
+        tracker
+            .cover_chunk_halo(position)
+            .context("generated light halo is out of range")?;
+        ensure!(
+            !tracker.active_chunks().contains(&position)
+                && tracker.has_queued_data(position) == Some(false),
+            "generated light chunk still has active or queued state"
+        );
+        tracker
+            .apply_events(&statuses)
+            .context("generated light registration is incomplete")?;
+        self.tracker = tracker;
+        self.registered.insert(position, Arc::clone(chunk));
+        if let Some(sources) = sources {
+            self.sky_sources.insert(position, Arc::from(sources));
+        }
+        Ok(())
+    }
+
+    /// Activate one registered generated chunk while preserving saved layers.
+    pub fn activate_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        self.validate_terrain(terrain)?;
+        ensure!(
+            self.registered.contains_key(&position),
+            "light chunk is not registered"
+        );
+        ensure!(
+            !self.tracker.active_chunks().contains(&position),
+            "light chunk is already active"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light bounds")?;
+        let mut tracker = self.tracker.clone();
+        tracker
+            .propagate_chunk(&terrain.world, bounds, position, &self.sky_sources)
+            .context("generated light activation inputs are incomplete or unsupported")?;
+        let column = tracker
+            .snapshot()
+            .complete_column(position)
+            .context("light column is unavailable")?;
+        let mut visible =
+            native_world::generation_light::VisibleLightSnapshot::new(true, self.has_skylight);
+        visible.insert_complete_column(position, column);
+        self.tracker = tracker;
+        Ok(visible)
+    }
+}
+
 // These worlds share the same append-only state registry lineage. Compare only
 // changed sections and cache block-state pairs within each changed chunk.
 fn unchanged_chunk_light_behavior(
@@ -4458,6 +4707,254 @@ impl TerrainGenerator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn queued_schedule_lights_generated_chunk_next_to_saved_chunks() {
+        use native_world::{
+            block_light::LightBounds,
+            generation_light::{LightChannel, QueuedLightEvent, QueuedSectionLightTracker},
+            loaded::{BLOCK_COUNT, BlockState, Chunk, ChunkPos, LIGHT_BYTES, Section, World},
+        };
+
+        let center = ChunkPos { x: 0, z: 0 };
+        let west = ChunkPos { x: -1, z: 0 };
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let is_air = |state: &BlockState| match state.name.as_str() {
+            "minecraft:air" => Some(true),
+            "minecraft:stone" | "minecraft:torch" => Some(false),
+            _ => None,
+        };
+        for has_sky in [true, false] {
+            let mut world = World::new("minecraft:overworld");
+            let state = |name: &str| BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            let air = world.intern_state(state("air"));
+            let stone = world.intern_state(state("stone"));
+            let torch = world.intern_state(state("torch"));
+            for x in -2..=2 {
+                for z in -2..=2 {
+                    let position = ChunkPos { x, z };
+                    let mut sections = BTreeMap::new();
+                    for y in 0..2 {
+                        let mut blocks = Box::new([air; BLOCK_COUNT]);
+                        if y == 0 {
+                            blocks[256] = stone;
+                        }
+                        if position == center && y == 1 {
+                            blocks[8 + 8 * 16 + 4 * 256] = torch;
+                        }
+                        sections.insert(
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: (position == west && y == 0)
+                                    .then(|| Box::new([0x33; LIGHT_BYTES])),
+                                sky_light: (has_sky && position == west && y == 0)
+                                    .then(|| Box::new([0xff; LIGHT_BYTES])),
+                            }),
+                        );
+                    }
+                    world.chunks.insert(
+                        position,
+                        Arc::new(Chunk {
+                            position,
+                            status: Some(
+                                if position == center {
+                                    "minecraft:terrain"
+                                } else {
+                                    "minecraft:full"
+                                }
+                                .into(),
+                            ),
+                            block_light_correct: position != center,
+                            sections,
+                        }),
+                    );
+                }
+            }
+            let mut terrain = CarvedTerrainWorld::new(MaterializedTerrain {
+                world,
+                position: center,
+                seed: 42,
+                min_y: 0,
+                height: 32,
+                postprocessing: Arc::from([]),
+                noise_postprocessing: None,
+                surface_postprocessing: None,
+                carver_postprocessing: None,
+            });
+            terrain.completed_decoration.insert(center);
+            let registered: BTreeSet<_> = (-1..=1)
+                .flat_map(|x| (-1..=1).map(move |z| ChunkPos { x, z }))
+                .filter(|&position| position != center)
+                .collect();
+            let mut tracker = QueuedSectionLightTracker::fresh(true, has_sky, []).unwrap();
+            let mut sources = BTreeMap::new();
+            for &position in &registered {
+                tracker.cover_chunk_halo(position).unwrap();
+                let saved = QueuedSectionLightTracker::saved_chunk_events(
+                    &terrain.world,
+                    position,
+                    bounds,
+                    has_sky,
+                )
+                .unwrap();
+                tracker.apply_events(&saved).unwrap();
+                let statuses = QueuedSectionLightTracker::initialization_events(
+                    &terrain.world,
+                    position,
+                    bounds,
+                    is_air,
+                )
+                .unwrap();
+                tracker.apply_events(&statuses).unwrap();
+                let heights = if has_sky {
+                    let heights: Arc<[i32; 256]> = Arc::from(
+                        native_world::sky_light::generated_chunk_sky_sources(
+                            &terrain.world,
+                            bounds,
+                            position,
+                        )
+                        .unwrap(),
+                    );
+                    let highest = *heights.iter().max().unwrap();
+                    sources.insert(position, heights);
+                    Some(highest)
+                } else {
+                    None
+                };
+                tracker
+                    .apply_events(&[
+                        QueuedLightEvent::Enable {
+                            position,
+                            enabled: true,
+                            highest_source_y: heights,
+                        },
+                        QueuedLightEvent::Retain {
+                            position,
+                            retain: false,
+                        },
+                    ])
+                    .unwrap();
+            }
+            assert_eq!(
+                tracker
+                    .data_layer(LightChannel::Block, west, 0)
+                    .unwrap()
+                    .unwrap()
+                    .bytes()[0],
+                0x33
+            );
+            let incomplete = registered
+                .iter()
+                .copied()
+                .filter(|&position| position != west);
+            assert!(
+                QueuedGenerationLightEngine::new(
+                    &terrain,
+                    tracker.clone(),
+                    incomplete,
+                    sources.clone(),
+                    has_sky,
+                    is_air
+                )
+                .is_err()
+            );
+            if has_sky {
+                let mut missing_sources = sources.clone();
+                missing_sources.remove(&west);
+                assert!(
+                    QueuedGenerationLightEngine::new(
+                        &terrain,
+                        tracker.clone(),
+                        registered.iter().copied(),
+                        missing_sources,
+                        has_sky,
+                        is_air,
+                    )
+                    .is_err()
+                );
+                let mut invalid_sources = sources.clone();
+                Arc::make_mut(invalid_sources.get_mut(&west).unwrap())[0] = i32::MAX;
+                assert!(
+                    QueuedGenerationLightEngine::new(
+                        &terrain,
+                        tracker.clone(),
+                        registered.iter().copied(),
+                        invalid_sources,
+                        has_sky,
+                        is_air,
+                    )
+                    .is_err()
+                );
+            }
+            let mut engine = QueuedGenerationLightEngine::new(
+                &terrain,
+                tracker,
+                registered.iter().copied(),
+                sources,
+                has_sky,
+                is_air,
+            )
+            .unwrap();
+            let mut schedule = schedule::GenerationSchedule::new();
+            schedule
+                .request(center, schedule::GenerationStage::Light)
+                .unwrap();
+            let imported: Vec<_> = schedule
+                .requirements()
+                .map(|(pos, required)| {
+                    (
+                        pos,
+                        if pos == center {
+                            schedule::GenerationStage::Features
+                        } else {
+                            required
+                        },
+                    )
+                })
+                .collect();
+            schedule.restore_imported(imported).unwrap();
+
+            let mut stale = terrain.clone();
+            Arc::make_mut(&mut stale.world)
+                .set_block_id(-16, 1, 0, air)
+                .unwrap();
+            assert!(
+                schedule
+                    .run_queued_light_initialization(&stale, center, &mut engine, is_air)
+                    .is_err()
+            );
+            assert_eq!(
+                schedule.completed(center),
+                Some(schedule::GenerationStage::Features)
+            );
+            schedule
+                .run_queued_light_initialization(&terrain, center, &mut engine, is_air)
+                .unwrap();
+            let visible = schedule
+                .run_queued_light(&terrain, center, &mut engine)
+                .unwrap();
+            assert_eq!(visible.block_light([8, 20, 8]), Some(14));
+            assert_eq!(
+                schedule.completed(center),
+                Some(schedule::GenerationStage::Light)
+            );
+            assert!(engine.tracker().active_chunks().contains(&center));
+            assert_eq!(
+                engine
+                    .tracker()
+                    .data_layer(LightChannel::Block, west, 0)
+                    .unwrap()
+                    .unwrap()
+                    .bytes()[0],
+                0x33
+            );
+        }
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]

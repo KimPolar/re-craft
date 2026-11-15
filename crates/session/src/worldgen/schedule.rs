@@ -1949,6 +1949,23 @@ impl GenerationSchedule {
         self.complete(center, InitializeLight)
     }
 
+    /// Register a new chunk in an observed engine that already contains saved
+    /// or live light. Failed registration leaves the schedule unchanged.
+    pub fn run_queued_light_initialization(
+        &mut self,
+        terrain: &super::CarvedTerrainWorld,
+        center: ChunkPos,
+        engine: &mut super::QueuedGenerationLightEngine,
+        is_air: impl FnMut(&native_world::loaded::BlockState) -> Option<bool>,
+    ) -> Result<()> {
+        ensure!(
+            self.ready(center, InitializeLight),
+            "light initialization dependencies are incomplete"
+        );
+        engine.initialize_chunk(terrain, center, is_air)?;
+        self.complete(center, InitializeLight)
+    }
+
     /// Advance LIGHT within a frozen, fully initialized generation batch.
     /// The returned snapshot does not write a chunk or make it saveable.
     pub fn run_light(
@@ -1963,6 +1980,23 @@ impl GenerationSchedule {
             "light dependencies are incomplete"
         );
         let snapshot = engine.activate(terrain, center, [center], registry)?;
+        self.complete(center, Light)?;
+        Ok(snapshot)
+    }
+
+    /// Advance a generated chunk's LIGHT stage over the same observed saved
+    /// engine revision. The result is not yet a playable or saveable chunk.
+    pub fn run_queued_light(
+        &mut self,
+        terrain: &super::CarvedTerrainWorld,
+        center: ChunkPos,
+        engine: &mut super::QueuedGenerationLightEngine,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        ensure!(
+            self.ready(center, Light),
+            "light dependencies are incomplete"
+        );
+        let snapshot = engine.activate_chunk(terrain, center)?;
         self.complete(center, Light)?;
         Ok(snapshot)
     }

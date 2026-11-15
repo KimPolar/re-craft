@@ -1170,6 +1170,34 @@ fn light_regions_touch(a: BlockPosition, ar: i32, b: BlockPosition, br: i32) -> 
         <= i64::from(ar + br + 1)
 }
 
+/// A pending block-light change can only modify its Manhattan-radius region.
+/// Limit the ordered-map scan to the largest supported radius in X.
+fn pending_light_affects(
+    pending: &BTreeMap<BlockPosition, PendingLight>,
+    position: BlockPosition,
+) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let radius = native_world::block_light::LightChange::unknown().radius();
+    let first = BlockPosition {
+        x: position.x.saturating_sub(radius),
+        y: i32::MIN,
+        z: i32::MIN,
+    };
+    let last = BlockPosition {
+        x: position.x.saturating_add(radius),
+        y: i32::MAX,
+        z: i32::MAX,
+    };
+    pending.range(first..=last).any(|(&other, entry)| {
+        (i64::from(position.x) - i64::from(other.x)).abs()
+            + (i64::from(position.y) - i64::from(other.y)).abs()
+            + (i64::from(position.z) - i64::from(other.z)).abs()
+            <= i64::from(entry.change.radius())
+    })
+}
+
 /// Find the exact connected set of pending light regions. Small groups avoid
 /// building an index; larger groups only inspect nearby, unvisited positions.
 /// The returned order is the same position order used by the relight pass.
@@ -16490,10 +16518,17 @@ impl LoadedSession {
     }
 
     fn crop_brightness(&self, relative: IVec3, minimum: u8) -> Option<u8> {
-        if !self.pending_light.is_empty() {
+        let absolute = add(self.origin, relative)?;
+        if pending_light_affects(
+            &self.pending_light,
+            BlockPosition {
+                x: absolute.x,
+                y: absolute.y,
+                z: absolute.z,
+            },
+        ) {
             return None;
         }
-        let absolute = add(self.origin, relative)?;
         let chunk = self.world.chunks.get(&ChunkPos {
             x: absolute.x.div_euclid(16),
             z: absolute.z.div_euclid(16),
@@ -16950,11 +16985,11 @@ impl LoadedSession {
 
     /// Check actual snow positions so a high randomTickSpeed can skip dark or
     /// unavailable sections without looping for every sampled coordinate.
-    fn snow_can_melt_in_section(&self, chunk: ChunkPos, section_y: i8, snow: &[usize]) -> bool {
-        if snow.is_empty() || !self.pending_light.is_empty() {
+    fn snow_can_melt_in_section(&self, chunk_pos: ChunkPos, section_y: i8, snow: &[usize]) -> bool {
+        if snow.is_empty() {
             return false;
         }
-        let Some(chunk) = self.world.chunks.get(&chunk) else {
+        let Some(chunk) = self.world.chunks.get(&chunk_pos) else {
             return false;
         };
         if !chunk.block_light_correct {
@@ -16983,16 +17018,51 @@ impl LoadedSession {
                 } else {
                     value >> 4
                 };
-                crate::snow::melts_in_block_light(light)
-                    && *loot_by_state
-                        .entry(id.0)
-                        .or_insert_with(|| self.preview_block_loot_without_entity(state))
+                if !crate::snow::melts_in_block_light(light) {
+                    return false;
+                }
+                if !self.pending_light.is_empty() {
+                    let Some(x) = chunk_pos
+                        .x
+                        .checked_mul(16)
+                        .and_then(|x| x.checked_add((index % 16) as i32))
+                    else {
+                        return false;
+                    };
+                    let Some(z) = chunk_pos
+                        .z
+                        .checked_mul(16)
+                        .and_then(|z| z.checked_add(((index / 16) % 16) as i32))
+                    else {
+                        return false;
+                    };
+                    if pending_light_affects(
+                        &self.pending_light,
+                        BlockPosition {
+                            x,
+                            y: i32::from(section_y) * 16 + (index / 256) as i32,
+                            z,
+                        },
+                    ) {
+                        return false;
+                    }
+                }
+                *loot_by_state
+                    .entry(id.0)
+                    .or_insert_with(|| self.preview_block_loot_without_entity(state))
             })
         })
     }
 
     fn melt_snow_at(&mut self, relative: IVec3, absolute: IVec3) -> bool {
-        if !self.pending_light.is_empty() {
+        if pending_light_affects(
+            &self.pending_light,
+            BlockPosition {
+                x: absolute.x,
+                y: absolute.y,
+                z: absolute.z,
+            },
+        ) {
             return false;
         }
         let Cell::State(id) = cell(
@@ -33536,6 +33606,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn crop_uses_block_light_outside_pending_change_radius() {
+        let position = IVec3::new(8, 2, 8);
+        let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        let world = Arc::make_mut(&mut session.world);
+        let chunk = Arc::make_mut(world.chunks.values_mut().next().unwrap());
+        Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).block_light =
+            Some(Box::new([0x88; LIGHT_BYTES]));
+        let absolute = session.origin + position;
+        let entry = PendingLight {
+            change: native_world::block_light::LightChange::unknown(),
+            last_attempt: None,
+        };
+        let changed = |dx, dy, dz| BlockPosition {
+            x: absolute.x + dx,
+            y: absolute.y + dy,
+            z: absolute.z + dz,
+        };
+        session.pending_light.insert(changed(14, 0, 0), entry);
+        assert_eq!(session.crop_brightness(position, 8), None);
+        session.pending_light.remove(&changed(14, 0, 0));
+        session.pending_light.insert(changed(15, 0, 0), entry);
+        assert_eq!(session.crop_brightness(position, 8), Some(8));
+        assert_eq!(session.crop_can_survive(position), Some(true));
+        session.pending_light.insert(changed(5, 4, 5), entry);
+        assert_eq!(session.crop_brightness(position, 8), None);
+        session.pending_light.remove(&changed(5, 4, 5));
+        session.pending_light.insert(changed(5, 5, 5), entry);
+        assert_eq!(session.crop_brightness(position, 8), Some(8));
+    }
+
+    #[test]
     fn crop_items_plant_and_apply_bonemeal_in_both_hands() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
@@ -45740,6 +45841,212 @@ pub(crate) mod tests {
                     full_scan(pending, first)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn pending_light_queries_match_full_scan_at_coordinate_boundaries() {
+        let air = state("minecraft:air", &[]);
+        let small =
+            native_world::block_light::light_change(&air, &state("minecraft:brown_mushroom", &[]))
+                .unwrap();
+        let medium =
+            native_world::block_light::light_change(&air, &state("minecraft:torch", &[])).unwrap();
+        let large = native_world::block_light::LightChange::unknown();
+        let mut pending = BTreeMap::new();
+        for x in -10..=10 {
+            for z in -5..=5 {
+                let position = BlockPosition {
+                    x: x * 17,
+                    y: (x - z) * 3,
+                    z: z * 19,
+                };
+                pending.insert(
+                    position,
+                    PendingLight {
+                        change: [small, medium, large][((x + 10 + z + 5) % 3) as usize],
+                        last_attempt: None,
+                    },
+                );
+            }
+        }
+        for edge in [i32::MIN, i32::MAX] {
+            pending.insert(
+                BlockPosition {
+                    x: edge,
+                    y: edge,
+                    z: edge,
+                },
+                PendingLight {
+                    change: large,
+                    last_attempt: None,
+                },
+            );
+        }
+        let full_scan = |position: BlockPosition| {
+            pending.iter().any(|(other, entry)| {
+                (i64::from(position.x) - i64::from(other.x)).abs()
+                    + (i64::from(position.y) - i64::from(other.y)).abs()
+                    + (i64::from(position.z) - i64::from(other.z)).abs()
+                    <= i64::from(entry.change.radius())
+            })
+        };
+        for x in (-200..=200).step_by(7) {
+            for z in (-120..=120).step_by(9) {
+                let position = BlockPosition {
+                    x,
+                    y: (x - z) / 5,
+                    z,
+                };
+                assert_eq!(
+                    pending_light_affects(&pending, position),
+                    full_scan(position),
+                    "{position:?}"
+                );
+            }
+        }
+        for edge in [i32::MIN, i32::MAX] {
+            for offset in 0..=16 {
+                let x = if edge == i32::MIN {
+                    edge + offset
+                } else {
+                    edge - offset
+                };
+                let position = BlockPosition {
+                    x,
+                    y: edge,
+                    z: edge,
+                };
+                assert_eq!(
+                    pending_light_affects(&pending, position),
+                    full_scan(position),
+                    "{position:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn unaffected_pending_block_light_matches_java_engine() {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("BlockLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../world/tests/java/BlockLightEngineOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        let position =
+            |x, y, z, state: &str| serde_json::json!({"x": x, "y": y, "z": z, "state": state});
+        let mut first = position(8, 15, 15, "air");
+        first["defer"] = serde_json::json!(true);
+        let data = serde_json::json!({
+            "initial": [position(8, 15, 15, "torch"), position(22, 15, 15, "torch"), position(15, 5, 5, "brown_mushroom")],
+            "actions": [position(0, 0, 0, "air"), first, position(22, 15, 15, "air"), position(15, 5, 5, "air")],
+        });
+        std::fs::write(&input, serde_json::to_vec(&data).unwrap()).unwrap();
+        let run = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("BlockLightEngineOracle")
+            .arg(input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let grids: Vec<Vec<u8>> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(grids.len(), 3);
+        let air = state("minecraft:air", &[]);
+        let entry = |name| PendingLight {
+            change: native_world::block_light::light_change(&air, &state(name, &[])).unwrap(),
+            last_attempt: None,
+        };
+        let torches = BTreeMap::from([
+            (
+                BlockPosition { x: 8, y: 15, z: 15 },
+                entry("minecraft:torch"),
+            ),
+            (
+                BlockPosition {
+                    x: 22,
+                    y: 15,
+                    z: 15,
+                },
+                entry("minecraft:torch"),
+            ),
+        ]);
+        let mushroom = BTreeMap::from([(
+            BlockPosition { x: 15, y: 5, z: 5 },
+            entry("minecraft:brown_mushroom"),
+        )]);
+        for (before, after, pending) in [
+            (&grids[0], &grids[1], &torches),
+            (&grids[1], &grids[2], &mushroom),
+        ] {
+            let mut unaffected = 0;
+            let mut changed = 0;
+            for y in 0..31 {
+                for z in 0..31 {
+                    for x in 0..31 {
+                        let index = (y * 31 * 31 + z * 31 + x) as usize;
+                        let pos = BlockPosition { x, y, z };
+                        if pending_light_affects(pending, pos) {
+                            changed += usize::from(before[index] != after[index]);
+                        } else {
+                            assert_eq!(
+                                before[index], after[index],
+                                "unaffected light changed at {pos:?}"
+                            );
+                            unaffected += 1;
+                        }
+                    }
+                }
+            }
+            assert!(unaffected > 10_000);
+            assert!(changed > 0);
         }
     }
 
@@ -74609,6 +74916,68 @@ pub(crate) mod tests {
             session.update(TICK);
             assert!(
                 matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(true))
+            );
+        }
+    }
+
+    #[test]
+    fn snow_melts_with_unrelated_pending_block_light() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/snow.json").then(|| {
+                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#.to_vec()
+                }))
+            }
+        }
+        let tables = Arc::new(BlockLootTables::load(&mut LootSource).unwrap());
+        for (distance, melts) in [(14, false), (15, true)] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session.set_block_drops(false);
+            let relative = IVec3::new(8, 5, 8);
+            let absolute = session.origin + relative;
+            let snow = session.intern_block(state("minecraft:snow", &[("layers", "1")]));
+            let chunk_pos = session.player_chunk().unwrap();
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            chunk.block_light_correct = true;
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            let index = relative.x as usize + relative.z as usize * 16 + relative.y as usize * 256;
+            section.blocks.as_mut().unwrap()[index] = snow;
+            section.block_light = Some(Box::new([0xff; LIGHT_BYTES]));
+            session.pending_light.insert(
+                BlockPosition {
+                    x: absolute.x + distance,
+                    y: absolute.y,
+                    z: absolute.z,
+                },
+                PendingLight {
+                    change: native_world::block_light::LightChange::unknown(),
+                    last_attempt: None,
+                },
+            );
+            assert_eq!(
+                session.snow_can_melt_in_section(chunk_pos, 0, &[index]),
+                melts
+            );
+            assert_eq!(session.melt_snow_at(relative, absolute), melts);
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                if melts {
+                    "minecraft:air"
+                } else {
+                    "minecraft:snow"
+                }
             );
         }
     }

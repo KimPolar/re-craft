@@ -92,6 +92,35 @@ fn streamed_pending_work_blocks_save_even_after_clean_chunk_is_evicted() {
     );
     assert!(session.validate_generation_block_readiness().is_err());
 
+    let later = ChunkPos {
+        x: home.x,
+        z: home.z + 1,
+    };
+    let empty = Tag::List {
+        element_type: TagType::List,
+        values: vec![
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            },
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            },
+        ],
+    };
+    session.queue_streamed_chunk(
+        later,
+        Some(streamed_chunk(later, empty)),
+        Some(SavedEntityData::Empty),
+        Some(SavedPoiData::Missing),
+        None,
+        None,
+    );
+    session.update(TICK);
+    assert!(session.saved_chunk_preparation_verified(later));
+    assert!(session.validate_saved_chunk_preparation().is_err());
+
     session.queue_chunk_window(home, 0);
     session.update(TICK);
     assert!(!session.world.chunks.contains_key(&neighbor));
@@ -112,4 +141,131 @@ fn uncaptured_preparation_is_rejected_only_after_a_tick() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("was not captured"), "{error}");
+}
+
+#[test]
+fn pending_saved_preparation_defers_ticks_without_stopping_other_chunks() {
+    for indexed in [false, true] {
+        let template = super::tests::session();
+        let home = template.player_chunk().unwrap();
+        // Sort the unresolved chunk before the valid chunk so inspection must
+        // continue after reporting the first failure.
+        let pending = ChunkPos {
+            x: home.x - 1,
+            z: home.z,
+        };
+        let mut world = template.world.as_ref().clone();
+        let ore = world.intern_state(state("minecraft:redstone_ore", &[("lit", "true")]));
+        let sand = world.intern_state(state("minecraft:sand", &[]));
+        for position in [pending, home] {
+            let mut chunk = world.chunks[&home].as_ref().clone();
+            chunk.position = position;
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.blocks = Some(Box::new([ore; BLOCK_COUNT]));
+            world.chunks.insert(position, Arc::new(chunk));
+            let target = [position.x * 16 + 3, 2, position.z * 16 + 4];
+            world
+                .set_block_id(target[0], target[1], target[2], sand)
+                .unwrap();
+            world.saved_block_ticks.insert(
+                position,
+                vec![SavedBlockTick {
+                    block: "minecraft:sand".into(),
+                    position: target,
+                    delay: 0,
+                    priority: 0,
+                }],
+            );
+            world.saved_fluid_ticks.insert(
+                position,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: target,
+                    delay: 0,
+                    priority: 0,
+                }],
+            );
+            world
+                .saved_block_entities
+                .insert(position, SavedBlockEntities::Empty);
+        }
+        let mut marks = native_core::postprocessing::PostProcessing::new(0, 32).unwrap();
+        assert!(marks.mark(pending.x * 16, 1, pending.z * 16));
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "PostProcessing".into(),
+                native_persistence::postprocessing::encode(&marks),
+            )]),
+        };
+        let activation = SavedChunkActivation::Encoded(
+            native_persistence::nbt::write(&document).unwrap().into(),
+        );
+        world.remember_saved_chunk_source_with_activation(pending, [1; 32], activation);
+        world.remember_saved_chunk_source_with_activation(
+            home,
+            [2; 32],
+            SavedChunkActivation::Empty,
+        );
+        let mut session =
+            LoadedSession::new(world, template.origin, template.bounds, template.player).unwrap();
+        session.set_initial_game_time(42).unwrap();
+        if indexed {
+            assert_eq!(
+                session.install_saved_tick_orders(&[pending, home]).unwrap(),
+                (true, true)
+            );
+        }
+        session.require_saved_chunk_sources().unwrap();
+        assert!(!session.simulation_allows_block_ticks(pending));
+        assert!(!session.simulation_allows_block_ticks(home));
+        session.inspect_saved_chunk_preparation();
+        assert!(!session.simulation_allows_block_ticks(pending));
+        assert!(session.simulation_allows_block_ticks(home));
+        assert!(session.validate_saved_chunk_preparation().is_err());
+
+        let fluids = session.collect_due_fluid_ticks();
+        assert_eq!(fluids.len(), 1);
+        assert_eq!(fluids[0].1.key.x.div_euclid(16), home.x);
+        session.advance_block_ticks();
+        assert_eq!(session.sand_ticks.len(), 1);
+        assert_eq!(
+            session
+                .sand_ticks
+                .first_key_value()
+                .unwrap()
+                .1
+                .x
+                .div_euclid(16),
+            pending.x
+        );
+        session.set_random_tick_speed(1);
+        session.refresh_random_tick_sections();
+        assert_eq!(session.active_random_tick_sections.len(), 1);
+        assert_eq!(session.active_random_tick_sections[0].0, home);
+        let mut expected_random = native_core::random::BlockRandomPosition::new(123);
+        expected_random.next_section_offset();
+        session.random_block_position = native_core::random::BlockRandomPosition::new(123);
+        session.advance_random_block_ticks();
+        assert_eq!(
+            session.random_block_position.next_section_offset(),
+            expected_random.next_section_offset()
+        );
+
+        // Simulate replacing the source with a separately verified clean one.
+        // The earlier unresolved effects still prevent saving this session.
+        Arc::make_mut(&mut session.world).remember_saved_chunk_source_with_activation(
+            pending,
+            [3; 32],
+            SavedChunkActivation::Empty,
+        );
+        session.inspect_saved_chunk_preparation();
+        assert!(session.simulation_allows_block_ticks(pending));
+        assert!(session.validate_saved_chunk_preparation().is_err());
+        session.refresh_random_tick_sections();
+        assert_eq!(session.active_random_tick_sections.len(), 2);
+        assert_eq!(session.collect_due_fluid_ticks().len(), 1);
+        session.advance_block_ticks();
+        assert!(session.sand_ticks.is_empty());
+    }
 }

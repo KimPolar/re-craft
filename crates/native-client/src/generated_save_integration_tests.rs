@@ -295,35 +295,41 @@ fn verify_portal_play_save(
         );
         Ok(BlockState { name, properties })
     };
-    let plan = frozen
-        .session()
-        .draft_captured_partial_save(
-            &sources,
-            &tags,
-            |saved| {
-                let state = resolve(saved)?;
-                Ok((
-                    matches!(
-                        state.name.as_str(),
-                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-                    ),
-                    FluidState::from_block(&state)
-                        .map_err(anyhow::Error::msg)?
-                        .is_some(),
-                ))
-            },
-            &resolve,
-            |state| {
-                ensure!(
-                    registry.is_canonical_state(&state.name, &state.properties),
-                    "unsupported block state"
-                );
-                Ok(())
-            },
-            |_| anyhow::bail!("unexpected POI change"),
-            1,
-        )
-        .context("cannot draft the played generated world")?;
+    let plan = frozen.session().draft_captured_partial_save(
+        &sources,
+        &tags,
+        |saved| {
+            let state = resolve(saved)?;
+            Ok((
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ),
+                FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some(),
+            ))
+        },
+        &resolve,
+        |state| {
+            ensure!(
+                registry.is_canonical_state(&state.name, &state.properties),
+                "unsupported block state"
+            );
+            Ok(())
+        },
+        |_| anyhow::bail!("unexpected POI change"),
+        1,
+    );
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Err(diagnostic) = report_pending_postprocessing(&mut reader, frozen.session()) {
+                eprintln!("could not inspect saved postprocessing: {diagnostic:#}");
+            }
+            return Err(error.context("cannot draft the played generated world"));
+        }
+    };
     let mut edits: std::collections::BTreeMap<_, _> = expected
         .world
         .loaded()
@@ -409,5 +415,83 @@ fn verify_portal_play_save(
     assert_eq!(camera.yaw, expected.player.yaw.to_degrees() - 180.0);
     assert_eq!(camera.pitch, -expected.player.pitch.to_degrees());
     assert_eq!(reader.game_time()?, expected.game_time as i64);
+    Ok(())
+}
+
+/// Report actual saved marks and nearby chunk coverage when an end-to-end
+/// save fails. This inspects only the private world created by the test.
+fn report_pending_postprocessing(
+    reader: &mut WorldReader,
+    session: &native_session::loaded::LoadedSession,
+) -> Result<()> {
+    for position in reader.saved_chunk_positions(RegionStore::Terrain)? {
+        let position = ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        if !session.has_resident_or_parked_chunk(position) {
+            continue;
+        }
+        let Some(chunk) = reader.read_chunk(position.x, position.z)? else {
+            continue;
+        };
+        let Some(tag) = chunk.document.value.get("PostProcessing") else {
+            continue;
+        };
+        if matches!(
+            tag,
+            native_persistence::nbt::Tag::List {
+                element_type: native_persistence::nbt::TagType::End
+                    | native_persistence::nbt::TagType::List,
+                values,
+            } if values.is_empty()
+        ) {
+            continue;
+        }
+        let marks = native_persistence::postprocessing::decode(tag, -64, 384)?;
+        let count: usize = marks.sections().iter().map(Vec::len).sum();
+        if count == 0 {
+            continue;
+        }
+        let mut disk_full = 0;
+        let mut session_full = 0;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let neighbor = ChunkPos {
+                    x: position.x + dx,
+                    z: position.z + dz,
+                };
+                if reader
+                    .read_chunk(neighbor.x, neighbor.z)?
+                    .is_some_and(|chunk| chunk.is_full())
+                {
+                    disk_full += 1;
+                }
+                session_full += usize::from(session.has_resident_or_parked_chunk(neighbor));
+            }
+        }
+        let marks_ref = &marks;
+        let samples: Vec<_> = marks
+            .sections()
+            .iter()
+            .enumerate()
+            .flat_map(|(section, values)| {
+                values.iter().filter_map(move |&packed| {
+                    marks_ref.unpack(section, packed, position.x, position.z)
+                })
+            })
+            .take(8)
+            .map(|[x, y, z]| {
+                let state = chunk
+                    .block(x, y, z)
+                    .map(|state| state.name.to_string_lossy())
+                    .unwrap_or_else(|| "<missing>".into());
+                ((x, y, z), state)
+            })
+            .collect();
+        eprintln!(
+            "pending postprocessing {position:?}: {count} marks, 3x3 disk FULL={disk_full}, session loaded={session_full}, samples={samples:?}"
+        );
+    }
     Ok(())
 }

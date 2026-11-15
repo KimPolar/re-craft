@@ -133,6 +133,27 @@ fn run_java_oracle(class: &str, java_source: &str) -> String {
 #[cfg(windows)]
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn ticking_chunk_activation_runs_postprocessing_before_starting_ticks() {
+    let stdout = run_java_oracle(
+        "SavedChunkActivationOracle",
+        include_str!("java/SavedChunkActivationOracle.java"),
+    );
+    let lines: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("ORDER ") || line.starts_with("FAILED "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "ORDER postprocess start-ticking send-future",
+            "FAILED postprocess"
+        ]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
 fn player_simulation_lifecycle_matches_java_26_3() {
     let stdout = run_java_oracle(
         "PlayerSimulationOracle",

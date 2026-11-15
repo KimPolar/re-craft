@@ -1678,6 +1678,7 @@ pub struct LoadedSession {
     require_saved_chunk_sources: bool,
     saved_world_session: Option<native_persistence::save::WorldSessionGuard>,
     checked_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
+    rejected_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
     unresolved_chunk_preparation: Option<String>,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
@@ -3466,11 +3467,26 @@ impl LoadedSession {
     }
 
     /// ServerLevel.shouldTickBlocksAt uses the simulation ticket level, not
-    /// the render window or the loading ticket level.
+    /// the render window or the loading ticket level. A saved chunk whose
+    /// postprocessing has not been handled cannot tick yet either.
     fn simulation_allows_block_ticks(&self, pos: ChunkPos) -> bool {
-        self.player_simulation
-            .as_ref()
-            .is_none_or(|state| state.player.tracker().in_block_ticking_range(pos))
+        self.saved_chunk_preparation_verified(pos)
+            && self
+                .player_simulation
+                .as_ref()
+                .is_none_or(|state| state.player.tracker().in_block_ticking_range(pos))
+    }
+
+    /// This only excludes known-unprepared or uncaptured saved chunks. It is
+    /// not evidence that the Java chunk holder's ticking future has completed.
+    fn saved_chunk_preparation_verified(&self, pos: ChunkPos) -> bool {
+        !self.require_saved_chunk_sources
+            || self
+                .world
+                .saved_chunk_source(pos)
+                .is_some_and(|fingerprint| {
+                    self.checked_chunk_preparation.get(&pos) == Some(&fingerprint)
+                })
     }
 
     /// Update the loading window independently of the simulation distance.
@@ -6886,30 +6902,42 @@ impl LoadedSession {
             self.tick == 0,
             "terrain source tracking must start before the first tick"
         );
+        if !self.require_saved_chunk_sources {
+            self.random_tick_revision = None;
+        }
         self.require_saved_chunk_sources = true;
         Ok(())
     }
 
     /// Record unresolved saved preparation before this experimental session
-    /// advances loaded chunks. This is a save guard, not a readiness test.
+    /// advances loaded chunks. A successful check excludes pending work but
+    /// does not establish the Java chunk holder's ticking readiness.
     fn inspect_saved_chunk_preparation(&mut self) {
-        if !self.require_saved_chunk_sources || self.unresolved_chunk_preparation.is_some() {
+        if !self.require_saved_chunk_sources {
             return;
         }
+        let previously_checked = self.checked_chunk_preparation.len();
         self.checked_chunk_preparation.retain(|pos, _| {
             self.world.chunks.contains_key(pos) || self.parked_chunks.contains_key(pos)
         });
+        self.rejected_chunk_preparation.retain(|pos, _| {
+            self.world.chunks.contains_key(pos) || self.parked_chunks.contains_key(pos)
+        });
+        let mut changed = previously_checked != self.checked_chunk_preparation.len();
         // Parked chunks can also supply deferred shape or lighting updates.
         for (&pos, chunk) in self.world.chunks.iter().chain(&self.parked_chunks) {
             if chunk.status.as_deref() != Some("minecraft:full") {
                 continue;
             }
+            let source = self.world.saved_chunk_source(pos);
+            if source.is_some_and(|fingerprint| {
+                self.rejected_chunk_preparation.get(&pos) == Some(&fingerprint)
+            }) {
+                continue;
+            }
             let result = (|| -> anyhow::Result<[u8; 32]> {
                 use anyhow::Context;
-                let fingerprint = self
-                    .world
-                    .saved_chunk_source(pos)
-                    .context("saved chunk source is unavailable")?;
+                let fingerprint = source.context("saved chunk source is unavailable")?;
                 if self.checked_chunk_preparation.get(&pos) == Some(&fingerprint) {
                     return Ok(fingerprint);
                 }
@@ -6931,14 +6959,26 @@ impl LoadedSession {
             })();
             match result {
                 Ok(fingerprint) => {
-                    self.checked_chunk_preparation.insert(pos, fingerprint);
+                    self.rejected_chunk_preparation.remove(&pos);
+                    changed |= self.checked_chunk_preparation.insert(pos, fingerprint)
+                        != Some(fingerprint);
                 }
                 Err(error) => {
-                    self.unresolved_chunk_preparation =
-                        Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
-                    return;
+                    changed |= self.checked_chunk_preparation.remove(&pos).is_some();
+                    if let Some(fingerprint) = source {
+                        self.rejected_chunk_preparation.insert(pos, fingerprint);
+                    } else {
+                        self.rejected_chunk_preparation.remove(&pos);
+                    }
+                    if self.unresolved_chunk_preparation.is_none() {
+                        self.unresolved_chunk_preparation =
+                            Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
+                    }
                 }
             }
+        }
+        if changed {
+            self.random_tick_revision = None;
         }
     }
 
@@ -9156,6 +9196,7 @@ impl LoadedSession {
             require_saved_chunk_sources: false,
             saved_world_session: None,
             checked_chunk_preparation: BTreeMap::new(),
+            rejected_chunk_preparation: BTreeMap::new(),
             unresolved_chunk_preparation: None,
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
@@ -16605,7 +16646,9 @@ impl LoadedSession {
         }
         let mut present = BTreeSet::new();
         for (&chunk_pos, chunk) in &self.world.chunks {
-            if chunk.status.as_deref() != Some("minecraft:full") {
+            if chunk.status.as_deref() != Some("minecraft:full")
+                || !self.saved_chunk_preparation_verified(chunk_pos)
+            {
                 continue;
             }
             for (&section_y, section) in &chunk.sections {

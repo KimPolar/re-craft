@@ -112,8 +112,17 @@ impl SkyLighting {
     pub(crate) fn capability(&self) -> Option<bool> {
         self.configured.then_some(self.enabled)
     }
-    pub(crate) fn is_current(&self) -> bool {
-        self.enabled && self.pending.is_empty()
+    /// Pending edits cannot affect sky light outside their propagation and
+    /// section-allocation chunk halo. Missing light data is still checked by
+    /// the caller; unknown dimension bounds cannot establish this proof.
+    pub(crate) fn is_current_at(
+        &self,
+        position: BlockPosition,
+        bounds: Option<LightBounds>,
+    ) -> bool {
+        self.enabled
+            && (self.pending.is_empty()
+                || (bounds.is_some() && !self.required_chunks.contains(&position.chunk())))
     }
 
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
@@ -1114,6 +1123,143 @@ mod tests {
         let second = BlockPosition { x: 2, y: 5, z: 1 };
         edit(&mut sky, &mut world, second, state("stone", &[]));
         assert!(!sky.light_unchanged(&world, Some(bounds)));
+    }
+
+    #[test]
+    fn distant_sky_light_is_current_only_outside_all_edit_halos() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        let near = BlockPosition { x: 0, y: 15, z: 0 };
+        let distant = BlockPosition { x: 32, y: 15, z: 0 };
+        assert!(!sky.is_current_at(distant, Some(bounds)));
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, near, state("stone", &[]));
+        assert!(!sky.light_unchanged(&world, Some(bounds)));
+        assert!(!sky.is_current_at(near, Some(bounds)));
+        assert!(!sky.is_current_at(BlockPosition { x: 31, ..distant }, Some(bounds)));
+        assert!(sky.is_current_at(distant, Some(bounds)));
+        assert!(!sky.is_current_at(distant, None));
+        edit(&mut sky, &mut world, distant, state("stone", &[]));
+        assert!(!sky.is_current_at(distant, Some(bounds)));
+        assert!(sky.is_current_at(BlockPosition { x: -33, ..near }, Some(bounds)));
+        sky.set_enabled(false);
+        assert!(!sky.is_current_at(BlockPosition { x: -33, ..near }, Some(bounds)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn distant_pending_sky_light_matches_java_engine() {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let saved = temp.path().join("SavedLiveLightOracle.java");
+        let source = temp.path().join("DistantSkyLightOracle.java");
+        std::fs::write(
+            &saved,
+            include_str!("../../world/tests/java/SavedLiveLightOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/DistantSkyLightOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let result = cmd.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&saved)
+            .arg(&source));
+        let output = temp.path().join("sky.bin");
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("DistantSkyLightOracle")
+            .arg(&output));
+        let data = std::fs::read(output).unwrap();
+        const X: usize = 112;
+        const Z: usize = 96;
+        const Y: usize = 34;
+        const GRID: usize = X * Z * Y;
+        assert_eq!(data.len(), GRID * 6);
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 0, y: 15, z: 0 },
+            state("stone", &[]),
+        );
+        let bounds = Some(LightBounds::new(0, 32).unwrap());
+        for scenario in 0..2 {
+            let first = &data[scenario * GRID * 3..][..GRID];
+            let second = &data[(scenario * 3 + 1) * GRID..][..GRID];
+            let third = &data[(scenario * 3 + 2) * GRID..][..GRID];
+            let mut near_changes = [0, 0];
+            let mut distant_positions = 0;
+            for (index, ((&before, &placed), &removed)) in
+                first.iter().zip(second).zip(third).enumerate()
+            {
+                let x = (index % X) as i32 - 32;
+                let z = (index / X % Z) as i32 - 32;
+                let y = (index / (X * Z)) as i32 - 1;
+                if sky.is_current_at(BlockPosition { x, y, z }, bounds) {
+                    assert_eq!(
+                        before, placed,
+                        "placement changed distant sky at {x},{y},{z}"
+                    );
+                    assert_eq!(
+                        placed, removed,
+                        "removal changed distant sky at {x},{y},{z}"
+                    );
+                    distant_positions += 1;
+                } else {
+                    near_changes[0] += usize::from(before != placed);
+                    near_changes[1] += usize::from(placed != removed);
+                }
+            }
+            assert!(
+                distant_positions > 0 && near_changes.iter().all(|&count| count > 0),
+                "scenario {scenario} did not exercise distant and changed light"
+            );
+        }
     }
 
     #[test]

@@ -1295,7 +1295,8 @@ struct RainView<'a> {
     raining: Option<bool>,
     origin: IVec3,
     world: &'a World,
-    light_current: bool,
+    sky_lighting: &'a crate::sky_lighting::SkyLighting,
+    sky_bounds: Option<native_world::block_light::LightBounds>,
     heightmaps: &'a BTreeMap<ChunkPos, Arc<SpawnHeightmaps>>,
     climates: Option<&'a BTreeMap<String, native_resources::biome_climate::BiomeClimate>>,
     sea_level: Option<i32>,
@@ -1337,7 +1338,16 @@ impl RainView<'_> {
             z: pos.z.div_euclid(16),
         };
         let chunk = self.world.chunks.get(&chunk_pos)?;
-        if !chunk.block_light_correct || !self.light_current {
+        if !chunk.block_light_correct
+            || !self.sky_lighting.is_current_at(
+                BlockPosition {
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z,
+                },
+                self.sky_bounds,
+            )
+        {
             return None;
         }
         if self.world.light(pos.x, pos.y, pos.z, true)? < 15 {
@@ -8313,7 +8323,11 @@ impl LoadedSession {
             raining: self.global_rain(),
             origin: self.origin,
             world: &self.world,
-            light_current: self.sky_lighting.is_current(),
+            sky_lighting: &self.sky_lighting,
+            sky_bounds: native_world::block_light::LightBounds::new(
+                self.bounds.min_y,
+                self.bounds.max_y,
+            ),
             heightmaps: &self.spawn_heightmaps,
             climates: self.biome_climates.as_deref(),
             sea_level: self.generator_sea_level,
@@ -16552,7 +16566,16 @@ impl LoadedSession {
         }
         let bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
-        if !(self.sky_lighting.settled() || self.sky_lighting.light_unchanged(&self.world, bounds))
+        if !(self.sky_lighting.settled()
+            || self.sky_lighting.is_current_at(
+                BlockPosition {
+                    x: absolute.x,
+                    y: absolute.y,
+                    z: absolute.z,
+                },
+                bounds,
+            )
+            || self.sky_lighting.light_unchanged(&self.world, bounds))
         {
             return None;
         }
@@ -23583,7 +23606,11 @@ impl LoadedSession {
                 raining: self.global_rain(),
                 origin,
                 world,
-                light_current: self.sky_lighting.is_current(),
+                sky_lighting: &self.sky_lighting,
+                sky_bounds: native_world::block_light::LightBounds::new(
+                    self.bounds.min_y,
+                    self.bounds.max_y,
+                ),
                 heightmaps: &self.spawn_heightmaps,
                 climates: self.biome_climates.as_deref(),
                 sea_level: self.generator_sea_level,
@@ -25544,7 +25571,11 @@ impl LoadedSession {
                 raining: self.global_rain(),
                 origin: self.origin,
                 world: &self.world,
-                light_current: self.sky_lighting.is_current(),
+                sky_lighting: &self.sky_lighting,
+                sky_bounds: native_world::block_light::LightBounds::new(
+                    self.bounds.min_y,
+                    self.bounds.max_y,
+                ),
                 heightmaps: &self.spawn_heightmaps,
                 climates: self.biome_climates.as_deref(),
                 sea_level: self.generator_sea_level,
@@ -25665,7 +25696,11 @@ impl LoadedSession {
             raining: self.global_rain(),
             origin,
             world,
-            light_current: self.sky_lighting.is_current(),
+            sky_lighting: &self.sky_lighting,
+            sky_bounds: native_world::block_light::LightBounds::new(
+                self.bounds.min_y,
+                self.bounds.max_y,
+            ),
             heightmaps: &self.spawn_heightmaps,
             climates: self.biome_climates.as_deref(),
             sea_level: self.generator_sea_level,
@@ -25829,7 +25864,11 @@ impl LoadedSession {
             raining: self.global_rain(),
             origin,
             world,
-            light_current: self.sky_lighting.is_current(),
+            sky_lighting: &self.sky_lighting,
+            sky_bounds: native_world::block_light::LightBounds::new(
+                self.bounds.min_y,
+                self.bounds.max_y,
+            ),
             heightmaps: &self.spawn_heightmaps,
             climates: self.biome_climates.as_deref(),
             sea_level: self.generator_sea_level,
@@ -33605,6 +33644,35 @@ pub(crate) mod tests {
         assert_eq!(session.crop_can_survive(position), Some(true));
     }
 
+    fn queue_distant_sky_change(session: &mut LoadedSession) {
+        let home = session.player_chunk().unwrap();
+        let distant = ChunkPos {
+            x: home.x + 4,
+            z: home.z,
+        };
+        let mut chunk = session.world.chunks[&home].as_ref().clone();
+        chunk.position = distant;
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(distant, Arc::new(chunk));
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(72, 5, 8), water, false));
+        assert!(!session.sky_lighting.settled());
+    }
+
+    #[test]
+    fn crop_uses_sky_light_during_distant_pending_edits() {
+        let position = IVec3::new(8, 2, 8);
+        let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        queue_distant_sky_change(&mut session);
+        assert!(session.pending_light.is_empty());
+        assert_eq!(session.crop_brightness(position, 9), Some(15));
+        assert_eq!(session.crop_can_survive(position), Some(true));
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(12, 5, 8), water, false));
+        assert_eq!(session.crop_brightness(position, 9), None);
+    }
+
     #[test]
     fn crop_uses_block_light_outside_pending_change_radius() {
         let position = IVec3::new(8, 2, 8);
@@ -36863,6 +36931,12 @@ pub(crate) mod tests {
                 Some(Box::new([0xff; LIGHT_BYTES]));
         }
         configure(&mut session, climate, Some(63));
+        queue_distant_sky_change(&mut session);
+        assert_eq!(
+            session.rain_at(pos),
+            Some(true),
+            "distant sky work does not affect rain"
+        );
         assert!(session.random_tick_farmland_at(soil));
         let soil_state = session
             .world

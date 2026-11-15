@@ -14,6 +14,9 @@ use native_resources::{
     worldgen_region_random::RegionRandom,
 };
 
+#[cfg(test)]
+mod brushable_tests;
+
 fn fluid_in_water_tag(state: &BlockState, water_fluids: &BTreeSet<String>) -> Result<bool> {
     let fluid =
         match native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)? {
@@ -1150,18 +1153,34 @@ where
             "unsupported ruin template block"
         );
         let old = region.read(position)?;
+        let brushable = matches!(
+            region.monster_entities.get(&position),
+            Some(Some(super::super::GeneratedMonsterRoomEntity::Brushable(entity)))
+                if entity.position == position && entity.state == old
+        );
         ensure!(
             self.marker
                 .registry
                 .is_canonical_state(&old.name, &old.properties)
-                && self.marker.registry.has_block_entity(&old.name) == Some(false)
-                && (disk_safe_solid(&old.name).is_some()
-                    || (old.name == "minecraft:seagrass" && old.properties.is_empty())
-                    || super::super::ocean_ruin::ocean_template_static_full(&old).is_ok())
-                && !region.monster_entities.contains_key(&position)
+                && ((self.marker.registry.has_block_entity(&old.name) == Some(false)
+                    && (disk_safe_solid(&old.name).is_some()
+                        || (old.name == "minecraft:seagrass" && old.properties.is_empty())
+                        || super::super::ocean_ruin::ocean_template_static_full(&old).is_ok())
+                    && !region.monster_entities.contains_key(&position))
+                    || (self.marker.registry.has_block_entity(&old.name) == Some(true)
+                        && brushable))
                 && !region.bee_nests.contains_key(&position),
             "unsupported ruin template replacement source at {position:?}: {old:?}"
         );
+        if brushable {
+            Arc::make_mut(&mut region.monster_entities).remove(&position);
+            if let Some(order) = region.entity_order.get_mut(&chunk(position)) {
+                Arc::make_mut(order).remove(position);
+            }
+            if let Some(pending) = region.pending_order.get_mut(&chunk(position)) {
+                Arc::make_mut(pending).remove(position);
+            }
+        }
         region.set_proto_block(position, state)?;
         Ok(true)
     }

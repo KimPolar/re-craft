@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use super::{
     CarvedTerrainWorld, DecorationAction, DecorationPlan, FreshGenerationLightTracker,
-    PreparedStructureStart, StagedGenerationLightEngine,
+    PreparedStructureStart, QueuedGenerationLightEngine, StagedGenerationLightEngine,
     structure_batch::{
         PlannedMixedStructureDecoration, PlannedStructureDecoration, PlannedStructureStart,
     },
@@ -857,6 +857,10 @@ enum DecorationLightTracking<'a> {
     ),
     Staged(
         &'a mut StagedGenerationLightEngine,
+        &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ),
+    Queued(
+        &'a mut QueuedGenerationLightEngine,
         &'a native_resources::block_registry::GeneratedBlockRegistry,
     ),
 }
@@ -1987,6 +1991,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         )
     }
 
+    /// Execute against a continuously observed saved or live light revision.
+    pub fn execute_with_queued_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        engine: &mut QueuedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Vec<bool>> {
+        self.execute_with_light_tracking(
+            terrain,
+            structures_enabled,
+            DecorationLightTracking::Queued(engine, registry),
+            None,
+            None,
+            None,
+        )
+    }
+
     fn execute_with_light_tracking(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -2019,6 +2041,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             }
             DecorationLightTracking::Staged(engine, registry) => {
                 engine.snapshot(terrain, covered, registry)?
+            }
+            DecorationLightTracking::Queued(engine, _) => {
+                engine.validate_terrain(terrain)?;
+                let mut tracker = engine.tracker.clone();
+                tracker
+                    .cover_columns(covered)
+                    .context("light coverage is invalid")?;
+                tracker.snapshot().clone()
             }
         };
         let block = |p| {
@@ -2078,6 +2108,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             terrain,
             structures,
             DecorationLightTracking::Staged(engine, registry),
+        )
+    }
+
+    /// Execute a structure plan against an observed saved or live revision.
+    pub fn execute_structures_with_queued_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        engine: &mut QueuedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        self.execute_structures_with_light_tracking(
+            terrain,
+            structures,
+            DecorationLightTracking::Queued(engine, registry),
         )
     }
 
@@ -2188,6 +2236,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures,
             ocean,
             Some(DecorationLightTracking::Staged(engine, registry)),
+            None,
+        )
+    }
+
+    /// Execute mixed structures and features against an observed light revision.
+    pub fn execute_mixed_with_queued_light<R: MixedOceanRuinPlacement + Clone>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedMixedStructureDecoration<'_>],
+        ocean: &mut R,
+        engine: &mut QueuedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
+        self.execute_mixed_with_optional_light(
+            terrain,
+            structures,
+            ocean,
+            Some(DecorationLightTracking::Queued(engine, registry)),
             None,
         )
     }
@@ -2663,19 +2729,23 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some((self.plan.generator_min_y, self.plan.generator_height));
         let guard_inputs = match &light_tracking {
             Some(DecorationLightTracking::Fresh(tracker, registry)) => {
-                Some((&**tracker, *registry, false))
+                Some((&tracker.registered, *registry, false))
             }
             Some(DecorationLightTracking::Staged(engine, registry)) => {
-                Some((&engine.fresh, *registry, true))
+                Some((&engine.fresh.registered, *registry, true))
+            }
+            Some(DecorationLightTracking::Queued(engine, registry)) => {
+                engine.validate_terrain(region.target)?;
+                Some((&engine.registered, *registry, true))
             }
             None => None,
         };
-        if let Some((tracker, registry, require_unchanged_light)) = guard_inputs {
+        if let Some((registered, registry, require_unchanged_light)) = guard_inputs {
             region.light_guard = Some(DecorationLightGuard {
                 registered: region
                     .writable
                     .iter()
-                    .filter(|pos| tracker.registered.contains_key(pos))
+                    .filter(|pos| registered.contains_key(pos))
                     .copied()
                     .collect(),
                 registry,
@@ -3121,7 +3191,7 @@ fn validate_decorated_hut_start(
 fn feature_sky_sources(
     region: &DecorationRegion<'_>,
     guard: &DecorationLightGuard<'_>,
-    tracker: &FreshGenerationLightTracker,
+    sky_sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     bounds: native_world::block_light::LightBounds,
 ) -> Result<BTreeMap<ChunkPos, Arc<[i32; 256]>>> {
     let checks: Vec<_> = guard
@@ -3139,8 +3209,7 @@ fn feature_sky_sources(
         let pos = chunk(position);
         if let std::collections::btree_map::Entry::Vacant(entry) = sources.entry(pos) {
             entry.insert(Arc::clone(
-                tracker
-                    .sky_sources
+                sky_sources
                     .get(&pos)
                     .context("feature update requires initialized sky sources")?,
             ));
@@ -3246,7 +3315,7 @@ fn finish_decoration_with_light(
                     .section_statuses,
             )?,
         ),
-        None => None,
+        Some(DecorationLightTracking::Queued(_, _)) | None => None,
     };
     let mut staged_replay = None;
     let mut incremental_columns = None;
@@ -3263,7 +3332,12 @@ fn finish_decoration_with_light(
                 .context("light height overflow")?;
             let bounds = native_world::block_light::LightBounds::new(tracker.min_y, max_y)
                 .context("unsupported light bounds")?;
-            fresh_sources = Some(feature_sky_sources(&region, guard, tracker, bounds)?);
+            fresh_sources = Some(feature_sky_sources(
+                &region,
+                guard,
+                &tracker.sky_sources,
+                bounds,
+            )?);
         }
     }
     if let Some(DecorationLightTracking::Staged(engine, registry)) = &*light_tracking {
@@ -3304,7 +3378,7 @@ fn finish_decoration_with_light(
                 .context("light height overflow")?;
             let bounds = native_world::block_light::LightBounds::new(tracker.min_y, max_y)
                 .context("unsupported light bounds")?;
-            let sources = feature_sky_sources(&region, guard, tracker, bounds)?;
+            let sources = feature_sky_sources(&region, guard, &tracker.sky_sources, bounds)?;
             let mut needs_incremental = !engine.incremental_columns.is_empty()
                 || !guard.section_statuses.is_empty()
                 || !guard.vine_light_positions.is_empty();
@@ -3465,6 +3539,114 @@ fn finish_decoration_with_light(
             }
         }
     }
+    let mut queued_replay = None;
+    if let Some(DecorationLightTracking::Queued(engine, _)) = &*light_tracking {
+        use native_world::generation_light::QueuedLightEvent;
+
+        engine.validate_terrain(region.target)?;
+        let guard = region
+            .light_guard
+            .as_ref()
+            .context("queued light guard missing")?;
+        let max_y = engine
+            .min_y
+            .checked_add(engine.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(engine.min_y, max_y)
+            .context("unsupported light bounds")?;
+
+        // Only replay the supported checked writes into the engine's prior
+        // input. Unregistered protochunk edits cannot silently change light.
+        let mut world = region.world.clone();
+        world.chunks = region.target.world.chunks.clone();
+        for &p in &guard.light_replay_positions {
+            let state = region
+                .world
+                .block(p[0], p[1], p[2])
+                .context("updated feature block missing")?
+                .clone();
+            let id = world.intern_state(state);
+            world
+                .set_block_id(p[0], p[1], p[2], id)
+                .map_err(|error| anyhow::anyhow!("cannot replay feature update: {error:?}"))?;
+        }
+        let world = Arc::new(world);
+        StagedGenerationLightEngine::validate_active_world_parts(
+            Some(&world),
+            engine.tracker.active_chunks(),
+            engine.min_y,
+            engine.height,
+            &region.world,
+        )?;
+        for (pos, before) in &engine.registered {
+            let after = region
+                .world
+                .chunks
+                .get(pos)
+                .context("registered light chunk is missing")?;
+            if !Arc::ptr_eq(before, after) {
+                ensure!(
+                    guard.changed_chunks.contains(pos),
+                    "untracked registered light chunk change"
+                );
+                let reference = world
+                    .chunks
+                    .get(pos)
+                    .context("registered light reference missing")?;
+                ensure!(
+                    super::unchanged_chunk_light_behavior(
+                        &world,
+                        &region.world,
+                        reference,
+                        after,
+                        engine.min_y,
+                        engine.height,
+                    )?,
+                    "registered light behavior changed"
+                );
+            }
+        }
+        let mut sources = engine.sky_sources.clone();
+        if engine.has_skylight && !guard.light_replay_positions.is_empty() {
+            sources.extend(feature_sky_sources(
+                &region,
+                guard,
+                &engine.sky_sources,
+                bounds,
+            )?);
+        }
+        let mut tracker = engine.tracker.clone();
+        let mut events = Vec::with_capacity(guard.section_statuses.len());
+        for &(position, section_y, nonempty) in &guard.section_statuses {
+            tracker
+                .cover_chunk_halo(position)
+                .context("feature light halo is out of range")?;
+            events.push(QueuedLightEvent::SectionStatus {
+                position,
+                section_y,
+                nonempty,
+            });
+        }
+        for &p in &guard.light_replay_positions {
+            let pos = chunk(p);
+            let mut columns = Vec::with_capacity(25);
+            for dz in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    columns.push(ChunkPos {
+                        x: pos.x.checked_add(dx).context("light X overflow")?,
+                        z: pos.z.checked_add(dz).context("light Z overflow")?,
+                    });
+                }
+            }
+            tracker
+                .cover_columns(columns)
+                .context("feature light coverage is invalid")?;
+        }
+        tracker
+            .apply_changes(&world, bounds, &events, &guard.light_check_order, &sources)
+            .context("queued feature light inputs are incomplete or unsupported")?;
+        queued_replay = Some((tracker, sources));
+    }
     let checked = region
         .light_guard
         .as_mut()
@@ -3473,7 +3655,7 @@ fn finish_decoration_with_light(
     let tracker = match &mut *light_tracking {
         Some(DecorationLightTracking::Fresh(tracker, _)) => Some(&mut **tracker),
         Some(DecorationLightTracking::Staged(engine, _)) => Some(&mut engine.fresh),
-        None => None,
+        Some(DecorationLightTracking::Queued(_, _)) | None => None,
     };
     if let Some(tracker) = tracker {
         tracker.apply_section_plan(section_plan.expect("tracked decoration has a section plan"));
@@ -3502,6 +3684,21 @@ fn finish_decoration_with_light(
         }
         if let Some(columns) = incremental_columns {
             engine.incremental_columns.extend(columns);
+        }
+    }
+    if let Some((tracker, sources)) = queued_replay {
+        let Some(DecorationLightTracking::Queued(engine, _)) = &mut *light_tracking else {
+            unreachable!("queued replay requires queued tracking");
+        };
+        engine.tracker = tracker;
+        engine.sky_sources = sources;
+        for (pos, current) in &mut engine.registered {
+            *current = Arc::clone(
+                committed
+                    .chunks
+                    .get(pos)
+                    .expect("registered light chunk was validated"),
+            );
         }
     }
     Ok(())
@@ -13895,6 +14092,24 @@ mod tests {
     }
 
     fn check_staged_light_modes(modes: &[&str]) {
+        check_generation_light_modes(modes, false);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn queued_saved_feature_light_matches_java_across_25_columns() {
+        check_generation_light_modes(
+            &[
+                "vine_active_glowing",
+                "vine_active_self_empty_plant_short_grass",
+                "vine_active_empty_room_stone_air_then",
+                "vine_active_lake_air",
+            ],
+            true,
+        );
+    }
+
+    fn check_generation_light_modes(modes: &[&str], saved: bool) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -13940,6 +14155,9 @@ mod tests {
             let inspect_allocations =
                 mode.contains("_empty_room_") || mode.contains("_empty_mineshaft_");
             let mut command = Command::new(java.join("java.exe"));
+            if saved {
+                command.arg("-Dtest.savedLight=true");
+            }
             command
                 .arg("-classpath")
                 .arg(&cp)
@@ -14234,21 +14452,84 @@ mod tests {
                 .completed_decoration
                 .extend(registered.iter().copied());
             let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
-            for pos in registered {
+            for pos in registered.iter().copied() {
                 tracker.initialize_chunk(&terrain, pos, &registry).unwrap();
             }
+            let sources = tracker.sky_sources.clone();
             let mut engine = StagedGenerationLightEngine::new(tracker);
             let covered: Vec<_> = (-2..=2)
                 .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
                 .collect();
-            let before = engine
-                .activate(
-                    &terrain,
-                    if self_active { east } else { center },
-                    covered.iter().copied(),
-                    &registry,
+            let mut queued = if saved {
+                use native_world::{
+                    block_light::LightBounds,
+                    generation_light::{LightChannel, QueuedLightEvent, QueuedSectionLightTracker},
+                };
+                let bounds =
+                    LightBounds::new(terrain.min_y, terrain.min_y + terrain.height).unwrap();
+                let mut light = QueuedSectionLightTracker::fresh(true, true, []).unwrap();
+                light.cover_columns(covered.iter().copied()).unwrap();
+                let mut events = vec![
+                    QueuedLightEvent::Queue {
+                        channel: LightChannel::Block,
+                        position: east,
+                        section_y: 0,
+                        bytes: Some(Arc::new([0x33; 2048])),
+                    },
+                    QueuedLightEvent::Queue {
+                        channel: LightChannel::Sky,
+                        position: east,
+                        section_y: 0,
+                        bytes: Some(Arc::new([0xff; 2048])),
+                    },
+                ];
+                for &pos in &registered {
+                    light.cover_chunk_halo(pos).unwrap();
+                    events.extend(
+                        QueuedSectionLightTracker::initialization_events(
+                            &terrain.world,
+                            pos,
+                            bounds,
+                            |state| super::super::generated_state_is_air(&registry, state),
+                        )
+                        .unwrap(),
+                    );
+                }
+                light.apply_events(&events).unwrap();
+                light
+                    .propagate_chunk(
+                        &terrain.world,
+                        bounds,
+                        if self_active { east } else { center },
+                        &sources,
+                    )
+                    .unwrap();
+                Some(
+                    QueuedGenerationLightEngine::new(
+                        &terrain,
+                        light,
+                        registered.iter().copied(),
+                        sources,
+                        true,
+                        |state| super::super::generated_state_is_air(&registry, state),
+                    )
+                    .unwrap(),
                 )
-                .unwrap();
+            } else {
+                None
+            };
+            let before = if let Some(engine) = &queued {
+                engine.tracker.snapshot().clone()
+            } else {
+                engine
+                    .activate(
+                        &terrain,
+                        if self_active { east } else { center },
+                        covered.iter().copied(),
+                        &registry,
+                    )
+                    .unwrap()
+            };
             let mut draft = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))
                 .unwrap();
@@ -14774,12 +15055,21 @@ mod tests {
                 };
                 assert_eq!(guard.section_statuses, expected, "{mode}");
             }
-            let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
-            finish_decoration_with_light(draft, &mut tracking).unwrap();
-            drop(tracking);
-            let after = engine
-                .snapshot(&terrain, covered.iter().copied(), &registry)
-                .unwrap();
+            if let Some(engine) = queued.as_mut() {
+                let mut tracking = Some(DecorationLightTracking::Queued(engine, &registry));
+                finish_decoration_with_light(draft, &mut tracking).unwrap();
+            } else {
+                let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
+                finish_decoration_with_light(draft, &mut tracking).unwrap();
+            }
+            let after = if let Some(engine) = &queued {
+                engine.validate_terrain(&terrain).unwrap();
+                engine.tracker.snapshot().clone()
+            } else {
+                engine
+                    .snapshot(&terrain, covered.iter().copied(), &registry)
+                    .unwrap()
+            };
             if let Some(allocations) = &allocations {
                 assert_eq!(allocations.len(), 2);
                 for (stage, light) in [&before, &after].into_iter().enumerate() {
@@ -15490,6 +15780,226 @@ mod tests {
                 .fresh_generation_light([center], [center], &registry, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn queued_feature_schedule_preserves_state_on_unsupported_writes() {
+        use super::super::schedule::{GenerationSchedule, GenerationStage};
+        use native_world::{block_light::LightBounds, generation_light::QueuedSectionLightTracker};
+
+        struct MushroomAt(i32);
+        impl ResourceProvider for MushroomAt {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[[{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:brown_mushroom"}},"placement":[{"type":"minecraft:offset","x":self.0,"y":8,"z":8}]}]]}),
+                    )?));
+                }
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let vanilla = resources.vanilla_generated_block_registry().unwrap();
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        for (x, active) in [(8, false), (8, true), (16, true)] {
+            let schedule = FeatureSchedule::load(
+                &mut MushroomAt(x),
+                std::slice::from_ref(&plains),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let (_, _, neighborhood) = scheduled_fixture(None);
+            let plan = fixture_plan(&schedule, &neighborhood);
+            let mut blocks = batch_registry();
+            blocks.insert("minecraft:brown_mushroom".into());
+            let prepared =
+                PreparedDecoration::load(&mut MushroomAt(x), &plan, &blocks, &mut resolve_test)
+                    .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            terrain.completed_decoration.insert(east);
+            let bounds = LightBounds::new(0, 16).unwrap();
+            let mut light = QueuedSectionLightTracker::fresh(true, false, []).unwrap();
+            light
+                .cover_columns((-2..=2).flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z })))
+                .unwrap();
+            let events = QueuedSectionLightTracker::initialization_events(
+                &terrain.world,
+                east,
+                bounds,
+                |state| super::super::generated_state_is_air(&vanilla, state),
+            )
+            .unwrap();
+            light.apply_events(&events).unwrap();
+            if active {
+                light
+                    .propagate_chunk(&terrain.world, bounds, east, &BTreeMap::new())
+                    .unwrap();
+            }
+            let mut engine = QueuedGenerationLightEngine::new(
+                &terrain,
+                light,
+                [east],
+                BTreeMap::new(),
+                false,
+                |state| super::super::generated_state_is_air(&vanilla, state),
+            )
+            .unwrap();
+            let mut steps = GenerationSchedule::new();
+            steps.request(center, GenerationStage::Features).unwrap();
+            while !steps.ready(center, GenerationStage::Features) {
+                let (pos, stage) = steps.next_ready().unwrap();
+                steps.complete(pos, stage).unwrap();
+            }
+            let before = terrain.snapshot();
+            let visible = engine.tracker.snapshot().clone();
+            let result = steps.run_features_with_queued_light(
+                &mut terrain,
+                &prepared,
+                false,
+                &mut engine,
+                &vanilla,
+            );
+            if active {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains(if x == 8 {
+                        "active light neighborhood changed"
+                    } else {
+                        "registered light behavior changed"
+                    }),
+                    "{error}"
+                );
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
+                assert_eq!(
+                    engine.tracker.snapshot().block_light([16, 8, 8]),
+                    visible.block_light([16, 8, 8])
+                );
+            } else {
+                assert_eq!(result.unwrap(), [true]);
+                assert_eq!(steps.completed(center), Some(GenerationStage::Features));
+                assert_eq!(
+                    terrain.snapshot().block(8, 8, 8).unwrap().name,
+                    "minecraft:brown_mushroom"
+                );
+            }
+            engine.validate_terrain(&terrain).unwrap();
+        }
+
+        struct GlowingVine;
+        impl ResourceProvider for GlowingVine {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let vine = json!({"feature":{"type":"minecraft:block_column","direction":"down",
+                        "allowed_placement":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"},
+                        "prioritize_tip":true,"layers":[{"height":1,
+                        "provider":{"id":"minecraft:cave_vines_plant","properties":{"berries":"true"}}}]},
+                        "placement":[{"type":"minecraft:offset","x":16,"y":10,"z":8}]});
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[vine]]}))?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let schedule =
+            FeatureSchedule::load(&mut GlowingVine, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut blocks = batch_registry();
+        blocks.insert("minecraft:cave_vines_plant".into());
+        let prepared =
+            PreparedDecoration::load(&mut GlowingVine, &plan, &blocks, &mut resolve_tree_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let template = world.chunks[&center].as_ref().clone();
+        for z in -2..=2 {
+            for x in -2..=3 {
+                let pos = ChunkPos { x, z };
+                world.chunks.entry(pos).or_insert_with(|| {
+                    let mut chunk = template.clone();
+                    chunk.position = pos;
+                    Arc::new(chunk)
+                });
+            }
+        }
+        let bounds = LightBounds::new(0, 16).unwrap();
+        let mut light = QueuedSectionLightTracker::fresh(true, false, []).unwrap();
+        light
+            .cover_columns((-2..=2).flat_map(|z| (-1..=3).map(move |x| ChunkPos { x, z })))
+            .unwrap();
+        let statuses = QueuedSectionLightTracker::initialization_events(
+            &terrain.world,
+            east,
+            bounds,
+            |state| super::super::generated_state_is_air(&vanilla, state),
+        )
+        .unwrap();
+        light.apply_events(&statuses).unwrap();
+        light
+            .propagate_chunk(&terrain.world, bounds, east, &BTreeMap::new())
+            .unwrap();
+        let mut engine = QueuedGenerationLightEngine::new(
+            &terrain,
+            light,
+            [east],
+            BTreeMap::new(),
+            false,
+            |state| super::super::generated_state_is_air(&vanilla, state),
+        )
+        .unwrap();
+        let mut steps = GenerationSchedule::new();
+        steps.request(center, GenerationStage::Features).unwrap();
+        while !steps.ready(center, GenerationStage::Features) {
+            let (pos, stage) = steps.next_ready().unwrap();
+            steps.complete(pos, stage).unwrap();
+        }
+        assert_eq!(engine.tracker.snapshot().block_light([16, 10, 8]), Some(0));
+        assert_eq!(
+            steps
+                .run_features_with_queued_light(
+                    &mut terrain,
+                    &prepared,
+                    false,
+                    &mut engine,
+                    &vanilla,
+                )
+                .unwrap(),
+            [true]
+        );
+        assert_eq!(
+            terrain.snapshot().block(16, 10, 8).unwrap().name,
+            "minecraft:cave_vines_plant"
+        );
+        assert!(engine.tracker.snapshot().block_light([16, 10, 8]).unwrap() > 0);
+        assert_eq!(steps.completed(center), Some(GenerationStage::Features));
+        engine.validate_terrain(&terrain).unwrap();
     }
 
     #[test]

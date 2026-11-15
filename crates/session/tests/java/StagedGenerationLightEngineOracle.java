@@ -140,6 +140,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean vineNoSky=args.length>1 && args[1].equals("tree_empty_vine_no_sky");
         boolean noSky=args.length>1 && (args[1].equals("tree_empty_no_sky") || vineNoSky);
         var engine=new LevelLightEngine(w,true,!noSky);
+        if (Boolean.getBoolean("test.savedLight")) {
+            var block = new byte[2048]; Arrays.fill(block, (byte)0x33);
+            var sky = new byte[2048]; Arrays.fill(sky, (byte)0xff);
+            engine.queueSectionData(LightLayer.BLOCK, SectionPos.of(1,0,0), new DataLayer(block));
+            if (!noSky) engine.queueSectionData(LightLayer.SKY, SectionPos.of(1,0,0), new DataLayer(sky));
+        }
         boolean patchFreshWater=args.length>1 && args[1].equals("patch_fresh_clay_water");
         boolean pileFresh=args.length>1 && args[1].startsWith("pile_fresh_");
         boolean pileFreshEmpty=pileFresh && args[1].contains("_empty_");

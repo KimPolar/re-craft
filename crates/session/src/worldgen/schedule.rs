@@ -1821,6 +1821,26 @@ impl GenerationSchedule {
         Ok(result)
     }
 
+    /// Complete FEATURES while preserving an observed saved or live light engine.
+    pub fn run_features_with_queued_light(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures_enabled: bool,
+        engine: &mut super::QueuedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Vec<bool>> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let result =
+            prepared.execute_with_queued_light(terrain, structures_enabled, engine, registry)?;
+        self.complete(center, Features)?;
+        Ok(result)
+    }
+
     /// Publish FEATURES only after the complete structure and feature pass succeeds.
     pub(super) fn run_features_with_structures(
         &mut self,

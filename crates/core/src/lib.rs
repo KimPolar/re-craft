@@ -1,6 +1,7 @@
 pub mod aquifer;
 pub mod beardifier;
 pub mod blended_noise;
+pub mod block_tick;
 pub mod button;
 pub mod leaf;
 pub mod normal_noise;

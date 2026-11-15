@@ -533,7 +533,8 @@ impl ChunkDraft {
         self.replace_block_ticks_inner(ticks, false)
     }
 
-    /// Replace supported falling-block, button, lamp, soil, ice, leaf and fluid block ticks.
+    /// Replace supported falling-block, air, speleothem, button, lamp, soil,
+    /// ice, leaf and fluid block ticks.
     /// Other chunk data, including lighting and entities, remains unvalidated.
     pub fn replace_block_ticks(
         &mut self,
@@ -559,6 +560,8 @@ impl ChunkDraft {
             ) || (include_simulated
                 && (native_core::button::Button::from_id(name).is_some()
                     || native_core::leaf::LeafKind::from_id(name).is_some()
+                    || native_core::block_tick::AirKind::from_id(name).is_some()
+                    || native_core::block_tick::SpeleothemKind::from_id(name).is_some()
                     || matches!(
                         name,
                         "minecraft:redstone_lamp"
@@ -1377,6 +1380,48 @@ mod tests {
         let mut unsupported = ticks.clone();
         unsupported[0].block = "example:oak_leaves".into();
         assert!(next.replace_block_ticks(&unsupported).is_err());
+        assert!(next.replace_falling_block_ticks(&[]).is_err());
+        assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn air_and_speleothem_ticks_preserve_order_without_accepting_unknown_types() {
+        use native_core::block_tick::{AirKind, SpeleothemKind};
+
+        let pos = ChunkPos { x: -1, z: 2 };
+        let ids = AirKind::ALL
+            .into_iter()
+            .flat_map(|kind| [kind.id(), kind.id().strip_prefix("minecraft:").unwrap()])
+            .chain(SpeleothemKind::ALL.into_iter().map(SpeleothemKind::id));
+        let ticks: Vec<_> = ids
+            .enumerate()
+            .map(|(index, id)| native_world::loaded::SavedBlockTick {
+                block: id.into(),
+                position: [-16 + index as i32, -60, 33],
+                delay: index as i32 - 4,
+                priority: index as i32 % 7 - 3,
+            })
+            .collect();
+        let mut initial = draft_chunk_blocks(&fixture(1, false), pos, &[]).unwrap();
+        initial.replace_block_ticks(&ticks).unwrap();
+        let source = initial.document().clone();
+        let mut next = draft_chunk_blocks(&source, pos, &[]).unwrap();
+        next.replace_block_ticks(&ticks).unwrap();
+        assert_eq!(
+            source.value.get("block_ticks"),
+            next.document().value.get("block_ticks")
+        );
+        let before = crate::nbt::write(next.document()).unwrap();
+        for invalid in [
+            "example:cave_air",
+            "pointed_dripstone",
+            "minecraft:future_air",
+        ] {
+            let mut rejected = ticks.clone();
+            rejected[0].block = invalid.into();
+            assert!(next.replace_block_ticks(&rejected).is_err());
+            assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
+        }
         assert!(next.replace_falling_block_ticks(&[]).is_err());
         assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
     }

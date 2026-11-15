@@ -10,6 +10,10 @@ mod frosted_ice_save_tests;
 mod bubble_save_tests;
 
 #[cfg(test)]
+#[path = "loaded_block_tick_save_tests.rs"]
+mod block_tick_save_tests;
+
+#[cfg(test)]
 #[path = "loaded_leaf_save_tests.rs"]
 mod leaf_save_tests;
 
@@ -23,7 +27,10 @@ use std::{
 };
 
 use glam::{DVec3, IVec3, Vec3};
-use native_core::leaf::LeafKind;
+use native_core::{
+    block_tick::{AirKind, SpeleothemKind},
+    leaf::LeafKind,
+};
 use native_persistence::heightmap::{
     BlockHeightFlags, HeightBounds, SpawnHeightmapKind, SpawnHeightmaps,
 };
@@ -1913,60 +1920,11 @@ impl GeneratedBlockTickKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum SpeleothemKind {
-    Dripstone,
-    Sulfur,
-}
-
-impl SpeleothemKind {
-    fn from_id(id: &str) -> Option<Self> {
-        match id {
-            "minecraft:pointed_dripstone" => Some(Self::Dripstone),
-            "minecraft:sulfur_spike" => Some(Self::Sulfur),
-            _ => None,
-        }
-    }
-
-    fn id(self) -> &'static str {
-        match self {
-            Self::Dripstone => "minecraft:pointed_dripstone",
-            Self::Sulfur => "minecraft:sulfur_spike",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SpeleothemTickKey {
     x: i32,
     y: i32,
     z: i32,
     kind: SpeleothemKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum AirKind {
-    Air,
-    Cave,
-    Void,
-}
-
-impl AirKind {
-    fn from_id(id: &str) -> Option<Self> {
-        match id {
-            "minecraft:air" | "air" => Some(Self::Air),
-            "minecraft:cave_air" | "cave_air" => Some(Self::Cave),
-            "minecraft:void_air" | "void_air" => Some(Self::Void),
-            _ => None,
-        }
-    }
-
-    fn id(self) -> &'static str {
-        match self {
-            Self::Air => "minecraft:air",
-            Self::Cave => "minecraft:cave_air",
-            Self::Void => "minecraft:void_air",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

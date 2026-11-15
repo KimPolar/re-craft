@@ -267,6 +267,10 @@ impl LiveFixture {
             ChangedBlock::WaterloggedChest => Cell::Chest { waterlogged: true },
             ChangedBlock::WaterloggedFence => Cell::FenceWater(liquid(FluidKind::Water, 0)),
             ChangedBlock::WaterloggedOpen => Cell::OpenWater(liquid(FluidKind::Water, 0)),
+            ChangedBlock::WaterloggedSpeleothem { faces } => Cell::Speleothem {
+                faces,
+                waterlogged: true,
+            },
             ChangedBlock::WaterloggedLadder { facing } => Cell::Ladder {
                 facing,
                 waterlogged: true,
@@ -330,6 +334,7 @@ impl fluid_sim::LiveFluidWorld for LiveFixture {
             Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
             Cell::FenceDry => ChangedBlock::WaterloggedFence,
             Cell::OpenDry => ChangedBlock::WaterloggedOpen,
+            Cell::Speleothem { faces, .. } => ChangedBlock::WaterloggedSpeleothem { faces },
             Cell::Ladder { facing, .. } => ChangedBlock::WaterloggedLadder { facing },
             _ => ChangedBlock::Fluid(fluid),
         };
@@ -938,6 +943,9 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                     ChangedBlock::WaterloggedChest => block_codes[&change.position] as i32 - 1,
                     ChangedBlock::WaterloggedFence => block_codes[&change.position] as i32 - 1,
                     ChangedBlock::WaterloggedOpen => block_codes[&change.position] as i32 - 1,
+                    ChangedBlock::WaterloggedSpeleothem { .. } => {
+                        panic!("the Java fluid fixture does not encode speleothems")
+                    }
                     ChangedBlock::WaterloggedLadder { .. } => {
                         block_codes[&change.position] as i32 - 1
                     }

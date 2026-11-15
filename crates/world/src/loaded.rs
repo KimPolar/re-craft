@@ -162,6 +162,21 @@ pub enum SavedBlockEntities {
     Unavailable,
 }
 
+/// Original chunk preparation fields. An empty value only means these saved
+/// fields are absent; it does not establish that a chunk is ready to tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedChunkActivation {
+    Empty,
+    Encoded(Arc<[u8]>),
+    Unavailable,
+}
+
+#[derive(Clone, Debug)]
+struct SavedChunkSource {
+    fingerprint: [u8; 32],
+    activation: Option<SavedChunkActivation>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Section {
     /// Absent data is not treated as air.
@@ -202,7 +217,7 @@ pub struct World {
     pub saved_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
     // Full original NBT fingerprints, shared by render snapshots. They remain
     // available while a dirty chunk is parked outside the active window.
-    saved_chunk_sources: Arc<BTreeMap<ChunkPos, [u8; 32]>>,
+    saved_chunk_sources: Arc<BTreeMap<ChunkPos, SavedChunkSource>>,
     /// Session changes visible to snapshots; the saved source remains unchanged
     /// so a later draft can check it for concurrent edits.
     pub live_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
@@ -212,11 +227,39 @@ pub struct World {
 impl World {
     /// Associate a saved chunk with the exact NBT document used to load it.
     pub fn remember_saved_chunk_source(&mut self, pos: ChunkPos, fingerprint: [u8; 32]) {
-        Arc::make_mut(&mut self.saved_chunk_sources).insert(pos, fingerprint);
+        Arc::make_mut(&mut self.saved_chunk_sources).insert(
+            pos,
+            SavedChunkSource {
+                fingerprint,
+                activation: None,
+            },
+        );
+    }
+
+    /// Retain preparation inputs from the same document as the fingerprint.
+    pub fn remember_saved_chunk_source_with_activation(
+        &mut self,
+        pos: ChunkPos,
+        fingerprint: [u8; 32],
+        activation: SavedChunkActivation,
+    ) {
+        Arc::make_mut(&mut self.saved_chunk_sources).insert(
+            pos,
+            SavedChunkSource {
+                fingerprint,
+                activation: Some(activation),
+            },
+        );
     }
 
     pub fn saved_chunk_source(&self, pos: ChunkPos) -> Option<[u8; 32]> {
-        self.saved_chunk_sources.get(&pos).copied()
+        self.saved_chunk_sources
+            .get(&pos)
+            .map(|source| source.fingerprint)
+    }
+
+    pub fn saved_chunk_activation(&self, pos: ChunkPos) -> Option<&SavedChunkActivation> {
+        self.saved_chunk_sources.get(&pos)?.activation.as_ref()
     }
 
     /// Forget clean, evicted chunks; dirty parked chunks retain their source.
@@ -455,8 +498,8 @@ impl World {
             }),
         );
         self.missing_chunks.remove(&pos);
-        if let Some(fingerprint) = source.saved_chunk_source(pos) {
-            self.remember_saved_chunk_source(pos, fingerprint);
+        if let Some(saved) = source.saved_chunk_sources.get(&pos) {
+            Arc::make_mut(&mut self.saved_chunk_sources).insert(pos, saved.clone());
         } else {
             self.forget_saved_chunk_source(pos);
         }
@@ -775,7 +818,11 @@ mod tests {
                 )]),
             }),
         );
-        source.remember_saved_chunk_source(pos, [7; 32]);
+        source.remember_saved_chunk_source_with_activation(
+            pos,
+            [7; 32],
+            SavedChunkActivation::Encoded(Arc::from([7u8, 8, 9])),
+        );
         let mut dest = World::new("minecraft:overworld");
         let dest_air = dest.intern_state(BlockState {
             name: "minecraft:air".into(),
@@ -785,6 +832,21 @@ mod tests {
         dest.missing_chunks.insert(pos);
         assert!(dest.import_chunk(&source, pos).unwrap());
         assert_eq!(dest.saved_chunk_source(pos), Some([7; 32]));
+        assert_eq!(
+            dest.saved_chunk_activation(pos),
+            source.saved_chunk_activation(pos)
+        );
+        let (
+            Some(SavedChunkActivation::Encoded(source_payload)),
+            Some(SavedChunkActivation::Encoded(dest_payload)),
+        ) = (
+            source.saved_chunk_activation(pos),
+            dest.saved_chunk_activation(pos),
+        )
+        else {
+            panic!("saved preparation payload missing");
+        };
+        assert!(Arc::ptr_eq(source_payload, dest_payload));
         assert!(dest.chunks[&pos].block_light_correct);
         assert_eq!(
             dest.saved_block_entities.get(&pos),
@@ -836,6 +898,10 @@ mod tests {
             Err(ChunkImportError::StaleChunkSource)
         );
         assert_eq!(dest.saved_chunk_source(pos), Some([7; 32]));
+        assert_eq!(
+            dest.saved_chunk_activation(pos),
+            source.saved_chunk_activation(pos)
+        );
         dest.saved_fluid_ticks.insert(
             pos,
             vec![SavedFluidTick {

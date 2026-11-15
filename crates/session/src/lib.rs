@@ -60,6 +60,7 @@ pub mod respawn;
 pub mod save_capture;
 mod saved_banner;
 pub mod saved_chest;
+mod saved_chunk_activation;
 mod saved_entity;
 pub mod saved_falling_block;
 pub mod saved_item;

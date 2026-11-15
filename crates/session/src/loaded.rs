@@ -25,6 +25,10 @@ mod lava_tests;
 #[path = "loaded_sulfur_tests.rs"]
 mod sulfur_tests;
 
+#[cfg(test)]
+#[path = "loaded_activation_tests.rs"]
+mod activation_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -1661,6 +1665,8 @@ pub struct LoadedSession {
     unsupported_states: usize,
     require_saved_chunk_sources: bool,
     saved_world_session: Option<native_persistence::save::WorldSessionGuard>,
+    checked_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
+    unresolved_chunk_preparation: Option<String>,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     placed_chests: BTreeSet<(i32, i32, i32)>,
@@ -5321,6 +5327,7 @@ impl LoadedSession {
         &self,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
+        self.validate_saved_chunk_preparation()?;
         let mode_trace = self.game_mode_trace;
         if let Some(trace) = mode_trace {
             anyhow::ensure!(
@@ -6739,6 +6746,65 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Record unresolved saved preparation before this experimental session
+    /// advances loaded chunks. This is a save guard, not a readiness test.
+    fn inspect_saved_chunk_preparation(&mut self) {
+        if !self.require_saved_chunk_sources || self.unresolved_chunk_preparation.is_some() {
+            return;
+        }
+        self.checked_chunk_preparation.retain(|pos, _| {
+            self.world.chunks.contains_key(pos) || self.parked_chunks.contains_key(pos)
+        });
+        // Parked chunks can also supply deferred shape or lighting updates.
+        for (&pos, chunk) in self.world.chunks.iter().chain(&self.parked_chunks) {
+            if chunk.status.as_deref() != Some("minecraft:full") {
+                continue;
+            }
+            let result = (|| -> anyhow::Result<[u8; 32]> {
+                use anyhow::Context;
+                let fingerprint = self
+                    .world
+                    .saved_chunk_source(pos)
+                    .context("saved chunk source is unavailable")?;
+                if self.checked_chunk_preparation.get(&pos) == Some(&fingerprint) {
+                    return Ok(fingerprint);
+                }
+                let preparation = self
+                    .world
+                    .saved_chunk_activation(pos)
+                    .context("saved chunk preparation was not captured")?;
+                let entities = self
+                    .world
+                    .saved_block_entities
+                    .get(&pos)
+                    .context("saved block entities were not captured")?;
+                crate::saved_chunk_activation::check_saved_work(
+                    preparation,
+                    entities,
+                    self.bounds,
+                )?;
+                Ok(fingerprint)
+            })();
+            match result {
+                Ok(fingerprint) => {
+                    self.checked_chunk_preparation.insert(pos, fingerprint);
+                }
+                Err(error) => {
+                    self.unresolved_chunk_preparation =
+                        Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn validate_saved_chunk_preparation(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.unresolved_chunk_preparation {
+            anyhow::bail!("saved chunk preparation could not be preserved: {error}");
+        }
+        Ok(())
+    }
+
     /// Bind disk captures to the same world lock as this loaded session.
     pub fn bind_saved_world_session(
         &mut self,
@@ -6867,6 +6933,7 @@ impl LoadedSession {
     }
 
     fn validate_generation_block_readiness(&self) -> anyhow::Result<()> {
+        self.validate_saved_chunk_preparation()?;
         anyhow::ensure!(
             !self.unresolved_lichen_shape
                 && !self.unresolved_fence_shape
@@ -8926,6 +8993,8 @@ impl LoadedSession {
             unsupported_states,
             require_saved_chunk_sources: false,
             saved_world_session: None,
+            checked_chunk_preparation: BTreeMap::new(),
+            unresolved_chunk_preparation: None,
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
             placed_chests: BTreeSet::new(),
@@ -12027,6 +12096,7 @@ impl LoadedSession {
     /// sub-tick order. This alone does not authorize writing a chunk.
     pub fn draft_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
         use anyhow::{Context, ensure};
+        self.validate_saved_chunk_preparation()?;
         ensure!(
             !self.unresolved_bubble_tick,
             "bubble column effects are not yet fully tracked for saving"
@@ -13998,6 +14068,9 @@ impl LoadedSession {
         }
         if respawn_changed {
             self.respawn_revision += 1;
+        }
+        if changed || respawn_changed || self.tick == 0 {
+            self.inspect_saved_chunk_preparation();
         }
     }
 
@@ -63406,8 +63479,15 @@ pub(crate) mod tests {
             .set_initial_entity_chunk(home, SavedEntityData::Empty)
             .unwrap();
         let source = fixture_chunk_document(home);
-        Arc::make_mut(&mut session.world)
-            .remember_saved_chunk_source(home, nbt::fingerprint(&source).unwrap());
+        let world = Arc::make_mut(&mut session.world);
+        world.remember_saved_chunk_source_with_activation(
+            home,
+            nbt::fingerprint(&source).unwrap(),
+            native_world::loaded::SavedChunkActivation::Empty,
+        );
+        world
+            .saved_block_entities
+            .insert(home, native_world::loaded::SavedBlockEntities::Empty);
         session.update(TICK);
         let chunk_nbt = nbt::write(&source).unwrap();
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());

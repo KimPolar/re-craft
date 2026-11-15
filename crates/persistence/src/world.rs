@@ -694,7 +694,11 @@ impl ChunkArea {
                 }),
             );
             if let Ok(fingerprint) = crate::nbt::fingerprint(&chunk.document) {
-                world.remember_saved_chunk_source(position, fingerprint);
+                world.remember_saved_chunk_source_with_activation(
+                    position,
+                    fingerprint,
+                    saved_chunk_activation_payload(&chunk.document.value),
+                );
             }
             let ticks = saved_fluid_ticks(&chunk.document.value, position);
             if !ticks.is_empty() {
@@ -709,6 +713,39 @@ impl ChunkArea {
                 .insert(position, saved_block_entity_payload(&chunk.document.value));
         }
         Ok(world)
+    }
+}
+
+fn saved_chunk_activation_payload(chunk: &Tag) -> native_world::loaded::SavedChunkActivation {
+    use native_world::loaded::SavedChunkActivation;
+    let Tag::Compound(fields) = chunk else {
+        return SavedChunkActivation::Unavailable;
+    };
+    let mut postprocessing = false;
+    let mut upgrade = false;
+    let mut saved = Vec::new();
+    for (name, value) in fields {
+        let seen = if name.matches("PostProcessing") {
+            &mut postprocessing
+        } else if name.matches("UpgradeData") {
+            &mut upgrade
+        } else {
+            continue;
+        };
+        if std::mem::replace(seen, true) {
+            return SavedChunkActivation::Unavailable;
+        }
+        saved.push((name.clone(), value.clone()));
+    }
+    if saved.is_empty() {
+        return SavedChunkActivation::Empty;
+    }
+    match crate::nbt::write(&crate::nbt::NamedTag {
+        name: "".into(),
+        value: Tag::Compound(saved),
+    }) {
+        Ok(bytes) => SavedChunkActivation::Encoded(bytes.into()),
+        Err(_) => SavedChunkActivation::Unavailable,
     }
 }
 
@@ -2768,6 +2805,82 @@ fn decode_chunk(document: NamedTag, expected: ChunkPos) -> Result<LoadedChunk> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn materialized_chunks_retain_original_preparation_fields_and_source() {
+        use super::*;
+        use native_world::loaded::SavedChunkActivation;
+
+        let position = ChunkPos { x: -2, z: 3 };
+        let post = Tag::List {
+            element_type: TagType::List,
+            values: vec![Tag::List {
+                element_type: TagType::Short,
+                values: vec![Tag::Short(15), Tag::Short(15)],
+            }],
+        };
+        let upgrade = Tag::Compound(vec![("unknown".into(), Tag::Int(7))]);
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("xPos".into(), Tag::Int(position.x)),
+                ("zPos".into(), Tag::Int(position.z)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+                ("UpgradeData".into(), upgrade.clone()),
+                ("unrelated".into(), Tag::Int(123)),
+                ("PostProcessing".into(), post.clone()),
+            ]),
+        };
+        let area = ChunkArea {
+            center: position,
+            radius: 0,
+            chunks: BTreeMap::from([(
+                position,
+                Arc::new(decode_chunk(document.clone(), position).unwrap()),
+            )]),
+            missing: vec![],
+        };
+        let runtime = area
+            .materialize(&DimensionId::parse("overworld").unwrap())
+            .unwrap();
+        let pos = native_world::loaded::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        assert_eq!(
+            runtime.saved_chunk_source(pos),
+            Some(nbt::fingerprint(&document).unwrap())
+        );
+        let Some(SavedChunkActivation::Encoded(bytes)) = runtime.saved_chunk_activation(pos) else {
+            panic!("saved preparation was not captured");
+        };
+        assert_eq!(
+            nbt::read(bytes).unwrap().value,
+            Tag::Compound(vec![
+                ("UpgradeData".into(), upgrade),
+                ("PostProcessing".into(), post)
+            ])
+        );
+        assert_eq!(*area.chunks[&position].document, document);
+
+        let duplicate = Tag::Compound(vec![
+            ("PostProcessing".into(), Tag::Int(0)),
+            ("PostProcessing".into(), Tag::Int(1)),
+        ]);
+        assert_eq!(
+            saved_chunk_activation_payload(&duplicate),
+            SavedChunkActivation::Unavailable
+        );
+        assert_eq!(
+            saved_chunk_activation_payload(&Tag::Compound(vec![])),
+            SavedChunkActivation::Empty
+        );
+        assert_eq!(
+            saved_chunk_activation_payload(&Tag::Int(0)),
+            SavedChunkActivation::Unavailable
+        );
+    }
+
     #[test]
     fn block_entity_payload_distinguishes_empty_data_and_ambiguous_sources() {
         use super::*;

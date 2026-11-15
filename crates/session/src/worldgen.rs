@@ -4394,6 +4394,8 @@ impl TerrainGenerator {
                     && structure_type.path == "ocean_monument";
                 let ruined_portal = structure_type.namespace == "minecraft"
                     && structure_type.path == "ruined_portal";
+                let woodland_mansion = structure_type.namespace == "minecraft"
+                    && structure_type.path == "woodland_mansion";
                 let jigsaw = jigsaws
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "jigsaw";
@@ -4405,6 +4407,7 @@ impl TerrainGenerator {
                     && !jigsaw
                     && !monument
                     && !ruined_portal
+                    && !woodland_mansion
                     && !shipwreck
                 {
                     Some(
@@ -4508,6 +4511,21 @@ impl TerrainGenerator {
                     )?
                 {
                     return Ok(None);
+                }
+                if woodland_mansion {
+                    native_resources::structure_start::decode_terrain_adjustment(&definition)
+                        .with_context(|| format!("in structure {path}"))?;
+                    let x = chunk[0]
+                        .checked_mul(16)
+                        .and_then(|x| x.checked_add(7))
+                        .context("mansion block X overflow")?;
+                    let z = chunk[1]
+                        .checked_mul(16)
+                        .and_then(|z| z.checked_add(7))
+                        .context("mansion block Z overflow")?;
+                    if !native_resources::structure_start::biome_column_allows(&mut env, [x, z])? {
+                        return Ok(None);
+                    }
                 }
                 if let Some(heightmap) = center_heightmap
                     && native_resources::structure_start::center_generation_point(
@@ -12732,6 +12750,7 @@ mod tests {
             json!({"type":"minecraft:igloo","biomes":["minecraft:plains"]}),
             json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9}),
             json!({"type":"minecraft:ocean_monument","biomes":["minecraft:plains"]}),
+            json!({"type":"minecraft:woodland_mansion","biomes":["minecraft:plains"]}),
         ] {
             data.0
                 .insert(path.into(), serde_json::to_vec(&definition).unwrap());

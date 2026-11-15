@@ -62,11 +62,6 @@ pub fn center_biome_column_allows(
     env: &mut impl StartEnvironment,
     chunk: [i32; 2],
 ) -> Result<bool> {
-    let (min_y, max_y) = env.vertical_bounds();
-    ensure!(
-        min_y <= max_y && i64::from(max_y) - i64::from(min_y) <= 4096,
-        "invalid dimension bounds"
-    );
     let x = chunk[0]
         .checked_mul(16)
         .and_then(|x| x.checked_add(8))
@@ -75,6 +70,17 @@ pub fn center_biome_column_allows(
         .checked_mul(16)
         .and_then(|z| z.checked_add(8))
         .context("chunk Z overflow")?;
+    biome_column_allows(env, [x, z])
+}
+
+/// Match Java's terrain-column biome precheck at an arbitrary block position.
+/// A positive result only permits the structure's remaining checks to run.
+pub fn biome_column_allows(env: &mut impl StartEnvironment, [x, z]: [i32; 2]) -> Result<bool> {
+    let (min_y, max_y) = env.vertical_bounds();
+    ensure!(
+        min_y <= max_y && i64::from(max_y) - i64::from(min_y) <= 4096,
+        "invalid dimension bounds"
+    );
     let (qx, qz) = (x.div_euclid(4), z.div_euclid(4));
     for qy in min_y.wrapping_sub(1).div_euclid(4)..=max_y.div_euclid(4) {
         if env.biome_allowed([qx, qy, qz], BiomeQuery::Column)? {
@@ -373,6 +379,53 @@ mod tests {
         assert!(center_biome_column_allows(&mut env, [-1, 2]).unwrap());
         assert_eq!(env.calls, vec![(BiomeQuery::Column, [-2, -17, 10])]);
         assert!(env.heights.is_empty());
+    }
+
+    #[test]
+    fn biome_column_uses_the_given_block_position() {
+        let mut env = Env {
+            calls: vec![],
+            heights: vec![],
+        };
+        assert!(biome_column_allows(&mut env, [-9, 39]).unwrap());
+        assert_eq!(env.calls, vec![(BiomeQuery::Column, [-3, -17, 9])]);
+        assert!(env.heights.is_empty());
+    }
+
+    #[test]
+    fn biome_column_checks_the_entire_vertical_range_and_stops_on_a_match() {
+        struct Column {
+            checked: Vec<i32>,
+            matching_y: Option<i32>,
+        }
+        impl StartEnvironment for Column {
+            fn vertical_bounds(&self) -> (i32, i32) {
+                (-4, 7)
+            }
+            fn sea_level(&self) -> i32 {
+                0
+            }
+            fn first_occupied_height(&mut self, _: i32, _: i32, _: Heightmap) -> Result<i32> {
+                unreachable!("a biome-only precheck must not sample terrain heights")
+            }
+            fn biome_allowed(&mut self, quart: [i32; 3], query: BiomeQuery) -> Result<bool> {
+                assert_eq!(query, BiomeQuery::Column);
+                self.checked.push(quart[1]);
+                Ok(self.matching_y == Some(quart[1]))
+            }
+        }
+        let mut no_match = Column {
+            checked: vec![],
+            matching_y: None,
+        };
+        assert!(!biome_column_allows(&mut no_match, [7, 7]).unwrap());
+        assert_eq!(no_match.checked, [-2, -1, 0, 1]);
+        let mut match_first = Column {
+            checked: vec![],
+            matching_y: Some(-2),
+        };
+        assert!(biome_column_allows(&mut match_first, [7, 7]).unwrap());
+        assert_eq!(match_first.checked, [-2]);
     }
     #[test]
     fn resolves_generation_biome_and_initial_piece_without_placing_blocks() {

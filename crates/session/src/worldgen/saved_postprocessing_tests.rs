@@ -162,7 +162,20 @@ fn begin_with_registration(
     registration: &[ChunkPos],
 ) -> Result<GeneratedPostprocessing> {
     let dimension = DimensionId::parse("overworld")?;
-    let defaults = BTreeMap::new();
+    let defaults = BTreeMap::from([
+        (
+            "minecraft:chest".into(),
+            BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        ),
+        (
+            "minecraft:potent_sulfur".into(),
+            BTreeMap::from([("potent_sulfur_state".into(), "dry".into())]),
+        ),
+    ]);
     begin_saved_postprocessing(
         &mut Tags,
         SavedPostprocessingInputs {
@@ -181,12 +194,345 @@ fn begin_with_registration(
         },
         |state| {
             ensure!(
-                ids.contains(&state.name) && state.properties.is_empty(),
+                ids.contains(&state.name)
+                    && state.properties == defaults.get(&state.name).cloned().unwrap_or_default(),
                 "unknown fixture state"
             );
             Ok(())
         },
     )
+}
+
+fn entity_fixture() -> Result<(ChunkArea, BTreeSet<String>)> {
+    let (mut area, mut ids) = fixture()?;
+    ids.extend(["minecraft:chest".into(), "minecraft:potent_sulfur".into()]);
+    let chunk = Arc::make_mut(area.chunks.get_mut(&area.center).unwrap());
+    let document = Arc::make_mut(&mut chunk.document);
+    let Tag::Compound(fields) = &mut document.value else {
+        unreachable!()
+    };
+    fn get<'a>(
+        fields: &'a mut [(native_persistence::nbt::JavaString, Tag)],
+        key: &str,
+    ) -> &'a mut (native_persistence::nbt::JavaString, Tag) {
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches(key))
+            .unwrap()
+    }
+    get(fields, "PostProcessing").1 =
+        native_persistence::postprocessing::encode(&PostProcessing::new(0, 16).unwrap());
+    get(fields, "block_ticks").1 = Tag::List {
+        element_type: TagType::End,
+        values: vec![],
+    };
+    let Tag::List {
+        values: sections, ..
+    } = &mut get(fields, "sections").1
+    else {
+        unreachable!()
+    };
+    let Tag::Compound(section) = &mut sections[0] else {
+        unreachable!()
+    };
+    let Tag::Compound(blocks) = &mut get(section, "block_states").1 else {
+        unreachable!()
+    };
+    let mut indices = vec![0; 4096];
+    let mut entities = Vec::new();
+    for i in 0..27 {
+        let pos = [i % 16, 8, i / 16];
+        let sulfur = i >= 24;
+        indices[(pos[0] + pos[2] * 16 + pos[1] * 256) as usize] = if sulfur { 2 } else { 1 };
+        let mut tag = if i % 3 == 1 {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("DUMMY".into())),
+                ("x".into(), Tag::Int(pos[0])),
+                ("y".into(), Tag::Int(pos[1])),
+                ("z".into(), Tag::Int(pos[2])),
+            ])
+        } else if sulfur {
+            super::super::GeneratedPotentSulfur::new(
+                pos,
+                BlockState {
+                    name: "minecraft:potent_sulfur".into(),
+                    properties: BTreeMap::from([("potent_sulfur_state".into(), "dry".into())]),
+                },
+            )?
+            .block_entity()
+        } else {
+            super::super::GeneratedEmptyChest {
+                position: pos,
+                state: BlockState {
+                    name: "minecraft:chest".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        ("type".into(), "single".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                },
+            }
+            .block_entity()
+        };
+        let Tag::Compound(ref mut contents) = tag else {
+            unreachable!()
+        };
+        if i % 3 != 0 || i % 2 == 0 {
+            contents.push(("keepPacked".into(), Tag::Byte(i8::from(i % 3 != 0))));
+        }
+        entities.push(tag);
+    }
+    get(blocks, "palette").1 = Tag::List {
+        element_type: TagType::String,
+        values: [
+            "minecraft:stone",
+            "minecraft:chest",
+            "minecraft:potent_sulfur",
+        ]
+        .into_iter()
+        .map(|name| Tag::String(name.into()))
+        .collect(),
+    };
+    get(blocks, "data").1 = Tag::LongArray(palette::encode_indices(3, &indices, 4)?.unwrap());
+    fields.push((
+        "block_entities".into(),
+        Tag::List {
+            element_type: TagType::Compound,
+            values: entities,
+        },
+    ));
+    chunk.sections = palette::decode_sections(&document.value)?;
+    Ok((area, ids))
+}
+
+fn entity_output(area: &ChunkArea, ids: &BTreeSet<String>) -> Result<Tag> {
+    let original = native_persistence::nbt::write(&area.chunks[&area.center].document)?;
+    let mut stage = begin(area, ids)?;
+    let pos = ChunkPos { x: 0, z: 0 };
+    while !stage.poll(pos, 1)? {}
+    let result = stage.finish()?.block_entity_data(pos)?;
+    assert_eq!(
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+        original
+    );
+    Ok(result)
+}
+
+fn deferred_entity_output(area: &ChunkArea, ids: &BTreeSet<String>) -> Result<(Tag, Tag)> {
+    let mut expanded = ChunkArea {
+        center: area.center,
+        radius: area.radius,
+        chunks: area.chunks.clone(),
+        missing: area.missing.clone(),
+    };
+    let mut neighbor = fixture()?.0.chunks[&SavedChunkPos { x: 0, z: 0 }]
+        .as_ref()
+        .clone();
+    neighbor.position = SavedChunkPos { x: 1, z: 0 };
+    let document = Arc::make_mut(&mut neighbor.document);
+    let Tag::Compound(fields) = &mut document.value else {
+        unreachable!()
+    };
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("xPos"))
+        .unwrap()
+        .1 = Tag::Int(1);
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("PostProcessing"))
+        .unwrap()
+        .1 = native_persistence::postprocessing::encode(&PostProcessing::new(0, 16).unwrap());
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("block_ticks"))
+        .unwrap()
+        .1 = Tag::List {
+        element_type: TagType::End,
+        values: vec![],
+    };
+    expanded
+        .chunks
+        .insert(neighbor.position, Arc::new(neighbor));
+    let home = ChunkPos { x: 0, z: 0 };
+    let east = ChunkPos { x: 1, z: 0 };
+    let mut stage = begin_with_registration(&expanded, ids, &[home, east])?;
+    stage.select_initial_targets(BTreeSet::from([east]))?;
+    let saved = stage.capture_deferred_block_entities(home)?;
+    stage.request_converted_chunk(home)?;
+    while !stage.poll(east, 1)? {}
+    while !stage.poll(home, 1)? {}
+    let after = stage.finish()?.block_entity_data(home)?;
+    Ok((saved, after))
+}
+
+#[test]
+fn saved_full_postprocessing_restores_default_block_entities_without_mutating_source() -> Result<()>
+{
+    let (area, ids) = entity_fixture()?;
+    let Tag::List { values, .. } = entity_output(&area, &ids)? else {
+        unreachable!()
+    };
+    assert_eq!(values.len(), 27);
+    let mut positions = BTreeSet::new();
+    for tag in values {
+        let (Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))) =
+            (tag.get("x"), tag.get("y"), tag.get("z"))
+        else {
+            unreachable!()
+        };
+        assert!(positions.insert((*x, *y, *z)));
+        assert_eq!(tag.get("keepPacked"), Some(&Tag::Byte(0)));
+        assert!(matches!(tag.get("id"), Some(Tag::String(id))
+            if id.matches(if x + z * 16 < 24 { "minecraft:chest" } else { "minecraft:potent_sulfur" })));
+    }
+    Ok(())
+}
+
+#[test]
+fn deferred_saved_entities_can_be_captured_then_postprocessed() -> Result<()> {
+    let (area, ids) = entity_fixture()?;
+    let (saved, after) = deferred_entity_output(&area, &ids)?;
+    for tag in [saved, after] {
+        let Tag::List { values, .. } = tag else {
+            unreachable!()
+        };
+        assert_eq!(values.len(), 27);
+        assert!(
+            values
+                .iter()
+                .all(|tag| tag.get("keepPacked") == Some(&Tag::Byte(0)))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn saved_full_postprocessing_rejects_ambiguous_or_unpreservable_entities() -> Result<()> {
+    for case in 0..6 {
+        let (mut area, ids) = entity_fixture()?;
+        let chunk = Arc::make_mut(area.chunks.get_mut(&area.center).unwrap());
+        let document = Arc::make_mut(&mut chunk.document);
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_entities"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        match case {
+            0 => values.push(values[0].clone()),
+            1 => {
+                let Tag::Compound(fields) = &mut values[0] else {
+                    unreachable!()
+                };
+                fields.push(("x".into(), Tag::Int(0)));
+            }
+            2 => {
+                let Tag::Compound(fields) = &mut values[1] else {
+                    unreachable!()
+                };
+                fields.push(("unknown".into(), Tag::Int(1)));
+            }
+            3 => {
+                let Tag::Compound(fields) = &mut values[0] else {
+                    unreachable!()
+                };
+                fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("x"))
+                    .unwrap()
+                    .1 = Tag::Int(16);
+            }
+            4 => {
+                let Tag::Compound(fields) = &mut values[0] else {
+                    unreachable!()
+                };
+                fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("keepPacked"))
+                    .unwrap()
+                    .1 = Tag::Int(0);
+            }
+            5 => {
+                let Tag::Compound(fields) = &mut values[24] else {
+                    unreachable!()
+                };
+                fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("countdown"))
+                    .unwrap()
+                    .1 = Tag::Int(10);
+            }
+            _ => unreachable!(),
+        }
+        let before = native_persistence::nbt::write(document)?;
+        assert!(
+            begin(&area, &ids).is_err(),
+            "case {case} unexpectedly succeeded"
+        );
+        assert_eq!(
+            native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+            before
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn saved_full_block_entities_match_java_deserialization_and_postprocessing() -> Result<()> {
+    let (area, ids) = entity_fixture()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("chunk.nbt");
+    std::fs::write(
+        &path,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    let java = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullBlockEntityOracle",
+        include_str!("../../tests/java/SavedFullBlockEntityOracle.java"),
+        &[
+            path.to_str().context("invalid NBT path")?,
+            directory.path().to_str().context("invalid output path")?,
+        ],
+    );
+    let (saved, after) = deferred_entity_output(&area, &ids)?;
+    let mut actual = Vec::new();
+    for (label, data) in [
+        ("S", saved),
+        ("T", after),
+        ("O", entity_output(&area, &ids)?),
+    ] {
+        let Tag::List { values, .. } = data else {
+            unreachable!()
+        };
+        let mut line = label.to_owned();
+        for tag in values {
+            let (Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))) =
+                (tag.get("x"), tag.get("y"), tag.get("z"))
+            else {
+                unreachable!()
+            };
+            line.push_str(&format!(" {x},{y},{z}"));
+            let expected = native_persistence::nbt::read(&std::fs::read(
+                directory.path().join(format!("{label}-{x}-{y}-{z}.nbt")),
+            )?)?
+            .value;
+            assert!(
+                crate::inventory::equal_tag(&tag, &expected),
+                "different NBT at {x},{y},{z}: {tag:?} vs {expected:?}"
+            );
+        }
+        actual.push(line);
+    }
+    assert_eq!(actual, java);
+    Ok(())
 }
 
 fn trace() -> Result<Vec<String>> {

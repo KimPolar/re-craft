@@ -30,6 +30,7 @@ use super::{
     captured_postprocessing::CapturedPostprocessingTags,
     chunk_ticks::{ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick},
     postprocessing::{ConvertedPostprocessingRegion, PostprocessingTask},
+    postprocessing_world::ConvertedBlockEntities,
 };
 
 /// Inputs captured from the same world and active resource/data-pack stack.
@@ -48,9 +49,9 @@ pub struct SavedPostprocessingInputs<'a> {
 }
 
 /// Restore an isolated postprocessing stage from original FULL chunk data.
-/// Saved tick entries remain pending during callbacks. Chunks with block
-/// entities or active upgrade data are rejected until their saved lifecycle is
-/// implemented. The result cannot by itself authorize a live commit or save.
+/// Saved tick entries remain pending during callbacks. Only reproducible default
+/// chest and potent sulfur entities are admitted; active upgrade data and other
+/// entity contents are rejected. This does not authorize a live commit or save.
 pub fn begin_saved_postprocessing(
     provider: &mut impl ResourceProvider,
     input: SavedPostprocessingInputs<'_>,
@@ -113,6 +114,7 @@ pub fn begin_saved_postprocessing(
     let mut tasks = BTreeMap::new();
     let mut containers = BTreeMap::new();
     let mut heightmaps = BTreeMap::new();
+    let mut block_entities = BTreeMap::new();
     for (position, source) in &input.area.chunks {
         let pos = ChunkPos {
             x: position.x,
@@ -125,9 +127,9 @@ pub fn begin_saved_postprocessing(
             .saved_block_entities
             .get(&pos)
             .context("saved block entities were not captured")?;
-        ensure!(
-            matches!(entities, SavedBlockEntities::Empty),
-            "saved block entity conversion is not yet supported at {pos:?}"
+        block_entities.insert(
+            pos,
+            ConvertedBlockEntities::from_saved(entities, &world, pos, input.bounds)?,
         );
         let blocks = world
             .saved_block_ticks
@@ -139,7 +141,9 @@ pub fn begin_saved_postprocessing(
             .map_or(&[][..], Vec::as_slice);
         let marks = read_saved_work(
             activation,
-            entities,
+            // The live-session guard must continue rejecting pending entities.
+            // Their complete saved payload was validated for this isolated stage above.
+            &SavedBlockEntities::Empty,
             input.bounds,
             SavedTickInputs {
                 position: pos,
@@ -204,6 +208,7 @@ pub fn begin_saved_postprocessing(
         heightmaps,
         Some(Arc::clone(&tags.heightmaps)),
     );
+    stage.set_block_entities(block_entities)?;
     tags.apply(&mut stage);
     Ok(stage)
 }

@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use native_resources::tree_leaf_update::ShapeEdgeWorld;
 use native_world::{
     generation_light::VisibleLightSnapshot,
-    loaded::{BlockPosition, BlockState, BlockStateId, ChunkPos, World},
+    loaded::{BlockPosition, BlockState, BlockStateId, ChunkPos, SavedBlockEntities, World},
 };
 
 use super::{
@@ -62,6 +62,138 @@ fn materialize_pending_block_entity(
 }
 
 impl ConvertedBlockEntities {
+    /// Restore the saved FULL chunk's actual insertion histories. Only records
+    /// whose complete contents can be reproduced are admitted here.
+    pub(super) fn from_saved(
+        data: &SavedBlockEntities,
+        world: &World,
+        chunk: ChunkPos,
+        bounds: crate::loaded::BuildBounds,
+    ) -> Result<Self> {
+        use native_persistence::nbt::{Tag, TagType};
+
+        fn unique_fields(tag: &Tag) -> Result<()> {
+            match tag {
+                Tag::Compound(fields) => {
+                    let mut names = BTreeSet::new();
+                    for (name, value) in fields {
+                        ensure!(names.insert(&name.0), "duplicate saved block entity field");
+                        unique_fields(value)?;
+                    }
+                }
+                Tag::List { values, .. } => {
+                    for value in values {
+                        unique_fields(value)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        let values = match data {
+            SavedBlockEntities::Empty => return Ok(Self::default()),
+            SavedBlockEntities::Unavailable => bail!("saved block entities are unavailable"),
+            SavedBlockEntities::Encoded(bytes) => match native_persistence::nbt::read(bytes)?.value
+            {
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values,
+                } => values,
+                _ => bail!("invalid saved block entity list"),
+            },
+        };
+        let mut result = Self::default();
+        for mut tag in values {
+            unique_fields(&tag)?;
+            let Tag::Compound(fields) = &mut tag else {
+                bail!("invalid saved block entity record")
+            };
+            let packed = match fields.iter().find(|(name, _)| name.matches("keepPacked")) {
+                None | Some((_, Tag::Byte(0))) => false,
+                Some((_, Tag::Byte(_))) => true,
+                _ => bail!("invalid saved block entity keepPacked"),
+            };
+            fields.retain(|(name, _)| !name.matches("keepPacked"));
+            let number = |name| match tag.get(name) {
+                Some(Tag::Int(value)) => Ok(*value),
+                _ => bail!("saved block entity coordinate is missing"),
+            };
+            let pos = [number("x")?, number("y")?, number("z")?];
+            ensure!(
+                pos[0].div_euclid(16) == chunk.x
+                    && pos[2].div_euclid(16) == chunk.z
+                    && (bounds.min_y..bounds.max_y).contains(&pos[1]),
+                "saved block entity lies outside its chunk"
+            );
+            let state = world
+                .block(pos[0], pos[1], pos[2])
+                .context("saved block entity state is missing")?;
+            if state.name == "minecraft:chest" {
+                ensure!(
+                    state.properties.len() == 3
+                        && matches!(
+                            state.properties.get("facing").map(String::as_str),
+                            Some("north" | "south" | "east" | "west")
+                        )
+                        && matches!(
+                            state.properties.get("type").map(String::as_str),
+                            Some("single" | "left" | "right")
+                        )
+                        && matches!(
+                            state.properties.get("waterlogged").map(String::as_str),
+                            Some("true" | "false")
+                        ),
+                    "invalid saved chest state"
+                );
+            }
+            let expected = materialize_pending_block_entity(pos, state.clone())?;
+            let dummy = matches!(tag.get("id"), Some(Tag::String(id)) if id.matches("DUMMY"));
+            if dummy {
+                ensure!(packed, "unpacked DUMMY block entity");
+                let Tag::Compound(fields) = &tag else {
+                    unreachable!()
+                };
+                ensure!(fields.len() == 4, "unsupported DUMMY block entity data");
+            } else {
+                ensure!(
+                    crate::inventory::equal_tag(&tag, &expected),
+                    "unsupported saved block entity contents"
+                );
+            }
+            ensure!(
+                result.records.insert(pos, tag).is_none(),
+                "duplicate saved block entity position"
+            );
+            if packed {
+                result.pending.insert(pos);
+            } else {
+                result.live.insert(pos);
+            }
+        }
+        // Detect hash-tree histories that cannot be reproduced before any work.
+        result.pending.positions()?;
+        Ok(result)
+    }
+
+    fn promote(&mut self, pos: [i32; 3], state: BlockState) -> Result<()> {
+        use native_persistence::nbt::Tag;
+        let original = self
+            .records
+            .get(&pos)
+            .context("pending block entity is missing")?;
+        let entity = materialize_pending_block_entity(pos, state)?;
+        ensure!(
+            matches!(original.get("id"), Some(Tag::String(id)) if id.matches("DUMMY"))
+                || crate::inventory::equal_tag(original, &entity),
+            "pending block entity no longer matches its block"
+        );
+        self.pending.remove(pos);
+        self.records.insert(pos, entity);
+        self.live.insert(pos);
+        Ok(())
+    }
+
     pub(super) fn from_proto(
         data: native_persistence::nbt::Tag,
         live: Option<&LivePositions>,
@@ -1081,7 +1213,6 @@ impl GeneratedPostprocessing {
         &mut self,
         pos: ChunkPos,
     ) -> Result<native_persistence::nbt::Tag> {
-        use native_persistence::nbt::Tag;
         ensure!(
             !self.failed && self.active.is_none(),
             "cannot capture block entities during postprocessing"
@@ -1109,19 +1240,12 @@ impl GeneratedPostprocessing {
                 position[0].div_euclid(16) == pos.x && position[2].div_euclid(16) == pos.z,
                 "pending block entity belongs to another chunk"
             );
-            ensure!(
-                matches!(entities.records.get(&position).and_then(|tag| tag.get("id")), Some(Tag::String(id)) if id.matches("DUMMY")),
-                "unsupported pending block entity data"
-            );
             let state = self
                 .world
                 .block(position[0], position[1], position[2])
                 .context("pending block entity state is missing")?
                 .clone();
-            let record = materialize_pending_block_entity(position, state)?;
-            entities.pending.remove(position);
-            entities.records.insert(position, record);
-            entities.live.insert(position);
+            entities.promote(position, state)?;
             read_world = true;
         }
         ensure!(
@@ -5312,10 +5436,7 @@ impl PostprocessingChunk for GeneratedBlockView<'_> {
             "pending block entity is missing"
         );
         let state = self.read(pos)?;
-        let entity = materialize_pending_block_entity(pos, state)?;
-        self.block_entities.pending.remove(pos);
-        self.block_entities.records.insert(pos, entity);
-        self.block_entities.live.insert(pos);
+        self.block_entities.promote(pos, state)?;
         Ok(())
     }
     fn clear_pending_block_entities(&mut self) -> Result<()> {

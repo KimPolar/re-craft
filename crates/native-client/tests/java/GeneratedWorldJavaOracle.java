@@ -7,7 +7,14 @@ import java.io.DataOutput;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.*;
@@ -17,6 +24,7 @@ import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.nbt.*;
 import net.minecraft.resources.*;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.*;
@@ -24,6 +32,10 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.chunk.storage.*;
 import net.minecraft.world.level.levelgen.WorldGenSettings;
+import net.minecraft.world.level.levelgen.structure.*;
+import net.minecraft.world.level.levelgen.structure.pieces.*;
+import net.minecraft.world.level.levelgen.structure.structures.RuinedPortalPiece;
+import net.minecraft.world.level.levelgen.structure.templatesystem.*;
 import net.minecraft.world.level.gamerules.GameRuleMap;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.storage.PrimaryLevelData;
@@ -69,6 +81,161 @@ public class GeneratedWorldJavaOracle {
         lookup.lookupOrThrow(key).listElements().forEach(holder ->
                 registry.register(holder.key(), holder.value(), RegistrationInfo.BUILT_IN));
         return registry.freeze();
+    }
+
+    /** Exercise Java's structure objects, not only the opaque chunk NBT. */
+    private static final class StructureVerifier {
+        private final StructurePieceSerializationContext context;
+        private final RegistryAccess access;
+        private final StructureTemplateManager manager;
+        private final java.lang.reflect.Method unpackStarts, unpackReferences, pack;
+        private final Set<String> starts = new HashSet<>();
+        private final Set<String> references = new HashSet<>();
+        private int portalStarts, portalReferences, mineshaftStarts, mineshaftReferences;
+
+        StructureVerifier(HolderLookup.Provider lookup) throws Exception {
+            var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            field.setAccessible(true);
+            manager = (StructureTemplateManager) ((sun.misc.Unsafe) field.get(null))
+                    .allocateInstance(StructureTemplateManager.class);
+            var templates = new HashMap<Identifier, Optional<StructureTemplate>>();
+            for (int i = 1; i <= 13; i++) {
+                var name = i <= 10 ? "portal_" + i : "giant_portal_" + (i - 10);
+                var id = Identifier.withDefaultNamespace("ruined_portal/" + name);
+                var template = new StructureTemplate();
+                try (var stream = GeneratedWorldJavaOracle.class.getClassLoader().getResourceAsStream(
+                        "data/minecraft/structure/ruined_portal/" + name + ".nbt")) {
+                    if (stream == null) throw new AssertionError("portal template missing: " + id);
+                    template.load(BuiltInRegistries.BLOCK, NbtIo.readCompressed(stream, NbtAccounter.unlimitedHeap()));
+                }
+                templates.put(id, Optional.of(template));
+            }
+            var repository = StructureTemplateManager.class.getDeclaredField("structureRepository");
+            repository.setAccessible(true);
+            repository.set(manager, templates);
+            var blocks = new MappedRegistry<Block>(Registries.BLOCK, Lifecycle.stable());
+            blocks.bindTags(Map.of(BlockTags.FEATURES_CANNOT_REPLACE, List.of()));
+            blocks.freeze();
+            access = new RegistryAccess.ImmutableRegistryAccess(List.of(blocks, copyRegistry(lookup, Registries.STRUCTURE)));
+            context = new StructurePieceSerializationContext(null, access, manager);
+            unpackStarts = SerializableChunkData.class.getDeclaredMethod("unpackStructureStart",
+                    StructurePieceSerializationContext.class, CompoundTag.class, long.class);
+            unpackReferences = SerializableChunkData.class.getDeclaredMethod("unpackStructureReferences",
+                    RegistryAccess.class, ChunkPos.class, CompoundTag.class);
+            pack = SerializableChunkData.class.getDeclaredMethod("packStructureData",
+                    StructurePieceSerializationContext.class, ChunkPos.class, Map.class, Map.class);
+            unpackStarts.setAccessible(true);
+            unpackReferences.setAccessible(true);
+            pack.setAccessible(true);
+        }
+
+        private static boolean isPortal(String key) {
+            return key.equals("minecraft:ruined_portal") || key.startsWith("minecraft:ruined_portal_");
+        }
+
+        private static boolean isMineshaft(String key) {
+            return key.equals("minecraft:mineshaft") || key.equals("minecraft:mineshaft_mesa");
+        }
+
+        private static boolean isSupported(String key) {
+            return isPortal(key) || isMineshaft(key);
+        }
+
+        void verify(CompoundTag structures, ChunkPos pos, long seed, boolean collect) throws Exception {
+            var originalStarts = structures.getCompoundOrEmpty("starts");
+            var originalRefs = structures.getCompoundOrEmpty("References");
+            var checkedStarts = new CompoundTag();
+            var checkedRefs = new CompoundTag();
+            for (var key : originalStarts.keySet()) if (isSupported(key)) checkedStarts.put(key, originalStarts.get(key));
+            for (var key : originalRefs.keySet()) if (isSupported(key)) checkedRefs.put(key, originalRefs.get(key));
+            var checked = new CompoundTag();
+            checked.put("starts", checkedStarts);
+            checked.put("References", checkedRefs);
+            var decodedStarts = (Map<?, ?>) unpackStarts.invoke(null, context, checked, seed);
+            var decodedRefs = (Map<?, ?>) unpackReferences.invoke(null, access, pos, checked);
+            if (decodedStarts.size() != checkedStarts.size() || decodedRefs.size() != checkedRefs.size())
+                throw new AssertionError("structure start or reference was dropped in chunk " + pos);
+            for (var value : decodedStarts.values()) {
+                var start = (StructureStart) value;
+                if (start.isValid() && (!start.getChunkPos().equals(pos) || start.getPieces().isEmpty()))
+                    throw new AssertionError("invalid structure start or pieces in chunk " + pos);
+            }
+            var repacked = (CompoundTag) pack.invoke(null, context, pos, decodedStarts, decodedRefs);
+            if (!checked.equals(repacked))
+                throw new AssertionError("structure changed on Java load/save in chunk " + pos + ": "
+                        + checked + " != " + repacked);
+            if (!collect) return;
+            for (var key : checkedStarts.keySet()) {
+                var start = checkedStarts.getCompoundOrEmpty(key);
+                if (!start.getStringOr("id", "").equals("INVALID")) {
+                    starts.add(key + " " + pos.pack());
+                    if (isPortal(key)) portalStarts++;
+                    else mineshaftStarts++;
+                }
+            }
+            for (var key : checkedRefs.keySet()) {
+                for (var source : checkedRefs.getLongArray(key).orElseThrow()) {
+                    references.add(key + " " + source);
+                    if (isPortal(key)) portalReferences++;
+                    else mineshaftReferences++;
+                }
+            }
+        }
+
+        void finish() {
+            for (var reference : references) if (!starts.contains(reference))
+                throw new AssertionError("structure reference has no saved valid start: " + reference);
+        }
+    }
+
+    private static void verifyPortalOracle() throws Exception {
+        var lookup = VanillaRegistries.createWorldLookup();
+        var verifier = new StructureVerifier(lookup);
+        var id = Identifier.withDefaultNamespace("ruined_portal/portal_1");
+        var structure = lookup.lookupOrThrow(Registries.STRUCTURE)
+                .getOrThrow(ResourceKey.create(Registries.STRUCTURE,
+                        Identifier.withDefaultNamespace("ruined_portal"))).value();
+        var pos = new ChunkPos(-3, 3);
+        var piece = new RuinedPortalPiece(verifier.access, verifier.manager, new BlockPos(-48, 90, 48),
+                RuinedPortalPiece.VerticalPlacement.values()[0],
+                new RuinedPortalPiece.Properties(false, 0.2f, false, false, false, false),
+                id, verifier.manager.get(id).orElseThrow(), Rotation.NONE, Mirror.NONE, new BlockPos(3, 0, 2));
+        var start = new StructureStart(structure, pos, 0, new PiecesContainer(List.of(piece)));
+        var starts = new CompoundTag();
+        starts.put("minecraft:ruined_portal", start.createTag(verifier.context, pos));
+        var references = new CompoundTag();
+        references.putLongArray("minecraft:ruined_portal", new long[]{pos.pack()});
+        var structures = new CompoundTag();
+        structures.put("starts", starts);
+        structures.put("References", references);
+        verifier.verify(structures, pos, 42L, true);
+        verifier.finish();
+        if (verifier.portalStarts != 1 || verifier.portalReferences != 1)
+            throw new AssertionError("portal oracle did not exercise its fixture");
+
+        var corrupted = structures.copy();
+        corrupted.getCompoundOrEmpty("starts").getCompoundOrEmpty("minecraft:ruined_portal")
+                .put("Children", new ListTag());
+        boolean rejected = false;
+        try {
+            verifier.verify(corrupted, pos, 42L, false);
+        } catch (AssertionError | Exception error) {
+            rejected = true;
+        }
+        if (!rejected) throw new AssertionError("portal oracle accepted an empty start");
+
+        var dangling = new StructureVerifier(lookup);
+        var danglingStructures = new CompoundTag();
+        danglingStructures.put("starts", new CompoundTag());
+        danglingStructures.put("References", references.copy());
+        dangling.verify(danglingStructures, new ChunkPos(-2, 3), 42L, true);
+        rejected = false;
+        try {
+            dangling.finish();
+        } catch (AssertionError error) {
+            rejected = true;
+        }
+        if (!rejected) throw new AssertionError("portal oracle accepted a reference without its start");
     }
 
     private static void verifyPlayerRoundTrip(CompoundTag saved) throws Exception {
@@ -193,6 +360,11 @@ public class GeneratedWorldJavaOracle {
             out.println("PLAYER_OK");
             return;
         }
+        if (args[0].equals("--portal-self-test")) {
+            verifyPortalOracle();
+            out.println("PORTAL_ORACLE_OK");
+            return;
+        }
         var world = Path.of(args[0]);
         long seed = Long.parseLong(args[1]);
         var worldSpawn = new BlockPos(Integer.parseInt(args[2]), Integer.parseInt(args[3]), Integer.parseInt(args[4]));
@@ -266,6 +438,8 @@ public class GeneratedWorldJavaOracle {
         var directory = world.resolve("dimensions/minecraft/overworld/region");
         var positions = Files.readAllLines(Path.of(args[8]));
         if (positions.isEmpty()) throw new AssertionError("no saved chunk positions");
+        var structures = new StructureVerifier(lookup);
+        var structureTypes = new TreeSet<String>();
         for (var position : positions) {
         var coordinates = position.split(" ");
         if (coordinates.length != 2) throw new AssertionError("invalid chunk position " + position);
@@ -279,9 +453,12 @@ public class GeneratedWorldJavaOracle {
             }
             var first = SerializableChunkData.parse(LevelHeightAccessor.create(-64, 384), factory, original);
             if (first == null) throw new AssertionError("Java could not parse chunk: " + chunkPos);
+            structureTypes.addAll(original.getCompoundOrEmpty("structures").getCompoundOrEmpty("starts").keySet());
+            structures.verify(original.getCompoundOrEmpty("structures"), chunkPos, seed, true);
             var rewritten = first.write();
             var second = SerializableChunkData.parse(LevelHeightAccessor.create(-64, 384), factory, rewritten);
             if (second == null || first.sectionData().size() != second.sectionData().size()) throw new AssertionError("section count differs");
+            structures.verify(rewritten.getCompoundOrEmpty("structures"), chunkPos, seed, false);
             for (var before : first.sectionData()) {
                 var after = second.sectionData().stream().filter(section -> section.y() == before.y()).findFirst().orElseThrow();
                 if ((before.chunkSection() == null) != (after.chunkSection() == null)) throw new AssertionError("section changed");
@@ -300,8 +477,12 @@ public class GeneratedWorldJavaOracle {
             try (var output = region.getChunkDataOutputStream(chunkPos)) { NbtIo.write(rewritten, (DataOutput) output); }
         }
         }
+        structures.finish();
         int entityCount = verifySidecars(world, "entities", Path.of(args[9]));
         verifySidecars(world, "poi", Path.of(args[10]));
+        out.println("STRUCTURE_TYPES " + String.join(",", structureTypes));
+        out.println("STRUCTURES " + structures.portalStarts + " " + structures.portalReferences + " "
+                + structures.mineshaftStarts + " " + structures.mineshaftReferences);
         out.println("ENTITIES " + entityCount);
         out.println("OK " + positions.size() + " " + Files.readAllLines(Path.of(args[9])).size() + " " + Files.readAllLines(Path.of(args[10])).size());
     }

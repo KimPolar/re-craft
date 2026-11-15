@@ -697,6 +697,21 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
         "Java compilation failed: {}",
         String::from_utf8_lossy(&compiled.stderr)
     );
+    let portal_check = Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&classpath)
+        .arg("GeneratedWorldJavaOracle")
+        .arg("--portal-self-test")
+        .output()?;
+    ensure!(
+        portal_check.status.success()
+            && String::from_utf8_lossy(&portal_check.stdout)
+                .lines()
+                .any(|line| line == "PORTAL_ORACLE_OK"),
+        "Java portal oracle self-test failed: {} {}",
+        String::from_utf8_lossy(&portal_check.stdout),
+        String::from_utf8_lossy(&portal_check.stderr)
+    );
     let checked = Command::new(java.join("java.exe"))
         .arg("-classpath")
         .arg(&classpath)
@@ -727,6 +742,30 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
                 )),
         "Java world check returned no result"
     );
+    let structures_line = String::from_utf8_lossy(&checked.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("STRUCTURES ").map(str::to_owned))
+        .context("Java structure count missing")?;
+    let structure_counts = structures_line
+        .split_whitespace()
+        .map(str::parse::<usize>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(structure_counts.len() == 4, "invalid Java structure counts");
+    let structure_types = String::from_utf8_lossy(&checked.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("STRUCTURE_TYPES ").map(str::to_owned))
+        .context("Java structure type report missing")?;
+    eprintln!("Saved structure types: {structure_types}");
+    eprintln!(
+        "Java restored {} portal starts and {} references, {} mineshaft starts and {} references",
+        structure_counts[0], structure_counts[1], structure_counts[2], structure_counts[3]
+    );
+    if seed == -1 {
+        ensure!(
+            structure_counts[2] > 0 && structure_counts[3] > 0,
+            "seed -1 did not exercise a mineshaft start and reference"
+        );
+    }
     let entity_count: usize = String::from_utf8_lossy(&checked.stdout)
         .lines()
         .find_map(|line| line.strip_prefix("ENTITIES "))

@@ -143,6 +143,35 @@ impl SkyLighting {
         })
     }
 
+    /// A changed source cannot contribute a value greater than 15 minus the
+    /// least possible horizontal/upward attenuation to the queried position.
+    /// Requiring the visible value to be strictly greater also rules out a
+    /// decrease if the changed source was removed. Callers must verify that
+    /// the visible value came from valid, loaded light data.
+    pub(crate) fn is_current_at_brightness(
+        &self,
+        position: BlockPosition,
+        bounds: Option<LightBounds>,
+        brightness: u8,
+    ) -> bool {
+        let Some(bounds) = bounds else {
+            return false;
+        };
+        if !self.enabled || !bounds.contains_build_y(position.y) || brightness > 15 {
+            return false;
+        }
+        if !self.required_chunks.contains(&position.chunk()) {
+            return true;
+        }
+        let maximum_distance = i64::from(15 - brightness);
+        self.pending.iter().all(|edit| {
+            let horizontal = (i64::from(position.x) - i64::from(edit.position.x)).abs()
+                + (i64::from(position.z) - i64::from(edit.position.z)).abs();
+            let upward = (i64::from(position.y) - i64::from(edit.position.y) - 1).max(0);
+            horizontal + upward > maximum_distance
+        })
+    }
+
     /// A previously visible level 15 remains unchanged when the same column
     /// has an unobstructed direct source in both its original and live
     /// terrain, and no queued edit can alter that source at this height.
@@ -1227,6 +1256,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_sky_light_brightness_requires_strictly_outside_the_change_bound() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let edit_position = BlockPosition { x: 8, y: 8, z: 8 };
+        edit(&mut sky, &mut world, edit_position, state("stone", &[]));
+        let adjacent = BlockPosition {
+            x: 9,
+            ..edit_position
+        };
+        let two_away = BlockPosition {
+            x: 10,
+            ..edit_position
+        };
+        assert!(sky.is_current_at_brightness(adjacent, Some(bounds), 15));
+        assert!(!sky.is_current_at_brightness(adjacent, Some(bounds), 14));
+        assert!(sky.is_current_at_brightness(two_away, Some(bounds), 14));
+        assert!(!sky.is_current_at_brightness(two_away, Some(bounds), 13));
+        assert!(!sky.is_current_at_brightness(two_away, None, 15));
+        assert!(!sky.is_current_at_brightness(two_away, Some(bounds), 16));
+        edit(&mut sky, &mut world, two_away, state("stone", &[]));
+        assert!(!sky.is_current_at_brightness(two_away, Some(bounds), 15));
+    }
+
+    #[test]
     fn direct_sky_proof_rejects_obstructions_and_unknown_source_history() {
         let bounds = LightBounds::new(0, 32).unwrap();
         let query = BlockPosition { x: 8, y: 10, z: 8 };
@@ -1441,6 +1496,7 @@ mod tests {
         let mut inside_halo = 0;
         let mut directly_above = 0;
         let mut direct_sources = 0;
+        let mut brightness_proofs = 0;
         for (scenario, (position, water, roof, empty, cave)) in scenarios.into_iter().enumerate() {
             let mut world = fixture();
             let mut sky = SkyLighting::default();
@@ -1499,6 +1555,19 @@ mod tests {
                 let z = (index / X % Z) as i32 - 32;
                 let y = (index / (X * Z)) as i32 - 1;
                 let query = BlockPosition { x, y, z };
+                if sky.is_current_at_brightness(query, bounds, before)
+                    && !sky.is_current_at(query, bounds)
+                {
+                    assert_eq!(
+                        before, placed,
+                        "brightness proof failed on placement at {query:?}, scenario {scenario}"
+                    );
+                    assert_eq!(
+                        before, removed,
+                        "brightness proof failed on removal at {query:?}, scenario {scenario}"
+                    );
+                    brightness_proofs += 1;
+                }
                 if sky.is_current_at(query, bounds) {
                     assert_eq!(
                         before, placed,
@@ -1573,9 +1642,11 @@ mod tests {
                 assert_eq!(first[index], second[index]);
             }
         }
-        assert!(inside_halo > 0 && directly_above > 0 && direct_sources > 0);
+        assert!(
+            inside_halo > 0 && directly_above > 0 && direct_sources > 0 && brightness_proofs > 0
+        );
         eprintln!(
-            "Java sky checks accepted {inside_halo} positions inside the original chunk halo, including {directly_above} directly above edits and {direct_sources} sampled direct sources"
+            "Java sky checks accepted {inside_halo} positions inside the original chunk halo, including {directly_above} directly above edits and {direct_sources} sampled direct sources; {brightness_proofs} additional brightness proofs matched"
         );
     }
 
@@ -2804,6 +2875,7 @@ mod tests {
         let bounds = LightBounds::new(0, 32).unwrap();
         let missing_pos = ChunkPos { x: 2, z: 1 };
         let mut missing_chunk = None;
+        let mut multi_edit_brightness_proofs = 0;
         for (x, y, z, name, defer) in actions {
             if x == -1 {
                 missing_chunk = Arc::make_mut(&mut world).chunks.remove(&missing_pos);
@@ -2822,8 +2894,36 @@ mod tests {
             if defer {
                 continue;
             }
-            finish(&mut sky, &mut world, bounds);
             let expected = expected.next().unwrap();
+            if sky.pending.len() > 1 {
+                let x_end = if x == 32 { 14 } else { 31 };
+                for query_y in 0..32 {
+                    for query_z in 0..31 {
+                        for query_x in 0..x_end {
+                            let query = BlockPosition {
+                                x: query_x,
+                                y: query_y,
+                                z: query_z,
+                            };
+                            let Some(before) = world.light(query_x, query_y, query_z, true) else {
+                                continue;
+                            };
+                            if sky.is_current_at_brightness(query, Some(bounds), before)
+                                && !sky.is_current_at(query, Some(bounds))
+                            {
+                                let index =
+                                    ((query_y + 15) * 31 * 31 + query_z * 31 + query_x) as usize;
+                                assert_eq!(
+                                    before, expected[index],
+                                    "multi-edit brightness proof failed at {query:?} after {name}"
+                                );
+                                multi_edit_brightness_proofs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            finish(&mut sky, &mut world, bounds);
             if x == 32 {
                 assert_eq!(sky.pending.len(), 1);
                 assert_eq!(sky.pending[0].position, BlockPosition { x, y, z });
@@ -2858,6 +2958,10 @@ mod tests {
             }
         }
         assert!(expected.next().is_none());
+        assert!(multi_edit_brightness_proofs > 0);
+        eprintln!(
+            "Java multi-edit sky checks accepted {multi_edit_brightness_proofs} additional brightness proofs"
+        );
 
         let boundary_edits = [
             serde_json::json!({"x":15,"y":24,"z":15,"state":"stone","defer":true}),

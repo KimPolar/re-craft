@@ -16752,8 +16752,12 @@ impl LoadedSession {
         }
         let bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
+        let sky = self.world.light(absolute.x, absolute.y, absolute.z, true)?;
         if !(self.sky_lighting.settled()
             || self.sky_lighting.is_current_at(position, bounds)
+            || self
+                .sky_lighting
+                .is_current_at_brightness(position, bounds, sky)
             || self.sky_lighting.light_unchanged(&self.world, bounds)
             || self
                 .sky_lighting
@@ -16761,9 +16765,7 @@ impl LoadedSession {
         {
             return None;
         }
-        self.world
-            .light(absolute.x, absolute.y, absolute.z, true)
-            .map(|sky| sky.max(block))
+        Some(sky.max(block))
     }
 
     /// Java's max-local brightness subtracts the cached dimension sky
@@ -16811,19 +16813,22 @@ impl LoadedSession {
         );
         let bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
-        ensure!(
-            self.sky_lighting.settled()
-                || self.sky_lighting.is_current_at(position, bounds)
-                || self.sky_lighting.light_unchanged(&self.world, bounds)
-                || self
-                    .sky_lighting
-                    .direct_sky_unchanged_at(&self.world, position, bounds),
-            "sky light is not settled at {absolute:?}"
-        );
         let sky = self
             .world
             .light(absolute.x, absolute.y, absolute.z, true)
             .with_context(|| format!("sky light is unavailable at {absolute:?}"))?;
+        ensure!(
+            self.sky_lighting.settled()
+                || self.sky_lighting.is_current_at(position, bounds)
+                || self
+                    .sky_lighting
+                    .is_current_at_brightness(position, bounds, sky)
+                || self.sky_lighting.light_unchanged(&self.world, bounds)
+                || self
+                    .sky_lighting
+                    .direct_sky_unchanged_at(&self.world, position, bounds),
+            "sky light is not settled at {absolute:?} (visible sky light {sky})"
+        );
         let darken = self.gameplay_sky_darken.context("sky darkening is unavailable")?;
         Ok(block.max(sky.saturating_sub(darken)))
     }
@@ -33989,6 +33994,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spreading_soil_reuses_sky_brighter_than_a_nearby_edit_can_affect() {
+        let mut session = spreading_test_session(Some(15.0));
+        let source = IVec3::new(8, 8, 8);
+        let sky = session.origin + source + IVec3::Y;
+        let chunk = Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(
+                    &BlockPosition {
+                        x: sky.x,
+                        y: sky.y,
+                        z: sky.z,
+                    }
+                    .chunk(),
+                )
+                .unwrap(),
+        );
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        let index = 8 + 8 * 16 + 9 * 256;
+        section.sky_light.as_mut().unwrap()[index / 2] = 0xfe;
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set_with_notify(IVec3::new(5, 8, 8), stone, false));
+        session.pending_light.clear();
+        assert!(!session.sky_lighting.settled());
+        assert_eq!(
+            session.spreading_soil_brightness(source + IVec3::Y).unwrap(),
+            14
+        );
+        assert!(session.set_with_notify(IVec3::new(7, 8, 8), stone, false));
+        session.pending_light.clear();
+        assert!(session.spreading_soil_brightness(source + IVec3::Y).is_err());
+    }
+
+    #[test]
     fn spreading_soil_participates_in_the_section_random_tick() {
         let seed = (0..10_000)
             .find(|seed| {
@@ -34847,6 +34886,9 @@ pub(crate) mod tests {
         assert!(session.pending_light.is_empty());
         assert!(!session.sky_lighting.settled());
         assert_eq!(session.crop_brightness(position, 8), Some(8));
+        assert_eq!(session.crop_brightness(position, 9), Some(15));
+        assert!(session.set_with_notify(IVec3::new(8, 5, 8), water, false));
+        assert_eq!(session.crop_brightness(position, 8), Some(8));
         assert_eq!(session.crop_brightness(position, 9), None);
         assert_eq!(session.crop_can_survive(position), Some(true));
     }
@@ -34877,6 +34919,8 @@ pub(crate) mod tests {
         assert_eq!(session.crop_can_survive(position), Some(true));
         let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
         assert!(session.set_with_notify(IVec3::new(12, 5, 8), water, false));
+        assert_eq!(session.crop_brightness(position, 9), Some(15));
+        assert!(session.set_with_notify(IVec3::new(8, 5, 8), water, false));
         assert_eq!(session.crop_brightness(position, 9), None);
     }
 

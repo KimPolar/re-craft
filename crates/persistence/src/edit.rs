@@ -533,7 +533,7 @@ impl ChunkDraft {
         self.replace_block_ticks_inner(ticks, false)
     }
 
-    /// Replace supported falling-block, button, lamp, soil, frosted ice, water and bubble-column ticks.
+    /// Replace supported falling-block, button, lamp, soil, ice, leaf and fluid block ticks.
     /// Other chunk data, including lighting and entities, remains unvalidated.
     pub fn replace_block_ticks(
         &mut self,
@@ -558,6 +558,7 @@ impl ChunkDraft {
                     | "gravel"
             ) || (include_simulated
                 && (native_core::button::Button::from_id(name).is_some()
+                    || native_core::leaf::LeafKind::from_id(name).is_some()
                     || matches!(
                         name,
                         "minecraft:redstone_lamp"
@@ -1346,6 +1347,38 @@ mod tests {
         invalid[1].priority = 4;
         assert!(second.replace_block_ticks(&invalid).is_err());
         assert_eq!(crate::nbt::write(second.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn leaf_ticks_preserve_order_and_reject_unsupported_types() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let original = fixture(1, false);
+        let ticks: Vec<_> = native_core::leaf::LeafKind::ALL
+            .into_iter()
+            .flat_map(|id| [id, id.strip_prefix("minecraft:").unwrap()])
+            .enumerate()
+            .map(|(index, id)| native_world::loaded::SavedBlockTick {
+                block: id.into(),
+                position: [-16 + (index as i32 % 16), -60, 33],
+                delay: index as i32 - 8,
+                priority: index as i32 % 7 - 3,
+            })
+            .collect();
+        let mut first = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        first.replace_block_ticks(&ticks).unwrap();
+        let source = first.document().clone();
+        let mut next = draft_chunk_blocks(&source, pos, &[]).unwrap();
+        next.replace_block_ticks(&ticks).unwrap();
+        assert_eq!(
+            source.value.get("block_ticks"),
+            next.document().value.get("block_ticks")
+        );
+        let before = crate::nbt::write(next.document()).unwrap();
+        let mut unsupported = ticks.clone();
+        unsupported[0].block = "example:oak_leaves".into();
+        assert!(next.replace_block_ticks(&unsupported).is_err());
+        assert!(next.replace_falling_block_ticks(&[]).is_err());
+        assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
     }
 
     #[test]

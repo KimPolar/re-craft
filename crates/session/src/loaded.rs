@@ -5,6 +5,10 @@
 #[path = "loaded_frosted_ice_tests.rs"]
 mod frosted_ice_save_tests;
 
+#[cfg(test)]
+#[path = "loaded_leaf_save_tests.rs"]
+mod leaf_save_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -15,6 +19,7 @@ use std::{
 };
 
 use glam::{DVec3, IVec3, Vec3};
+use native_core::leaf::LeafKind;
 use native_persistence::heightmap::{
     BlockHeightFlags, HeightBounds, SpawnHeightmapKind, SpawnHeightmaps,
 };
@@ -1817,36 +1822,6 @@ struct ButtonTickKey {
     y: i32,
     z: i32,
     kind: native_core::button::Button,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct LeafKind(&'static str);
-
-impl LeafKind {
-    const ALL: [&'static str; 11] = [
-        "minecraft:oak_leaves",
-        "minecraft:spruce_leaves",
-        "minecraft:birch_leaves",
-        "minecraft:jungle_leaves",
-        "minecraft:acacia_leaves",
-        "minecraft:dark_oak_leaves",
-        "minecraft:mangrove_leaves",
-        "minecraft:cherry_leaves",
-        "minecraft:pale_oak_leaves",
-        "minecraft:azalea_leaves",
-        "minecraft:flowering_azalea_leaves",
-    ];
-
-    fn from_id(id: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|name| *name == id || name.strip_prefix("minecraft:") == Some(id))
-            .map(Self)
-    }
-
-    fn id(self) -> &'static str {
-        self.0
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

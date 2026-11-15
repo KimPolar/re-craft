@@ -30,9 +30,9 @@ pub struct CapturedPostprocessedChunkData {
     pub block_entities: native_persistence::nbt::Tag,
 }
 
-struct CapturedPostprocessingTags {
-    heightmaps: Arc<native_resources::heightmap_tags::HeightmapTags>,
-    mushroom: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+pub(super) struct CapturedPostprocessingTags {
+    pub(super) heightmaps: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    pub(super) mushroom: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     aquatic: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
@@ -45,7 +45,10 @@ struct CapturedPostprocessingTags {
 }
 
 impl CapturedPostprocessingTags {
-    fn load(provider: &mut impl ResourceProvider, block_ids: &BTreeSet<String>) -> Result<Self> {
+    pub(super) fn load(
+        provider: &mut impl ResourceProvider,
+        block_ids: &BTreeSet<String>,
+    ) -> Result<Self> {
         let heightmaps = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
             provider, block_ids,
         )?);
@@ -106,7 +109,7 @@ impl CapturedPostprocessingTags {
         })
     }
 
-    fn apply(self, stage: &mut GeneratedPostprocessing) {
+    pub(super) fn apply(self, stage: &mut GeneratedPostprocessing) {
         stage.set_aquatic_tags(self.aquatic);
         stage.set_leaf_tags(self.leaf);
         stage.set_snow_tags(self.snow);

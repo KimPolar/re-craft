@@ -19,16 +19,25 @@ use crate::generation_pipeline::{InitialWorldOptions, InitialWorldPipeline, Init
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
 fn generated_portal_world_preserves_remote_chunks_after_play_save() -> Result<()> {
-    verify_generated_portal_play_save(0)
+    verify_generated_portal_play_save(0, false)
 }
 
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
 fn generated_portal_world_saves_after_forty_ticks_without_random_ticks() -> Result<()> {
-    verify_generated_portal_play_save(40)
+    verify_generated_portal_play_save(40, false)
 }
 
-fn verify_generated_portal_play_save(additional_ticks: u64) -> Result<()> {
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
+fn generated_world_saved_full_chunk_can_resume_postprocessing() -> Result<()> {
+    verify_generated_portal_play_save(0, true)
+}
+
+fn verify_generated_portal_play_save(
+    additional_ticks: u64,
+    check_saved_postprocessing: bool,
+) -> Result<()> {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -112,7 +121,154 @@ fn verify_generated_portal_play_save(additional_ticks: u64) -> Result<()> {
     let published = stage.publish(&parent_path, "Test", "New World")?;
     let path = published.path.clone();
     let lock = published.session().clone();
+    if check_saved_postprocessing {
+        return verify_saved_postprocessing(&path, &game, lock);
+    }
     verify_portal_play_save(&path, &game, lock, additional_ticks)
+}
+
+fn verify_saved_postprocessing(
+    path: &std::path::Path,
+    game: &std::path::Path,
+    lock: native_persistence::save::WorldSessionGuard,
+) -> Result<()> {
+    use native_session::{
+        loaded::BuildBounds,
+        worldgen::{
+            GeneratedLavaRules, PostprocessingAttempt,
+            saved_postprocessing::{SavedPostprocessingInputs, begin_saved_postprocessing},
+        },
+    };
+    let dimension = DimensionId::parse("overworld")?;
+    let mut reader = WorldReader::open_with_session(path, dimension.clone(), lock)?;
+    let mut resources = native_resources::packs::ResourceStack::open(game)?;
+    let ids = resources.vanilla_block_ids()?;
+    let registry = resources.vanilla_generated_block_registry()?;
+    let defaults = registry.default_states();
+    let game_time = reader.game_time()?;
+    let rules = reader.fluid_game_rules()?;
+    let mut failures = Vec::new();
+    for saved_pos in reader.saved_chunk_positions(RegionStore::Terrain)? {
+        let Some(chunk) = reader.read_chunk(saved_pos.x, saved_pos.z)? else {
+            continue;
+        };
+        if !chunk.is_full() {
+            continue;
+        }
+        let Some(post) = chunk.document.value.get("PostProcessing") else {
+            continue;
+        };
+        if matches!(post, native_persistence::nbt::Tag::List { values, .. } if values.is_empty()) {
+            continue;
+        }
+        let marks = native_persistence::postprocessing::decode(post, -64, 384)?;
+        if marks.sections().iter().all(Vec::is_empty) {
+            continue;
+        }
+        let before = native_persistence::nbt::fingerprint(&chunk.document)?;
+        let mut area = reader.read_area(saved_pos, 0)?;
+        let pos = ChunkPos {
+            x: saved_pos.x,
+            z: saved_pos.z,
+        };
+        let mut registration = vec![pos];
+        let mut fingerprints = std::collections::BTreeMap::from([(pos, before)]);
+        loop {
+            let mut stage = match begin_saved_postprocessing(
+                &mut resources,
+                SavedPostprocessingInputs {
+                    area: &area,
+                    dimension: &dimension,
+                    defaults: &defaults,
+                    block_ids: &ids,
+                    bounds: BuildBounds {
+                        min_y: -64,
+                        max_y: 320,
+                    },
+                    registration: &registration,
+                    game_time,
+                    next_sub_tick: 0,
+                    light: None,
+                },
+                |state| {
+                    ensure!(
+                        registry.is_canonical_state(&state.name, &state.properties),
+                        "unknown block state: {state:?}"
+                    );
+                    Ok(())
+                },
+            ) {
+                Ok(stage) => stage,
+                Err(error) => {
+                    failures.push(format!("{pos:?}: {error:#}"));
+                    break;
+                }
+            };
+            stage.select_initial_targets(BTreeSet::from([pos]))?;
+            stage.set_water_source_conversion(rules.water_source_conversion)?;
+            stage.set_lava_rules(GeneratedLavaRules {
+                fast_lava: false,
+                source_conversion: rules.lava_source_conversion,
+            })?;
+            let outcome = loop {
+                match stage.try_poll(pos, 256) {
+                    Ok(PostprocessingAttempt::Progress { complete: false }) => {}
+                    other => break other,
+                }
+            };
+            match outcome {
+                Ok(PostprocessingAttempt::Progress { complete: true }) => {
+                    let completed = stage.finish()?;
+                    ensure!(
+                        completed.chunks.contains(&pos),
+                        "target was not postprocessed"
+                    );
+                    for (source_pos, expected) in &fingerprints {
+                        let after = reader
+                            .read_chunk(source_pos.x, source_pos.z)?
+                            .context("saved chunk disappeared")?;
+                        ensure!(
+                            native_persistence::nbt::fingerprint(&after.document)? == *expected,
+                            "isolated postprocessing changed the source chunk"
+                        );
+                    }
+                    eprintln!("finished saved postprocessing for generated chunk {pos:?}");
+                    return Ok(());
+                }
+                Ok(PostprocessingAttempt::NeedsChunk(missing)) => {
+                    if registration.len() >= 32 || registration.contains(&missing) {
+                        failures.push(format!("{pos:?}: cannot add neighbor {missing:?}"));
+                        break;
+                    }
+                    let Some(neighbor) = reader.read_chunk(missing.x, missing.z)? else {
+                        failures.push(format!("{pos:?}: missing neighbor {missing:?}"));
+                        break;
+                    };
+                    if !neighbor.is_full() {
+                        failures.push(format!("{pos:?}: neighbor {missing:?} is not FULL"));
+                        break;
+                    }
+                    let fingerprint = native_persistence::nbt::fingerprint(&neighbor.document)?;
+                    let saved = native_persistence::world::ChunkPos {
+                        x: missing.x,
+                        z: missing.z,
+                    };
+                    area.chunks.insert(saved, std::sync::Arc::new(neighbor));
+                    fingerprints.insert(missing, fingerprint);
+                    registration.push(missing);
+                }
+                Ok(PostprocessingAttempt::Progress { complete: false }) => unreachable!(),
+                Err(error) => {
+                    failures.push(format!("{pos:?}: {error:#}"));
+                    break;
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "no generated FULL chunk could resume postprocessing: {}",
+        failures.join("; ")
+    )
 }
 
 fn verify_portal_play_save(

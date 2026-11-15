@@ -71,6 +71,7 @@ pub mod postprocessing;
 pub mod postprocessing_drops;
 mod postprocessing_world;
 pub(crate) use postprocessing_world::{fence_connection, speleothem_thickness};
+pub mod saved_postprocessing;
 pub mod ruined_portal;
 pub mod saved_structure_starts;
 pub mod schedule;

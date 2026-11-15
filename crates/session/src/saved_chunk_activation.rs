@@ -24,6 +24,24 @@ pub(crate) fn check_saved_work(
     bounds: BuildBounds,
     ticks: SavedTickInputs<'_>,
 ) -> Result<()> {
+    read_saved_work(saved, entities, bounds, ticks, false).map(|_| ())
+}
+
+/// Retain the original ordered marks when a caller will run the complete
+/// isolated pass. This does not establish chunk-holder or save readiness.
+pub(crate) fn read_saved_work(
+    saved: &SavedChunkActivation,
+    entities: &SavedBlockEntities,
+    bounds: BuildBounds,
+    ticks: SavedTickInputs<'_>,
+    allow_postprocessing: bool,
+) -> Result<native_core::postprocessing::PostProcessing> {
+    let height = bounds
+        .max_y
+        .checked_sub(bounds.min_y)
+        .context("invalid dimension height")?;
+    let mut marks = native_core::postprocessing::PostProcessing::new(bounds.min_y, height)
+        .context("invalid postprocessing bounds")?;
     let mut block_ticks_seen = false;
     let mut fluid_ticks_seen = false;
     match saved {
@@ -38,7 +56,20 @@ pub(crate) fn check_saved_work(
             for (name, value) in fields {
                 ensure!(seen.insert(name.0.clone()), "duplicate preparation field");
                 if name.matches("PostProcessing") {
-                    check_postprocessing(&value, bounds)?;
+                    if !matches!(&value, Tag::List { element_type: TagType::End | TagType::List, values } if values.is_empty())
+                    {
+                        marks = native_persistence::postprocessing::decode(
+                            &value,
+                            bounds.min_y,
+                            height,
+                        )?;
+                    }
+                    if !allow_postprocessing {
+                        ensure!(
+                            marks.sections().iter().all(Vec::is_empty),
+                            "saved postprocessing needs block and fluid updates"
+                        );
+                    }
                 } else if name.matches("UpgradeData") {
                     check_upgrade_data(&value, bounds)?;
                 } else if name.matches("block_ticks") {
@@ -88,7 +119,7 @@ pub(crate) fn check_saved_work(
         "saved fluid ticks were not captured"
     );
     match entities {
-        SavedBlockEntities::Empty => Ok(()),
+        SavedBlockEntities::Empty => {}
         SavedBlockEntities::Unavailable => bail!("saved block entities are unavailable"),
         SavedBlockEntities::Encoded(bytes) => {
             let document = nbt::read(bytes).context("cannot read saved block entities")?;
@@ -112,9 +143,9 @@ pub(crate) fn check_saved_work(
                     Some(_) => bail!("keepPacked marker has an unsupported type"),
                 }
             }
-            Ok(())
         }
     }
+    Ok(marks)
 }
 
 fn supports_fluid_tick(id: &str) -> bool {
@@ -202,23 +233,6 @@ fn check_tick_list<'a>(
             "saved tick priority is unsupported"
         );
     }
-    Ok(())
-}
-
-fn check_postprocessing(tag: &Tag, bounds: BuildBounds) -> Result<()> {
-    if matches!(tag, Tag::List { element_type: TagType::End | TagType::List, values } if values.is_empty())
-    {
-        return Ok(());
-    }
-    let height = bounds
-        .max_y
-        .checked_sub(bounds.min_y)
-        .context("invalid dimension height")?;
-    let marks = native_persistence::postprocessing::decode(tag, bounds.min_y, height)?;
-    ensure!(
-        marks.sections().iter().all(Vec::is_empty),
-        "saved postprocessing needs block and fluid updates"
-    );
     Ok(())
 }
 

@@ -5668,7 +5668,7 @@ fn snowy_bonus_neighbor_changes(state: &BlockState, dy: i32) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::worldgen::{
         chunk_ticks::{ChunkTicks, ConvertedChunkTicks, SavedTick},
@@ -13472,7 +13472,11 @@ mod tests {
         java_results_with_args(class_name, java_source, &[])
     }
 
-    fn java_results_with_args(class_name: &str, java_source: &str, args: &[&str]) -> Vec<String> {
+    pub(crate) fn java_results_with_args(
+        class_name: &str,
+        java_source: &str,
+        args: &[&str],
+    ) -> Vec<String> {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)

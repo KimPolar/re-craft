@@ -5093,6 +5093,20 @@ fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) -> Result<boo
         ),
         "invalid support direction"
     );
+    if matches!(
+        state.name.as_str(),
+        "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
+    ) {
+        ensure!(
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("dusted").map(String::as_str),
+                    Some("0" | "1" | "2" | "3")
+                ),
+            "invalid brushable support state"
+        );
+        return Ok(true);
+    }
     if generated_portal_slab_stair(state) {
         return native_world::collision::button_support_face(
             state,
@@ -21311,7 +21325,7 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 if path == "data/minecraft/tags/block/cannot_support_seagrass.json" {
                     return Ok(Some(if self.0 {
-                        br#"{"values":["minecraft:magma_block","minecraft:stone"]}"#.to_vec()
+                        br#"{"values":["minecraft:magma_block","minecraft:stone","minecraft:suspicious_gravel"]}"#.to_vec()
                     } else {
                         br#"{"values":["minecraft:magma_block"]}"#.to_vec()
                     }));
@@ -21406,6 +21420,8 @@ mod tests {
             "minecraft:magma_block".into(),
             "minecraft:seagrass".into(),
             "minecraft:tall_seagrass".into(),
+            "minecraft:suspicious_sand".into(),
+            "minecraft:suspicious_gravel".into(),
         ]);
         let motion = HeightmapTags::load(&mut GrassData(false), &registry).unwrap();
         let mut checked = 0;
@@ -21443,7 +21459,17 @@ mod tests {
                     1 => state("sand"),
                     2 => state("magma_block"),
                     3 => state("air"),
-                    _ => sample(6),
+                    4 => sample(6),
+                    5 | 6 => BlockState {
+                        name: if base == 5 {
+                            "minecraft:suspicious_sand"
+                        } else {
+                            "minecraft:suspicious_gravel"
+                        }
+                        .into(),
+                        properties: BTreeMap::from([("dusted".into(), "0".into())]),
+                    },
+                    _ => unreachable!(),
                 };
                 region.set_section_block([8, 7, 8], &support).unwrap();
                 region.set_section_block([8, 8, 8], &sample(here)).unwrap();
@@ -21473,7 +21499,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 8 * 3 * 5 * 8 * 8);
+        assert_eq!(checked, 8 * 3 * 7 * 8 * 8);
     }
 
     #[test]

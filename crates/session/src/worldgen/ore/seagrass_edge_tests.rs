@@ -16,9 +16,11 @@ impl ResourceProvider for Tags {
         let mut values = Vec::new();
         if self.0 & 1 != 0 {
             values.push("minecraft:stone");
+            values.push("minecraft:suspicious_gravel");
         }
         if self.0 & 2 != 0 {
             values.push("minecraft:magma_block");
+            values.push("minecraft:suspicious_sand");
         }
         Ok(Some(serde_json::to_vec(
             &serde_json::json!({"values": values}),
@@ -41,6 +43,8 @@ fn support(index: usize) -> BlockState {
         3 => state("water"),
         4..=6 => state("stone_slab"),
         7..=8 => state("stone_brick_stairs"),
+        9..=12 => state("suspicious_sand"),
+        13..=16 => state("suspicious_gravel"),
         _ => panic!("unknown support"),
     };
     match index {
@@ -64,9 +68,25 @@ fn support(index: usize) -> BlockState {
                 ("waterlogged".into(), "false".into()),
             ]);
         }
+        9..=16 => {
+            block
+                .properties
+                .insert("dusted".into(), ((index - 9) % 4).to_string());
+        }
         _ => {}
     }
     block
+}
+
+#[test]
+fn brushable_support_rejects_invalid_states() {
+    let mut invalid = state("suspicious_gravel");
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    invalid.properties.insert("dusted".into(), "4".into());
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    invalid.properties.insert("dusted".into(), "0".into());
+    invalid.properties.insert("other".into(), "true".into());
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
 }
 
 #[test]
@@ -136,14 +156,39 @@ fn seagrass_edge_updates_match_java() -> Result<()> {
         "minecraft:seagrass".into(),
         "minecraft:stone_slab".into(),
         "minecraft:stone_brick_stairs".into(),
+        "minecraft:suspicious_sand".into(),
+        "minecraft:suspicious_gravel".into(),
     ]);
     let tag = ResourceId::parse("minecraft:cannot_support_seagrass")?;
     let plant = state("seagrass");
+    let output = String::from_utf8(output.stdout)?;
+    let mut supports = 0;
+    for line in output.lines().filter_map(|v| v.strip_prefix("S ")) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        ensure!(fields.len() == 4, "unexpected support row {line}");
+        let block = BlockState {
+            name: fields[0].into(),
+            properties: BTreeMap::from([("dusted".into(), fields[1].into())]),
+        };
+        let direction = match fields[2] {
+            "down" => [0, -1, 0],
+            "up" => [0, 1, 0],
+            "north" => [0, 0, -1],
+            "south" => [0, 0, 1],
+            "west" => [-1, 0, 0],
+            "east" => [1, 0, 0],
+            _ => bail!("invalid direction"),
+        };
+        assert_eq!(
+            generation_face_sturdy(&block, direction)?,
+            fields[3].parse::<bool>()?,
+            "{line}"
+        );
+        supports += 1;
+    }
+    assert_eq!(supports, 2 * 4 * 6);
     let mut count = 0;
-    for line in String::from_utf8(output.stdout)?
-        .lines()
-        .filter_map(|v| v.strip_prefix("E "))
-    {
+    for line in output.lines().filter_map(|v| v.strip_prefix("E ")) {
         let fields: Vec<_> = line.split_whitespace().collect();
         ensure!(fields.len() == 9, "unexpected oracle row {line}");
         let mask: u8 = fields[0].parse()?;
@@ -200,6 +245,6 @@ fn seagrass_edge_updates_match_java() -> Result<()> {
         assert!(region.world.saved_block_ticks.is_empty(), "{line}");
         count += 1;
     }
-    assert_eq!(count, 4 * 9 * 3 * 6);
+    assert_eq!(count, 4 * 17 * 3 * 6);
     Ok(())
 }

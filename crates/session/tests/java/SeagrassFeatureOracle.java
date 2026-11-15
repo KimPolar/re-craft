@@ -24,13 +24,14 @@ public class SeagrassFeatureOracle {
       if(state.hasBlockEntity()||PoiTypes.hasPoi(state)||state.getPostProcessPos(null,BlockPos.ZERO)!=null)throw new AssertionError("unsupported seagrass effects "+state);
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
     bind.invoke(Blocks.MAGMA_BLOCK.builtInRegistryHolder(),List.of(BlockTags.CANNOT_SUPPORT_SEAGRASS));
-    var base=new BlockState[]{Blocks.STONE.defaultBlockState(),Blocks.SAND.defaultBlockState(),Blocks.MAGMA_BLOCK.defaultBlockState(),Blocks.AIR.defaultBlockState(),Blocks.TALL_SEAGRASS.defaultBlockState()};
+    var base=new BlockState[]{Blocks.STONE.defaultBlockState(),Blocks.SAND.defaultBlockState(),Blocks.MAGMA_BLOCK.defaultBlockState(),Blocks.AIR.defaultBlockState(),Blocks.TALL_SEAGRASS.defaultBlockState(),Blocks.SUSPICIOUS_SAND.defaultBlockState(),Blocks.SUSPICIOUS_GRAVEL.defaultBlockState()};
     var positions=new BlockState[]{Blocks.AIR.defaultBlockState(),Blocks.WATER.defaultBlockState(),Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1),Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,8),Blocks.LAVA.defaultBlockState(),Blocks.SEAGRASS.defaultBlockState(),Blocks.TALL_SEAGRASS.defaultBlockState(),Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF,DoubleBlockHalf.UPPER)};
     var origin=new BlockPos(8,8,8);
     for(int mode=0;mode<8;mode++){
       bind.invoke(Fluids.WATER.builtInRegistryHolder(),(mode&1)!=0?List.of(FluidTags.WATER):List.of());
       bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),(mode&2)!=0?List.of(FluidTags.WATER):List.of());
       bind.invoke(Blocks.STONE.builtInRegistryHolder(),(mode&4)!=0?List.of(BlockTags.CANNOT_SUPPORT_SEAGRASS):List.of());
+      bind.invoke(Blocks.SUSPICIOUS_GRAVEL.builtInRegistryHolder(),(mode&4)!=0?List.of(BlockTags.CANNOT_SUPPORT_SEAGRASS):List.of());
       for(int kind=0;kind<3;kind++)for(int b=0;b<base.length;b++)for(int here=0;here<positions.length;here++)for(int above=0;above<positions.length;above++){
         var blocks=new HashMap<BlockPos,BlockState>();blocks.put(origin.below(),base[b]);blocks.put(origin,positions[here]);blocks.put(origin.above(),positions[above]);
         var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{

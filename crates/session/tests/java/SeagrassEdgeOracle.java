@@ -8,6 +8,7 @@ import net.minecraft.tags.*;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.attribute.EnvironmentAttributeSystem;
 import net.minecraft.world.level.ServerLevelAccessor;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.*;
@@ -21,21 +22,37 @@ public class SeagrassEdgeOracle {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         var attrs = EnvironmentAttributeSystem.builder().build();
-        var supports = List.of(
+        var supports = new ArrayList<>(List.of(
             Blocks.STONE.defaultBlockState(), Blocks.MAGMA_BLOCK.defaultBlockState(),
             Blocks.AIR.defaultBlockState(), Blocks.WATER.defaultBlockState(),
             Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM),
             Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.TOP),
             Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.DOUBLE),
             Blocks.STONE_BRICK_STAIRS.defaultBlockState().setValue(StairBlock.HALF, Half.TOP),
-            Blocks.STONE_BRICK_STAIRS.defaultBlockState().setValue(StairBlock.HALF, Half.BOTTOM));
+            Blocks.STONE_BRICK_STAIRS.defaultBlockState().setValue(StairBlock.HALF, Half.BOTTOM)));
+        for (Block block : List.of(Blocks.SUSPICIOUS_SAND, Blocks.SUSPICIOUS_GRAVEL)) {
+            var dusted = (IntegerProperty) block.getStateDefinition().getProperty("dusted");
+            for (int value = 0; value < 4; value++) {
+                var state = block.defaultBlockState().setValue(dusted, value);
+                supports.add(state);
+                for (Direction direction : Direction.values())
+                    out.printf("S %s %d %s %s%n", BuiltInRegistries.BLOCK.getKey(block), value,
+                        direction.getSerializedName(), state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, direction));
+            }
+        }
         var neighbors = List.of(Blocks.AIR.defaultBlockState(), Blocks.STONE.defaultBlockState(),
             Blocks.WATER.defaultBlockState());
         var pos = new BlockPos(8, 8, 8);
         for (int mask = 0; mask < 4; mask++) {
             var tagged = new ArrayList<Holder<Block>>();
-            if ((mask & 1) != 0) tagged.add(Blocks.STONE.builtInRegistryHolder());
-            if ((mask & 2) != 0) tagged.add(Blocks.MAGMA_BLOCK.builtInRegistryHolder());
+            if ((mask & 1) != 0) {
+                tagged.add(Blocks.STONE.builtInRegistryHolder());
+                tagged.add(Blocks.SUSPICIOUS_GRAVEL.builtInRegistryHolder());
+            }
+            if ((mask & 2) != 0) {
+                tagged.add(Blocks.MAGMA_BLOCK.builtInRegistryHolder());
+                tagged.add(Blocks.SUSPICIOUS_SAND.builtInRegistryHolder());
+            }
             BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK,
                 Map.of(BlockTags.CANNOT_SUPPORT_SEAGRASS, tagged))).apply();
             for (int index = 0; index < supports.size(); index++) {

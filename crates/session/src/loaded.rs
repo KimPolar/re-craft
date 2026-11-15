@@ -70112,6 +70112,7 @@ pub(crate) mod tests {
         }
 
         let mut in_lava = session();
+        in_lava.set_random_tick_speed(0);
         let lava = in_lava.intern_block(state("minecraft:lava", &[("level", "0")]));
         for x in 7..=9 {
             for y in 1..=3 {
@@ -70126,6 +70127,7 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("lava and fire"), "{error:#}");
 
         let mut crossing = session();
+        crossing.set_random_tick_speed(0);
         let lava = crossing.intern_block(state("minecraft:lava", &[("level", "0")]));
         assert!(crossing.set(IVec3::new(10, 1, 8), lava));
         crossing.motion.velocity.x = 3.0;

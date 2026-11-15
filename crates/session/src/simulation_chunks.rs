@@ -246,6 +246,28 @@ impl SimulationChunks {
         true
     }
 
+    /// TicketStorage reports a single graph update after removing all stale
+    /// simulation tickets in the same chunk.
+    pub(crate) fn remove_expired_tickets(&mut self, pos: ChunkPos, tickets: &[(u64, i32)]) {
+        let key = pack(pos);
+        let Some(sources) = self.sources.get_mut(&key) else {
+            debug_assert!(tickets.is_empty(), "simulation ticket source missing");
+            return;
+        };
+        let mut removed = false;
+        for ticket in tickets {
+            let existed = sources.remove(ticket);
+            debug_assert!(existed, "simulation ticket source missing");
+            removed |= existed;
+        }
+        if sources.is_empty() {
+            self.sources.remove(&key);
+        }
+        if removed {
+            self.check_edge(SOURCE, key, self.source_level(key), false);
+        }
+    }
+
     /// Apply all pending changes. Call after all ticket changes for a tick,
     /// before selecting chunks, to preserve Java's propagation history.
     pub fn run_updates(&mut self) {

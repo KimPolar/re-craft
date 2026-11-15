@@ -9,6 +9,7 @@ fn captured_ticket_activation_checks_world_dimension_and_epoch() {
         world::{DimensionId, TARGET_DATA_VERSION, WorldReader},
     };
     use native_session::simulation_chunks::SimulationChunks;
+    use native_session::simulation_tickets::SimulationTickets;
     use native_world::loaded::ChunkPos;
 
     let world = tempfile::tempdir().unwrap();
@@ -51,6 +52,21 @@ fn captured_ticket_activation_checks_world_dimension_and_epoch() {
     let reader = WorldReader::open_for_session(world.path(), dimension.clone()).unwrap();
     let guard = reader.session_guard().unwrap();
     let capture = reader.capture_chunk_tickets().unwrap();
+    let mut live_tickets = SimulationTickets::from_capture(&capture, &guard, &dimension).unwrap();
+    live_tickets.run_updates();
+    assert!(
+        live_tickets
+            .tracker()
+            .in_entity_ticking_range(ChunkPos { x: -3, z: 4 })
+    );
+    assert!(
+        SimulationTickets::from_capture(
+            &capture,
+            &guard,
+            &DimensionId::parse("the_nether").unwrap()
+        )
+        .is_err()
+    );
     let mut tracker = SimulationChunks::default();
     tracker
         .activate_captured_tickets(&capture, &guard, &dimension)
@@ -65,6 +81,7 @@ fn captured_ticket_activation_checks_world_dimension_and_epoch() {
     );
     assert_eq!(tracker.entity_ticking_order().collect::<Vec<_>>(), before);
     drop(guard.acquire_write().unwrap());
+    assert!(SimulationTickets::from_capture(&capture, &guard, &dimension).is_err());
     assert!(
         tracker
             .activate_captured_tickets(&capture, &guard, &dimension)

@@ -84,6 +84,11 @@ impl TicketKind {
             _ => None,
         }
     }
+
+    /// Java's unknown loading ticket may expire before its chunk is ready.
+    pub fn can_expire_if_unloaded(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

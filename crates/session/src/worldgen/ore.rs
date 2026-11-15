@@ -5085,7 +5085,7 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
         .with_context(|| format!("unsupported tree support shape {}", state.name))
 }
 
-fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) -> Result<bool> {
+pub(super) fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) -> Result<bool> {
     ensure!(
         matches!(
             direction,

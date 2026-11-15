@@ -490,6 +490,7 @@ struct DecorationConfig {
     inline_dimension_type: Option<Arc<str>>,
     ambient_light: Option<f32>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    aquatic_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
@@ -2236,6 +2237,13 @@ impl FreshTerrainBatch {
         .ok()
         .map(Arc::new);
         let leaf_tag = ResourceId::parse("minecraft:prevents_nearby_leaf_decay")?;
+        let aquatic_tags = native_resources::ore_feature::OreBlockTags::load(
+            provider,
+            &block_registry,
+            &BTreeSet::from([ResourceId::parse("minecraft:cannot_support_seagrass")?]),
+        )
+        .ok()
+        .map(Arc::new);
         let leaf_tags = native_resources::ore_feature::OreBlockTags::load(
             provider,
             &block_registry,
@@ -2291,6 +2299,7 @@ impl FreshTerrainBatch {
             block_registry: Arc::new(block_registry),
             heightmap_tags,
             mushroom_tags,
+            aquatic_tags,
             leaf_tags,
             snow_tags,
             fence_tags,
@@ -3184,6 +3193,11 @@ impl FreshTerrainBatch {
                 .collect(),
         )?;
         stage.bind_batch_revision(self.schedule.revision());
+        stage.set_aquatic_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.aquatic_tags.clone()),
+        );
         stage.set_leaf_tags(
             self.decoration
                 .as_ref()
@@ -3369,6 +3383,7 @@ impl FreshTerrainBatch {
             Arc::new(config.heightmap_tags.clone()),
         )?;
         stage.set_leaf_tags(config.leaf_tags.clone());
+        stage.set_aquatic_tags(config.aquatic_tags.clone());
         stage.set_snow_tags(config.snow_tags.clone());
         stage.set_fence_tags(config.fence_tags.clone());
         stage.set_speleothem_tags(config.speleothem_tags.clone());

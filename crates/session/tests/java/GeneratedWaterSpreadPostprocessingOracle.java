@@ -238,6 +238,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             for(var kind:kinds)for(var side:List.of("north","south","west","east"))
                 scenarios.add("aquatic_flow_"+kind+"_"+side);
         }
+        if(args.length>0 && args[0].equals("seagrass_postprocessing")) {
+            scenarios.clear();scenarios.addAll(List.of("seagrass_change","seagrass_neighbor_stable","seagrass_neighbor_tagged","seagrass_neighbor_broken","marked_seagrass_stable","marked_seagrass_side","marked_seagrass_tagged","marked_seagrass_unsupported"));
+        }
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("building_barriers")){
             scenarios.clear();for(var name:List.of("oak_planks","deepslate_bricks","light_blue_concrete","white_wool","blue_ice"))scenarios.add("barrier_"+name);
@@ -290,6 +293,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     scenarios.add("snow_"+kind+"_"+name+"_"+initial+"_"+tagged);
         }
         for(String scenario:scenarios) {
+            bind.invoke(Blocks.STONE.builtInRegistryHolder(),scenario.endsWith("_tagged")?List.of(BlockTags.CANNOT_SUPPORT_SEAGRASS):List.of());
             bind.invoke(Fluids.LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_flowing_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_source_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
@@ -578,6 +582,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 blocks.put(plantPos,plant);
                 if(flow)blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1));
             }
+            if(scenario.equals("seagrass_change")){blocks.put(pos.below(),Blocks.SEAGRASS.defaultBlockState());blocks.put(pos.east(),Blocks.AIR.defaultBlockState());}
+            if(scenario.startsWith("seagrass_neighbor_")) {
+                blocks.put(pos.below(),Blocks.AIR.defaultBlockState());blocks.put(pos.below().east(),Blocks.SEAGRASS.defaultBlockState());
+                if(scenario.endsWith("_broken"))blocks.put(pos.below(2).east(),Blocks.AIR.defaultBlockState());
+            }
+            if(scenario.startsWith("marked_seagrass_")) {
+                blocks.put(pos,Blocks.SEAGRASS.defaultBlockState());
+                if(scenario.endsWith("_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.endsWith("_unsupported"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+            }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
             var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
@@ -603,6 +617,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 var spike=get(pos.east().above());
                 out.printf("shape_above %s %s %s %s%n",BuiltInRegistries.BLOCK.getKey(spike.getBlock()),
                     spike.getValue(SpeleothemBlock.TIP_DIRECTION),spike.getValue(SpeleothemBlock.THICKNESS),spike.getValue(SpeleothemBlock.WATERLOGGED));
+            }
+            if(scenario.startsWith("seagrass_neighbor_")) {
+                var p=pos.below().east();var s=get(p);
+                out.printf("plant %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.is(Blocks.WATER)?s.getValue(LiquidBlock.LEVEL):"-");
             }
             if(scenario.startsWith("bubble_"))for(int y=8;y<=9;y++){
                 var s=get(new BlockPos(8,y,8));

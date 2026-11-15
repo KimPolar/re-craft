@@ -33,6 +33,7 @@ pub struct CapturedPostprocessedChunkData {
 struct CapturedPostprocessingTags {
     heightmaps: Arc<native_resources::heightmap_tags::HeightmapTags>,
     mushroom: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    aquatic: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
@@ -65,6 +66,7 @@ impl CapturedPostprocessingTags {
                 &["minecraft:overrides_mushroom_light_requirement"],
             )?,
             leaf: load_tags(provider, &["minecraft:prevents_nearby_leaf_decay"])?,
+            aquatic: load_tags(provider, &["minecraft:cannot_support_seagrass"])?,
             snow: load_tags(provider, &["minecraft:snow"])?,
             fence: load_tags(
                 provider,
@@ -90,6 +92,7 @@ impl CapturedPostprocessingTags {
     }
 
     fn apply(self, stage: &mut GeneratedPostprocessing) {
+        stage.set_aquatic_tags(self.aquatic);
         stage.set_leaf_tags(self.leaf);
         stage.set_snow_tags(self.snow);
         stage.set_fence_tags(self.fence);

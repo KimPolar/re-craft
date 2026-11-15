@@ -1224,6 +1224,13 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn generated_seagrass_loot_and_random_streams_match_java() {
+        generated_block_loot_and_random_streams_match_java("seagrass");
+    }
+
+    #[cfg(target_os = "windows")]
     fn generated_block_loot_and_random_streams_match_java(block_name: &str) {
         use native_resources::packs::ResourceStack;
         use std::{path::PathBuf, process::Command};
@@ -1311,6 +1318,11 @@ mod tests {
                 for (step, row) in group.iter().enumerate() {
                     let mut block = if block_name == "ladder" {
                         ladder()
+                    } else if block_name == "seagrass" {
+                        BlockState {
+                            name: "minecraft:seagrass".into(),
+                            properties: BTreeMap::new(),
+                        }
                     } else {
                         BlockState {
                             name: "minecraft:glow_lichen".into(),
@@ -1320,9 +1332,11 @@ mod tests {
                                 .collect(),
                         }
                     };
-                    block
-                        .properties
-                        .insert("waterlogged".into(), (step % 2 == 0).to_string());
+                    if block_name != "seagrass" {
+                        block
+                            .properties
+                            .insert("waterlogged".into(), (step % 2 == 0).to_string());
+                    }
                     let previous = generated.records(chunk).len();
                     generated.drop_block(IVec3::ZERO, &block).unwrap();
                     let actual: Vec<_> = generated.records(chunk)[previous..]

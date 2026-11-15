@@ -188,6 +188,7 @@ struct StagedTerrainChunk {
 /// save; ticks, block entities, POIs, entities and lighting need other proofs.
 pub struct GenerationTerrainStage {
     session: Arc<()>,
+    bounds: BuildBounds,
     live_world: Arc<World>,
     saved_world: Arc<World>,
     chunks: BTreeMap<ChunkPos, StagedTerrainChunk>,
@@ -201,6 +202,18 @@ pub struct GenerationTerrainStage {
 /// is deferred so callers can validate the draft on a worker thread.
 pub struct GenerationTerrainStageDraft {
     stage: GenerationTerrainStage,
+}
+
+/// A detached block and biome view. Lighting, ticks, entities, POI and saved
+/// chunk status have not been reconciled and this cannot authorize a save.
+pub struct GenerationTerrainOverlay {
+    world: World,
+}
+
+impl GenerationTerrainOverlay {
+    pub fn world(&self) -> &World {
+        &self.world
+    }
 }
 
 /// Live work that prevents taking a stable intermediate terrain snapshot.
@@ -302,6 +315,177 @@ impl GenerationTerrainStage {
             + (z.rem_euclid(16) as usize / 4) * 4
             + (y.rem_euclid(16) as usize / 4) * 16;
         world.biome_by_id(*section.biomes.as_ref()?.get(index)?)
+    }
+
+    /// Apply recorded live block edits to a detached copy of the captured
+    /// saved terrain. The caller must recheck this stage before using results.
+    pub fn overlay_saved_world(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<GenerationTerrainOverlay> {
+        use anyhow::{Context, ensure};
+
+        let mut world = self.saved_world.as_ref().clone();
+        let mut seen = BTreeSet::new();
+        for position in positions {
+            check()?;
+            ensure!(seen.insert(position), "duplicate staged terrain chunk");
+            let captured = self
+                .chunks
+                .get(&position)
+                .context("terrain chunk is outside the staged input")?;
+            ensure!(
+                world.chunks.contains_key(&position),
+                "saved terrain chunk is missing"
+            );
+            for (&(x, y, z), edit) in &captured.edits {
+                ensure!(
+                    (self.bounds.min_y..self.bounds.max_y).contains(&y),
+                    "staged block edit is outside the dimension"
+                );
+                let original = self
+                    .live_world
+                    .state(edit.original.context("edited source block is unknown")?)
+                    .context("original block state is unknown")?;
+                ensure!(
+                    world.block(x, y, z) == Some(original),
+                    "staged block source changed at {x},{y},{z}"
+                );
+                let replacement = self
+                    .live_world
+                    .state(edit.current)
+                    .context("edited block state is unknown")?
+                    .clone();
+                let replacement = world.intern_state(replacement);
+                world
+                    .set_block_id(x, y, z, replacement)
+                    .map_err(|error| anyhow::anyhow!("cannot stage block edit: {error:?}"))?;
+            }
+            // These blocks may already differ from the saved light layers.
+            // A reader must see unknown light, not a stale saved value.
+            let chunk = Arc::make_mut(world.chunks.get_mut(&position).unwrap());
+            chunk.block_light_correct = false;
+            for section in chunk.sections.values_mut() {
+                let section = Arc::make_mut(section);
+                section.block_light = None;
+                section.sky_light = None;
+            }
+        }
+        world.chunks.retain(|position, _| seen.contains(position));
+        world
+            .missing_chunks
+            .retain(|position| seen.contains(position));
+        world.saved_fluid_ticks.clear();
+        world.saved_block_ticks.clear();
+        world.live_block_entities.clear();
+        world.saved_block_entities = seen
+            .iter()
+            .map(|&position| {
+                (
+                    position,
+                    native_world::loaded::SavedBlockEntities::Unavailable,
+                )
+            })
+            .collect();
+        check()?;
+        Ok(GenerationTerrainOverlay { world })
+    }
+
+    /// Rebuild heightmaps for a captured FULL chunk with live block edits.
+    /// Stale original maps and unsupported block states are rejected.
+    pub fn saved_heightmaps_after_edits(
+        &self,
+        position: ChunkPos,
+        source: &native_persistence::world::LoadedChunk,
+        mut classify: impl FnMut(
+            &native_persistence::palette::BlockState,
+        )
+            -> anyhow::Result<native_persistence::heightmap::BlockHeightFlags>,
+    ) -> anyhow::Result<native_persistence::heightmap::SavedGenerationHeightmaps> {
+        use anyhow::{Context, ensure};
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            heightmap::{HeightBounds, SavedGenerationHeightmaps},
+            palette,
+        };
+
+        let captured = self
+            .chunks
+            .get(&position)
+            .context("terrain chunk is outside the staged input")?;
+        ensure!(
+            source.position.x == position.x && source.position.z == position.z,
+            "saved terrain position differs"
+        );
+        let fingerprint = self
+            .saved_world
+            .saved_chunk_source(position)
+            .context("saved terrain fingerprint is missing")?;
+        ensure!(
+            native_persistence::nbt::fingerprint(&source.document)? == fingerprint,
+            "saved terrain source changed"
+        );
+        let bounds = HeightBounds {
+            min_y: self.bounds.min_y,
+            max_y: self.bounds.max_y,
+        };
+        if captured.edits.is_empty() {
+            return SavedGenerationHeightmaps::read(&source.document, bounds);
+        }
+        ensure!(
+            source
+                .document
+                .value
+                .get("Status")
+                .is_some_and(|status| matches!(status, native_persistence::nbt::Tag::String(value) if value.matches("minecraft:full"))),
+            "live edited terrain is not a FULL chunk"
+        );
+        let sections = palette::decode_sections(&source.document.value)?;
+        let mut changes = Vec::with_capacity(captured.edits.len());
+        for (&(x, y, z), edit) in &captured.edits {
+            ensure!(
+                (self.bounds.min_y..self.bounds.max_y).contains(&y),
+                "staged block edit is outside the dimension"
+            );
+            let section_y =
+                i8::try_from(y.div_euclid(16)).context("edited section is out of range")?;
+            let blocks = sections
+                .iter()
+                .find(|section| section.y == section_y)
+                .and_then(|section| section.blocks.as_ref())
+                .context("saved edited block data is missing")?;
+            let index = x.rem_euclid(16) as usize
+                + z.rem_euclid(16) as usize * 16
+                + y.rem_euclid(16) as usize * 256;
+            let expected = blocks
+                .indices
+                .get(index)
+                .and_then(|&index| blocks.states.get(index as usize))
+                .context("saved block palette is incomplete")?
+                .clone();
+            let replacement = self
+                .live_world
+                .state(edit.current)
+                .context("edited block state is unknown")?;
+            changes.push(BlockChange {
+                x,
+                y,
+                z,
+                expected,
+                replacement: palette::BlockState {
+                    name: replacement.name.as_str().into(),
+                    properties: replacement
+                        .properties
+                        .iter()
+                        .map(|(name, value)| (name.as_str().into(), value.as_str().into()))
+                        .collect(),
+                },
+            });
+        }
+        let mut draft = draft_chunk_blocks(&source.document, source.position, &changes)?;
+        draft.rebuild_heightmaps(bounds, &mut classify)?;
+        SavedGenerationHeightmaps::read(draft.document(), bounds)
     }
 }
 
@@ -6608,6 +6792,7 @@ impl LoadedSession {
         Ok(GenerationTerrainStageDraft {
             stage: GenerationTerrainStage {
                 session: Arc::clone(&self.generation_identity),
+                bounds: self.bounds,
                 live_world: Arc::clone(&self.world),
                 saved_world: source,
                 chunks,
@@ -31550,6 +31735,151 @@ pub(crate) mod tests {
         session
             .capture_generation_terrain_stage(Arc::clone(&source), [home])
             .unwrap();
+    }
+
+    #[test]
+    fn staged_generation_overlay_preserves_live_blocks_and_rebuilds_heightmaps() {
+        use native_persistence::{
+            heightmap::{BlockHeightFlags, SavedGenerationHeightmapKind},
+            palette,
+            world::{ChunkPos as SavedChunkPos, LoadedChunk},
+        };
+
+        let (mut saved, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut neighbor_chunk = saved.chunks[&home].as_ref().clone();
+        neighbor_chunk.position = neighbor;
+        saved.chunks.insert(neighbor, Arc::new(neighbor_chunk));
+        let chunk = Arc::make_mut(saved.chunks.get_mut(&home).unwrap());
+        chunk.block_light_correct = true;
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.block_light = Some(Box::new([0xee; LIGHT_BYTES]));
+        section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        saved
+            .saved_block_entities
+            .insert(home, native_world::loaded::SavedBlockEntities::Empty);
+        let document = fixture_chunk_document(home);
+        saved.remember_saved_chunk_source(
+            home,
+            native_persistence::nbt::fingerprint(&document).unwrap(),
+        );
+        let loaded = LoadedChunk {
+            position: SavedChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            data_version: 5023,
+            status: Some("minecraft:full".into()),
+            sections: palette::decode_sections(&document.value).unwrap(),
+            document: Arc::new(document),
+        };
+        let saved = Arc::new(saved);
+        let mut session = LoadedSession::new(
+            saved.as_ref().clone(),
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let edited = IVec3::new(8, 2, 6);
+        assert!(session.set(edited, session.states[0]));
+        let stage = session
+            .capture_generation_terrain_stage(Arc::clone(&saved), [home])
+            .unwrap();
+        assert!(
+            stage
+                .overlay_saved_world([home], || anyhow::bail!("cancelled"))
+                .is_err()
+        );
+        assert!(stage.overlay_saved_world([home, home], || Ok(())).is_err());
+        let overlay = stage.overlay_saved_world([home], || Ok(())).unwrap();
+        assert_eq!(
+            overlay
+                .world()
+                .block(origin.x + 8, 2, origin.z + 6)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            saved.block(origin.x + 8, 2, origin.z + 6).unwrap().name,
+            "minecraft:stone"
+        );
+        assert_eq!(saved.light(origin.x + 8, 2, origin.z + 6, false), Some(14));
+        assert_eq!(saved.light(origin.x + 8, 2, origin.z + 6, true), Some(15));
+        assert_eq!(
+            overlay.world().light(origin.x + 8, 2, origin.z + 6, false),
+            None
+        );
+        assert_eq!(
+            overlay.world().light(origin.x + 8, 2, origin.z + 6, true),
+            None
+        );
+        assert!(!overlay.world().chunks.contains_key(&neighbor));
+        assert!(matches!(
+            overlay.world().saved_block_entities.get(&home),
+            Some(native_world::loaded::SavedBlockEntities::Unavailable)
+        ));
+        let classify = |state: &palette::BlockState| -> anyhow::Result<BlockHeightFlags> {
+            let is_air = state.name.matches("minecraft:air");
+            anyhow::ensure!(
+                is_air || state.name.matches("minecraft:stone"),
+                "unknown state"
+            );
+            Ok(BlockHeightFlags {
+                is_air,
+                blocks_motion: !is_air,
+                blocks_motion_no_leaves: !is_air,
+                has_fluid: false,
+            })
+        };
+        let maps = stage
+            .saved_heightmaps_after_edits(home, &loaded, classify)
+            .unwrap();
+        assert_eq!(
+            maps.first_available(SavedGenerationHeightmapKind::WorldSurface, 8, 6),
+            Some(1)
+        );
+        assert_eq!(
+            maps.first_available(SavedGenerationHeightmapKind::MotionBlockingNoLeaves, 8, 6),
+            Some(1)
+        );
+        assert_eq!(
+            maps.first_available(SavedGenerationHeightmapKind::WorldSurfaceWorldgen, 8, 6),
+            None
+        );
+        assert!(
+            stage
+                .saved_heightmaps_after_edits(home, &loaded, |_| anyhow::bail!("unknown block"))
+                .is_err()
+        );
+        let mut changed_source = loaded.clone();
+        Arc::make_mut(&mut changed_source.document).name = "different".into();
+        assert!(
+            stage
+                .saved_heightmaps_after_edits(home, &changed_source, classify)
+                .is_err()
+        );
+        assert!(session.set(IVec3::new(1, 0, 1), session.states[0]));
+        assert!(session.verify_generation_terrain_stage(&stage).is_err());
+        assert_eq!(
+            overlay
+                .world()
+                .block(origin.x + 1, 0, origin.z + 1)
+                .unwrap()
+                .name,
+            "minecraft:stone"
+        );
     }
 
     #[test]

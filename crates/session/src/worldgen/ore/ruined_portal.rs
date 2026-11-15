@@ -307,22 +307,22 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
             }
             return Ok(state.clone());
         }
-        if state.name == "minecraft:lava" {
+        if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
             ensure!(
                 self.inner
                     .registry
                     .is_canonical_state(&neighbor.name, &neighbor.properties),
                 "invalid portal lava neighbor"
             );
-            portal_template_full(state)?;
             let fluid = FluidState::from_block(state)
                 .map_err(anyhow::Error::msg)?
-                .context("missing portal lava")?;
+                .context("missing portal liquid")?;
             let adjacent = FluidState::from_block(neighbor).map_err(anyhow::Error::msg)?;
-            let fluid_id = if fluid.source {
-                "minecraft:lava"
-            } else {
-                "minecraft:flowing_lava"
+            let fluid_id = match (fluid.kind, fluid.source) {
+                (native_world::fluid::FluidKind::Water, true) => "minecraft:water",
+                (native_world::fluid::FluidKind::Water, false) => "minecraft:flowing_water",
+                (native_world::fluid::FluidKind::Lava, true) => "minecraft:lava",
+                (native_world::fluid::FluidKind::Lava, false) => "minecraft:flowing_lava",
             };
             if fluid.source || adjacent.is_some_and(|value| value.source) {
                 SpringWorld::schedule_spring_tick(
@@ -1322,6 +1322,200 @@ mod tests {
             falling_count += 1;
         }
         assert_eq!(falling_count, 72);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn portal_liquid_edge_updates_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong Minecraft version");
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let source = temp.path().join("PortalLiquidEdgeOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/PortalLiquidEdgeOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "javac failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let oracle = temp.path().join("rows.json");
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("PortalLiquidEdgeOracle")
+            .arg(&oracle)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(oracle)?)?;
+        assert_eq!(rows.len(), 18_816);
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let mut wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let pos = [3, 7, 3];
+        let fluid_ids = [
+            "minecraft:empty",
+            "minecraft:water",
+            "minecraft:flowing_water",
+            "minecraft:lava",
+            "minecraft:flowing_lava",
+        ];
+        for row in rows {
+            let mask = row["mask"].as_u64().context("fluid mask missing")?;
+            wall_tags.bubble_fluids = fluid_ids
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, name)| name.to_owned())
+                .collect();
+            let support = row["support"].as_u64().context("support mode missing")?;
+            wall_tags.bubble_drag = BTreeSet::from([if support == 0 {
+                "minecraft:magma_block"
+            } else {
+                "minecraft:stone"
+            }
+            .to_owned()]);
+            wall_tags.bubble_push = BTreeSet::from([if support == 0 {
+                "minecraft:soul_sand"
+            } else {
+                "minecraft:magma_block"
+            }
+            .to_owned()]);
+            let block = row["block"].as_str().context("block missing")?;
+            let level = row["level"].as_u64().context("level missing")?;
+            let (name, properties) = registry.resolve(
+                &serde_json::json!({"id":block,"properties":{"level":level.to_string()}}),
+            )?;
+            let state = BlockState { name, properties };
+            let neighbor_name = row["neighbor"].as_str().context("neighbor missing")?;
+            let neighbor_level = row["neighborLevel"]
+                .as_i64()
+                .context("neighbor level missing")?;
+            let spec = if neighbor_level < 0 {
+                serde_json::json!(neighbor_name)
+            } else {
+                serde_json::json!({"id":neighbor_name,"properties":{"level":neighbor_level.to_string()}})
+            };
+            let (name, properties) = registry.resolve(&spec)?;
+            let neighbor = BlockState { name, properties };
+            let direction = match row["direction"].as_str().context("direction missing")? {
+                "down" => [0, -1, 0],
+                "up" => [0, 1, 0],
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "west" => [-1, 0, 0],
+                "east" => [1, 0, 0],
+                _ => anyhow::bail!("invalid liquid edge direction"),
+            };
+            region.set_proto_block(pos, &state)?;
+            region.world.saved_block_ticks.clear();
+            region.world.saved_fluid_ticks.clear();
+            region.block_tick_keys.clear();
+            region.fluid_tick_keys.clear();
+            let mut world = PortalTemplateRegion {
+                inner: super::super::jigsaw::JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                },
+                wall_tags: &wall_tags,
+                temporary_jigsaws: BTreeSet::new(),
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    world.update_shape(pos, &state, direction, pos, &neighbor)?,
+                    state,
+                    "{row}"
+                );
+            }
+            let fluid_ticks = world.inner.region.world.saved_fluid_ticks.get(&chunk(pos));
+            let block_ticks = world.inner.region.world.saved_block_ticks.get(&chunk(pos));
+            assert_eq!(
+                fluid_ticks.map_or(0, Vec::len) as u64,
+                row["fluidCount"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                block_ticks.map_or(0, Vec::len) as u64,
+                row["blockCount"].as_u64().unwrap(),
+                "{row}"
+            );
+            if let Some(ticks) = fluid_ticks {
+                let tick = &ticks[0];
+                assert_eq!(tick.fluid, row["fluidId"].as_str().unwrap(), "{row}");
+                assert_eq!(tick.position, pos, "{row}");
+                assert_eq!(
+                    tick.delay as i64,
+                    row["fluidDelay"].as_i64().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    tick.priority as i64,
+                    row["fluidPriority"].as_i64().unwrap(),
+                    "{row}"
+                );
+            }
+            if let Some(ticks) = block_ticks {
+                let tick = &ticks[0];
+                assert_eq!(tick.block, row["blockId"].as_str().unwrap(), "{row}");
+                assert_eq!(tick.position, pos, "{row}");
+                assert_eq!(
+                    tick.delay as i64,
+                    row["blockDelay"].as_i64().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    tick.priority as i64,
+                    row["blockPriority"].as_i64().unwrap(),
+                    "{row}"
+                );
+            }
+        }
         Ok(())
     }
 

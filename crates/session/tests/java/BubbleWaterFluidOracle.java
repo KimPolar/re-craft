@@ -40,7 +40,7 @@ public class BubbleWaterFluidOracle {
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var world=(World)unsafe.allocateInstance(World.class); world.rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         var rows=new JsonArray();
-        for(int below=0;below<4;below++) for(int mask=0;mask<16;mask++) for(int variant=0;variant<4;variant++) for(boolean holes:new boolean[]{false,true}) for(boolean drag:new boolean[]{false,true}) {
+        for(int below=0;below<4;below++) for(int mask=0;mask<16;mask++) for(int variant=0;variant<5;variant++) for(boolean holes:new boolean[]{false,true}) for(boolean drag:new boolean[]{false,true}) {
             world.blocks=new HashMap<>(); world.changes=new JsonArray();
             var bubble=Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,drag);
             world.blocks.put(CENTER,bubble);
@@ -48,7 +48,7 @@ public class BubbleWaterFluidOracle {
             world.blocks.put(CENTER.below(),down);
             for(int i=0;i<4;i++) if((mask & (1<<i))!=0) {
                 var pos=CENTER.relative(SIDES[i]);
-                var state=switch(variant) { case 0->Blocks.AIR.defaultBlockState(); case 1->Blocks.WATER.defaultBlockState(); case 2->bubble; default->Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1); };
+                var state=switch(variant) { case 0->Blocks.AIR.defaultBlockState(); case 1->Blocks.WATER.defaultBlockState(); case 2->bubble; case 3->Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1); default->Blocks.GLOW_LICHEN.defaultBlockState().setValue(MultifaceBlock.getFaceProperty(Direction.WEST),true).setValue(MultifaceBlock.WATERLOGGED,true); };
                 world.blocks.put(pos,state);
                 if(holes) world.blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             }

@@ -19,6 +19,16 @@ use crate::generation_pipeline::{InitialWorldOptions, InitialWorldPipeline, Init
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
 fn generated_portal_world_preserves_remote_chunks_after_play_save() -> Result<()> {
+    verify_generated_portal_play_save(0)
+}
+
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
+fn generated_portal_world_saves_after_forty_ticks_without_random_ticks() -> Result<()> {
+    verify_generated_portal_play_save(40)
+}
+
+fn verify_generated_portal_play_save(additional_ticks: u64) -> Result<()> {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -27,15 +37,21 @@ fn generated_portal_world_preserves_remote_chunks_after_play_save() -> Result<()
     let parent = tempfile::Builder::new()
         .prefix("portal-play-save-")
         .tempdir_in(test_root)?;
+    let parent_path = parent.path().to_path_buf();
     let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
     settings.seed = crate::chat_input::ChatInput::field("-1");
+    if additional_ticks != 0 {
+        // Keep this test focused on scheduled fluid and block ticks. Default
+        // random ticks still need complete sky-light and neighboring chunks.
+        settings.game_rules.random_tick_speed = 0;
+    }
     let targets = BTreeSet::from([
         ChunkPos { x: 20, z: 19 },
         ChunkPos { x: 21, z: 19 },
         ChunkPos { x: 28, z: 24 },
     ]);
     let options = InitialWorldOptions {
-        staging_parent: parent.path().to_path_buf(),
+        staging_parent: parent_path.clone(),
         border: SavedWorldBorder::default(),
         player_random_seed: 1234,
         ceiling_spawn_height: None,
@@ -93,9 +109,18 @@ fn generated_portal_world_preserves_remote_chunks_after_play_save() -> Result<()
         std::thread::sleep(Duration::from_millis(20));
     };
     let (_, stage) = world.into_parts();
-    let published = stage.publish(parent.path(), "Test", "New World")?;
+    let published = stage.publish(&parent_path, "Test", "New World")?;
     let path = published.path.clone();
     let lock = published.session().clone();
+    verify_portal_play_save(&path, &game, lock, additional_ticks)
+}
+
+fn verify_portal_play_save(
+    path: &std::path::Path,
+    game: &std::path::Path,
+    lock: native_persistence::save::WorldSessionGuard,
+    additional_ticks: u64,
+) -> Result<()> {
     let options = crate::ViewOptions {
         dimension: None,
         chunk: None,
@@ -178,6 +203,20 @@ fn generated_portal_world_preserves_remote_chunks_after_play_save() -> Result<()
         jump: false,
     });
     session.update(Duration::from_millis(50));
+    for _ in 0..additional_ticks {
+        // Keep disk streaming responsive without advancing simulation faster
+        // than the game's 20 TPS while waiting for its next tick.
+        let next_tick = Instant::now() + Duration::from_millis(50);
+        loop {
+            streamer.service(&mut session)?;
+            let now = Instant::now();
+            if now >= next_tick {
+                break;
+            }
+            std::thread::sleep((next_tick - now).min(Duration::from_millis(5)));
+        }
+        session.update(Duration::from_millis(50));
+    }
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut next_tick = Instant::now() + Duration::from_millis(50);
     while !session.required_shape_update_chunks().is_empty() {
@@ -206,6 +245,10 @@ fn generated_portal_world_preserves_remote_chunks_after_play_save() -> Result<()
     }
     drop(streamer);
     let expected = session.snapshot();
+    ensure!(
+        expected.tick >= before.tick + 2 + additional_ticks,
+        "not all requested gameplay ticks were processed"
+    );
     let before_position = before.origin.as_vec3() + before.player.position;
     let expected_position = expected.origin.as_vec3() + expected.player.position;
     ensure!(

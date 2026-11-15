@@ -26427,6 +26427,15 @@ impl SessionFluidTick<'_> {
                     && fluid.source
                     && matches!(FluidState::from_block(state), Ok(Some(actual)) if actual == fluid)
             }
+            fluid_sim::Cell::OpenWater(fluid) => {
+                native_world::collision::glow_lichen_faces(state).is_some()
+                    && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+                    && fluid.kind == FluidKind::Water
+                    && fluid.amount == 8
+                    && fluid.source
+                    && !fluid.falling
+                    && matches!(FluidState::from_block(state), Ok(Some(actual)) if actual == fluid)
+            }
             fluid_sim::Cell::Solid => {
                 if matches!(
                     state.name.as_str(),
@@ -26496,7 +26505,15 @@ impl SessionFluidTick<'_> {
                 complete.set(false);
                 return;
             };
-            self.observe_bubble_cell(neighbor, self.session.simulation_cell(neighbor));
+            let simulated = self.session.simulation_cell(neighbor);
+            // Read-only waterlogged lichen is understood, but a neighboring
+            // block change also invokes shape callbacks. Keep rejecting that
+            // case until those callbacks are proven for this fluid path.
+            if matches!(simulated, fluid_sim::Cell::OpenWater(_)) {
+                complete.set(false);
+                return;
+            }
+            self.observe_bubble_cell(neighbor, simulated);
             if !complete.get() {
                 return;
             }
@@ -50821,7 +50838,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 1024);
+        assert_eq!(rows.len(), 1280);
         let source = FluidState {
             kind: FluidKind::Water,
             amount: 8,
@@ -50860,7 +50877,8 @@ pub(crate) mod tests {
                             0 => fluid_sim::Cell::Air,
                             1 => fluid_sim::Cell::Fluid(source),
                             2 => fluid_sim::Cell::BubbleWater(source),
-                            _ => fluid_sim::Cell::Fluid(flowing),
+                            3 => fluid_sim::Cell::Fluid(flowing),
+                            _ => fluid_sim::Cell::OpenWater(source),
                         },
                     );
                     if holes {
@@ -50897,6 +50915,67 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(serde_json::json!(actual), row["changes"], "{row}");
         }
+    }
+
+    #[test]
+    fn bubble_fluid_proof_accepts_lichen_reads_but_not_neighbor_changes() {
+        let position = IVec3::new(8, 10, 8);
+        let source = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let lichen = state(
+            "minecraft:glow_lichen",
+            &[
+                ("down", "false"),
+                ("up", "false"),
+                ("north", "false"),
+                ("south", "false"),
+                ("west", "true"),
+                ("east", "false"),
+                ("waterlogged", "true"),
+            ],
+        );
+        let mut session = session();
+        let id = session.intern_block(lichen.clone());
+        assert!(session.set_with_notify(position, id, false));
+        let settings = session.fluid_settings();
+        let live = SessionFluidTick {
+            session: &mut session,
+            settings,
+            kind: FluidKind::Water,
+            retry_wash: false,
+            bubble_complete: Some(std::cell::Cell::new(true)),
+        };
+        let complete = live.bubble_complete.as_ref().unwrap();
+        let observed = live.session.simulation_cell(position);
+        assert_eq!(observed, fluid_sim::Cell::OpenWater(source));
+        live.observe_bubble_cell(position, observed);
+        assert!(complete.get());
+
+        live.observe_bubble_cell(
+            position,
+            fluid_sim::Cell::OpenWater(FluidState {
+                amount: 7,
+                source: false,
+                ..source
+            }),
+        );
+        assert!(!complete.get());
+
+        complete.set(true);
+        live.observe_bubble_change(position + IVec3::X, fluid_sim::Cell::Air, source);
+        assert!(!complete.get());
+
+        let mut malformed = lichen;
+        malformed.properties.remove("west");
+        let id = live.session.intern_block(malformed);
+        assert!(live.session.set_with_notify(position, id, false));
+        complete.set(true);
+        live.observe_bubble_cell(position, fluid_sim::Cell::OpenWater(source));
+        assert!(!complete.get());
     }
 
     #[test]

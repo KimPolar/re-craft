@@ -50,7 +50,8 @@ public class LeafDecayLootOracle {
     var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
     var leaves=List.of(Blocks.OAK_LEAVES,Blocks.SPRUCE_LEAVES,Blocks.BIRCH_LEAVES,Blocks.JUNGLE_LEAVES,
         Blocks.ACACIA_LEAVES,Blocks.DARK_OAK_LEAVES,Blocks.MANGROVE_LEAVES,Blocks.CHERRY_LEAVES,
-        Blocks.PALE_OAK_LEAVES,Blocks.AZALEA_LEAVES,Blocks.FLOWERING_AZALEA_LEAVES);
+        Blocks.PALE_OAK_LEAVES,Blocks.RED_POPLAR_LEAVES,Blocks.ORANGE_POPLAR_LEAVES,
+        Blocks.YELLOW_POPLAR_LEAVES,Blocks.AZALEA_LEAVES,Blocks.FLOWERING_AZALEA_LEAVES);
     var result=new JsonArray();
     for(int i=0;i<leaves.size();i++) {
       var block=leaves.get(i);
@@ -73,7 +74,7 @@ public class LeafDecayLootOracle {
         var row=new JsonObject(); row.addProperty("name",name); row.addProperty("seed",seed); row.addProperty("step",step); row.add("drops",drops); row.addProperty("next",random.nextLong()); row.addProperty("levelNext",world.seeded.nextDouble()); result.add(row);
       }
     }
-    Files.writeString(Path.of(args[13]),result.toString());
+    Files.writeString(Path.of(args[2 + leaves.size()]),result.toString());
     var states=new JsonArray();
     var server=(Server)unsafe.allocateInstance(Server.class);
     for(var block:leaves) for(int distance=1;distance<=7;distance++) for(boolean persistent:new boolean[]{false,true}) for(boolean wet:new boolean[]{false,true}) {
@@ -84,6 +85,6 @@ public class LeafDecayLootOracle {
       row.addProperty("ticks",current.isRandomlyTicking()); row.addProperty("replacement",BuiltInRegistries.BLOCK.getKey(replacement.getBlock()).toString());
       states.add(row);
     }
-    Files.writeString(Path.of(args[14]),states.toString());
+    Files.writeString(Path.of(args[3 + leaves.size()]),states.toString());
   }
 }

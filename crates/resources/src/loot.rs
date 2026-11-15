@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 67] = [
+const BASIC_BLOCKS: [&str; 56] = [
     "grass_block",
     "dirt",
     "sand",
@@ -67,17 +67,6 @@ const BASIC_BLOCKS: [&str; 67] = [
     "dead_bush",
     "fire",
     "soul_fire",
-    "oak_leaves",
-    "spruce_leaves",
-    "birch_leaves",
-    "jungle_leaves",
-    "acacia_leaves",
-    "dark_oak_leaves",
-    "mangrove_leaves",
-    "cherry_leaves",
-    "pale_oak_leaves",
-    "azalea_leaves",
-    "flowering_azalea_leaves",
 ];
 
 /// Loot functions consume both floating-point and bounded integer random values.
@@ -851,6 +840,11 @@ impl BlockLootTables {
         let names =
             BASIC_BLOCKS
                 .into_iter()
+                .chain(
+                    native_core::leaf::LeafKind::ALL
+                        .into_iter()
+                        .map(|name| name.strip_prefix("minecraft:").unwrap()),
+                )
                 .chain(native_core::stairs::ITEMS.iter().copied())
                 .chain(
                     native_core::button::Button::ALL

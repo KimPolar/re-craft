@@ -96,7 +96,9 @@ pub fn random_tick(
     }
     let above = offset(position, 0, 1, 0)?;
     let cover = world.block(above)?;
-    if !can_stay_alive(source, &cover).context("unsupported soil cover")? {
+    if !can_stay_alive(source, &cover)
+        .with_context(|| format!("unsupported soil cover {} at {above:?}", cover.name))?
+    {
         world.set_block(
             position,
             BlockState {
@@ -120,9 +122,14 @@ pub fn random_tick(
             continue;
         }
         ensure!(current.properties.is_empty(), "unsupported dirt state");
-        let above = world.block(offset(target, 0, 1, 0)?)?;
-        if can_stay_alive(source, &above).context("unsupported soil cover")?
-            && !world.water_tagged(&above)?
+        let above_position = offset(target, 0, 1, 0)?;
+        let above = world.block(above_position)?;
+        if can_stay_alive(source, &above).with_context(|| {
+            format!(
+                "unsupported soil cover {} at {above_position:?}",
+                above.name
+            )
+        })? && !world.water_tagged(&above)?
         {
             let snowy = world.snowy(&above)?;
             world.set_block(

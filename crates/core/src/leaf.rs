@@ -4,7 +4,7 @@
 pub struct LeafKind(&'static str);
 
 impl LeafKind {
-    pub const ALL: [&'static str; 11] = [
+    pub const ALL: [&'static str; 14] = [
         "minecraft:oak_leaves",
         "minecraft:spruce_leaves",
         "minecraft:birch_leaves",
@@ -14,6 +14,9 @@ impl LeafKind {
         "minecraft:mangrove_leaves",
         "minecraft:cherry_leaves",
         "minecraft:pale_oak_leaves",
+        "minecraft:red_poplar_leaves",
+        "minecraft:orange_poplar_leaves",
+        "minecraft:yellow_poplar_leaves",
         "minecraft:azalea_leaves",
         "minecraft:flowering_azalea_leaves",
     ];

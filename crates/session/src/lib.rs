@@ -53,6 +53,7 @@ mod movement_events;
 pub mod orbs;
 pub mod physics;
 pub mod player_data;
+mod random_tick;
 pub mod redstone;
 pub mod respawn;
 pub mod save_capture;

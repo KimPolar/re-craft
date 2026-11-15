@@ -1712,6 +1712,9 @@ pub struct LoadedSession {
     unresolved_leaf_decay: bool,
     unresolved_crop_tick: bool,
     unresolved_spreading_soil_tick: bool,
+    unresolved_spreading_soil_detail: Option<String>,
+    unresolved_other_random_tick: bool,
+    unresolved_other_random_tick_detail: Option<String>,
     unresolved_crop_shape: bool,
     unresolved_speleothem_shape: bool,
     unresolved_stalactite_lifecycle: bool,
@@ -2394,6 +2397,7 @@ struct RandomTickCounts {
     crops: usize,
     crop_positions: Arc<[usize]>,
     spreading_soil: usize,
+    other: bool,
 }
 
 impl RandomTickCounts {
@@ -2404,6 +2408,32 @@ impl RandomTickCounts {
             || self.crops > 0
             || self.spreading_soil > 0
             || !self.leaves.is_empty()
+            || self.other
+    }
+}
+
+pub(crate) fn random_tick_kind(state: &BlockState) -> u8 {
+    if redstone_ore_lit(state) == Some(true) {
+        1
+    } else if native_world::collision::snow_layers(state).is_some() {
+        2
+    } else if farmland_moisture(state).is_some_and(|moisture| moisture < 7) {
+        3
+    } else if farmland_moisture(state) == Some(7) {
+        4
+    } else if leaf_randomly_ticks(state) {
+        5
+    } else if crop_state(state).is_some_and(|(crop, age)| age < crop.max_age()) {
+        6
+    } else if matches!(
+        state.name.as_str(),
+        "minecraft:grass_block" | "minecraft:mycelium"
+    ) {
+        7
+    } else if crate::random_tick::is_randomly_ticking(state) {
+        8
+    } else {
+        0
     }
 }
 
@@ -5317,7 +5347,17 @@ impl LoadedSession {
         );
         anyhow::ensure!(
             !self.unresolved_spreading_soil_tick,
-            "a spreading soil random tick could not be resolved for saving"
+            "a spreading soil random tick could not be resolved for saving: {}",
+            self.unresolved_spreading_soil_detail
+                .as_deref()
+                .unwrap_or("unknown cause")
+        );
+        anyhow::ensure!(
+            !self.unresolved_other_random_tick,
+            "an unsupported random block or fluid tick could not be preserved for saving: {}",
+            self.unresolved_other_random_tick_detail
+                .as_deref()
+                .unwrap_or("unknown cause")
         );
         anyhow::ensure!(
             !self.unresolved_crop_shape,
@@ -6817,6 +6857,7 @@ impl LoadedSession {
                 && !self.unresolved_stalactite_lifecycle
                 && !self.unresolved_crop_tick
                 && !self.unresolved_spreading_soil_tick
+                && !self.unresolved_other_random_tick
                 && !self.unresolved_ice_tick
                 && !self.unresolved_bubble_tick,
             "a block update could not be resolved before generation"
@@ -8917,6 +8958,9 @@ impl LoadedSession {
             unresolved_leaf_decay: false,
             unresolved_crop_tick: false,
             unresolved_spreading_soil_tick: false,
+            unresolved_spreading_soil_detail: None,
+            unresolved_other_random_tick: false,
+            unresolved_other_random_tick_detail: None,
             unresolved_crop_shape: false,
             unresolved_speleothem_shape: false,
             unresolved_stalactite_lifecycle: false,
@@ -11981,7 +12025,17 @@ impl LoadedSession {
         );
         ensure!(
             !self.unresolved_spreading_soil_tick,
-            "a spreading soil random tick could not be resolved for saving"
+            "a spreading soil random tick could not be resolved for saving: {}",
+            self.unresolved_spreading_soil_detail
+                .as_deref()
+                .unwrap_or("unknown cause")
+        );
+        ensure!(
+            !self.unresolved_other_random_tick,
+            "an unsupported random block or fluid tick could not be preserved for saving: {}",
+            self.unresolved_other_random_tick_detail
+                .as_deref()
+                .unwrap_or("unknown cause")
         );
         ensure!(
             !self.unresolved_crop_shape,
@@ -16247,7 +16301,8 @@ impl LoadedSession {
         self.set(relative, id)
     }
 
-    /// Cache known randomly ticking blocks in each immutable section.
+    /// Cache randomly ticking blocks in each immutable section, including
+    /// kinds whose effects are not yet implemented.
     fn refresh_random_tick_sections(&mut self) {
         if self.random_tick_revision == Some(self.revision) {
             return;
@@ -16260,26 +16315,7 @@ impl LoadedSession {
                 let Some(state) = self.world.state(id) else {
                     return 0;
                 };
-                if redstone_ore_lit(state) == Some(true) {
-                    1
-                } else if native_world::collision::snow_layers(state).is_some() {
-                    2
-                } else if farmland_moisture(state).is_some_and(|moisture| moisture < 7) {
-                    3
-                } else if farmland_moisture(state) == Some(7) {
-                    4
-                } else if leaf_randomly_ticks(state) {
-                    5
-                } else if crop_state(state).is_some_and(|(crop, age)| age < crop.max_age()) {
-                    6
-                } else if matches!(
-                    state.name.as_str(),
-                    "minecraft:grass_block" | "minecraft:mycelium"
-                ) {
-                    7
-                } else {
-                    0
-                }
+                random_tick_kind(state)
             })
             .collect();
         if !kinds.iter().any(|kind| *kind != 0) {
@@ -16324,6 +16360,7 @@ impl LoadedSession {
                                 crop_positions.push(index);
                             }
                             Some(7) => active.spreading_soil += 1,
+                            Some(8) => active.other = true,
                             _ => {}
                         }
                     }
@@ -16384,6 +16421,18 @@ impl LoadedSession {
             let mut crops_active = active.crops > 0
                 && (self.random_tick_speed <= 64
                     || self.crop_random_effect_in_section(chunk, section, &active.crop_positions));
+            // An unsupported random tick may consume the level RNG or mutate
+            // the world. Do not claim it can be saved. At extreme speeds,
+            // reject conservatively instead of iterating billions of samples.
+            let mut other_active = active.other && !self.unresolved_other_random_tick;
+            if other_active && self.random_tick_speed > 64 {
+                self.unresolved_other_random_tick = true;
+                self.unresolved_other_random_tick_detail = Some(format!(
+                    "unverified section ({}, {}, {}) at random tick speed {}",
+                    chunk.x, section, chunk.z, self.random_tick_speed
+                ));
+                other_active = false;
+            }
             if leaves_active && self.random_tick_speed > 64 {
                 leaves_active = self.leaf_can_decay_in_section(chunk, section, &active.leaves);
                 if !leaves_active {
@@ -16397,6 +16446,7 @@ impl LoadedSession {
                     && !leaves_active
                     && !crops_active
                     && active.spreading_soil == 0
+                    && !other_active
                 {
                     self.random_block_position
                         .skip(self.random_tick_speed - index);
@@ -16410,6 +16460,17 @@ impl LoadedSession {
                 else {
                     continue;
                 };
+                if other_active
+                    && let Some(state) = self
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .filter(|state| random_tick_kind(state) == 8)
+                {
+                    self.unresolved_other_random_tick = true;
+                    self.unresolved_other_random_tick_detail =
+                        Some(format!("{} at {absolute:?}", state.name));
+                    other_active = false;
+                }
                 if let Some(relative) = subtract(absolute, self.origin) {
                     let changed = if self.set_redstone_ore_lit(relative, false) {
                         active.lit_ores = active.lit_ores.saturating_sub(1);
@@ -16649,48 +16710,64 @@ impl LoadedSession {
 
     /// Java's max-local brightness subtracts the cached dimension sky
     /// darkening, unlike the raw light value used by crop growth.
-    fn spreading_soil_brightness(&self, relative: IVec3) -> Option<u8> {
-        let absolute = add(self.origin, relative)?;
+    fn spreading_soil_brightness(&self, relative: IVec3) -> anyhow::Result<u8> {
+        use anyhow::{Context, ensure};
+
+        let absolute = add(self.origin, relative).context("soil light position overflow")?;
         if !(-30_000_000..30_000_000).contains(&absolute.x)
             || !(-30_000_000..30_000_000).contains(&absolute.z)
         {
-            return Some(15);
+            return Ok(15);
         }
         let position = BlockPosition {
             x: absolute.x,
             y: absolute.y,
             z: absolute.z,
         };
-        if pending_light_affects(&self.pending_light, position) {
-            return None;
-        }
-        let chunk = self.world.chunks.get(&ChunkPos {
-            x: absolute.x.div_euclid(16),
-            z: absolute.z.div_euclid(16),
-        })?;
-        if !chunk.block_light_correct {
-            return None;
-        }
-        let block = self.world.light(absolute.x, absolute.y, absolute.z, false)?;
+        ensure!(
+            !pending_light_affects(&self.pending_light, position),
+            "block light updates are pending at {absolute:?}"
+        );
+        let chunk = self
+            .world
+            .chunks
+            .get(&ChunkPos {
+                x: absolute.x.div_euclid(16),
+                z: absolute.z.div_euclid(16),
+            })
+            .with_context(|| format!("soil light chunk is unavailable at {absolute:?}"))?;
+        ensure!(
+            chunk.block_light_correct,
+            "block light is not valid at {absolute:?}"
+        );
+        let block = self
+            .world
+            .light(absolute.x, absolute.y, absolute.z, false)
+            .with_context(|| format!("block light is unavailable at {absolute:?}"))?;
         if block >= 9 || self.sky_lighting.capability() == Some(false) {
-            return Some(block);
+            return Ok(block);
         }
-        if self.sky_lighting.capability() != Some(true) {
-            return None;
-        }
+        ensure!(
+            self.sky_lighting.capability() == Some(true),
+            "sky light capability is unknown"
+        );
         let bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
-        if !(self.sky_lighting.settled()
-            || self.sky_lighting.is_current_at(position, bounds)
-            || self.sky_lighting.light_unchanged(&self.world, bounds)
-            || self
-                .sky_lighting
-                .direct_sky_unchanged_at(&self.world, position, bounds))
-        {
-            return None;
-        }
-        let sky = self.world.light(absolute.x, absolute.y, absolute.z, true)?;
-        Some(block.max(sky.saturating_sub(self.gameplay_sky_darken?)))
+        ensure!(
+            self.sky_lighting.settled()
+                || self.sky_lighting.is_current_at(position, bounds)
+                || self.sky_lighting.light_unchanged(&self.world, bounds)
+                || self
+                    .sky_lighting
+                    .direct_sky_unchanged_at(&self.world, position, bounds),
+            "sky light is not settled at {absolute:?}"
+        );
+        let sky = self
+            .world
+            .light(absolute.x, absolute.y, absolute.z, true)
+            .with_context(|| format!("sky light is unavailable at {absolute:?}"))?;
+        let darken = self.gameplay_sky_darken.context("sky darkening is unavailable")?;
+        Ok(block.max(sky.saturating_sub(darken)))
     }
 
     fn crop_can_survive(&self, relative: IVec3) -> Option<bool> {
@@ -16881,8 +16958,10 @@ impl LoadedSession {
             &mut random,
         );
         self.level_random = random;
-        if result.is_err() {
+        if let Err(error) = result {
             self.unresolved_spreading_soil_tick = true;
+            self.unresolved_spreading_soil_detail
+                .get_or_insert_with(|| format!("at {absolute:?}: {error:#}"));
         }
         Some(self.revision != before)
     }
@@ -29388,6 +29467,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unsupported_random_ticks_advance_positions_and_prevent_unsafe_save() {
+        let seed = (0_i32..10_000)
+            .map(|candidate| candidate.wrapping_mul(1_000_003))
+            .find(|&seed| {
+                let mut random = native_core::random::BlockRandomPosition::new(seed);
+                let first = random.next_section_offset();
+                let second = random.next_section_offset();
+                first != second
+                    && (2..=13).contains(&first[1])
+                    && (2..=13).contains(&second[1])
+                    && first != [8, 2, 6]
+                    && second != [8, 2, 6]
+            })
+            .unwrap();
+        let mut expected = native_core::random::BlockRandomPosition::new(seed);
+        let first = expected.next_section_offset();
+        let second = expected.next_section_offset();
+        let mut session = session();
+        let lava = session.intern_block(state("minecraft:lava", &[("level", "0")]));
+        assert!(session.set(IVec3::from_array(second), lava));
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(1);
+        session.advance_random_block_ticks();
+        assert!(
+            !session.unresolved_other_random_tick,
+            "first sample {first:?}"
+        );
+        let mut observed = session.random_block_position;
+        assert_eq!(observed.next_section_offset(), second);
+        session.advance_random_block_ticks();
+        assert!(session.unresolved_other_random_tick);
+        let home = session.player_chunk().unwrap();
+        let error = session.draft_block_ticks(home).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported random block or fluid tick")
+        );
+        assert!(error.to_string().contains("minecraft:lava"));
+        assert!(session.validate_generation_block_readiness().is_err());
+    }
+
+    #[test]
+    fn unsupported_random_ticks_skip_extreme_speeds_without_spinning() {
+        let mut session = session();
+        let lava = session.intern_block(state("minecraft:lava", &[("level", "0")]));
+        assert!(session.set(IVec3::new(8, 4, 8), lava));
+        let seed = 123;
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(i32::MAX as u32);
+        let mut expected = native_core::random::BlockRandomPosition::new(seed);
+        expected.skip(i32::MAX as u32);
+        session.advance_random_block_ticks();
+        assert!(session.unresolved_other_random_tick);
+        assert_eq!(
+            session.random_block_position.next_section_offset(),
+            expected.next_section_offset()
+        );
+    }
+
+    #[test]
     fn leaf_random_tick_respects_persistence_distance_water_and_drop_rule() {
         let loot = test_leaf_loot();
         for name in LeafKind::ALL {
@@ -29611,7 +29751,7 @@ pub(crate) mod tests {
         );
         let states: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(state_output).unwrap()).unwrap();
-        assert_eq!(states.len(), 11 * 7 * 2 * 2);
+        assert_eq!(states.len(), LeafKind::ALL.len() * 7 * 2 * 2);
         let mut state_session = session();
         for row in states {
             let mut state = test_leaf_state(
@@ -29637,7 +29777,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 11 * 5 * 16);
+        assert_eq!(rows.len(), LeafKind::ALL.len() * 5 * 16);
         let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
         for group in rows.chunks_exact(16) {
             let name = group[0]["name"].as_str().unwrap();
@@ -33592,6 +33732,10 @@ pub(crate) mod tests {
                 expected
             );
             assert_eq!(session.unresolved_spreading_soil_tick, unresolved);
+            if unresolved {
+                let detail = session.unresolved_spreading_soil_detail.as_deref().unwrap();
+                assert!(detail.contains("sky darkening is unavailable"), "{detail}");
+            }
             if sky == Some(4.0) {
                 assert_eq!(
                     session.level_random.next_int(),
@@ -33650,7 +33794,10 @@ pub(crate) mod tests {
         let stone = session.intern_block(state("minecraft:stone", &[]));
         assert!(session.set_with_notify(IVec3::new(1, 1, 0), stone, false));
         assert!(!session.sky_lighting.settled());
-        assert_eq!(session.spreading_soil_brightness(source + IVec3::Y), Some(13));
+        assert_eq!(
+            session.spreading_soil_brightness(source + IVec3::Y).unwrap(),
+            13
+        );
         assert!(session.random_tick_spreading_soil_at(source).is_some());
         let target = session.origin + IVec3::new(9, 7, 9);
         assert_eq!(

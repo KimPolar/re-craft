@@ -2,13 +2,13 @@
 //!
 //! This tracks the vertical source boundary only. Diffuse sky-light updates
 //! are a separate step and are not performed by this module.
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     block_light::{
         LightBounds, LightProperties, faces_occlude, light_properties, transparent_light_properties,
     },
-    loaded::{BlockPosition, BlockStateId, ChunkPos, World},
+    loaded::{BlockPosition, BlockStateId, Chunk, ChunkPos, World},
 };
 
 /// Whether an edit can affect sky-light attenuation or occlusion. Unlike
@@ -91,6 +91,7 @@ impl SkyColumn {
 /// world snapshot. Construct a new scanner after changing block data.
 pub struct SkySourceScanner<'a> {
     world: &'a World,
+    overrides: Option<&'a BTreeMap<ChunkPos, Arc<Chunk>>>,
     bounds: LightBounds,
     require_full: bool,
     empty_sections: BTreeMap<(ChunkPos, i8), Option<bool>>,
@@ -100,6 +101,24 @@ impl<'a> SkySourceScanner<'a> {
     pub fn new(world: &'a World, bounds: LightBounds) -> Self {
         Self {
             world,
+            overrides: None,
+            bounds,
+            require_full: true,
+            empty_sections: BTreeMap::new(),
+        }
+    }
+
+    /// Scan historical chunk contents using the current world's state registry.
+    /// An override is used only while the corresponding live chunk is present.
+    /// Keep the supplied world and overrides immutable for this scanner's life.
+    pub fn with_chunk_overrides(
+        world: &'a World,
+        bounds: LightBounds,
+        overrides: &'a BTreeMap<ChunkPos, Arc<Chunk>>,
+    ) -> Self {
+        Self {
+            world,
+            overrides: Some(overrides),
             bounds,
             require_full: true,
             empty_sections: BTreeMap::new(),
@@ -107,8 +126,18 @@ impl<'a> SkySourceScanner<'a> {
     }
 
     pub fn load(&mut self, x: i32, z: i32) -> Option<SkyColumn> {
+        let position = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        let live = self.world.chunks.get(&position)?;
+        let chunk = self
+            .overrides
+            .and_then(|overrides| overrides.get(&position))
+            .unwrap_or(live);
         let lowest = scan(
             self.world,
+            chunk,
             self.bounds,
             x,
             z,
@@ -149,6 +178,7 @@ pub fn generated_chunk_sky_sources(
     base_z.checked_add(15)?;
     let mut scanner = SkySourceScanner {
         world,
+        overrides: None,
         bounds,
         require_full: false,
         empty_sections: BTreeMap::new(),
@@ -184,6 +214,7 @@ pub fn generated_chunk_sky_issue(world: &World, bounds: LightBounds, pos: ChunkP
     };
     let mut scanner = SkySourceScanner {
         world,
+        overrides: None,
         bounds,
         require_full: false,
         empty_sections: BTreeMap::new(),
@@ -215,6 +246,7 @@ pub fn generated_chunk_sky_issue(world: &World, bounds: LightBounds, pos: ChunkP
 
 struct ColumnReader<'a> {
     world: &'a World,
+    chunk: &'a Chunk,
     range: std::ops::Range<i32>,
     x: i32,
     z: i32,
@@ -239,12 +271,30 @@ impl<'a> ColumnReader<'a> {
             }
             .chunk(),
         )?;
-        if require_full && chunk.status.as_deref() != Some("minecraft:full") {
+        Self::with_chunk(world, chunk, bounds, x, z, require_full)
+    }
+
+    fn with_chunk(
+        world: &'a World,
+        chunk: &'a Chunk,
+        bounds: LightBounds,
+        x: i32,
+        z: i32,
+        require_full: bool,
+    ) -> Option<Self> {
+        let position = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        if chunk.position != position
+            || (require_full && chunk.status.as_deref() != Some("minecraft:full"))
+        {
             return None;
         }
         Some(Self {
             world,
-            range,
+            chunk,
+            range: bounds.build_range(),
             x,
             z,
             cache: BTreeMap::new(),
@@ -256,7 +306,14 @@ impl<'a> ColumnReader<'a> {
         if !self.range.contains(&y) {
             return Some(0);
         }
-        let id = self.world.block_id(self.x, y, self.z)?;
+        let section = self
+            .chunk
+            .sections
+            .get(&i8::try_from(y.div_euclid(16)).ok()?)?;
+        let index = self.x.rem_euclid(16) as usize
+            + self.z.rem_euclid(16) as usize * 16
+            + y.rem_euclid(16) as usize * 256;
+        let id = *section.blocks.as_ref()?.get(index)?;
         if let Some(&index) = self.cache.get(&id) {
             return Some(index);
         }
@@ -305,20 +362,20 @@ impl<'a> ColumnReader<'a> {
 
 fn scan(
     world: &World,
+    chunk: &Chunk,
     bounds: LightBounds,
     x: i32,
     z: i32,
     require_full: bool,
     empty_sections: &mut BTreeMap<(ChunkPos, i8), Option<bool>>,
 ) -> Option<i32> {
-    let mut reader = ColumnReader::new(world, bounds, x, z, require_full)?;
+    let mut reader = ColumnReader::with_chunk(world, chunk, bounds, x, z, require_full)?;
     let pos = BlockPosition {
         x,
         y: reader.range.start,
         z,
     }
     .chunk();
-    let chunk = world.chunks.get(&pos)?;
     let mut above = 0;
     for section_y in (reader.range.start.div_euclid(16)..reader.range.end.div_euclid(16)).rev() {
         let sy = i8::try_from(section_y).ok()?;
@@ -478,6 +535,34 @@ mod tests {
         let invalid = world.intern_state(state("air", &[("unknown", "true")]));
         world.set_block_id(15, 31, 15, invalid).unwrap();
         assert!(SkyColumn::load(&world, LightBounds::new(0, 32).unwrap(), 15, 15).is_none());
+    }
+
+    #[test]
+    fn scanner_uses_historical_chunks_without_replacing_the_live_world() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let original = Arc::clone(&world.chunks[&pos]);
+        let overrides = BTreeMap::from([(pos, original)]);
+        put(&mut world, 20, state("stone", &[]));
+        assert_eq!(
+            SkyColumn::load(&world, bounds, 15, 15)
+                .unwrap()
+                .lowest_source_y(),
+            21
+        );
+        let mut historical = SkySourceScanner::with_chunk_overrides(&world, bounds, &overrides);
+        assert_eq!(
+            historical.load(15, 15).unwrap().lowest_source_y(),
+            UNBOUNDED_SKY_SOURCE
+        );
+        assert_eq!(world.block(15, 20, 15).unwrap().name, "minecraft:stone");
+        world.chunks.remove(&pos);
+        assert!(
+            SkySourceScanner::with_chunk_overrides(&world, bounds, &overrides)
+                .load(15, 15)
+                .is_none()
+        );
     }
 
     #[test]

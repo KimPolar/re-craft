@@ -9,7 +9,7 @@ use native_world::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{self, Receiver, TryRecvError},
     },
 };
@@ -38,6 +38,13 @@ struct Reply {
     generation: u64,
     result: Option<(Computed, Vec<usize>)>,
     missing_chunks: BTreeSet<ChunkPos>,
+}
+
+struct LightUnchangedCache {
+    generation: u64,
+    bounds: LightBounds,
+    chunks: BTreeMap<ChunkPos, Arc<Chunk>>,
+    result: bool,
 }
 
 /// Identifies the pending work and source history used by a terrain-only
@@ -70,6 +77,7 @@ pub(crate) struct SkyLighting {
     originals: BTreeMap<ChunkPos, Arc<Chunk>>,
     sources: SkySources,
     applied_originals: BTreeMap<ChunkPos, Arc<Chunk>>,
+    unchanged_cache: Mutex<Option<LightUnchangedCache>>,
 }
 
 impl SkyLighting {
@@ -116,6 +124,9 @@ impl SkyLighting {
     }
 
     pub(crate) fn invalidate(&mut self) {
+        if let Ok(cache) = self.unchanged_cache.get_mut() {
+            *cache = None;
+        }
         if self.enabled {
             self.generation = self.generation.wrapping_add(1);
             self.missing_chunks.clear();
@@ -213,6 +224,9 @@ impl SkyLighting {
                         });
                         match result {
                             Some(((updated, sources, originals), completed)) => {
+                                if let Ok(cache) = self.unchanged_cache.get_mut() {
+                                    *cache = None;
+                                }
                                 let mut completed = completed.into_iter().peekable();
                                 let mut index = 0;
                                 self.pending.retain(|_| {
@@ -321,15 +335,48 @@ impl SkyLighting {
         self.pending.is_empty() && self.worker.is_none()
     }
 
-    /// Existing light remains valid when every pending edit has identical
-    /// verified sky behavior. Unknown states or any changed behavior do not qualify.
-    pub(crate) fn light_unchanged(&self, world: &World) -> bool {
-        self.pending.iter().all(|edit| {
-            let Some(new) = world.state(edit.new) else {
+    /// Reuse pending sky light only when its direct-source and section
+    /// allocation histories, as well as sky-light behavior, are unchanged.
+    pub(crate) fn light_unchanged(&self, world: &World, bounds: Option<LightBounds>) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        let Some(bounds) = bounds else {
+            return false;
+        };
+        if let Ok(cache) = self.unchanged_cache.lock()
+            && let Some(cache) = cache.as_ref()
+            && cache.generation == self.generation
+            && cache.bounds == bounds
+            && cache.chunks.iter().all(|(position, original)| {
+                world
+                    .chunks
+                    .get(position)
+                    .is_some_and(|current| Arc::ptr_eq(current, original))
+            })
+        {
+            return cache.result;
+        }
+        let mut chunks = BTreeMap::new();
+        for edit in &self.pending {
+            let position = edit.position.chunk();
+            let Some(chunk) = world.chunks.get(&position) else {
                 return false;
             };
-            !sky_change_for_edit(edit.old.and_then(|old| world.state(old)), new)
-        })
+            chunks.entry(position).or_insert_with(|| Arc::clone(chunk));
+        }
+        let result =
+            unchanged_light_proof(world, bounds, &self.pending, &self.originals, &self.sources)
+                .is_some();
+        if let Ok(mut cache) = self.unchanged_cache.lock() {
+            *cache = Some(LightUnchangedCache {
+                generation: self.generation,
+                bounds,
+                chunks,
+                result,
+            });
+        }
+        result
     }
 
     pub(crate) fn take_applied_originals(&mut self) -> BTreeMap<ChunkPos, Arc<Chunk>> {
@@ -534,6 +581,89 @@ fn observed_block_id(
         missing.insert(position.chunk());
     }
     id
+}
+
+/// Prove the narrow case in which queued edits cannot change the visible sky
+/// arrays. Different edits in one column need ordered intermediate states and
+/// are left for the light worker. A section that changes air status must have
+/// an untouched, known non-air block throughout the batch.
+fn unchanged_light_proof(
+    world: &World,
+    bounds: LightBounds,
+    edits: &[Edit],
+    originals: &BTreeMap<ChunkPos, Arc<Chunk>>,
+    sources: &SkySources,
+) -> Option<()> {
+    let mut columns = BTreeSet::new();
+    let mut indices = BTreeMap::<(ChunkPos, i8), BTreeSet<usize>>::new();
+    let mut needs_witness = BTreeSet::new();
+    for edit in edits {
+        let p = edit.position;
+        if !columns.insert((p.x, p.z)) || world.block_id(p.x, p.y, p.z)? != edit.new {
+            return None;
+        }
+        let old = world.state(edit.old?)?;
+        let new = world.state(edit.new)?;
+        if sky_change_for_edit(Some(old), new) {
+            return None;
+        }
+        let air = |state: &native_world::loaded::BlockState| {
+            let is_air = matches!(
+                state.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            );
+            (!is_air || state.properties.is_empty()).then_some(is_air)
+        };
+        let key = (p.chunk(), i8::try_from(p.y.div_euclid(16)).ok()?);
+        let chunk = world.chunks.get(&key.0)?;
+        if chunk.position != key.0
+            || chunk.status.as_deref() != Some("minecraft:full")
+            || !chunk.block_light_correct
+        {
+            return None;
+        }
+        let index = p.x.rem_euclid(16) as usize
+            + p.z.rem_euclid(16) as usize * 16
+            + p.y.rem_euclid(16) as usize * 256;
+        indices.entry(key).or_default().insert(index);
+        if air(old)? != air(new)? {
+            needs_witness.insert(key);
+        }
+    }
+    for key in needs_witness {
+        let blocks = world
+            .chunks
+            .get(&key.0)?
+            .sections
+            .get(&key.1)?
+            .blocks
+            .as_ref()?;
+        let edited = indices.get(&key)?;
+        let witness = blocks.iter().enumerate().any(|(index, &id)| {
+            !edited.contains(&index)
+                && world.state(id).is_some_and(|state| {
+                    !matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ) && same_sky_behavior(state, state) == Some(true)
+                })
+        });
+        if !witness {
+            return None;
+        }
+    }
+    let mut scanner = SkySourceScanner::with_chunk_overrides(world, bounds, originals);
+    for edit in edits {
+        let p = edit.position;
+        let mut column = sources
+            .get(&(p.x, p.z))
+            .copied()
+            .or_else(|| scanner.load(p.x, p.z))?;
+        if column.update(world, p.y) != Some(false) {
+            return None;
+        }
+    }
+    Some(())
 }
 
 /// Columns whose pending edits return both their sky-light behavior and
@@ -909,16 +1039,121 @@ mod tests {
     }
     #[test]
     fn pending_sky_light_is_reusable_only_for_equivalent_edits() {
+        let bounds = LightBounds::new(0, 32).unwrap();
         let mut world = fixture();
+        let witness = Arc::make_mut(&mut world).intern_state(state("glass", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(3, 0, 3, witness)
+            .unwrap();
         let mut sky = SkyLighting::default();
         sky.set_enabled(true);
         let first = BlockPosition { x: 1, y: 5, z: 1 };
         edit(&mut sky, &mut world, first, state("wheat", &[("age", "0")]));
         assert!(!sky.settled());
-        assert!(sky.light_unchanged(&world));
+        assert!(sky.light_unchanged(&world, Some(bounds)));
         let second = BlockPosition { x: 2, y: 5, z: 1 };
         edit(&mut sky, &mut world, second, state("stone", &[]));
-        assert!(!sky.light_unchanged(&world));
+        assert!(!sky.light_unchanged(&world, Some(bounds)));
+    }
+
+    #[test]
+    fn equivalent_sky_behavior_does_not_prove_an_unchanged_source() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let position = BlockPosition { x: 15, y: 0, z: 15 };
+        let slab = Arc::make_mut(&mut world).intern_state(state(
+            "stone_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        ));
+        Arc::make_mut(&mut world)
+            .set_block_id(position.x, position.y, position.z, slab)
+            .unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        sky.sources.insert(
+            (position.x, position.z),
+            SkyColumn::load(&world, bounds, position.x, position.z).unwrap(),
+        );
+        edit(
+            &mut sky,
+            &mut world,
+            position,
+            state("oak_slab", &[("type", "bottom"), ("waterlogged", "false")]),
+        );
+        assert!(!sky.settled());
+        assert!(!sky.light_unchanged(&world, Some(bounds)));
+    }
+
+    #[test]
+    fn equivalent_sky_behavior_does_not_prove_section_allocation() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 1, y: 5, z: 1 },
+            state("glass", &[]),
+        );
+        assert!(!sky.settled());
+        assert!(!sky.light_unchanged(&world, Some(bounds)));
+    }
+
+    #[test]
+    fn neutral_light_proof_rechecks_changed_chunk_and_bounds() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let witness = Arc::make_mut(&mut world).intern_state(state("glass", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(3, 0, 3, witness)
+            .unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 1, y: 5, z: 1 },
+            state("wheat", &[("age", "0")]),
+        );
+        assert!(sky.light_unchanged(&world, Some(bounds)));
+        assert!(sky.light_unchanged(&world, Some(bounds)));
+        assert!(!sky.light_unchanged(&world, None));
+        let air = Arc::make_mut(&mut world).intern_state(state("air", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(3, 0, 3, air)
+            .unwrap();
+        assert!(!sky.light_unchanged(&world, Some(bounds)));
+        Arc::make_mut(&mut world)
+            .set_block_id(3, 0, 3, witness)
+            .unwrap();
+        assert!(sky.light_unchanged(&world, Some(bounds)));
+    }
+
+    #[test]
+    fn neutral_light_proof_requires_ordered_state_for_repeated_columns() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let witness = Arc::make_mut(&mut world).intern_state(state("glass", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(3, 0, 3, witness)
+            .unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 1, y: 5, z: 1 },
+            state("glass", &[]),
+        );
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { x: 1, y: 6, z: 1 },
+            state("glass", &[]),
+        );
+        assert_eq!(sky.pending.len(), 2);
+        assert!(!sky.light_unchanged(&world, Some(bounds)));
     }
     #[test]
     fn worker_applies_sky_to_current_world_and_preserves_snapshot() {

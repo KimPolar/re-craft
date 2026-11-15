@@ -16488,9 +16488,7 @@ impl LoadedSession {
     }
 
     fn crop_brightness(&self, relative: IVec3, minimum: u8) -> Option<u8> {
-        if !self.pending_light.is_empty()
-            || !(self.sky_lighting.settled() || self.sky_lighting.light_unchanged(&self.world))
-        {
+        if !self.pending_light.is_empty() {
             return None;
         }
         let absolute = add(self.origin, relative)?;
@@ -16513,6 +16511,12 @@ impl LoadedSession {
             return Some(block);
         }
         if self.sky_lighting.capability() != Some(true) {
+            return None;
+        }
+        let bounds =
+            native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
+        if !(self.sky_lighting.settled() || self.sky_lighting.light_unchanged(&self.world, bounds))
+        {
             return None;
         }
         self.world
@@ -33464,9 +33468,29 @@ pub(crate) mod tests {
     fn crop_neighbor_check_keeps_crops_after_light_equivalent_planting() {
         let position = IVec3::new(8, 2, 8);
         let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        let air = session.states[0];
+        let chunk = Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .values_mut()
+                .next()
+                .unwrap(),
+        );
+        chunk.sections.insert(
+            1,
+            Arc::new(Section {
+                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                biomes: None,
+                block_light: None,
+                sky_light: None,
+            }),
+        );
         let neighbor = session.intern_block(state("minecraft:carrots", &[("age", "0")]));
         assert!(session.set(position + IVec3::X, neighbor));
-        assert!(session.sky_lighting.light_unchanged(&session.world));
+        assert!(session.sky_lighting.light_unchanged(
+            &session.world,
+            native_world::block_light::LightBounds::new(session.bounds.min_y, session.bounds.max_y)
+        ));
         assert!(!session.unresolved_crop_shape);
         let absolute = add(session.origin, position).unwrap();
         assert_eq!(
@@ -33490,6 +33514,23 @@ pub(crate) mod tests {
         let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
         section.block_light = Some(Box::new([0x88; LIGHT_BYTES]));
         assert_eq!(session.crop_brightness(position, 8), Some(8));
+    }
+
+    #[test]
+    fn crop_can_use_sufficient_block_light_while_sky_light_waits() {
+        let position = IVec3::new(8, 2, 8);
+        let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        let world = Arc::make_mut(&mut session.world);
+        let chunk = Arc::make_mut(world.chunks.values_mut().next().unwrap());
+        Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).block_light =
+            Some(Box::new([0x88; LIGHT_BYTES]));
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(12, 5, 8), water, false));
+        assert!(session.pending_light.is_empty());
+        assert!(!session.sky_lighting.settled());
+        assert_eq!(session.crop_brightness(position, 8), Some(8));
+        assert_eq!(session.crop_brightness(position, 9), None);
+        assert_eq!(session.crop_can_survive(position), Some(true));
     }
 
     #[test]

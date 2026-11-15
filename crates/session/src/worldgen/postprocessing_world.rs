@@ -24,6 +24,10 @@ use super::{
     },
 };
 
+#[cfg(test)]
+#[path = "postprocessing_world_kelp_tests.rs"]
+mod kelp_shape_tests;
+
 /// Block entities owned by the converted LevelChunk, isolated from the protochunk.
 #[derive(Clone, Default)]
 pub(super) struct ConvertedBlockEntities {
@@ -1775,12 +1779,9 @@ fn bubble_column_drag(state: &BlockState) -> Option<bool> {
     }
 }
 
-fn aquatic_source_plant(state: &BlockState) -> bool {
-    super::ore::valid_generated_kelp(state)
-        || (matches!(
-            state.name.as_str(),
-            "minecraft:seagrass" | "minecraft:tall_seagrass"
-        ) && native_world::block_light::same_light_behavior(state, state) == Some(true))
+fn tall_seagrass_source(state: &BlockState) -> bool {
+    state.name == "minecraft:tall_seagrass"
+        && native_world::block_light::same_light_behavior(state, state) == Some(true)
 }
 
 fn short_seagrass(state: &BlockState) -> bool {
@@ -2055,7 +2056,7 @@ impl GeneratedBlockView<'_> {
                 Cell::OpenDry
             };
         }
-        if short_seagrass(state) {
+        if short_seagrass(state) || super::ore::valid_generated_kelp(state) {
             return Cell::OpenWater(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
                 amount: 8,
@@ -2191,10 +2192,10 @@ impl GeneratedBlockView<'_> {
         // Unknown rules must yield the same plan for both possible values.
         // Water's delay is fixed and never samples lava's delay RNG.
         let mut planned = None;
-        // Aquatic plants contain source water and have an empty collision
-        // shape. Prove a no-op before accepting them: live changes still need
-        // the plants' shape callbacks and may need the level RNG.
-        let consulted_plant = std::cell::Cell::new(false);
+        // Tall seagrass contains source water and has an empty collision
+        // shape. Prove a no-op before accepting it: live changes still need
+        // both halves' shape callbacks.
+        let consulted_tall_seagrass = std::cell::Cell::new(false);
         for converts in [false, true] {
             if fluid.kind == FluidKind::Water
                 && self
@@ -2235,9 +2236,9 @@ impl GeneratedBlockView<'_> {
                             if fluid.kind == FluidKind::Water
                                 && self
                                     .read(p.to_array())
-                                    .is_ok_and(|state| aquatic_source_plant(&state)) =>
+                                    .is_ok_and(|state| tall_seagrass_source(&state)) =>
                         {
-                            consulted_plant.set(true);
+                            consulted_tall_seagrass.set(true);
                             Cell::OpenWater(native_world::fluid::FluidState {
                                 kind: FluidKind::Water,
                                 amount: 8,
@@ -2267,8 +2268,8 @@ impl GeneratedBlockView<'_> {
             return Ok(());
         }
         ensure!(
-            !consulted_plant.get(),
-            "generated fluid changes need aquatic plant neighbor callbacks"
+            !consulted_tall_seagrass.get(),
+            "generated fluid changes need tall seagrass neighbor callbacks"
         );
         use native_world::fluid_sim::ChangedBlock;
         if fluid.kind == FluidKind::Lava
@@ -3535,6 +3536,15 @@ impl GeneratedBlockView<'_> {
                     next,
                     depth - 1,
                 )?;
+            } else if super::ore::valid_generated_kelp(&state) {
+                self.update_water_kelp(
+                    p.to_array(),
+                    &state,
+                    [-d[0], -d[1], -d[2]],
+                    target.to_array(),
+                    next,
+                    depth - 1,
+                )?;
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
             {
@@ -3747,6 +3757,15 @@ impl GeneratedBlockView<'_> {
                     changed,
                     depth - 1,
                 )?;
+            } else if super::ore::valid_generated_kelp(&state) {
+                self.update_water_kelp(
+                    neighbor,
+                    &state,
+                    [-d[0], -d[1], -d[2]],
+                    pos,
+                    changed,
+                    depth - 1,
+                )?;
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
             {
@@ -3809,6 +3828,27 @@ impl GeneratedBlockView<'_> {
             );
             self.destroy_water_contained_block(pos, state, true, depth)?;
             self.destroyed_plant_during_mark.insert(pos);
+        }
+        Ok(())
+    }
+
+    fn update_water_kelp(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        direction: [i32; 3],
+        changed_pos: [i32; 3],
+        changed: &BlockState,
+        depth: usize,
+    ) -> Result<()> {
+        let next = self.update_shape(pos, state, direction, changed_pos, changed)?;
+        if next != *state {
+            ensure!(
+                super::ore::valid_generated_kelp(&next),
+                "invalid kelp shape update"
+            );
+            self.write_postprocessed_state(pos, state, &next)?;
+            self.update_water_shape_neighbors(pos, &next, depth)?;
         }
         Ok(())
     }
@@ -3922,6 +3962,10 @@ impl GeneratedBlockView<'_> {
                 nonempty >= 2,
                 "water removal requires light section allocation update"
             );
+            return self.write_postprocessed_state(pos, &old, next);
+        }
+        if super::ore::valid_generated_kelp(&old) && super::ore::valid_generated_kelp(next) {
+            ensure!(flags == 276, "unsupported generated kelp shape write");
             return self.write_postprocessed_state(pos, &old, next);
         }
         if ladder_state(&old).is_some() || short_seagrass(&old) {
@@ -4404,6 +4448,99 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if super::ore::valid_generated_kelp(state) {
+            ensure!(
+                matches!(
+                    direction,
+                    [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1] | [-1, 0, 0] | [1, 0, 0]
+                ),
+                "invalid kelp update direction"
+            );
+            let body = state.name == "minecraft:kelp_plant";
+            if direction == [0, -1, 0] {
+                let below = self.read([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+                let is_kelp = matches!(
+                    below.name.as_str(),
+                    "minecraft:kelp" | "minecraft:kelp_plant"
+                );
+                if is_kelp {
+                    ensure!(
+                        super::ore::valid_generated_kelp(&below),
+                        "invalid kelp support state"
+                    );
+                }
+                static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
+                    std::sync::OnceLock::new();
+                let tag = TAG.get_or_init(|| {
+                    native_resources::packs::ResourceId::parse("minecraft:cannot_support_kelp")
+                        .expect("static tag identifier")
+                });
+                let forbidden = self
+                    .aquatic_tags
+                    .context("kelp support tags unavailable")?
+                    .contains(tag, &below.name)?;
+                let survives = !forbidden
+                    && (is_kelp || super::ore::generation_face_sturdy(&below, [0, 1, 0])?);
+                if !survives {
+                    ensure!(
+                        self.ticks
+                            .schedule(TickRegistry::Block, &state.name, pos, 1, 0)?
+                            != ScheduleOutcome::MissingChunk,
+                        "kelp block tick container is missing"
+                    );
+                } else if !body {
+                    let above = self.read([pos[0], pos[1].wrapping_add(1), pos[2]])?;
+                    if matches!(
+                        above.name.as_str(),
+                        "minecraft:kelp" | "minecraft:kelp_plant"
+                    ) {
+                        ensure!(
+                            super::ore::valid_generated_kelp(&above),
+                            "invalid kelp above head"
+                        );
+                        return Ok(BlockState {
+                            name: "minecraft:kelp_plant".into(),
+                            properties: BTreeMap::new(),
+                        });
+                    }
+                }
+            }
+            if direction == [0, 1, 0] {
+                let neighbor_is_kelp = matches!(
+                    neighbor.name.as_str(),
+                    "minecraft:kelp" | "minecraft:kelp_plant"
+                );
+                if neighbor_is_kelp {
+                    ensure!(
+                        super::ore::valid_generated_kelp(neighbor),
+                        "invalid kelp neighbor"
+                    );
+                }
+                if body && !neighbor_is_kelp {
+                    let drops = self
+                        .block_drops
+                        .as_mut()
+                        .context("kelp conversion requires the shared level random stream")?;
+                    let mut random = drops.level_random().clone();
+                    let age = random
+                        .next_int_bound(25)
+                        .context("invalid kelp age bound")?;
+                    drops.set_level_random(random);
+                    return Ok(BlockState {
+                        name: "minecraft:kelp".into(),
+                        properties: BTreeMap::from([("age".into(), age.to_string())]),
+                    });
+                }
+                if !body && neighbor_is_kelp {
+                    return Ok(BlockState {
+                        name: "minecraft:kelp_plant".into(),
+                        properties: BTreeMap::new(),
+                    });
+                }
+            }
+            self.schedule_contained_water(pos)?;
+            return Ok(state.clone());
+        }
         if short_seagrass(state) {
             let below = self.read([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
             let sturdy = super::ore::generation_face_sturdy(&below, [0, 1, 0])?;
@@ -4734,7 +4871,7 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         self.read(pos)
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
-        if short_seagrass(state) {
+        if short_seagrass(state) || super::ore::valid_generated_kelp(state) {
             return Ok(self
                 .fluid_cell_from_state(state, glam::IVec3::ZERO)
                 .contained_fluid());
@@ -5582,7 +5719,7 @@ mod tests {
             .unwrap()
     }
 
-    fn fixture(unsupported: bool) -> (GeneratedPostprocessing, Arc<World>, ChunkPos) {
+    pub(super) fn fixture(unsupported: bool) -> (GeneratedPostprocessing, Arc<World>, ChunkPos) {
         let pos = ChunkPos { x: 0, z: 0 };
         let mut world = World::new("minecraft:overworld");
         let state = |name: &str| BlockState {
@@ -9509,17 +9646,17 @@ mod tests {
             }
             case if case.starts_with("aquatic_noop_")
                 || case.starts_with("aquatic_flow_")
-                || case == "kelp_change"
                 || case == "kelp_invalid"
                 || case == "seagrass_change"
+                || case == "tall_seagrass_change"
                 || case == "seagrass_invalid" =>
             {
-                let (kind, direction) = if case == "kelp_change" {
-                    ("body", "below")
-                } else if case == "kelp_invalid" {
+                let (kind, direction) = if case == "kelp_invalid" {
                     ("26", "below")
                 } else if case == "seagrass_change" {
                     ("short", "below")
+                } else if case == "tall_seagrass_change" {
+                    ("lower", "below")
                 } else if case == "seagrass_invalid" {
                     ("invalid", "below")
                 } else {
@@ -9558,8 +9695,42 @@ mod tests {
                     });
                     world.set_block_id(8, 8, 8, flowing).unwrap();
                 }
-                if matches!(case, "kelp_change" | "seagrass_change") {
+                if matches!(case, "seagrass_change" | "tall_seagrass_change") {
                     world.set_block_id(9, 8, 8, air).unwrap();
+                }
+            }
+            case if case.starts_with("kelp_live_") => {
+                let head = case.contains("_head");
+                let plant = world.intern_state(BlockState {
+                    name: if head {
+                        "minecraft:kelp"
+                    } else {
+                        "minecraft:kelp_plant"
+                    }
+                    .into(),
+                    properties: if head {
+                        BTreeMap::from([("age".into(), "17".into())])
+                    } else {
+                        BTreeMap::new()
+                    },
+                });
+                if case.contains("_side_") {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                    world.set_block_id(9, 7, 8, plant).unwrap();
+                } else if case.contains("_over_") || case.contains("_under_") {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                    world
+                        .set_block_id(9, if case.contains("_over_") { 7 } else { 9 }, 8, plant)
+                        .unwrap();
+                } else {
+                    world.set_block_id(8, 8, 8, plant).unwrap();
+                    if case.ends_with("_chain") {
+                        let body = world.intern_state(BlockState {
+                            name: "minecraft:kelp_plant".into(),
+                            properties: BTreeMap::new(),
+                        });
+                        world.set_block_id(8, 9, 8, body).unwrap();
+                    }
                 }
             }
             case if case.starts_with("seagrass_neighbor_")
@@ -10359,6 +10530,8 @@ mod tests {
             "ladder",
             "glow_lichen",
             "seagrass",
+            "kelp",
+            "kelp_plant",
             "sulfur_spike",
             "pointed_dripstone",
             "grass_block",
@@ -10397,6 +10570,34 @@ mod tests {
             stage.set_aquatic_tags(Some(Arc::new(
                 native_resources::ore_feature::OreBlockTags::load(
                     &mut SeagrassTags(case.ends_with("_tagged")),
+                    &registry,
+                    &BTreeSet::from([tag]),
+                )
+                .unwrap(),
+            )));
+        }
+        if case.starts_with("kelp_live_") && !case.ends_with("_missing_tag") {
+            struct KelpTags(bool);
+            impl ResourceProvider for KelpTags {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    if path == "data/minecraft/tags/block/cannot_support_kelp.json" {
+                        return Ok(Some(if self.0 {
+                            br#"{"values":["minecraft:stone"]}"#.to_vec()
+                        } else {
+                            br#"{"values":[]}"#.to_vec()
+                        }));
+                    }
+                    Ok(None)
+                }
+            }
+            let tag = native_resources::packs::ResourceId::parse("minecraft:cannot_support_kelp")
+                .unwrap();
+            stage.set_aquatic_tags(Some(Arc::new(
+                native_resources::ore_feature::OreBlockTags::load(
+                    &mut KelpTags(case.ends_with("_tagged")),
                     &registry,
                     &BTreeSet::from([tag]),
                 )
@@ -10593,11 +10794,14 @@ mod tests {
                 .unwrap();
         }
         stage.required = stage.region.tasks.keys().copied().collect();
-        if matches!(case, "kelp_change" | "kelp_invalid" | "seagrass_invalid") {
+        if matches!(
+            case,
+            "kelp_invalid" | "seagrass_invalid" | "tall_seagrass_change"
+        ) {
             let before_ticks = stage.region.ticks.activated_snapshot();
             let error = stage.try_poll(chunk, 1).unwrap_err();
-            let expected = if case == "kelp_change" {
-                "generated fluid changes need aquatic plant neighbor callbacks"
+            let expected = if case == "tall_seagrass_change" {
+                "generated fluid changes need tall seagrass neighbor callbacks"
             } else {
                 "unsupported block state"
             };
@@ -10696,6 +10900,51 @@ mod tests {
                     ),
                 )
                 .unwrap();
+        }
+        if case.starts_with("kelp_live_") && !case.ends_with("_no_random") {
+            stage
+                .set_block_drops(
+                    super::super::postprocessing_drops::GeneratedBlockDrops::new(
+                        Arc::new(native_resources::loot::BlockLootTables::load(&mut Tags).unwrap()),
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                        native_core::random::LegacyRandom::new(42),
+                        native_core::random::XoroshiroRandom::new(77),
+                        true,
+                    ),
+                )
+                .unwrap();
+        }
+        if matches!(
+            case,
+            "kelp_live_over_body_no_random" | "kelp_live_under_body_missing_tag"
+        ) {
+            let before_ticks = stage.region.ticks.activated_snapshot();
+            let before_random = stage
+                .block_drops
+                .as_ref()
+                .map(|drops| drops.level_random().state());
+            let error = stage.try_poll(chunk, 1).unwrap_err();
+            let message = if case.ends_with("_no_random") {
+                "kelp conversion requires the shared level random stream"
+            } else {
+                "kelp support tags unavailable"
+            };
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(
+                stage
+                    .block_drops
+                    .as_ref()
+                    .map(|drops| drops.level_random().state()),
+                before_random
+            );
+            assert_eq!(stage.world.block(8, 8, 8), source.block(8, 8, 8));
+            assert_eq!(stage.world.block(9, 8, 8), source.block(9, 8, 8));
+            assert_eq!(stage.world.block(9, 7, 8), source.block(9, 7, 8));
+            assert_eq!(stage.world.block(9, 9, 8), source.block(9, 9, 8));
+            assert!(stage.edits.is_empty());
+            return vec!["rolled back".into()];
         }
         if matches!(
             case,
@@ -11155,6 +11404,21 @@ mod tests {
                 state.properties.get("level").map_or("-", String::as_str)
             ));
         }
+        if case.starts_with("kelp_live_") {
+            let [x, y, z] = if case.contains("_side_") || case.contains("_over_") {
+                [9, 7, 8]
+            } else if case.contains("_under_") {
+                [9, 9, 8]
+            } else {
+                [8, 8, 8]
+            };
+            let state = result.world.block(x, y, z).unwrap();
+            trace.push(format!(
+                "kelp {x},{y},{z} {} {}",
+                state.name,
+                state.properties.get("age").map_or("-", String::as_str)
+            ));
+        }
         if case.starts_with("bubble_") {
             for y in 8..=9 {
                 let state = result.world.block(8, y, 8).unwrap();
@@ -11266,7 +11530,10 @@ mod tests {
             }
         }
         trace.push(format!("counter {}", result.ticks.next_sub_tick()));
-        if case.starts_with("lava_rise_") || case.starts_with("lava_convert_") {
+        if case.starts_with("lava_rise_")
+            || case.starts_with("lava_convert_")
+            || case.starts_with("kelp_live_")
+        {
             trace.push(format!(
                 "random {}",
                 result
@@ -12209,9 +12476,48 @@ mod tests {
 
     #[test]
     fn aquatic_plant_fluid_changes_and_invalid_states_roll_back() {
-        assert_eq!(water_spread_trace("kelp_change"), ["rolled back"]);
         assert_eq!(water_spread_trace("kelp_invalid"), ["rolled back"]);
         assert_eq!(water_spread_trace("seagrass_invalid"), ["rolled back"]);
+        assert_eq!(water_spread_trace("tall_seagrass_change"), ["rolled back"]);
+    }
+
+    #[test]
+    fn kelp_missing_random_and_support_tags_roll_back() {
+        assert_eq!(
+            water_spread_trace("kelp_live_over_body_no_random"),
+            ["rolled back"]
+        );
+        assert_eq!(
+            water_spread_trace("kelp_live_under_body_missing_tag"),
+            ["rolled back"]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn kelp_water_updates_match_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["kelp_postprocessing"],
+        );
+        let expected: Vec<_> = [
+            "kelp_live_side_body",
+            "kelp_live_side_head",
+            "kelp_live_over_body",
+            "kelp_live_over_head",
+            "kelp_live_under_body",
+            "kelp_live_under_head",
+            "kelp_live_marked_body",
+            "kelp_live_marked_body_tagged",
+            "kelp_live_marked_head",
+            "kelp_live_marked_head_tagged",
+            "kelp_live_marked_head_chain",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -12559,7 +12865,7 @@ mod tests {
         assert!(stage.finish().is_err());
     }
 
-    fn java_results(class_name: &str, java_source: &str) -> Vec<String> {
+    pub(super) fn java_results(class_name: &str, java_source: &str) -> Vec<String> {
         java_results_with_args(class_name, java_source, &[])
     }
 

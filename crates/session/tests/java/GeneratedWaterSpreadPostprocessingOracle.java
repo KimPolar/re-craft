@@ -241,6 +241,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("seagrass_postprocessing")) {
             scenarios.clear();scenarios.addAll(List.of("seagrass_change","seagrass_neighbor_stable","seagrass_neighbor_tagged","seagrass_neighbor_broken","marked_seagrass_stable","marked_seagrass_side","marked_seagrass_tagged","marked_seagrass_unsupported"));
         }
+        if(args.length>0 && args[0].equals("kelp_postprocessing")) {
+            scenarios.clear();scenarios.addAll(List.of("kelp_live_side_body","kelp_live_side_head","kelp_live_over_body","kelp_live_over_head","kelp_live_under_body","kelp_live_under_head","kelp_live_marked_body","kelp_live_marked_body_tagged","kelp_live_marked_head","kelp_live_marked_head_tagged","kelp_live_marked_head_chain"));
+        }
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("building_barriers")){
             scenarios.clear();for(var name:List.of("oak_planks","deepslate_bricks","light_blue_concrete","white_wool","blue_ice"))scenarios.add("barrier_"+name);
@@ -293,7 +296,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     scenarios.add("snow_"+kind+"_"+name+"_"+initial+"_"+tagged);
         }
         for(String scenario:scenarios) {
-            bind.invoke(Blocks.STONE.builtInRegistryHolder(),scenario.endsWith("_tagged")?List.of(BlockTags.CANNOT_SUPPORT_SEAGRASS):List.of());
+            bind.invoke(Blocks.STONE.builtInRegistryHolder(),scenario.endsWith("_tagged")?List.of(scenario.startsWith("kelp_live_")?BlockTags.CANNOT_SUPPORT_KELP:BlockTags.CANNOT_SUPPORT_SEAGRASS):List.of());
             bind.invoke(Fluids.LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_flowing_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_source_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
@@ -592,6 +595,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 if(scenario.endsWith("_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
                 if(scenario.endsWith("_unsupported"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             }
+            if(scenario.startsWith("kelp_live_")) {
+                var plant=scenario.contains("_head")?Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,17):Blocks.KELP_PLANT.defaultBlockState();
+                if(scenario.contains("_side_")){blocks.put(pos.below(),Blocks.AIR.defaultBlockState());blocks.put(pos.below().east(),plant);}
+                else if(scenario.contains("_over_") || scenario.contains("_under_")){
+                    blocks.put(pos.east(),Blocks.AIR.defaultBlockState());blocks.put(scenario.contains("_over_")?pos.east().below():pos.east().above(),plant);
+                } else {
+                    blocks.put(pos,plant);
+                    if(scenario.endsWith("_chain"))blocks.put(pos.above(),Blocks.KELP_PLANT.defaultBlockState());
+                }
+            }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
             var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
@@ -602,7 +615,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             counter=2;random=RandomSource.create(42);set(level,"random",random);updater=new CollectingNeighborUpdater(level,100000);
             chunk.postProcessGeneration(level);
             long nextRandom=random.nextLong();
-            if(!scenario.startsWith("lava_rise_") && !scenario.startsWith("lava_convert_") && nextRandom!=RandomSource.create(42).nextLong())throw new AssertionError("unexpected random use");
+            if(!scenario.startsWith("lava_rise_") && !scenario.startsWith("lava_convert_") && !scenario.startsWith("kelp_live_") && nextRandom!=RandomSource.create(42).nextLong())throw new AssertionError("unexpected random use");
             out.println("case "+scenario);
             for(var p:List.of(pos,pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
                 var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
@@ -621,6 +634,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(scenario.startsWith("seagrass_neighbor_")) {
                 var p=pos.below().east();var s=get(p);
                 out.printf("plant %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.is(Blocks.WATER)?s.getValue(LiquidBlock.LEVEL):"-");
+            }
+            if(scenario.startsWith("kelp_live_")) {
+                var p=scenario.contains("_side_")?pos.below().east():scenario.contains("_over_")?pos.east().below():scenario.contains("_under_")?pos.east().above():pos;
+                var s=get(p);out.printf("kelp %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.is(Blocks.KELP)?s.getValue(GrowingPlantHeadBlock.AGE):"-");
             }
             if(scenario.startsWith("bubble_"))for(int y=8;y<=9;y++){
                 var s=get(new BlockPos(8,y,8));
@@ -645,7 +662,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             for(var tick:ft.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:eastFt.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             out.println("counter "+counter);
-            if(scenario.startsWith("lava_rise_") || scenario.startsWith("lava_convert_"))out.println("random "+nextRandom);
+            if(scenario.startsWith("lava_rise_") || scenario.startsWith("lava_convert_") || scenario.startsWith("kelp_live_"))out.println("random "+nextRandom);
         }
         out.println("END_RESULT");
     }

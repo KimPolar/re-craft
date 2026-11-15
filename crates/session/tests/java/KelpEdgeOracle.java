@@ -33,6 +33,7 @@ public class KelpEdgeOracle {
         var aboveStates = List.of(Blocks.AIR.defaultBlockState(), kelp, body);
         var neighbors = List.of(Blocks.AIR.defaultBlockState(), Blocks.STONE.defaultBlockState(), kelp, body);
         var pos = new BlockPos(8, 8, 8);
+        out.println("BEGIN_RESULT");
         for (int mask = 0; mask < 4; mask++) {
             var tagged = new ArrayList<Holder<Block>>();
             if ((mask & 1) != 0) tagged.add(Blocks.STONE.builtInRegistryHolder());
@@ -88,5 +89,6 @@ public class KelpEdgeOracle {
                     blocks.size(), fluids.size(), requests.isEmpty() ? "-" : String.join("", requests), random.nextInt());
             }
         }
+        out.println("END_RESULT");
     }
 }

@@ -66,7 +66,13 @@ impl CapturedPostprocessingTags {
                 &["minecraft:overrides_mushroom_light_requirement"],
             )?,
             leaf: load_tags(provider, &["minecraft:prevents_nearby_leaf_decay"])?,
-            aquatic: load_tags(provider, &["minecraft:cannot_support_seagrass"])?,
+            aquatic: load_tags(
+                provider,
+                &[
+                    "minecraft:cannot_support_seagrass",
+                    "minecraft:cannot_support_kelp",
+                ],
+            )?,
             snow: load_tags(provider, &["minecraft:snow"])?,
             fence: load_tags(
                 provider,

@@ -2240,7 +2240,10 @@ impl FreshTerrainBatch {
         let aquatic_tags = native_resources::ore_feature::OreBlockTags::load(
             provider,
             &block_registry,
-            &BTreeSet::from([ResourceId::parse("minecraft:cannot_support_seagrass")?]),
+            &BTreeSet::from([
+                ResourceId::parse("minecraft:cannot_support_seagrass")?,
+                ResourceId::parse("minecraft:cannot_support_kelp")?,
+            ]),
         )
         .ok()
         .map(Arc::new);

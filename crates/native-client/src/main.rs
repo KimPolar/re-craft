@@ -1214,6 +1214,10 @@ fn prepare_world_with_session(
             Ok(tag) => session.set_farmland_water_tag(Arc::new(tag)),
             Err(error) => eprintln!("Farmland water fluid tag is unavailable: {error:#}"),
         }
+        match native_resources::fluid_tags::load_lava(&mut resources) {
+            Ok(tag) => session.set_lava_fluid_tag(Arc::new(tag)),
+            Err(error) => eprintln!("Lava fluid tag is unavailable: {error:#}"),
+        }
         session
             .set_has_skylight(profile.has_skylight)
             .map_err(anyhow::Error::msg)?;

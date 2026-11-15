@@ -1467,6 +1467,7 @@ pub struct LoadedSession {
     crop_soils: Option<Arc<BTreeSet<String>>>,
     crop_supports: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
+    lava_fluid_tag: Option<u8>,
     washed_away_blocks: Option<Arc<BTreeSet<String>>>,
     weather: Option<crate::weather::Weather>,
     weather_tick_order: Vec<WeatherTickLevel>,
@@ -7646,19 +7647,12 @@ impl LoadedSession {
     }
 
     pub fn set_farmland_water_tag(&mut self, tag: Arc<BTreeSet<String>>) {
-        let bits = [
-            "minecraft:empty",
-            "minecraft:water",
-            "minecraft:flowing_water",
-            "minecraft:lava",
-            "minecraft:flowing_lava",
-        ]
-        .into_iter()
-        .enumerate()
-        .fold(0_u8, |bits, (index, name)| {
-            bits | (u8::from(tag.contains(name)) << index)
-        });
-        self.farmland_water_tag = Some(bits);
+        self.farmland_water_tag = Some(fluid_tag_bits(&tag));
+    }
+
+    /// Preserve the active lava tag when certifying water-related callbacks.
+    pub fn set_lava_fluid_tag(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.lava_fluid_tag = Some(fluid_tag_bits(&tag));
     }
 
     /// Unknown dimension or weather data prevents speculative precipitation decisions.
@@ -8643,6 +8637,7 @@ impl LoadedSession {
             crop_soils: None,
             crop_supports: None,
             farmland_water_tag: None,
+            lava_fluid_tag: None,
             washed_away_blocks: None,
             weather: None,
             weather_source: None,
@@ -23431,21 +23426,41 @@ impl LoadedSession {
             if fluid.kind != scheduled.key.kind || fluid.source != scheduled.key.source {
                 continue;
             }
-            if is_bubble_column {
-                self.unresolved_bubble_tick = true;
-            }
-            let (retry_wash, result) = {
+            const WATER_TYPES: u8 = (1 << 1) | (1 << 2);
+            let bubble_complete = is_bubble_column.then(|| {
+                std::cell::Cell::new(
+                    !self.notifying_blocks
+                        && self.block_notifications.is_empty()
+                        && self
+                            .farmland_water_tag
+                            .is_some_and(|tag| tag & WATER_TYPES == WATER_TYPES)
+                        && self
+                            .lava_fluid_tag
+                            .is_some_and(|tag| tag & WATER_TYPES == 0),
+                )
+            });
+            let (retry_wash, bubble_complete, result) = {
                 let mut live = SessionFluidTick {
                     session: self,
                     settings,
                     kind: fluid.kind,
                     retry_wash: false,
+                    bubble_complete,
                 };
                 // Existing gameplay treats unsupported or unloaded cells as
                 // barriers. Generation uses the strict variant instead.
                 let result = fluid_sim::tick_live(&mut live, relative, fluid, settings);
-                (live.retry_wash, result)
+                (
+                    live.retry_wash,
+                    live.bubble_complete
+                        .as_ref()
+                        .is_none_or(|value| value.get()),
+                    result,
+                )
             };
+            if is_bubble_column && (!bubble_complete || retry_wash || result.is_err()) {
+                self.unresolved_bubble_tick = true;
+            }
             match result {
                 Ok(()) => {}
                 // Barrier mode cannot fail on a later unknown read, so these
@@ -26183,6 +26198,185 @@ struct SessionFluidTick<'a> {
     settings: fluid_sim::Settings,
     kind: FluidKind,
     retry_wash: bool,
+    // Only a bubble-column tick can use this proof to authorize saving.
+    bubble_complete: Option<std::cell::Cell<bool>>,
+}
+
+fn fluid_tag_bits(tag: &BTreeSet<String>) -> u8 {
+    [
+        "minecraft:empty",
+        "minecraft:water",
+        "minecraft:flowing_water",
+        "minecraft:lava",
+        "minecraft:flowing_lava",
+    ]
+    .into_iter()
+    .enumerate()
+    .fold(0_u8, |bits, (index, name)| {
+        bits | (u8::from(tag.contains(name)) << index)
+    })
+}
+
+fn bubble_proof_water(state: &BlockState) -> Option<FluidState> {
+    if state.name != "minecraft:water"
+        || state.properties.len() != 1
+        || !matches!(
+            state.properties.get("level").map(String::as_str),
+            Some(
+                "0" | "1"
+                    | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "10"
+                    | "11"
+                    | "12"
+                    | "13"
+                    | "14"
+                    | "15"
+            )
+        )
+    {
+        return None;
+    }
+    FluidState::from_block(state).ok().flatten()
+}
+
+fn bubble_proof_water_level(fluid: FluidState) -> Option<u8> {
+    if fluid.kind != FluidKind::Water {
+        return None;
+    }
+    match (fluid.source, fluid.falling, fluid.amount) {
+        (true, false, 8) => Some(0),
+        (false, true, 8) => Some(8),
+        (false, false, amount @ 1..=7) => Some(8 - amount),
+        _ => None,
+    }
+}
+
+impl SessionFluidTick<'_> {
+    fn observe_bubble_cell(&self, position: IVec3, simulated: fluid_sim::Cell) {
+        let Some(complete) = self.bubble_complete.as_ref().filter(|value| value.get()) else {
+            return;
+        };
+        let Some(absolute) = add(self.session.origin, position) else {
+            complete.set(false);
+            return;
+        };
+        if absolute.y < self.session.bounds.min_y || absolute.y >= self.session.bounds.max_y {
+            complete.set(false);
+            return;
+        }
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            position,
+            self.session.states[0],
+        ) else {
+            complete.set(false);
+            return;
+        };
+        let Some(state) = self.session.world.state(id) else {
+            complete.set(false);
+            return;
+        };
+        let supported = match simulated {
+            fluid_sim::Cell::Air => {
+                state.properties.is_empty()
+                    && matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    )
+            }
+            fluid_sim::Cell::Fluid(fluid) => {
+                fluid.kind == FluidKind::Water && bubble_proof_water(state) == Some(fluid)
+            }
+            fluid_sim::Cell::BubbleWater(fluid) => {
+                bubble_column_drag(state).is_some()
+                    && fluid.kind == FluidKind::Water
+                    && fluid.source
+                    && matches!(FluidState::from_block(state), Ok(Some(actual)) if actual == fluid)
+            }
+            fluid_sim::Cell::Solid => {
+                if matches!(
+                    state.name.as_str(),
+                    "minecraft:deepslate" | "minecraft:basalt"
+                ) {
+                    state.properties.len() == 1
+                        && matches!(
+                            state.properties.get("axis").map(String::as_str),
+                            Some("x" | "y" | "z")
+                        )
+                } else {
+                    state.properties.is_empty()
+                        && matches!(
+                            state.name.as_str(),
+                            "minecraft:stone"
+                                | "minecraft:dirt"
+                                | "minecraft:coarse_dirt"
+                                | "minecraft:cobblestone"
+                                | "minecraft:mossy_cobblestone"
+                                | "minecraft:cobbled_deepslate"
+                                | "minecraft:granite"
+                                | "minecraft:diorite"
+                                | "minecraft:andesite"
+                                | "minecraft:tuff"
+                                | "minecraft:sandstone"
+                                | "minecraft:red_sandstone"
+                                | "minecraft:stone_bricks"
+                                | "minecraft:clay"
+                                | "minecraft:magma_block"
+                                | "minecraft:glass"
+                                | "minecraft:bedrock"
+                                | "minecraft:obsidian"
+                                | "minecraft:netherrack"
+                                | "minecraft:end_stone"
+                                | "minecraft:blackstone"
+                                | "minecraft:nether_bricks"
+                                | "minecraft:soul_soil"
+                                | "minecraft:moss_block"
+                        )
+                }
+            }
+            _ => false,
+        };
+        if !supported {
+            complete.set(false);
+        }
+    }
+
+    fn observe_bubble_change(&self, position: IVec3, old: fluid_sim::Cell, fluid: FluidState) {
+        let Some(complete) = self.bubble_complete.as_ref().filter(|value| value.get()) else {
+            return;
+        };
+        if old != fluid_sim::Cell::Air || fluid.kind != FluidKind::Water {
+            complete.set(false);
+            return;
+        }
+        for direction in [
+            IVec3::ZERO,
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_Y,
+            IVec3::Y,
+        ] {
+            let Some(neighbor) = add(position, direction) else {
+                complete.set(false);
+                return;
+            };
+            self.observe_bubble_cell(neighbor, self.session.simulation_cell(neighbor));
+            if !complete.get() {
+                return;
+            }
+        }
+    }
 }
 
 impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
@@ -26193,7 +26387,9 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
     }
 
     fn cell(&self, position: IVec3) -> fluid_sim::Cell {
-        self.session.simulation_cell(position)
+        let value = self.session.simulation_cell(position);
+        self.observe_bubble_cell(position, value);
+        value
     }
 
     fn delay(
@@ -26202,6 +26398,9 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
         old: FluidState,
         next: Option<FluidState>,
     ) -> Result<u64, Self::Error> {
+        if let Some(complete) = &self.bubble_complete {
+            complete.set(false);
+        }
         let above_same = add(position, IVec3::Y).is_some_and(|above| {
             matches!(self.session.simulation_cell(above), fluid_sim::Cell::Fluid(state) if state.kind == old.kind)
         });
@@ -26225,6 +26424,9 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
         position: IVec3,
         next: Option<FluidState>,
     ) -> Result<(), Self::Error> {
+        if let Some(complete) = &self.bubble_complete {
+            complete.set(false);
+        }
         let change = fluid_sim::Change {
             position,
             block: next.map_or(fluid_sim::ChangedBlock::Air, fluid_sim::ChangedBlock::Fluid),
@@ -26241,6 +26443,9 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
         fluid: FluidState,
         delay: u64,
     ) -> Result<(), Self::Error> {
+        if let Some(complete) = &self.bubble_complete {
+            complete.set(false);
+        }
         self.session.schedule_fluid(position, fluid, delay);
         Ok(())
     }
@@ -26253,6 +26458,7 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
         direction: IVec3,
     ) -> Result<(), Self::Error> {
         use fluid_sim::{Cell as FluidCell, ChangedBlock, Solidified};
+        self.observe_bubble_change(position, old, fluid);
         let block = match old {
             FluidCell::Unknown => return Ok(()),
             FluidCell::Fluid(other)
@@ -26308,11 +26514,36 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             }
             _ => ChangedBlock::Fluid(fluid),
         };
-        self.retry_wash |= !self.session.apply_fluid_tick_change(
+        let applied = self.session.apply_fluid_tick_change(
             fluid_sim::Change { position, block },
             self.kind,
             self.settings,
         );
+        self.retry_wash |= !applied;
+        if let Some(complete) = self.bubble_complete.as_ref().filter(|value| value.get()) {
+            let actual = match cell(
+                &self.session.world,
+                self.session.origin,
+                self.session.bounds,
+                position,
+                self.session.states[0],
+            ) {
+                Cell::State(id) => self.session.world.state(id),
+                Cell::Missing => None,
+            };
+            if !applied
+                || !actual.is_some_and(|state| {
+                    bubble_proof_water(state) == Some(fluid)
+                        && state
+                            .properties
+                            .get("level")
+                            .and_then(|value| value.parse::<u8>().ok())
+                            == bubble_proof_water_level(fluid)
+                })
+            {
+                complete.set(false);
+            }
+        }
         Ok(())
     }
 }
@@ -31212,6 +31443,10 @@ pub(crate) mod tests {
         session.set_farmland_water_tag(Arc::new(BTreeSet::from([
             "minecraft:water".into(),
             "minecraft:flowing_water".into(),
+        ])));
+        session.set_lava_fluid_tag(Arc::new(BTreeSet::from([
+            "minecraft:lava".into(),
+            "minecraft:flowing_lava".into(),
         ])));
         session.set_bubble_column_tags(Arc::new(
             native_resources::fluid_tags::BubbleColumnTags::new(
@@ -39487,6 +39722,7 @@ pub(crate) mod tests {
             settings,
             kind: FluidKind::Water,
             retry_wash: false,
+            bubble_complete: None,
         };
         live.spread_to(
             position,
@@ -39585,6 +39821,7 @@ pub(crate) mod tests {
                 settings,
                 kind: FluidKind::Water,
                 retry_wash: false,
+                bubble_complete: None,
             };
             fluid_sim::tick_live(&mut live, origin, original, settings).unwrap();
             let absolute = live.session.origin + if case == "support" { origin } else { target };
@@ -50007,47 +50244,78 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 64);
+        assert_eq!(rows.len(), 91_952);
         let center = IVec3::new(8, 10, 8);
         let sides = [IVec3::NEG_Z, IVec3::Z, IVec3::NEG_X, IVec3::X];
+        let fluid_tag = |mask: u64| {
+            Arc::new(
+                [
+                    "minecraft:empty",
+                    "minecraft:water",
+                    "minecraft:flowing_water",
+                    "minecraft:lava",
+                    "minecraft:flowing_lava",
+                ]
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, name)| name.to_owned())
+                .collect::<BTreeSet<_>>(),
+            )
+        };
         for row in rows {
             let mut session = session();
             session.sky_lighting.set_enabled(false);
+            session.set_farmland_water_tag(fluid_tag(row["waterTag"].as_u64().unwrap()));
+            session.set_lava_fluid_tag(fluid_tag(row["lavaTag"].as_u64().unwrap()));
             let bubble =
                 session.intern_block(state("minecraft:bubble_column", &[("drag", "true")]));
-            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let base = row["base"].as_str().unwrap();
+            let axis = row["axis"].as_str().unwrap();
+            let solid = if axis.is_empty() {
+                session.intern_block(state(base, &[]))
+            } else {
+                session.intern_block(state(base, &[("axis", axis)]))
+            };
             let air = session.states[0];
+            let source = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            let flowing = session.intern_block(state("minecraft:water", &[("level", "1")]));
+            let ids = [solid, air, source, bubble, flowing];
             let chunk = session.player_chunk().unwrap();
             let world = Arc::make_mut(&mut session.world);
             let chunk = Arc::make_mut(world.chunks.get_mut(&chunk).unwrap());
             let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
             let blocks = section.blocks.as_mut().unwrap();
-            blocks.fill(stone);
+            blocks.fill(solid);
             let index = |p: IVec3| (p.x + p.z * 16 + p.y * 256) as usize;
             blocks[index(center)] = bubble;
-            if row["hole"].as_bool().unwrap() {
-                blocks[index(center - IVec3::Y)] = air;
-            }
-            let mask = row["mask"].as_u64().unwrap();
+            let below = row["below"].as_u64().unwrap() as usize;
+            blocks[index(center - IVec3::Y)] = ids[below];
             for (index_side, side) in sides.iter().enumerate() {
-                if mask & (1 << index_side) != 0 {
-                    blocks[index(center + *side)] = air;
-                }
+                let kind = row["sides"][index_side].as_u64().unwrap() as usize;
+                blocks[index(center + *side)] = ids[kind];
             }
             let down = if row["tagged"].as_bool().unwrap() {
-                BTreeSet::from(["minecraft:stone".into()])
+                BTreeSet::from([base.into()])
             } else {
                 BTreeSet::new()
             };
             session.set_bubble_column_tags(Arc::new(
-                native_resources::fluid_tags::BubbleColumnTags::new(down, BTreeSet::new()),
+                native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                    down,
+                    BTreeSet::new(),
+                    (*fluid_tag(row["occupyTag"].as_u64().unwrap())).clone(),
+                ),
             ));
+            session.set_source_conversion(row["convert"].as_bool().unwrap(), false);
             let fluid = FluidState::from_block(session.world.state(bubble).unwrap())
                 .unwrap()
                 .unwrap();
+            session.level_random = native_core::random::LegacyRandom::new(1);
             session.schedule_fluid(center, fluid, 0);
             session.advance_fluid_ticks();
-            assert!(session.unresolved_bubble_tick, "{row}");
+            assert!(!session.unresolved_bubble_tick, "{row}");
+            assert_eq!(row["gameEvents"], 0, "{row}");
             let mut changes: Vec<_> = session
                 .block_edits
                 .values()
@@ -50124,6 +50392,11 @@ pub(crate) mod tests {
             assert_eq!(
                 serde_json::json!(fluids.into_iter().map(|event| event.1).collect::<Vec<_>>()),
                 row["fluidTicks"],
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
                 "{row}"
             );
         }
@@ -50318,7 +50591,12 @@ pub(crate) mod tests {
         );
         session.tick = 5;
         session.advance_fluid_ticks();
-        assert!(session.unresolved_bubble_tick);
+        assert!(!session.unresolved_bubble_tick);
+        assert!(
+            session
+                .draft_fluid_ticks(session.player_chunk().unwrap())
+                .is_ok()
+        );
         assert_eq!(
             session
                 .world

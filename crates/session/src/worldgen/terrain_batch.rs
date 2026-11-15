@@ -519,6 +519,7 @@ struct GeneratedSessionBlockTags {
     bounce_suppression: Option<Arc<BTreeSet<String>>>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     farmland_water: Option<Arc<BTreeSet<String>>>,
+    lava_fluid: Option<Arc<BTreeSet<String>>>,
     snow_support: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
     snowy: Option<Arc<BTreeSet<String>>>,
     mining: Option<Arc<native_resources::mining_tags::MiningTags>>,
@@ -543,6 +544,7 @@ impl GeneratedSessionBlockTags {
                 .ok()
                 .map(Arc::new),
             farmland_water: fluid_tags::load_water(provider).ok().map(Arc::new),
+            lava_fluid: fluid_tags::load_lava(provider).ok().map(Arc::new),
             snow_support: respawn_tags::SnowSupportTags::load(provider, registry)
                 .ok()
                 .map(Arc::new),
@@ -1294,6 +1296,9 @@ impl FreshTerrainBatch {
         }
         if let Some(value) = &tags.farmland_water {
             session.set_farmland_water_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.lava_fluid {
+            session.set_lava_fluid_tag(Arc::clone(value));
         }
         if let Some(value) = &tags.snow_support {
             session.set_snow_support_tags(Arc::clone(value));
@@ -5681,6 +5686,18 @@ mod session_block_support_tests {
                     br#"{"values":["minecraft:water","minecraft:flowing_water"]}"#.to_vec(),
                 ));
             }
+            if path == "data/minecraft/tags/fluid/lava.json" {
+                let values = if self.custom {
+                    vec![
+                        "minecraft:lava",
+                        "minecraft:flowing_lava",
+                        "minecraft:water",
+                    ]
+                } else {
+                    vec!["minecraft:lava", "minecraft:flowing_lava"]
+                };
+                return Ok(Some(serde_json::to_vec(&json!({"values": values}))?));
+            }
             if path.starts_with("data/minecraft/tags/") {
                 return Ok(Some(br#"{"values":[]}"#.to_vec()));
             }
@@ -5846,6 +5863,14 @@ mod session_block_support_tests {
             config
                 .session_blocks
                 .farmland_water
+                .as_ref()
+                .unwrap()
+                .contains("minecraft:water")
+        );
+        assert!(
+            config
+                .session_blocks
+                .lava_fluid
                 .as_ref()
                 .unwrap()
                 .contains("minecraft:water")
@@ -6338,6 +6363,7 @@ mod session_block_support_tests {
             tags.farmland_water.is_some(),
             "farmland water tag unavailable"
         );
+        ensure!(tags.lava_fluid.is_some(), "lava fluid tag unavailable");
         ensure!(tags.snow_support.is_some(), "snow support tags unavailable");
         ensure!(tags.snowy.is_some(), "snow tag unavailable");
         ensure!(tags.mining.is_some(), "mining tags unavailable");

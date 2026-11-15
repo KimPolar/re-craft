@@ -658,6 +658,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (15, 15)
         }
         "minecraft:magma_block" if state.properties.is_empty() => (15, 3),
+        "minecraft:crying_obsidian" if state.properties.is_empty() => (15, 10),
         "minecraft:jack_o_lantern" if state.properties.len() == 1 && facing() => (15, 15),
         "minecraft:stone"
         | "minecraft:melon"
@@ -707,6 +708,14 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:sulfur"
         | "minecraft:cobbled_deepslate"
         | "minecraft:stone_bricks"
+        | "minecraft:mossy_stone_bricks"
+        | "minecraft:cracked_stone_bricks"
+        | "minecraft:chiseled_stone_bricks"
+        | "minecraft:gold_block"
+        | "minecraft:polished_blackstone"
+        | "minecraft:polished_blackstone_bricks"
+        | "minecraft:cracked_polished_blackstone_bricks"
+        | "minecraft:chiseled_polished_blackstone"
         | "minecraft:cobblestone"
         | "minecraft:coarse_dirt"
         | "minecraft:rooted_dirt"
@@ -1446,6 +1455,26 @@ mod tests {
             properties: lit
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn ruined_portal_solids_have_checked_light_properties() {
+        for (name, emission) in [
+            ("crying_obsidian", 10),
+            ("gold_block", 0),
+            ("mossy_stone_bricks", 0),
+            ("cracked_stone_bricks", 0),
+            ("chiseled_stone_bricks", 0),
+            ("polished_blackstone", 0),
+            ("polished_blackstone_bricks", 0),
+            ("cracked_polished_blackstone_bricks", 0),
+            ("chiseled_polished_blackstone", 0),
+        ] {
+            let mut block = state(name, None);
+            assert_eq!(properties(&block), Some((15, emission)), "{name}");
+            block.properties.insert("unexpected".into(), "true".into());
+            assert_eq!(properties(&block), None, "{name}");
         }
     }
 
@@ -2696,6 +2725,15 @@ mod tests {
             "flowering_azalea_leaves",
             "cobbled_deepslate",
             "stone_bricks",
+            "mossy_stone_bricks",
+            "cracked_stone_bricks",
+            "chiseled_stone_bricks",
+            "gold_block",
+            "polished_blackstone",
+            "polished_blackstone_bricks",
+            "cracked_polished_blackstone_bricks",
+            "chiseled_polished_blackstone",
+            "crying_obsidian",
             "cobblestone",
             "coarse_dirt",
             "rooted_dirt",
@@ -3390,6 +3428,15 @@ mod tests {
             "cauldron",
             "potted_red_mushroom",
             "stone",
+            "mossy_stone_bricks",
+            "cracked_stone_bricks",
+            "chiseled_stone_bricks",
+            "gold_block",
+            "polished_blackstone",
+            "polished_blackstone_bricks",
+            "cracked_polished_blackstone_bricks",
+            "chiseled_polished_blackstone",
+            "crying_obsidian",
             "dirt",
             "sand",
             "gravel",

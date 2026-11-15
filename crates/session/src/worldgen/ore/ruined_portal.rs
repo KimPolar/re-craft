@@ -288,6 +288,13 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
         if native_world::collision::jigsaw_state(state) {
             return Ok(state.clone());
         }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+        ) {
+            SimpleBlockWorld::schedule_simple_tick(self.inner.region, pos)?;
+            return Ok(state.clone());
+        }
         if state.name == "minecraft:iron_chain"
             && native_world::collision::block_shape(state).is_some()
         {
@@ -1186,7 +1193,8 @@ mod tests {
         };
         let pos = [3, 7, 3];
         let mut count = 0;
-        for line in String::from_utf8(result.stdout)?.lines().filter(|line| {
+        let output = String::from_utf8(result.stdout)?;
+        for line in output.lines().filter(|line| {
             line.starts_with("SHAPE ") || line.starts_with("UPDATE ") || line.starts_with("LIGHT ")
         }) {
             let values: Vec<_> = line.split_whitespace().collect();
@@ -1274,6 +1282,46 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 48);
+        let mut falling_count = 0;
+        for line in output.lines().filter(|line| line.starts_with("FALLING ")) {
+            let values: Vec<_> = line.split_whitespace().collect();
+            ensure!(values.len() == 7, "invalid falling edge oracle");
+            let (name, properties) = registry.resolve(&serde_json::json!(values[1]))?;
+            let state = BlockState { name, properties };
+            let (name, properties) = registry.resolve(&serde_json::json!(values[3]))?;
+            let neighbor = BlockState { name, properties };
+            let direction = match values[2] {
+                "down" => [0, -1, 0],
+                "up" => [0, 1, 0],
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "west" => [-1, 0, 0],
+                "east" => [1, 0, 0],
+                _ => anyhow::bail!("invalid falling edge direction"),
+            };
+            world.inner.region.set_proto_block(pos, &state)?;
+            world.inner.region.world.saved_block_ticks.clear();
+            world.inner.region.block_tick_keys.clear();
+            for _ in 0..2 {
+                let updated = world.update_shape(pos, &state, direction, pos, &neighbor)?;
+                assert_eq!(updated, state, "{line}");
+            }
+            assert_eq!(values[4], "2", "{line}");
+            let ticks = world
+                .inner
+                .region
+                .world
+                .saved_block_ticks
+                .get(&chunk(pos))
+                .context("falling block tick missing")?;
+            assert_eq!(ticks.len(), 1, "duplicate falling ticks: {line}");
+            assert_eq!(ticks[0].block, values[1], "{line}");
+            assert_eq!(ticks[0].position, pos, "{line}");
+            assert_eq!(ticks[0].delay, values[5].parse::<i32>()?, "{line}");
+            assert_eq!(ticks[0].priority, values[6].parse::<i32>()?, "{line}");
+            falling_count += 1;
+        }
+        assert_eq!(falling_count, 72);
         Ok(())
     }
 

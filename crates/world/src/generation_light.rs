@@ -6,7 +6,7 @@
 //! columns not included in a snapshot must not be conflated.
 use crate::loaded::{BlockState, ChunkPos, LIGHT_BYTES, World};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     sync::Arc,
 };
@@ -177,6 +177,183 @@ pub struct VisibleLightSnapshot {
     has_sky: bool,
     columns: BTreeMap<ChunkPos, VisibleLightColumn>,
 }
+
+/// Section allocation state for one fully observed light-engine revision.
+///
+/// The tracked data-section set and enabled columns must describe the same
+/// engine as the visible snapshot. Queued saved layers, pending light checks,
+/// concurrent chunk loading and unpublished status changes require separate
+/// reconciliation before this tracker can be used.
+#[derive(Clone)]
+pub struct SectionLightTracker {
+    visible: VisibleLightSnapshot,
+    data_sections: BTreeSet<(ChunkPos, i32)>,
+    references: BTreeMap<(ChunkPos, i32), u8>,
+    active: BTreeSet<ChunkPos>,
+}
+
+fn section_position_supported(center: ChunkPos, y: i32) -> bool {
+    (-2_097_151..=2_097_150).contains(&center.x)
+        && (-2_097_151..=2_097_150).contains(&center.z)
+        && (-524_287..=524_286).contains(&y)
+}
+
+fn section_neighborhood(center: ChunkPos, y: i32) -> Option<Vec<(ChunkPos, i32)>> {
+    if !section_position_supported(center, y) {
+        return None;
+    }
+    let mut result = Vec::with_capacity(27);
+    result.push((center, y));
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                result.push((
+                    ChunkPos {
+                        x: center.x + dx,
+                        z: center.z + dz,
+                    },
+                    y + dy,
+                ));
+            }
+        }
+    }
+    Some(result)
+}
+
+impl SectionLightTracker {
+    /// Attach section-status history to an already published snapshot. The
+    /// caller must provide every registered nonempty section, including those
+    /// outside covered columns whose allocation halo reaches the snapshot.
+    /// Existing layer sets are checked against that complete history.
+    pub fn new(
+        visible: VisibleLightSnapshot,
+        data_sections: impl IntoIterator<Item = (ChunkPos, i32)>,
+        active: BTreeSet<ChunkPos>,
+    ) -> Option<Self> {
+        let mut registered = BTreeSet::new();
+        let mut references = BTreeMap::<(ChunkPos, i32), u8>::new();
+        // Only covered columns can be updated through this tracker. Keep all
+        // data-section identities, but count halos only where they matter.
+        let mut relevant = BTreeSet::new();
+        for &position in visible.columns.keys() {
+            for dx in -1i32..=1 {
+                for dz in -1i32..=1 {
+                    let (Some(x), Some(z)) =
+                        (position.x.checked_add(dx), position.z.checked_add(dz))
+                    else {
+                        continue;
+                    };
+                    relevant.insert(ChunkPos { x, z });
+                }
+            }
+        }
+        for (position, y) in data_sections {
+            if !section_position_supported(position, y) || !registered.insert((position, y)) {
+                return None;
+            }
+            if !relevant.contains(&position) {
+                continue;
+            }
+            for section in section_neighborhood(position, y)? {
+                if !visible.columns.contains_key(&section.0) {
+                    continue;
+                }
+                let count = references.entry(section).or_default();
+                *count = count.checked_add(1)?;
+            }
+        }
+        for (&(position, y), _) in &references {
+            let Some(column) = visible.columns.get(&position) else {
+                continue;
+            };
+            if (visible.has_block && !column.block.contains_key(&y))
+                || (visible.has_sky && !column.sky.contains_key(&y))
+            {
+                return None;
+            }
+        }
+        for (&position, column) in &visible.columns {
+            if (!visible.has_block && !column.block.is_empty())
+                || (!visible.has_sky && !column.sky.is_empty())
+                || column
+                    .block
+                    .keys()
+                    .chain(column.sky.keys())
+                    .any(|&y| !references.contains_key(&(position, y)))
+            {
+                return None;
+            }
+        }
+        Some(Self {
+            visible,
+            data_sections: registered,
+            references,
+            active,
+        })
+    }
+
+    pub fn snapshot(&self) -> &VisibleLightSnapshot {
+        &self.visible
+    }
+
+    pub fn is_data_section(&self, position: ChunkPos, y: i32) -> bool {
+        self.data_sections.contains(&(position, y))
+    }
+
+    /// Replay status callbacks in order, then publish one drained revision.
+    /// Each tuple is (chunk, section Y, is_nonempty). All affected columns
+    /// must be covered. Repeated statuses are no-ops, and removing then
+    /// re-adding before the drain retains the original arrays, as in Java.
+    /// Failure leaves this tracker and previous snapshots unchanged.
+    pub fn apply_statuses(&mut self, changes: &[(ChunkPos, i32, bool)]) -> Option<()> {
+        let mut draft = self.clone();
+        let mut removed = BTreeSet::new();
+        for &(position, y, nonempty) in changes {
+            let neighborhood = section_neighborhood(position, y)?;
+            if draft.data_sections.contains(&(position, y)) == nonempty {
+                continue;
+            }
+            if neighborhood
+                .iter()
+                .any(|(position, _)| !draft.visible.columns.contains_key(position))
+            {
+                return None;
+            }
+            if nonempty {
+                draft.visible = draft
+                    .visible
+                    .allocate_nonempty_sections(&[(position, y)], &draft.active)?;
+                draft.data_sections.insert((position, y));
+                for section in neighborhood {
+                    let count = draft.references.entry(section).or_default();
+                    *count = count.checked_add(1)?;
+                    removed.remove(&section);
+                }
+            } else {
+                draft.data_sections.remove(&(position, y));
+                for section in neighborhood {
+                    let count = draft.references.get_mut(&section)?;
+                    *count = count.checked_sub(1)?;
+                    if *count == 0 {
+                        draft.references.remove(&section);
+                        removed.insert(section);
+                    }
+                }
+            }
+        }
+        for (position, y) in removed {
+            let column = draft.visible.columns.get_mut(&position)?;
+            column.block.remove(&y);
+            column.sky.remove(&y);
+        }
+        *self = draft;
+        Some(())
+    }
+}
+
 impl VisibleLightSnapshot {
     pub fn new(has_block: bool, has_sky: bool) -> Self {
         Self {
@@ -539,6 +716,258 @@ mod tests {
     fn layer(n: u8) -> Arc<[u8; LIGHT_BYTES]> {
         Arc::new([n | (n << 4); LIGHT_BYTES])
     }
+
+    #[test]
+    fn section_status_batches_preserve_shared_layers_and_cancelled_removals() {
+        let center = ChunkPos { x: 0, z: 0 };
+        let adjacent = ChunkPos { x: 1, z: 0 };
+        let covered: Vec<_> = (-2..=2)
+            .flat_map(|z| (-2..=3).map(move |x| ChunkPos { x, z }))
+            .collect();
+        let initial = [(center, 0), (adjacent, 0), (center, 8)];
+        let mut visible = VisibleLightSnapshot::fresh_after_section_updates(
+            true,
+            true,
+            initial,
+            covered.iter().copied(),
+        )
+        .unwrap();
+        visible.set_stored_sky([0, 128, 0], 7).unwrap();
+        let before = visible.clone();
+        let mut tracker = SectionLightTracker::new(visible, initial, BTreeSet::new()).unwrap();
+        tracker
+            .apply_statuses(&[(center, 8, false), (center, 8, true)])
+            .unwrap();
+        for &position in &covered {
+            assert_eq!(
+                before.same_complete_column(tracker.snapshot(), position),
+                Some(true)
+            );
+        }
+        assert!(tracker.is_data_section(center, 8));
+
+        tracker.apply_statuses(&[(center, 0, false)]).unwrap();
+        assert!(!tracker.is_data_section(center, 0));
+        assert_eq!(
+            tracker
+                .snapshot()
+                .sky_section_allocated(ChunkPos { x: -1, z: 0 }, 0),
+            Some(false)
+        );
+        assert_eq!(
+            tracker.snapshot().sky_section_allocated(center, 0),
+            Some(true)
+        );
+        assert_eq!(tracker.snapshot().sky_light([0, 128, 0]), Some(7));
+
+        let saved = tracker.snapshot().clone();
+        assert!(
+            tracker
+                .apply_statuses(&[(adjacent, 0, false), (ChunkPos { x: 20, z: 0 }, 0, true)])
+                .is_none()
+        );
+        assert!(tracker.is_data_section(adjacent, 0));
+        for &position in &covered {
+            assert_eq!(
+                saved.same_complete_column(tracker.snapshot(), position),
+                Some(true)
+            );
+        }
+        assert_eq!(before.sky_light([0, 128, 0]), Some(7));
+        assert!(SectionLightTracker::new(saved.clone(), [(center, 8)], BTreeSet::new()).is_none());
+        assert!(
+            SectionLightTracker::new(saved, [(center, 8), (center, 8)], BTreeSet::new()).is_none()
+        );
+    }
+
+    #[test]
+    fn section_statuses_outside_coverage_keep_identity_without_allocating_layers() {
+        let center = ChunkPos { x: 0, z: 0 };
+        let distant = ChunkPos { x: 100, z: -100 };
+        let registered = [(center, 0), (distant, 4)];
+        let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
+        let visible =
+            VisibleLightSnapshot::fresh_after_section_updates(true, true, registered, covered)
+                .unwrap();
+        let mut tracker =
+            SectionLightTracker::new(visible.clone(), registered, BTreeSet::new()).unwrap();
+        assert!(tracker.is_data_section(distant, 4));
+        tracker.apply_statuses(&[(distant, 4, true)]).unwrap();
+        assert!(tracker.apply_statuses(&[(distant, 4, false)]).is_none());
+        assert!(tracker.is_data_section(distant, 4));
+        assert_eq!(
+            visible.same_complete_column(tracker.snapshot(), center),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn section_status_batches_match_java_visible_storage() {
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SectionTransitionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SectionTransitionOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let run = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SectionTransitionOracle")
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let center = ChunkPos { x: 0, z: 0 };
+        let adjacent = ChunkPos { x: 1, z: 0 };
+        let other = ChunkPos { x: 2, z: 0 };
+        let covered: Vec<_> = (-1..=1)
+            .flat_map(|z| (-1..=3).map(move |x| ChunkPos { x, z }))
+            .collect();
+        let initial = [(center, 0), (adjacent, 0), (center, 8)];
+        let mut visible = VisibleLightSnapshot::fresh_after_section_updates(
+            true,
+            true,
+            initial,
+            covered.iter().copied(),
+        )
+        .unwrap();
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let value = ((x * 3 + y * 5 + z * 7) & 15) as u8;
+                    visible.set_stored_block([x, y + 128, z], value).unwrap();
+                    visible
+                        .set_stored_sky([x, y + 128, z], (value + 4) & 15)
+                        .unwrap();
+                }
+            }
+        }
+        let active = BTreeSet::from([center, other]);
+        let cases: Vec<Vec<_>> = vec![
+            vec![(center, 8, false)],
+            vec![(center, 8, false), (center, 8, true)],
+            vec![(other, 4, true), (other, 4, false)],
+            vec![(center, 8, false), (center, 9, true)],
+            vec![(center, 0, false)],
+            vec![
+                (adjacent, 0, false),
+                (adjacent, 0, false),
+                (other, 0, true),
+                (other, 0, true),
+                (center, 0, false),
+                (center, 0, true),
+            ],
+            vec![(center, 0, false), (adjacent, 0, false), (center, 8, false)],
+            vec![(center, 7, true), (center, 8, false)],
+        ];
+
+        fn compare<'a>(
+            lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+            snapshot: &VisibleLightSnapshot,
+            covered: &[ChunkPos],
+        ) {
+            let mut seen = BTreeSet::new();
+            while lines.peek().is_some_and(|line| line.starts_with("L ")) {
+                let row = lines.next().unwrap();
+                let mut fields = row.split_whitespace();
+                assert_eq!(fields.next(), Some("L"));
+                let channel = fields.next().unwrap();
+                let x: i32 = fields.next().unwrap().parse().unwrap();
+                let y: i32 = fields.next().unwrap().parse().unwrap();
+                let z: i32 = fields.next().unwrap().parse().unwrap();
+                let encoded = fields.next().unwrap().as_bytes();
+                assert!(fields.next().is_none());
+                assert_eq!(encoded.len(), LIGHT_BYTES * 2);
+                let position = ChunkPos { x, z };
+                assert!(seen.insert((channel, position, y)));
+                let column = snapshot.complete_column(position).unwrap();
+                let layer = match channel {
+                    "B" => column.block_layers().get(&y),
+                    "S" => column.sky_layers().get(&y),
+                    _ => panic!("invalid Java light channel"),
+                }
+                .unwrap_or_else(|| panic!("missing Java layer {channel} {position:?} {y}"));
+                for (index, pair) in encoded.chunks_exact(2).enumerate() {
+                    let expected =
+                        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+                    assert_eq!(
+                        layer[index], expected,
+                        "{channel} {position:?} {y} byte {index}"
+                    );
+                }
+            }
+            let count: usize = covered
+                .iter()
+                .map(|&position| {
+                    let column = snapshot.complete_column(position).unwrap();
+                    column.block_layers().len() + column.sky_layers().len()
+                })
+                .sum();
+            assert_eq!(seen.len(), count, "extra Rust light layers");
+        }
+
+        let output = String::from_utf8(run.stdout).unwrap();
+        let mut lines = output
+            .lines()
+            .filter(|line| line.starts_with("H ") || line.starts_with("L "))
+            .peekable();
+        for (index, changes) in cases.iter().enumerate() {
+            let mut tracker =
+                SectionLightTracker::new(visible.clone(), initial, active.clone()).unwrap();
+            assert_eq!(lines.next(), Some(format!("H {index} before").as_str()));
+            compare(&mut lines, tracker.snapshot(), &covered);
+            tracker.apply_statuses(changes).unwrap();
+            assert_eq!(lines.next(), Some(format!("H {index} after").as_str()));
+            compare(&mut lines, tracker.snapshot(), &covered);
+        }
+        assert!(lines.next().is_none());
+    }
+
     #[test]
     fn adding_sections_inherits_sky_and_preserves_visible_revision() {
         let center = ChunkPos { x: 0, z: 0 };

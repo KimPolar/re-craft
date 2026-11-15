@@ -2689,6 +2689,29 @@ impl FreshTerrainBatch {
         engine.snapshot(terrain, covered, registry)
     }
 
+    /// Capture the sealed engine's visible arrays and registered section
+    /// statuses together. The detached tracker does not authorize publication
+    /// into a live session or bypass postprocessing and save validation.
+    pub fn section_light_tracker(
+        &self,
+        covered: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<native_world::generation_light::SectionLightTracker> {
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        let engine = self
+            .light_engine
+            .as_ref()
+            .context("light propagation is not sealed")?;
+        let terrain = self.terrain.as_ref().context("light terrain is missing")?;
+        let registry = self
+            .light_registry
+            .as_ref()
+            .context("light registry is missing")?;
+        engine.section_tracker(terrain, covered, registry)
+    }
+
     /// Build a read-only rendering view containing the selected light columns.
     /// Chunk status and light-correct flags remain intermediate; this view is
     /// not a saveable world. Unselected chunks retain their original data.

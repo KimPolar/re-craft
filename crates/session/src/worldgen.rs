@@ -281,6 +281,7 @@ pub struct FreshGenerationLightTracker {
     height: i32,
     has_skylight: bool,
     registered: BTreeMap<native_world::loaded::ChunkPos, Arc<native_world::loaded::Chunk>>,
+    data_sections: BTreeSet<(native_world::loaded::ChunkPos, i32)>,
     allocated: BTreeMap<native_world::loaded::ChunkPos, BTreeSet<i32>>,
     sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
     checked_blocks: BTreeSet<String>,
@@ -323,6 +324,7 @@ impl FreshGenerationLightTracker {
             height: terrain.height,
             has_skylight,
             registered: BTreeMap::new(),
+            data_sections: BTreeSet::new(),
             allocated: BTreeMap::new(),
             sky_sources: BTreeMap::new(),
             checked_blocks: BTreeSet::new(),
@@ -435,6 +437,7 @@ impl FreshGenerationLightTracker {
             .chunks
             .get(&pos)
             .context("light chunk is missing")?;
+        self.data_sections.extend(statuses.iter().copied());
         for (position, y) in statuses {
             for dz in -1..=1 {
                 for dx in -1..=1 {
@@ -898,12 +901,16 @@ impl StagedGenerationLightEngine {
             if sections.is_empty() {
                 None
             } else {
-                let before = self.snapshot(terrain, affected.iter().copied(), registry)?;
-                let after = before
-                    .allocate_nonempty_sections(&sections, &self.active)
-                    .context(
-                        "registration light section allocation is incomplete or unsupported",
-                    )?;
+                let mut tracker =
+                    self.section_tracker(terrain, affected.iter().copied(), registry)?;
+                let changes: Vec<_> = sections
+                    .iter()
+                    .map(|&(position, y)| (position, y, true))
+                    .collect();
+                tracker.apply_statuses(&changes).context(
+                    "registration light section allocation is incomplete or unsupported",
+                )?;
+                let after = tracker.snapshot();
                 Some(
                     affected
                         .iter()
@@ -939,6 +946,24 @@ impl StagedGenerationLightEngine {
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
         self.snapshot_for(terrain, covered, registry, &self.active)
+    }
+
+    /// Branch the exact registered-section and visible-light revision. The
+    /// result is detached; publishing its later updates requires validating
+    /// the generation and live-session revisions separately.
+    pub fn section_tracker(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        covered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::SectionLightTracker> {
+        let visible = self.snapshot(terrain, covered, registry)?;
+        native_world::generation_light::SectionLightTracker::new(
+            visible,
+            self.fresh.data_sections.iter().copied(),
+            self.active.clone(),
+        )
+        .context("registered light section history differs")
     }
 
     /// Activate one initialized chunk and return the requested visible data.
@@ -5293,6 +5318,23 @@ mod tests {
         assert!(batch.is_complete());
         let before = batch.light_snapshot([center]).unwrap();
         let original = batch.snapshot().unwrap();
+        let tracked = batch.section_light_tracker([center]).unwrap();
+        assert_eq!(
+            before.same_complete_column(tracked.snapshot(), center),
+            Some(true)
+        );
+        let nonempty = original.chunks[&center].sections[&0]
+            .blocks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|id| {
+                !matches!(
+                    original.state(*id).unwrap().name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                )
+            });
+        assert_eq!(tracked.is_data_section(center, 0), nonempty);
         let before_view = batch.lit_snapshot([center]).unwrap();
         assert!(batch.lit_render_snapshot([center]).is_err());
         assert!(batch.lit_render_snapshot([]).is_err());
@@ -5317,6 +5359,12 @@ mod tests {
         assert_eq!(
             batch.step(&mut data, &mut classify, &mut resolve).unwrap(),
             Some((center, schedule::GenerationStage::Light))
+        );
+        let active = batch.light_snapshot([center]).unwrap();
+        let tracked = batch.section_light_tracker([center]).unwrap();
+        assert_eq!(
+            active.same_complete_column(tracked.snapshot(), center),
+            Some(true)
         );
         assert!(
             batch

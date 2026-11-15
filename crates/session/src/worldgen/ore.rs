@@ -3109,6 +3109,11 @@ fn finish_decoration_with_light(
     mut region: DecorationRegion<'_>,
     light_tracking: &mut Option<DecorationLightTracking<'_>>,
 ) -> Result<()> {
+    let new_data_sections = region
+        .light_guard
+        .as_ref()
+        .map(|guard| guard.new_nonempty_sections.clone())
+        .unwrap_or_default();
     let mut staged_replay = None;
     let mut incremental_columns = None;
     let mut incremental_allocations = None;
@@ -3228,11 +3233,25 @@ fn finish_decoration_with_light(
                     }
                 }
                 let before = engine.snapshot(region.target, covered.iter().copied(), registry)?;
-                let updating = before
-                    .allocate_nonempty_sections(&guard.new_nonempty_sections, active)
-                    .context(
+                let updating = if guard.new_nonempty_sections.is_empty() {
+                    before
+                } else {
+                    let mut sections = native_world::generation_light::SectionLightTracker::new(
+                        before,
+                        tracker.data_sections.iter().copied(),
+                        active.clone(),
+                    )
+                    .context("incremental light section history differs")?;
+                    let changes: Vec<_> = guard
+                        .new_nonempty_sections
+                        .iter()
+                        .map(|&(position, y)| (position, y, true))
+                        .collect();
+                    sections.apply_statuses(&changes).context(
                         "incremental section allocation inputs are incomplete or unsupported",
                     )?;
+                    sections.snapshot().clone()
+                };
                 let after_block =
                     native_world::generation_block_light::check_generated_block_light(
                         &world,
@@ -3356,6 +3375,7 @@ fn finish_decoration_with_light(
         None => None,
     };
     if let Some(tracker) = tracker {
+        tracker.data_sections.extend(new_data_sections);
         for (pos, current) in &mut tracker.registered {
             *current = Arc::clone(
                 committed

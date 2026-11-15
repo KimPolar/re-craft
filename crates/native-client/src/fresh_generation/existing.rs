@@ -1710,6 +1710,36 @@ pub(crate) struct LiveGenerationTerrainStageDraft {
     terrain: native_session::loaded::GenerationTerrainStageDraft,
 }
 
+/// Detached generation terrain incorporating captured live blocks. The
+/// retained batch cannot yet be used for features, lighting, play or saving.
+pub(crate) struct StagedLiveTerrainBatch {
+    batch: CapturedTerrainBatch,
+}
+
+impl StagedLiveTerrainBatch {
+    pub fn snapshot(&self) -> Arc<native_world::loaded::World> {
+        self.batch.terrain.snapshot()
+    }
+
+    pub fn heightmaps(&self, pos: native_world::loaded::ChunkPos) -> Result<Tag> {
+        self.batch.terrain.generated_heightmap_data(pos)
+    }
+
+    pub fn biome_chunk(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<Arc<native_session::worldgen::QuartBiomeChunk>> {
+        self.batch.biomes.chunk([pos.x, pos.z]).cloned()
+    }
+
+    pub fn completed_stage(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<native_session::worldgen::schedule::GenerationStage> {
+        self.batch.schedule.completed(pos)
+    }
+}
+
 impl LiveGenerationTerrainStageDraft {
     pub fn validate_checked(
         self,
@@ -7619,13 +7649,35 @@ impl PreparedExistingGenerator {
         positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
         mut check: impl FnMut() -> Result<()>,
     ) -> Result<CapturedTerrainBatch> {
+        self.assemble_captured_terrain_with_sources_checked(
+            work,
+            restored,
+            positions,
+            &restored.world,
+            &restored.heightmaps,
+            &mut check,
+        )
+    }
+
+    fn assemble_captured_terrain_with_sources_checked(
+        &self,
+        work: CapturedBiomeSchedule,
+        restored: &RestoredSavedTerrain,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        world: &native_world::loaded::World,
+        heightmaps: &BTreeMap<
+            native_world::loaded::ChunkPos,
+            native_persistence::heightmap::SavedGenerationHeightmaps,
+        >,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<CapturedTerrainBatch> {
         use native_session::worldgen::schedule::GenerationStage;
         check()?;
         ensure!(
             Arc::ptr_eq(&self.identity, &restored.identity),
             "saved terrain belongs to another capture"
         );
-        let mut batch = self.assemble_captured_terrain_checked(work, &mut check)?;
+        let mut batch = self.assemble_captured_terrain_checked(work, &mut *check)?;
         let captured = self.context.inputs().sources().chunks();
         let mut imported = Vec::new();
         for position in positions {
@@ -7660,20 +7712,16 @@ impl PreparedExistingGenerator {
                 "saved terrain prerequisites are incomplete"
             );
             ensure!(!batch.sources.contains_key(&key), "duplicate terrain chunk");
-            let heightmaps = restored
-                .heightmaps
+            let heightmaps = heightmaps
                 .get(&position)
                 .context("saved heightmaps are missing")?;
             let marks = restored
                 .postprocessing
                 .get(&position)
                 .context("saved postprocessing is missing")?;
-            batch.terrain.insert_saved_chunk(
-                &restored.world,
-                position,
-                heightmaps,
-                marks.as_ref(),
-            )?;
+            batch
+                .terrain
+                .insert_saved_chunk(world, position, heightmaps, marks.as_ref())?;
             batch.sources.insert(key, Some(Arc::clone(&saved.document)));
             batch.saved_stages.insert(position, stage);
             imported.push((position, GenerationStage::Terrain));
@@ -7682,6 +7730,114 @@ impl PreparedExistingGenerator {
         batch.schedule.restore_imported(imported)?;
         check()?;
         Ok(batch)
+    }
+
+    /// Build a detached terrain view using the staged live blocks and
+    /// verified heightmaps. Lighting, ticks, entities and POI remain unbound.
+    pub fn assemble_captured_terrain_with_live_stage_checked(
+        &mut self,
+        work: CapturedBiomeSchedule,
+        restored: &RestoredSavedTerrain,
+        live: &LiveGenerationTerrainStage,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<StagedLiveTerrainBatch> {
+        use native_persistence::heightmap::BlockHeightFlags;
+
+        check()?;
+        self.validate_restored_capture(restored)?;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &live.identity),
+            "live terrain belongs to another generation capture"
+        );
+        let positions: Vec<_> = positions.into_iter().collect();
+        let overlay = live
+            .terrain
+            .overlay_saved_world(positions.iter().copied(), &mut check)?;
+        self.ensure_terrain_assets()?;
+        if self.heightmap_tags.is_none() {
+            let blocks = self.resources.vanilla_block_ids()?;
+            self.heightmap_tags = Some(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut self.resources,
+                &blocks,
+            )?);
+        }
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let tags = self
+            .heightmap_tags
+            .as_ref()
+            .context("heightmap tags are missing")?;
+        let defaults = registry.default_states();
+        let mut heightmaps = BTreeMap::new();
+        for &position in &positions {
+            check()?;
+            let source = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                })
+                .and_then(|chunk| chunk.terrain.as_ref())
+                .context("saved terrain source is missing")?;
+            let maps = live
+                .terrain
+                .saved_heightmaps_after_edits(position, source, |state| {
+                    check()?;
+                    let name = String::from_utf16(&state.name.0)
+                        .context("block state name is not valid UTF-16")?;
+                    let mut properties = defaults
+                        .get(&name)
+                        .cloned()
+                        .context("block state defaults are unavailable")?;
+                    let mut seen = BTreeSet::new();
+                    for (key, value) in &state.properties {
+                        let key = String::from_utf16(&key.0)
+                            .context("block property name is not valid UTF-16")?;
+                        let value = String::from_utf16(&value.0)
+                            .context("block property value is not valid UTF-16")?;
+                        ensure!(seen.insert(key.clone()), "duplicate block property");
+                        properties.insert(key, value);
+                    }
+                    ensure!(
+                        registry.is_canonical_state(&name, &properties),
+                        "unsupported heightmap block state: {name}"
+                    );
+                    let block = BlockState { name, properties };
+                    let motion = tags.for_block(&block.name)?;
+                    Ok(BlockHeightFlags {
+                        is_air: matches!(
+                            block.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        blocks_motion: motion.blocks_motion,
+                        blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+                        has_fluid: FluidState::from_block(&block)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    })
+                })?;
+            ensure!(
+                heightmaps.insert(position, maps).is_none(),
+                "duplicate saved terrain chunk"
+            );
+        }
+        check()?;
+        let batch = self.assemble_captured_terrain_with_sources_checked(
+            work,
+            restored,
+            positions,
+            overlay.world(),
+            &heightmaps,
+            &mut check,
+        )?;
+        Ok(StagedLiveTerrainBatch { batch })
     }
 
     /// Restore the effective reference sets from one captured saved chunk.

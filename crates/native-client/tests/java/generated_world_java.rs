@@ -1128,6 +1128,11 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
                     generated.generated().len(),
                     generated.saved().len()
                 );
+                let saved_positions: BTreeSet<_> = generated
+                    .saved()
+                    .iter()
+                    .map(|(position, _)| *position)
+                    .collect();
                 let failure = match crate::chunk_stream::MissingGenerationAssemblyWorker::start(
                     generated, &streamer, session,
                 ) {
@@ -1135,15 +1140,106 @@ fn generated_world_round_trips_through_java(seed: i64, check: GenerationCheck) -
                     Err(failure) => failure,
                 };
                 eprintln!("Live assembly remains gated: {:#}", failure.error);
-                let biomed = failure.terrain.into_checked_state(&streamer, session)?;
-                let (work, _, _, _, _, _) = biomed.into_checked_parts(&streamer, session)?;
+                let mut assembly =
+                    crate::chunk_stream::MissingGenerationStagedAssemblyWorker::start(
+                        failure.terrain,
+                        &streamer,
+                        session,
+                    )
+                    .map_err(|failure| failure.error)?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                let staged = loop {
+                    if let Some(result) = assembly.try_result(&streamer, session)? {
+                        break result;
+                    }
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "staged live terrain assembly timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                };
                 ensure!(
-                    work.schedule().completed(target) == Some(GenerationStage::Terrain),
+                    staged.is_current(&streamer, session),
+                    "staged live terrain is stale"
+                );
+                ensure!(
+                    staged.completed_stage(target) == Some(GenerationStage::Terrain),
                     "target did not reach terrain stage"
                 );
-                let biome = work
-                    .biomes()
-                    .chunk([target.x, target.z])
+                let staged_world = staged.snapshot();
+                let snapshot = session.snapshot();
+                let live_world = snapshot.world.loaded().context("loaded world missing")?;
+                let mut edit_count = 0;
+                for edit in live_world.block_edits() {
+                    if !saved_positions.contains(&edit.position.chunk()) {
+                        continue;
+                    }
+                    let pos = edit.position;
+                    ensure!(
+                        staged_world.block(pos.x, pos.y, pos.z) == Some(&edit.replacement),
+                        "staged terrain differs from live block at {pos:?}"
+                    );
+                    ensure!(
+                        staged_world.light(pos.x, pos.y, pos.z, false).is_none()
+                            && staged_world.light(pos.x, pos.y, pos.z, true).is_none(),
+                        "unverified lighting leaked into staged terrain at {pos:?}"
+                    );
+                    edit_count += 1;
+                }
+                ensure!(
+                    edit_count > 0,
+                    "fixture has no live edits in saved terrain inputs"
+                );
+                use native_persistence::heightmap::{
+                    HeightBounds, SavedGenerationHeightmapKind as SavedKind,
+                    SavedGenerationHeightmaps, SpawnHeightmapKind as LiveKind,
+                };
+                let mut height_count = 0;
+                for position in &saved_positions {
+                    let Some(live_maps) = session.spawn_heightmaps_for_chunk(*position) else {
+                        continue;
+                    };
+                    let document = native_persistence::nbt::NamedTag {
+                        name: "".into(),
+                        value: native_persistence::nbt::Tag::Compound(vec![(
+                            "Heightmaps".into(),
+                            staged.heightmaps(*position)?,
+                        )]),
+                    };
+                    let staged_maps = SavedGenerationHeightmaps::read(
+                        &document,
+                        HeightBounds {
+                            min_y: -64,
+                            max_y: 320,
+                        },
+                    )?;
+                    for (saved_kind, live_kind) in [
+                        (SavedKind::WorldSurface, LiveKind::WorldSurface),
+                        (SavedKind::OceanFloor, LiveKind::OceanFloor),
+                        (SavedKind::MotionBlocking, LiveKind::MotionBlocking),
+                    ] {
+                        for z in 0..16 {
+                            for x in 0..16 {
+                                let staged_height = staged_maps
+                                    .first_available(saved_kind, x, z)
+                                    .map(|height| height - 1);
+                                let live_height = live_maps.highest(live_kind, x, z);
+                                if staged_height.is_some() && live_height.is_some() {
+                                    ensure!(
+                                        staged_height == live_height,
+                                        "heightmap differs at {position:?} ({x}, {z}): {saved_kind:?}"
+                                    );
+                                    height_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "Staged {edit_count} live block edits and compared {height_count} live heights"
+                );
+                let biome = staged
+                    .biome_chunk(target)
                     .context("target biome volume is missing")?;
                 let biome_source = oracle.path().join("GeneratedMissingBiomeOracle.java");
                 std::fs::write(

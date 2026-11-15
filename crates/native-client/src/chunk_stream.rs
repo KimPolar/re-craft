@@ -947,6 +947,185 @@ impl Drop for MissingGenerationTerrainWorker {
     }
 }
 
+/// Terrain assembled against one live block snapshot. It cannot advance to
+/// features, lighting, play or saving until the remaining state is bound.
+pub(crate) struct StagedMissingTerrain {
+    batch: crate::fresh_generation::existing::StagedLiveTerrainBatch,
+    generator: crate::fresh_generation::existing::PreparedExistingGenerator,
+    restored: crate::fresh_generation::existing::RestoredSavedTerrain,
+    evaluator: native_resources::density::DensityEvaluator,
+    live: crate::fresh_generation::existing::LiveGenerationTerrainStage,
+    observed: MissingGenerationTargets,
+}
+
+impl StagedMissingTerrain {
+    pub fn is_current(&self, streamer: &ChunkStreamer, session: &LoadedSession) -> bool {
+        self.observed.is_current(streamer, session)
+            && self
+                .generator
+                .verify_live_terrain_stage(session, &self.live)
+                .is_ok()
+    }
+
+    pub fn snapshot(&self) -> Arc<World> {
+        self.batch.snapshot()
+    }
+
+    pub fn heightmaps(&self, position: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        self.batch.heightmaps(position)
+    }
+
+    pub fn biome_chunk(
+        &self,
+        position: ChunkPos,
+    ) -> Option<Arc<native_session::worldgen::QuartBiomeChunk>> {
+        self.batch.biome_chunk(position)
+    }
+
+    pub fn completed_stage(
+        &self,
+        position: ChunkPos,
+    ) -> Option<native_session::worldgen::schedule::GenerationStage> {
+        self.batch.completed_stage(position)
+    }
+}
+
+pub(crate) struct MissingGenerationStagedAssemblyStartError {
+    pub terrain: TerrainBatchMissingGeneration,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct MissingGenerationStagedAssemblyWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<Result<StagedMissingTerrain>>,
+    finished: bool,
+}
+
+impl MissingGenerationStagedAssemblyWorker {
+    pub fn start(
+        terrain: TerrainBatchMissingGeneration,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> std::result::Result<Self, MissingGenerationStagedAssemblyStartError> {
+        if !terrain.is_current(streamer, session) || terrain.remaining != 0 {
+            let error = if terrain.remaining != 0 {
+                "terrain generation is incomplete"
+            } else {
+                "terrain generation is stale"
+            };
+            return Err(MissingGenerationStagedAssemblyStartError {
+                terrain,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = terrain.state.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            terrain,
+            move |terrain| {
+                let result = (|| -> Result<StagedMissingTerrain> {
+                    let TerrainBatchMissingGeneration { state, saved, .. } = terrain;
+                    let BiomedMissingGeneration {
+                        work,
+                        mut generator,
+                        terrain: restored,
+                        live_terrain: live,
+                        evaluator,
+                        observed,
+                    } = state;
+                    let check = || -> Result<()> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "staged terrain assembly cancelled"
+                        );
+                        anyhow::ensure!(observed.stamp.is_current(), "terrain generation is stale");
+                        Ok(())
+                    };
+                    let batch = generator.assemble_captured_terrain_with_live_stage_checked(
+                        work,
+                        &restored,
+                        &live,
+                        saved.into_iter().map(|(position, _)| position),
+                        check,
+                    )?;
+                    Ok(StagedMissingTerrain {
+                        batch,
+                        generator,
+                        restored,
+                        evaluator,
+                        live,
+                        observed,
+                    })
+                })();
+                let _ = sender.send(result);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-live-terrain".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(
+            |(terrain, error)| MissingGenerationStagedAssemblyStartError {
+                terrain,
+                error: anyhow::Error::new(error).context("cannot start staged terrain assembly"),
+            },
+        )?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<StagedMissingTerrain>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("staged terrain assembly stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            if let Ok(batch) = result {
+                crate::generation_staging::discard_async(batch);
+            }
+            anyhow::bail!("staged terrain assembly was cancelled or became stale");
+        }
+        let staged = result?;
+        if !staged.is_current(streamer, session) {
+            crate::generation_staging::discard_async(staged);
+            anyhow::bail!("live terrain changed during staged assembly");
+        }
+        Ok(Some(staged))
+    }
+}
+
+impl Drop for MissingGenerationStagedAssemblyWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
 /// Intermediate data guarded against the captured live terrain, POI and
 /// supported entities. Other live state, disk inputs and later stages still
 /// require validation before attaching or writing anything.
@@ -3636,11 +3815,23 @@ mod tests {
                 })
                 .is_some()
         );
-        let incomplete =
-            match MissingGenerationAssemblyWorker::start(first_terrain, &streamer, &session) {
-                Ok(_) => anyhow::bail!("incomplete terrain was accepted for assembly"),
-                Err(error) => error,
-            };
+        let incomplete_stage = match MissingGenerationStagedAssemblyWorker::start(
+            first_terrain,
+            &streamer,
+            &session,
+        ) {
+            Ok(_) => anyhow::bail!("incomplete terrain was accepted for staged assembly"),
+            Err(error) => error,
+        };
+        assert!(incomplete_stage.error.to_string().contains("incomplete"));
+        let incomplete = match MissingGenerationAssemblyWorker::start(
+            incomplete_stage.terrain,
+            &streamer,
+            &session,
+        ) {
+            Ok(_) => anyhow::bail!("incomplete terrain was accepted for assembly"),
+            Err(error) => error,
+        };
         assert!(incomplete.error.to_string().contains("incomplete"));
         let biomed = incomplete.terrain.into_checked_state(&streamer, &session)?;
         let mut second_terrain_worker =

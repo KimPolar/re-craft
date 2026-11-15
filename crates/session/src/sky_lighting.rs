@@ -2,7 +2,7 @@
 use native_world::{
     block_light::LightBounds,
     loaded::{BlockPosition, BlockStateId, Chunk, ChunkPos, Section, World},
-    sky_light::{SkyColumn, SkySourceScanner, sky_change_for_edit},
+    sky_light::{SkyColumn, SkySourceScanner, same_sky_behavior, sky_change_for_edit},
     sky_propagation::{SkyChange, relight_changes},
     sky_storage::restore_missing_for_changes,
 };
@@ -536,6 +536,121 @@ fn observed_block_id(
     id
 }
 
+/// Columns whose pending edits return both their sky-light behavior and
+/// direct sky source to the pre-edit state. Each affected section must remain
+/// nonempty throughout the recorded edits, avoiding allocation callbacks.
+fn cancelled_sky_columns(
+    baseline: &World,
+    current: &World,
+    edits: &[Edit],
+    initial: &SkySources,
+    final_sources: &SkySources,
+) -> BTreeSet<(i32, i32)> {
+    let mut candidates: BTreeSet<_> = initial
+        .iter()
+        .filter_map(|(&column, source)| {
+            (final_sources.get(&column) == Some(source)).then_some(column)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut originals = BTreeMap::new();
+    let mut edited_sections =
+        BTreeMap::<(ChunkPos, i8), (BTreeSet<usize>, Vec<(BlockStateId, BlockStateId)>)>::new();
+    for edit in edits {
+        let Some(old) = edit.old else {
+            return BTreeSet::new();
+        };
+        let p = edit.position;
+        let Ok(section) = i8::try_from(p.y.div_euclid(16)) else {
+            return BTreeSet::new();
+        };
+        let local = p.x.rem_euclid(16) as usize
+            + p.z.rem_euclid(16) as usize * 16
+            + p.y.rem_euclid(16) as usize * 256;
+        let section = edited_sections.entry((p.chunk(), section)).or_default();
+        section.0.insert(local);
+        section.1.push((old, edit.new));
+        originals.entry(p).or_insert(old);
+    }
+    let mut witnesses = BTreeMap::new();
+    for (position, old) in originals {
+        let column = (position.x, position.z);
+        if !candidates.contains(&column) {
+            continue;
+        }
+        let equivalent = baseline
+            .state(old)
+            .zip(current.block(position.x, position.y, position.z))
+            .and_then(|(before, after)| same_sky_behavior(before, after))
+            == Some(true);
+        if !equivalent {
+            candidates.remove(&column);
+            continue;
+        }
+        let Ok(section) = i8::try_from(position.y.div_euclid(16)) else {
+            return BTreeSet::new();
+        };
+        let key = (position.chunk(), section);
+        let nonempty = *witnesses.entry(key).or_insert_with(|| {
+            let Some(chunk) = baseline.chunks.get(&key.0) else {
+                return false;
+            };
+            if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
+                return false;
+            }
+            let Some(blocks) = chunk.sections.get(&key.1).and_then(|s| s.blocks.as_ref()) else {
+                return false;
+            };
+            let Some((edited, transitions)) = edited_sections.get(&key) else {
+                return false;
+            };
+            let known_nonair = |id| {
+                let Some(state) = baseline.state(id) else {
+                    return false;
+                };
+                // Java 26.3's block registry has exactly these three air
+                // blocks. Unsupported states cannot establish a witness.
+                !matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ) && same_sky_behavior(state, state) == Some(true)
+            };
+            if blocks
+                .iter()
+                .enumerate()
+                .any(|(index, &id)| !edited.contains(&index) && known_nonair(id))
+            {
+                return true;
+            }
+            // Without an untouched witness, count only known non-air states.
+            // This lower bound must stay positive after every section edit.
+            let mut count = blocks.iter().filter(|&&id| known_nonair(id)).count();
+            if count == 0 {
+                return false;
+            }
+            for &(before, after) in transitions {
+                if known_nonair(before) {
+                    let Some(next) = count.checked_sub(1) else {
+                        return false;
+                    };
+                    count = next;
+                }
+                count += usize::from(known_nonair(after));
+                if count == 0 {
+                    return false;
+                }
+            }
+            true
+        });
+        if !nonempty {
+            candidates.remove(&column);
+        }
+    }
+    candidates
+}
+
 fn compute(
     snapshot: &World,
     bounds: LightBounds,
@@ -571,6 +686,7 @@ fn compute(
     }
     let mut scanner = SkySourceScanner::new(&historical, bounds);
     let mut changes = Vec::new();
+    let mut initial_columns = SkySources::new();
     for edit in edits {
         let p = edit.position;
         let old = edit.old?;
@@ -580,6 +696,7 @@ fn compute(
         let affects_sky = sky_change_for_edit(work.state(old), work.state(edit.new)?);
         let mut column =
             observed_source_for(&mut sources, &mut scanner, &historical, p.x, p.z, missing)?;
+        initial_columns.entry((p.x, p.z)).or_insert(column);
         let previous_source = column.lowest_source_y();
         work.set_block_id(p.x, p.y, p.z, edit.new).ok()?;
         column.update(&work, p.y)?;
@@ -592,6 +709,10 @@ fn compute(
                 current_source,
             });
         }
+    }
+    if !changes.is_empty() {
+        let cancelled = cancelled_sky_columns(&baseline, &work, edits, &initial_columns, &sources);
+        changes.retain(|change| !cancelled.contains(&(change.position.x, change.position.z)));
     }
     let restored =
         restore_missing_for_changes(&mut baseline, &historical, bounds, &changes, |x, z| {
@@ -1334,6 +1455,153 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_changes_finish_without_missing_neighbor_when_section_stays_nonempty() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let reverted = BlockPosition {
+            x: 30,
+            y: 15,
+            z: 15,
+        };
+        let changed = BlockPosition { x: 31, ..reverted };
+        let prepare = || {
+            let mut world = fixture();
+            let glass = Arc::make_mut(&mut world).intern_state(state("glass", &[]));
+            Arc::make_mut(&mut world)
+                .set_block_id(20, 0, 0, glass)
+                .unwrap();
+            world
+        };
+        let run = |sky: &mut SkyLighting, world: &mut Arc<World>| {
+            edit(sky, world, reverted, state("stone", &[]));
+            edit(sky, world, changed, state("stone", &[]));
+            edit(sky, world, reverted, state("air", &[]));
+        };
+
+        let mut expected = prepare();
+        let mut baseline = SkyLighting::default();
+        baseline.set_enabled(true);
+        run(&mut baseline, &mut expected);
+        finish(&mut baseline, &mut expected, bounds);
+        assert!(baseline.settled());
+
+        let mut world = prepare();
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let before = Arc::clone(&world);
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        run(&mut sky, &mut world);
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.pending.len(), 1);
+        assert_eq!(sky.pending[0].position, changed);
+        assert_eq!(sky.missing_chunks(), &BTreeSet::from([missing]));
+        assert_eq!(
+            world.light(reverted.x, reverted.y - 1, reverted.z, true),
+            Some(15)
+        );
+        assert_eq!(
+            before.light(reverted.x, reverted.y - 1, reverted.z, true),
+            Some(15)
+        );
+
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for (pos, chunk) in &expected.chunks {
+            for (y, section) in &chunk.sections {
+                assert_eq!(world.chunks[pos].sections[y].sky_light, section.sky_light);
+            }
+        }
+
+        let mut world = prepare();
+        Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let before = Arc::clone(&world);
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, reverted, state("stone", &[]));
+        edit(&mut sky, &mut world, reverted, state("air", &[]));
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert!(sky.settled());
+        assert!(sky.required_chunks().is_empty());
+        assert!(sky.missing_chunks().is_empty());
+        for (pos, chunk) in &before.chunks {
+            for (y, section) in &chunk.sections {
+                assert_eq!(world.chunks[pos].sections[y].sky_light, section.sky_light);
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_changes_can_keep_a_section_nonempty_without_a_fixed_witness() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let first = BlockPosition {
+            x: 30,
+            y: 15,
+            z: 15,
+        };
+        let second = BlockPosition { x: 31, ..first };
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let before = Arc::clone(&world);
+
+        // Both non-air blocks are edited, but at least one remains in the
+        // section after every transition.
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, second, state("air", &[]));
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("air", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        assert!(sky.missing_chunks().is_empty());
+        for (pos, chunk) in &before.chunks {
+            for (y, section) in &chunk.sections {
+                assert_eq!(world.chunks[pos].sections[y].sky_light, section.sky_light);
+            }
+        }
+
+        // The same final blocks do not prove the same section-allocation
+        // history if the only non-air block is removed first.
+        edit(&mut sky, &mut world, second, state("air", &[]));
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("air", &[]));
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert_eq!(sky.pending.len(), 4);
+        assert_eq!(sky.missing_chunks(), &BTreeSet::from([missing]));
+    }
+
+    #[test]
+    fn cancelled_changes_keep_waiting_when_section_allocation_is_unknown() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let missing = ChunkPos { x: 2, z: 0 };
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let position = BlockPosition {
+            x: 31,
+            y: 15,
+            z: 15,
+        };
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, position, state("stone", &[]));
+        edit(&mut sky, &mut world, position, state("air", &[]));
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.pending.len(), 2);
+        assert_eq!(sky.missing_chunks(), &BTreeSet::from([missing]));
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+    }
+
+    #[test]
     fn unavailable_light_retains_a_neutral_edit_that_changes_the_source() {
         let bounds = LightBounds::new(0, 32).unwrap();
         let mut world = fixture();
@@ -1645,6 +1913,112 @@ mod tests {
                         expected[0][index],
                         "after deferred neutral edit, at {x},{y},{z}"
                     );
+                }
+            }
+        }
+
+        let cancelled_edits = [
+            serde_json::json!({"x":20,"y":0,"z":0,"state":"glass","defer":false}),
+            serde_json::json!({"x":31,"y":15,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":31,"y":15,"z":15,"state":"air","defer":false}),
+            serde_json::json!({"x":30,"y":15,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":31,"y":15,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":30,"y":15,"z":15,"state":"air","defer":false}),
+        ];
+        std::fs::write(&input, serde_json::to_vec(&cancelled_edits).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 3);
+        assert_eq!(expected[0], expected[1]);
+
+        let mut world = fixture();
+        let glass = Arc::make_mut(&mut world).intern_state(state("glass", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(20, 0, 0, glass)
+            .unwrap();
+        let unloaded = Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let first = BlockPosition {
+            x: 31,
+            y: 15,
+            z: 15,
+        };
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("air", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(world.light(x, y, z, true).unwrap(), expected[1][index]);
+                }
+            }
+        }
+
+        let reverted = BlockPosition { x: 30, ..first };
+        edit(&mut sky, &mut world, reverted, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, reverted, state("air", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert_eq!(sky.pending.len(), 1);
+        assert_eq!(sky.pending[0].position, first);
+        Arc::make_mut(&mut world).chunks.insert(missing, unloaded);
+        sky.streaming_changed();
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(world.light(x, y, z, true).unwrap(), expected[2][index]);
+                }
+            }
+        }
+
+        let rotating_witness = [
+            serde_json::json!({"x":31,"y":15,"z":15,"state":"stone","defer":false}),
+            serde_json::json!({"x":30,"y":15,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":31,"y":15,"z":15,"state":"air","defer":true}),
+            serde_json::json!({"x":31,"y":15,"z":15,"state":"stone","defer":true}),
+            serde_json::json!({"x":30,"y":15,"z":15,"state":"air","defer":false}),
+        ];
+        std::fs::write(&input, serde_json::to_vec(&rotating_witness).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0], expected[1]);
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        Arc::make_mut(&mut world).chunks.remove(&missing).unwrap();
+        edit(&mut sky, &mut world, reverted, state("stone", &[]));
+        edit(&mut sky, &mut world, first, state("air", &[]));
+        edit(&mut sky, &mut world, first, state("stone", &[]));
+        edit(&mut sky, &mut world, reverted, state("air", &[]));
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                    assert_eq!(world.light(x, y, z, true).unwrap(), expected[1][index]);
                 }
             }
         }

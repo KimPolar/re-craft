@@ -195,6 +195,40 @@ impl SimulationChunks {
         true
     }
 
+    /// Activate a decoded ticket store in Java's order. This only installs
+    /// initial simulation tickets; callers must manage their timeouts, chunk
+    /// loading, and subsequent ticket changes before advancing game ticks.
+    pub fn activate_saved_tickets(
+        &mut self,
+        tickets: &native_persistence::chunk_tickets::SavedChunkTickets,
+    ) {
+        for ticket in tickets.activation_order() {
+            if ticket.kind.simulates() {
+                self.add_ticket(
+                    ChunkPos {
+                        x: ticket.position.x,
+                        z: ticket.position.z,
+                    },
+                    ticket.kind.simulation_key(),
+                    ticket.level,
+                );
+            }
+        }
+    }
+
+    /// Apply a locked world's captured tickets only if its epoch and
+    /// dimension still match; a failed check leaves the tracker unchanged.
+    pub fn activate_captured_tickets(
+        &mut self,
+        captured: &native_persistence::world::CapturedChunkTickets,
+        session: &native_persistence::save::WorldSessionGuard,
+        dimension: &native_persistence::world::DimensionId,
+    ) -> anyhow::Result<()> {
+        let _lease = captured.lock_current_for(session, dimension)?;
+        self.activate_saved_tickets(captured.tickets());
+        Ok(())
+    }
+
     /// Remove an existing ticket and schedule propagation. Java notifies the
     /// graph even when a different ticket still supplies the same level.
     pub fn remove_ticket(&mut self, pos: ChunkPos, kind: u64, level: i32) -> bool {

@@ -343,6 +343,42 @@ pub struct SessionSaveSources {
     stamp: crate::save::WorldReadStamp,
 }
 
+/// Ticket data read from one locked world and dimension at a particular epoch.
+/// Attachment must hold `lock_current_for` until the result has been applied.
+pub struct CapturedChunkTickets {
+    dimension: DimensionId,
+    tickets: crate::chunk_tickets::SavedChunkTickets,
+    stamp: crate::save::WorldReadStamp,
+}
+
+impl CapturedChunkTickets {
+    pub fn tickets(&self) -> &crate::chunk_tickets::SavedChunkTickets {
+        &self.tickets
+    }
+
+    pub fn is_current_for(
+        &self,
+        session: &crate::save::WorldSessionGuard,
+        dimension: &DimensionId,
+    ) -> bool {
+        &self.dimension == dimension
+            && self.stamp.belongs_to_session(session)
+            && self.stamp.is_current()
+    }
+
+    pub fn lock_current_for(
+        &self,
+        session: &crate::save::WorldSessionGuard,
+        dimension: &DimensionId,
+    ) -> Result<crate::save::WorldReadLease<'_>> {
+        ensure!(
+            &self.dimension == dimension && self.stamp.belongs_to_session(session),
+            "chunk ticket capture belongs to a different world or dimension"
+        );
+        self.stamp.lock_current()
+    }
+}
+
 impl SessionSaveSources {
     pub fn level(&self) -> &NamedTag {
         &self.level
@@ -1764,6 +1800,68 @@ impl WorldReader {
 
     pub fn hardcore(&self) -> Result<bool> {
         Ok(self.difficulty_settings()?.hardcore)
+    }
+
+    /// Read this dimension's 26.3 ticket store, retaining unknown fields.
+    /// Locked readers use a world read lease; unlocked callers must coordinate
+    /// concurrent writes themselves.
+    pub fn chunk_tickets(&self) -> Result<crate::chunk_tickets::SavedChunkTickets> {
+        let stamp = self
+            .session_guard
+            .as_ref()
+            .map(crate::save::WorldSessionGuard::read_stamp)
+            .transpose()?;
+        let _lease = stamp
+            .as_ref()
+            .map(crate::save::WorldReadStamp::lock_current)
+            .transpose()?;
+        self.read_chunk_tickets()
+    }
+
+    /// Capture tickets together with their world epoch for later attachment.
+    pub fn capture_chunk_tickets(&self) -> Result<CapturedChunkTickets> {
+        let session = self
+            .session_guard
+            .as_ref()
+            .context("chunk ticket capture requires a locked world session")?;
+        let stamp = session.read_stamp()?;
+        let tickets = {
+            let _lease = stamp.lock_current()?;
+            self.read_chunk_tickets()?
+        };
+        Ok(CapturedChunkTickets {
+            dimension: self.dimension.clone(),
+            tickets,
+            stamp,
+        })
+    }
+
+    fn read_chunk_tickets(&self) -> Result<crate::chunk_tickets::SavedChunkTickets> {
+        let path = self
+            .root
+            .join("dimensions")
+            .join(&self.dimension.namespace)
+            .join(&self.dimension.path)
+            .join("data/minecraft/chunk_tickets.dat");
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return crate::chunk_tickets::SavedChunkTickets::read(None);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot open {}", path.display()));
+            }
+        };
+        let bytes = nbt::decompress_limited(file)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let document = if bytes.starts_with(&[0x1f, 0x8b]) {
+            nbt::read_gzip(bytes.as_slice())
+        } else {
+            nbt::read(&bytes)
+        }
+        .with_context(|| format!("invalid {}", path.display()))?;
+        crate::chunk_tickets::SavedChunkTickets::read(Some(document))
+            .with_context(|| format!("invalid {}", path.display()))
     }
 
     /// Read this dimension's `data/minecraft/world_border.dat`. Invalid or
@@ -3320,6 +3418,73 @@ mod tests {
                 WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
             assert_eq!(reader.allow_commands().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn chunk_tickets_are_dimension_scoped_and_read_without_modification() {
+        use crate::chunk_tickets::TicketKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let path = dir
+            .path()
+            .join("dimensions/minecraft/overworld/data/minecraft/chunk_tickets.dat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "tickets".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![Tag::Compound(vec![
+                                ("chunk_pos".into(), Tag::IntArray(vec![-3, 4])),
+                                ("type".into(), Tag::String("minecraft:forced".into())),
+                                ("level".into(), Tag::Int(31)),
+                            ])],
+                        },
+                    )]),
+                ),
+            ]),
+        };
+        write_gzip(&path, &document);
+        let before = std::fs::read(&path).unwrap();
+        let reader = WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap())
+            .unwrap();
+        let tickets = reader.chunk_tickets().unwrap();
+        assert_eq!(tickets.entries().len(), 1);
+        assert_eq!(tickets.entries()[0].position, ChunkPos { x: -3, z: 4 });
+        assert_eq!(tickets.entries()[0].kind, TicketKind::Forced);
+        assert_eq!(tickets.source(), Some(&document));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let other = WorldReader::open(dir.path(), DimensionId::parse("the_nether").unwrap())
+            .unwrap();
+        assert!(other.chunk_tickets().unwrap().entries().is_empty());
+        assert!(reader.capture_chunk_tickets().is_err());
+        #[cfg(windows)]
+        {
+            let locked = WorldReader::open_for_session(
+                dir.path(),
+                DimensionId::parse("overworld").unwrap(),
+            )
+            .unwrap();
+            let guard = locked.session_guard().unwrap();
+            let captured = locked.capture_chunk_tickets().unwrap();
+            assert!(captured.is_current_for(&guard, locked.dimension()));
+            assert!(!captured.is_current_for(&guard, other.dimension()));
+            assert!(captured.lock_current_for(&guard, locked.dimension()).is_ok());
+            assert!(captured.lock_current_for(&guard, other.dimension()).is_err());
+            let writer = guard.acquire_write().unwrap();
+            assert!(locked.chunk_tickets().is_err());
+            assert!(!captured.is_current_for(&guard, locked.dimension()));
+            drop(writer);
+            assert!(captured.lock_current_for(&guard, locked.dimension()).is_err());
+        }
+        std::fs::write(&path, b"not an NBT file").unwrap();
+        assert!(reader.chunk_tickets().is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod anvil;
 pub mod chest_loot;
+pub mod chunk_tickets;
 mod chest_transfer;
 pub mod edit;
 pub mod generated_chunk;

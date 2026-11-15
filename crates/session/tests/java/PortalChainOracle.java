@@ -110,7 +110,9 @@ public class PortalChainOracle {
                 var state = block.defaultBlockState();
                 if (block instanceof RedStoneOreBlock) state = state.setValue(RedStoneOreBlock.LIT, lit != 0);
                 if (!state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
-                        || !state.getFluidState().isEmpty() || state.hasBlockEntity())
+                        || !state.getFluidState().isEmpty() || state.hasBlockEntity()
+                        || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                        || state.getPostProcessPos(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) != null)
                     throw new AssertionError("unexpected ore properties " + state);
                 for (var direction : Direction.values()) for (var neighbor : List.of(Blocks.AIR, Blocks.WATER, Blocks.MAGMA_BLOCK)) {
                     if (!state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, direction))

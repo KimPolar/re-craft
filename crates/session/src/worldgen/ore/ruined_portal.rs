@@ -932,6 +932,7 @@ impl PortalDecorationWorld for PortalRegion<'_, '_, '_> {
             self.registry.is_canonical_state(&old.name, &old.properties)
                 && self.registry.has_block_entity(&old.name) == Some(false)
                 && (disk_safe_solid(&old.name).is_some()
+                    || generated_ore_state(&old)?
                     || portal_state
                     || native_world::collision::slab_stair_solid(&old).is_some()
                     || native_world::wall::Wall::from_state(&old).is_some())
@@ -2576,6 +2577,101 @@ mod tests {
         assert_eq!(random.next_long(), expected.next_long());
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn portal_decoration_replaces_supported_generated_ores() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let protected = resolve_block_tag(
+            &mut resources,
+            &ResourceId::parse("minecraft:features_cannot_replace")?,
+            &ids,
+        )?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let names = [
+            "coal_ore",
+            "deepslate_coal_ore",
+            "iron_ore",
+            "deepslate_iron_ore",
+            "copper_ore",
+            "deepslate_copper_ore",
+            "gold_ore",
+            "deepslate_gold_ore",
+            "emerald_ore",
+            "deepslate_emerald_ore",
+            "lapis_ore",
+            "deepslate_lapis_ore",
+            "diamond_ore",
+            "deepslate_diamond_ore",
+            "nether_gold_ore",
+            "nether_quartz_ore",
+            "redstone_ore",
+            "deepslate_redstone_ore",
+            "raw_iron_block",
+            "raw_copper_block",
+        ];
+        let mut checked = 0;
+        for name in names {
+            let is_redstone = name.contains("redstone");
+            for lit in [false, true] {
+                if lit && !is_redstone {
+                    continue;
+                }
+                let id = format!("minecraft:{name}");
+                let spec = if is_redstone {
+                    serde_json::json!({"id":id,"properties":{"lit":lit.to_string()}})
+                } else {
+                    serde_json::json!(id)
+                };
+                let (name, properties) = registry.resolve(&spec)?;
+                let old = BlockState { name, properties };
+                for replacement in [PortalBlock::Netherrack, PortalBlock::Magma] {
+                    let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                    let center = ChunkPos { x: 0, z: 0 };
+                    let writable = terrain.snapshot().chunks.keys().copied().collect();
+                    let mut setup = terrain.decoration_region(&tags, &motion, writable)?;
+                    setup.set_proto_block([8, 7, 8], &old)?;
+                    setup.finish()?;
+                    let writable = terrain.snapshot().chunks.keys().copied().collect();
+                    let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                    let mut portal = PortalRegion {
+                        region: &mut region,
+                        registry: &registry,
+                        protected: &protected,
+                    };
+                    assert!(!portal.is_protected(&old)?);
+                    portal.set_block([8, 7, 8], replacement)?;
+                    assert_eq!(portal.region.world_surface_height(8, 8)?, 8);
+                    assert!(portal.region.world.saved_block_ticks.is_empty());
+                    assert!(portal.region.world.saved_fluid_ticks.is_empty());
+                    region.finish()?;
+                    let expected = if replacement == PortalBlock::Magma {
+                        "minecraft:magma_block"
+                    } else {
+                        "minecraft:netherrack"
+                    };
+                    assert_eq!(terrain.snapshot().block(8, 7, 8).unwrap().name, expected);
+                    if replacement == PortalBlock::Magma {
+                        assert!(
+                            terrain
+                                .feature_postprocessing(center)
+                                .context("magma postprocessing missing")?
+                                .sections()[0]
+                                .contains(&0x888)
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 44);
         Ok(())
     }
 }

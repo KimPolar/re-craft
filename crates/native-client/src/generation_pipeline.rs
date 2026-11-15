@@ -1017,6 +1017,7 @@ mod tests {
         });
         session.update(Duration::from_millis(50));
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut next_tick = Instant::now() + Duration::from_millis(50);
         let unavailable = loop {
             let required = session.required_shape_update_chunks();
             if required.is_empty() {
@@ -1044,7 +1045,10 @@ mod tests {
                 "saved shape-update neighbors did not settle: {required:?}"
             );
             streamer.service(&mut session)?;
-            session.update(Duration::from_millis(50));
+            if Instant::now() >= next_tick {
+                session.update(Duration::from_millis(50));
+                next_tick += Duration::from_millis(50);
+            }
             std::thread::sleep(Duration::from_millis(5));
         };
         drop(streamer);
@@ -1152,22 +1156,69 @@ mod tests {
             return Ok(());
         }
         let plan = plan.context("cannot draft the ticked generated session")?;
+        let mut expected_edits: std::collections::BTreeMap<_, _> = expected
+            .world
+            .loaded()
+            .context("saved session terrain is missing")?
+            .block_edits()
+            .map(|edit| (edit.position, edit.clone()))
+            .collect();
+        let mut written_edits = Vec::new();
+        let dimension = DimensionId::parse("overworld")?;
         drop(reader);
         let mut writer = lock.acquire_write()?;
-        writer.write_plan(plan, |_, _| {
-            anyhow::bail!("unexpected block edit in player round trip")
+        writer.write_plan(plan, |actual_dimension, change| {
+            ensure!(
+                *actual_dimension == dimension,
+                "block edit is in another dimension"
+            );
+            let position = native_world::loaded::BlockPosition {
+                x: change.x,
+                y: change.y,
+                z: change.z,
+            };
+            let expected = expected_edits
+                .remove(&position)
+                .context("block edit was not recorded by the session")?;
+            ensure!(
+                expected.original.as_ref() == Some(&resolve(&change.expected)?),
+                "block edit source changed"
+            );
+            ensure!(
+                expected.replacement == resolve(&change.replacement)?,
+                "block edit result changed"
+            );
+            written_edits.push((position, expected.replacement));
+            Ok(())
         })?;
+        ensure!(
+            expected_edits.is_empty(),
+            "session block edits were not included in the save"
+        );
         drop(writer);
-        let reader = WorldReader::open_with_session(
+        let mut reader = WorldReader::open_with_session(
             world_path,
             DimensionId::parse("overworld")?,
             lock.clone(),
         )?;
         let player = reader.read_player()?.context("saved player missing")?;
         let camera = crate::saved_camera(&player)?.context("saved player camera missing")?;
-        assert_eq!(camera.yaw, expected.player.yaw);
-        assert_eq!(camera.pitch, expected.player.pitch);
+        assert_eq!(camera.yaw, expected.player.yaw.to_degrees() - 180.0);
+        assert_eq!(camera.pitch, -expected.player.pitch.to_degrees());
         assert_eq!(reader.game_time()?, expected.game_time as i64);
+        for (position, expected_state) in &written_edits {
+            let chunk = reader
+                .read_chunk(position.x.div_euclid(16), position.z.div_euclid(16))?
+                .context("saved edited chunk missing")?;
+            let actual = chunk
+                .block(position.x, position.y, position.z)
+                .context("saved edited block missing")?;
+            ensure!(
+                resolve(actual)? == *expected_state,
+                "saved block state changed at {position:?}"
+            );
+        }
+        eprintln!("Verified {} saved block edits", written_edits.len());
         drop(reader);
         drop(frozen);
         let reopened = crate::prepare_world_with_session(
@@ -1190,8 +1241,8 @@ mod tests {
             anyhow::bail!("saved generated world did not reopen as a play session");
         };
         let actual = reopened.session.snapshot();
-        assert_eq!(actual.player.yaw, expected.player.yaw);
-        assert_eq!(actual.player.pitch, expected.player.pitch);
+        assert!((actual.player.yaw - expected.player.yaw).abs() < 0.00001);
+        assert!((actual.player.pitch - expected.player.pitch).abs() < 0.00001);
         assert_eq!(actual.game_time, expected.game_time);
         let expected_pos = expected.origin.as_vec3() + expected.player.position;
         let actual_pos = actual.origin.as_vec3() + actual.player.position;

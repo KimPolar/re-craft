@@ -61,6 +61,8 @@ fn fixture(
                 BTreeSet::new(),
             ),
         ));
+    } else {
+        session.bubble_column_tags = None;
     }
     let ticks = vec![
         SavedBlockTick {
@@ -149,15 +151,303 @@ fn unchanged_bubble_callbacks_preserve_other_ticks_and_allow_a_chunk_draft() {
     }
 }
 
-#[test]
-fn changed_or_unknown_bubble_callbacks_still_block_saving() {
-    let column = state("minecraft:bubble_column", &[("drag", "false")]);
-    for with_tags in [false, true] {
-        let (mut session, home, _, _) = fixture(column.clone(), BubbleTickKind::Column, with_tags);
-        session.advance_block_ticks();
-        assert!(session.unresolved_bubble_tick);
-        assert!(session.draft_block_ticks(home).is_err());
+fn effect_fixture() -> (LoadedSession, ChunkPos, NamedTag) {
+    let water = state("minecraft:water", &[("level", "0")]);
+    let (mut session, home, _, source) = fixture(water.clone(), BubbleTickKind::Water, true);
+    let center = session.origin + IVec3::new(8, 5, 8);
+    let side = center + IVec3::X;
+    let additions = [
+        (center + IVec3::Y, water),
+        (side, state("minecraft:bubble_column", &[("drag", "false")])),
+    ];
+    let mut changes = Vec::new();
+    for (position, next) in additions {
+        let old = session
+            .world
+            .block(position.x, position.y, position.z)
+            .unwrap()
+            .clone();
+        let id = session.intern_block(next.clone());
+        Arc::make_mut(&mut session.world)
+            .set_block_id(position.x, position.y, position.z, id)
+            .unwrap();
+        changes.push(BlockChange {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+            expected: saved(&old),
+            replacement: saved(&next),
+        });
     }
+    let fluids = vec![
+        SavedFluidTick {
+            fluid: "minecraft:water".into(),
+            position: side.to_array(),
+            delay: 13,
+            priority: -2,
+        },
+        SavedFluidTick {
+            fluid: "minecraft:flowing_water".into(),
+            position: (center - IVec3::X).to_array(),
+            delay: 15,
+            priority: 1,
+        },
+    ];
+    let mut initial = native_persistence::edit::draft_chunk_blocks(
+        &source,
+        native_persistence::world::ChunkPos {
+            x: home.x,
+            z: home.z,
+        },
+        &changes,
+    )
+    .unwrap();
+    initial.replace_fluid_ticks(&fluids).unwrap();
+    Arc::make_mut(&mut session.world)
+        .saved_fluid_ticks
+        .insert(home, fluids.clone());
+    session.enqueue_saved_fluids(home, &fluids);
+    (session, home, initial.document().clone())
+}
+
+fn bubble_heightmap_tags() -> HeightmapTags {
+    struct Provider;
+    impl native_resources::packs::ResourceProvider for Provider {
+        fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+            Ok(vec![
+                br#"{"values":["minecraft:stone","minecraft:magma_block"]}"#.to_vec(),
+            ])
+        }
+    }
+    let registry = ["air", "stone", "magma_block", "water", "bubble_column"]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+    HeightmapTags::load(&mut Provider, &registry).unwrap()
+}
+
+fn bubble_air_and_fluid(state: &SavedState) -> anyhow::Result<(bool, bool)> {
+    Ok((
+        state.name.matches("minecraft:air"),
+        state.name.matches("minecraft:water") || state.name.matches("minecraft:bubble_column"),
+    ))
+}
+
+#[test]
+fn changed_bubble_callbacks_save_blocks_and_scheduled_ticks_together() {
+    let (mut session, home, source) = effect_fixture();
+    let center = session.origin + IVec3::new(8, 5, 8);
+    let side = center + IVec3::X;
+    let before_random = session.level_random.state();
+    session.advance_block_ticks();
+    assert!(!session.unresolved_bubble_tick);
+    assert_eq!(session.level_random.state(), before_random);
+    let column = state("minecraft:bubble_column", &[("drag", "true")]);
+    for position in [center, center + IVec3::Y] {
+        assert_eq!(
+            session.world.block(position.x, position.y, position.z),
+            Some(&column)
+        );
+    }
+    let blocks = session.draft_block_ticks(home).unwrap();
+    assert_eq!(
+        blocks,
+        vec![
+            SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position: center.to_array(),
+                delay: 20,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position: center.to_array(),
+                delay: 10,
+                priority: 1,
+            },
+            SavedBlockTick {
+                block: "minecraft:bubble_column".into(),
+                position: side.to_array(),
+                delay: 5,
+                priority: 0,
+            },
+        ]
+    );
+    let fluids = session.draft_fluid_ticks(home).unwrap();
+    assert_eq!(
+        fluids,
+        vec![
+            SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: side.to_array(),
+                delay: 13,
+                priority: -2,
+            },
+            SavedFluidTick {
+                fluid: "minecraft:flowing_water".into(),
+                position: (center - IVec3::X).to_array(),
+                delay: 15,
+                priority: 1,
+            },
+            SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: (center + IVec3::Y).to_array(),
+                delay: 5,
+                priority: 0,
+            },
+            SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: center.to_array(),
+                delay: 5,
+                priority: 0,
+            },
+        ]
+    );
+    let draft = session
+        .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+            home,
+            &source,
+            &bubble_heightmap_tags(),
+            bubble_air_and_fluid,
+        )
+        .unwrap();
+    let water = state("minecraft:water", &[("level", "0")]);
+    let changes: Vec<_> = [center, center + IVec3::Y]
+        .into_iter()
+        .map(|position| BlockChange {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+            expected: saved(&water),
+            replacement: saved(&column),
+        })
+        .collect();
+    let mut expected = native_persistence::edit::draft_chunk_blocks(
+        &source,
+        native_persistence::world::ChunkPos {
+            x: home.x,
+            z: home.z,
+        },
+        &changes,
+    )
+    .unwrap();
+    expected.replace_block_ticks(&blocks).unwrap();
+    expected.replace_fluid_ticks(&fluids).unwrap();
+    for field in [
+        "sections",
+        "block_ticks",
+        "fluid_ticks",
+        "unknown_chunk_data",
+    ] {
+        assert_eq!(
+            draft.document().value.get(field),
+            expected.document().value.get(field),
+            "{field}"
+        );
+    }
+    assert!(draft.matches_source(&source).unwrap());
+}
+
+#[test]
+fn bubble_tick_in_a_nonfull_chunk_remains_deferred_without_losing_its_schedule() {
+    let (mut session, home, _) = effect_fixture();
+    let world = Arc::make_mut(&mut session.world);
+    Arc::make_mut(world.chunks.get_mut(&home).unwrap()).status = Some("minecraft:features".into());
+    let before = Arc::clone(&session.world);
+    let blocks = session.draft_block_ticks(home).unwrap();
+    let fluids = session.draft_fluid_ticks(home).unwrap();
+    session.advance_block_ticks();
+    assert!(!session.unresolved_bubble_tick);
+    assert_eq!(session.bubble_deferred.len(), 1);
+    assert!(Arc::ptr_eq(&before, &session.world));
+    assert_eq!(session.draft_block_ticks(home).unwrap(), blocks);
+    assert_eq!(session.draft_fluid_ticks(home).unwrap(), fluids);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn changed_bubble_callback_saves_both_tick_queues_for_java() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::{path::PathBuf, process::Command};
+
+    let (mut session, home, source) = effect_fixture();
+    let center = session.origin + IVec3::new(8, 5, 8);
+    session.advance_block_ticks();
+    let draft = session.draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+        home,
+        &source,
+        &bubble_heightmap_tags(),
+        bubble_air_and_fluid,
+    )?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let version = game.join("versions/26.3");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+    ensure!(metadata["id"] == "26.3", "wrong Minecraft version");
+    let temp = tempfile::tempdir()?;
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for library in metadata["libraries"]
+        .as_array()
+        .context("libraries missing")?
+    {
+        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let classpath = std::env::join_paths(paths)?;
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+        .join("bin");
+    let oracle = temp.path().join("BubbleEffectSavedTickOracle.java");
+    let nbt = temp.path().join("chunk.nbt");
+    std::fs::write(
+        &oracle,
+        include_str!("../tests/java/BubbleEffectSavedTickOracle.java"),
+    )?;
+    std::fs::write(&nbt, native_persistence::nbt::write(draft.document())?)?;
+    let compiled = Command::new(java.join("javac.exe"))
+        .arg("-cp")
+        .arg(&classpath)
+        .arg(oracle)
+        .output()?;
+    ensure!(
+        compiled.status.success(),
+        "Java tick oracle did not compile: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = Command::new(java.join("java.exe"))
+        .arg("-cp")
+        .arg(classpath)
+        .arg("BubbleEffectSavedTickOracle")
+        .arg(nbt)
+        .args(center.to_array().map(|coordinate| coordinate.to_string()))
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Java tick comparison failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_bubble_callbacks_still_block_saving() {
+    let column = state("minecraft:bubble_column", &[("drag", "false")]);
+    let (mut session, home, _, _) = fixture(column, BubbleTickKind::Column, false);
+    session.advance_block_ticks();
+    assert!(session.unresolved_bubble_tick);
+    assert!(session.draft_block_ticks(home).is_err());
     let (mut session, home, _, _) = fixture(
         state("minecraft:bubble_column", &[("drag", "true")]),
         BubbleTickKind::Column,

@@ -20472,8 +20472,8 @@ impl LoadedSession {
 
                     continue;
                 }
-                // A matching callback is staged before deciding whether it
-                // produces effects that cannot yet be saved as a complete unit.
+                // Stage supported block replacements and their related ticks
+                // together. Unknown effects leave the original tick pending.
                 let Some(tags) = self.bubble_column_tags.as_ref() else {
                     self.unresolved_bubble_tick = true;
                     self.bubble_pending.insert(key);
@@ -20501,9 +20501,6 @@ impl LoadedSession {
                     continue;
                 }
                 let actions = stage.actions;
-                if !actions.is_empty() {
-                    self.unresolved_bubble_tick = true;
-                }
                 let mut prepared = Vec::with_capacity(actions.len());
                 let mut valid = true;
                 for action in &actions {
@@ -20519,6 +20516,7 @@ impl LoadedSession {
                     }
                 }
                 if !valid {
+                    self.unresolved_bubble_tick = true;
                     self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
@@ -20528,6 +20526,7 @@ impl LoadedSession {
                 for (action, replacement) in actions.into_iter().zip(prepared) {
                     if let Some((position, id)) = replacement {
                         if !self.set_with_notify(position, id, false) {
+                            self.unresolved_bubble_tick = true;
                             self.stream_errors
                                 .push("bubble column changed during application".into());
                             break;
@@ -50303,15 +50302,16 @@ pub(crate) mod tests {
                 Some("true")
             );
         }
-        assert!(session.unresolved_bubble_tick);
+        assert!(!session.unresolved_bubble_tick);
         assert!(!session.fluid_ticks.is_empty());
         assert!(
             session
                 .draft_block_ticks(session.player_chunk().unwrap())
-                .is_err()
+                .is_ok()
         );
         session.tick = 5;
         session.advance_fluid_ticks();
+        assert!(session.unresolved_bubble_tick);
         assert_eq!(
             session
                 .world
@@ -50465,6 +50465,8 @@ pub(crate) mod tests {
             }]);
             session.advance_block_ticks();
             assert!(session.bubble_deferred.is_empty(), "{row}");
+            assert!(!session.unresolved_bubble_tick, "{row}");
+            assert_eq!(row["gameEvents"], 0, "{row}");
             let states: Vec<_> = (0..3)
                 .map(|i| {
                     let pos = absolute + IVec3::Y * i;

@@ -38,7 +38,7 @@ public class BubbleTickCallbackOracle {
     }
     static class World extends ServerLevel {
         Map<BlockPos,BlockState> blocks; RandomSource random; CollectingNeighborUpdater updater;
-        EnvironmentAttributeSystem attributes; JsonArray blockTicks, fluidTicks; Set<String> pending;
+        EnvironmentAttributeSystem attributes; JsonArray blockTicks, fluidTicks; Set<String> pending; int gameEvents;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public RandomSource getRandom() { return random; }
         @Override public ResourceKey<Level> dimension() { return Level.OVERWORLD; }
@@ -65,7 +65,7 @@ public class BubbleTickCallbackOracle {
             if(!pending.add("f:"+pos.toShortString()+":"+id)) return;
             var entry=new JsonArray(); entry.add(id); entry.add(pos.getX()); entry.add(pos.getY()); entry.add(pos.getZ()); entry.add(delay); fluidTicks.add(entry);
         }
-        @Override public void gameEvent(Holder<GameEvent> event,Vec3 pos,GameEvent.Context context) { }
+        @Override public void gameEvent(Holder<GameEvent> event,Vec3 pos,GameEvent.Context context) { gameEvents++; }
     }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
@@ -83,13 +83,13 @@ public class BubbleTickCallbackOracle {
                 FluidTags.BUBBLE_COLUMN_CAN_OCCUPY,waterTagged?List.of(Fluids.WATER.builtInRegistryHolder()):List.of()))).apply();
             for(int root:new int[]{1,3,4}) for(int above=0;above<6;above++) for(int top=0;top<6;top++) for(int side=0;side<5;side++) {
                 world.blocks=new HashMap<>(); world.random=new LegacyRandomSource(1); world.updater=new CollectingNeighborUpdater(world,100000);
-                world.blockTicks=new JsonArray(); world.fluidTicks=new JsonArray(); world.pending=new HashSet<>();
+                world.blockTicks=new JsonArray(); world.fluidTicks=new JsonArray(); world.pending=new HashSet<>(); world.gameEvents=0;
                 world.blocks.put(CENTER.below(),cell(5)); world.blocks.put(CENTER,cell(root)); world.blocks.put(CENTER.above(),cell(above)); world.blocks.put(CENTER.above(2),cell(top));
                 if(side!=0) { world.blocks.put(CENTER.east(),cell(side)); world.blocks.put(CENTER.east().below(),cell(5)); }
                 (root==1?waterTick:bubbleTick).invoke(root==1?Blocks.WATER:Blocks.BUBBLE_COLUMN,cell(root),world,CENTER,world.random);
                 var states=new JsonArray(); for(int i=0;i<3;i++) states.add(name(world.getBlockState(CENTER.above(i))));
                 var row=new JsonObject(); row.addProperty("support",support); row.addProperty("water",waterTagged); row.addProperty("root",root); row.addProperty("above",above); row.addProperty("top",top); row.addProperty("side",side);
-                row.add("states",states); row.add("blockTicks",world.blockTicks); row.add("fluidTicks",world.fluidTicks); rows.add(row);
+                row.add("states",states); row.add("blockTicks",world.blockTicks); row.add("fluidTicks",world.fluidTicks); row.addProperty("gameEvents",world.gameEvents); rows.add(row);
             }
         }
         Files.writeString(Path.of(args[0]),rows.toString());

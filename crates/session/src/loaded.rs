@@ -3465,6 +3465,14 @@ impl LoadedSession {
         )
     }
 
+    /// ServerLevel.shouldTickBlocksAt uses the simulation ticket level, not
+    /// the render window or the loading ticket level.
+    fn simulation_allows_block_ticks(&self, pos: ChunkPos) -> bool {
+        self.player_simulation
+            .as_ref()
+            .is_none_or(|state| state.player.tracker().in_block_ticking_range(pos))
+    }
+
     /// Update the loading window independently of the simulation distance.
     pub fn set_simulation_view_distance(&mut self, distance: u32) {
         let Some(state) = &mut self.player_simulation else {
@@ -20238,12 +20246,13 @@ impl LoadedSession {
             return Some(Vec::new());
         }
         let time = i64::try_from(i128::from(indexed.base_time) + self.scheduled_tick()).ok()?;
-        let world = &self.world;
         let selected = indexed.queue.collect_due(time, 65_536, |pos| {
-            world
-                .chunks
-                .get(&pos)
-                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            self.simulation_allows_block_ticks(pos)
+                && self
+                    .world
+                    .chunks
+                    .get(&pos)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
         });
         let mut orders = BTreeSet::new();
         let mut entries = Vec::with_capacity(selected.len());
@@ -20441,6 +20450,7 @@ impl LoadedSession {
         };
         let using_index = indexed.is_some();
         let mut collected = indexed.unwrap_or_default();
+        let mut paused = Vec::new();
         let mut ready = 0;
         while !using_index && ready < 65_536 {
             let sand_order = process_sand
@@ -20537,18 +20547,23 @@ impl LoadedSession {
                 }
                 _ => unreachable!(),
             };
-            let available = subtract(absolute, self.origin).is_some_and(|relative| {
-                matches!(
-                    cell(
-                        &self.world,
-                        self.origin,
-                        self.bounds,
-                        relative,
-                        self.states[0]
-                    ),
-                    Cell::State(_)
-                )
+            let in_simulation = self.simulation_allows_block_ticks(ChunkPos {
+                x: absolute.x.div_euclid(16),
+                z: absolute.z.div_euclid(16),
             });
+            let available = in_simulation
+                && subtract(absolute, self.origin).is_some_and(|relative| {
+                    matches!(
+                        cell(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            relative,
+                            self.states[0]
+                        ),
+                        Cell::State(_)
+                    )
+                });
             if available {
                 ready += 1;
             }
@@ -20626,7 +20641,47 @@ impl LoadedSession {
                 }
                 _ => unreachable!(),
             };
-            collected.push((order, entry));
+            if in_simulation {
+                collected.push((order, entry));
+            } else {
+                paused.push((order, entry));
+            }
+        }
+        // Keep out-of-range ticks in their original queues and uniqueness
+        // sets. They can become eligible without a world revision change.
+        for (order, entry) in paused {
+            match entry {
+                CollectedBlockTick::Sand(key) => {
+                    self.sand_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Button(key) => {
+                    self.button_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Soil(pos, kind) => {
+                    self.soil_ticks.insert(order, (pos, kind));
+                }
+                CollectedBlockTick::Lamp(key) => {
+                    self.lamp_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Ice(key) => {
+                    self.ice_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Bubble(key) => {
+                    self.bubble_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Sensor(key) => {
+                    self.sensor_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Leaf(key) => {
+                    self.leaf_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Speleothem(key) => {
+                    self.speleothem_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Air(key) => {
+                    self.air_ticks.insert(order, key);
+                }
+            }
         }
         // Java removes every collected identity before the first callback.
         for (order, entry) in collected {
@@ -23853,12 +23908,13 @@ impl LoadedSession {
             return Some(Vec::new());
         }
         let time = i64::try_from(i128::from(indexed.base_time) + self.scheduled_tick()).ok()?;
-        let world = &self.world;
         let selected = indexed.queue.collect_due(time, 65_536, |pos| {
-            world
-                .chunks
-                .get(&pos)
-                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            self.simulation_allows_block_ticks(pos)
+                && self
+                    .world
+                    .chunks
+                    .get(&pos)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
         });
         let mut orders = BTreeSet::new();
         let mut entries = Vec::with_capacity(selected.len());
@@ -23918,6 +23974,13 @@ impl LoadedSession {
             }
             self.fluid_ticks.pop_first();
             let absolute = IVec3::new(scheduled.key.x, scheduled.key.y, scheduled.key.z);
+            if !self.simulation_allows_block_ticks(ChunkPos {
+                x: absolute.x.div_euclid(16),
+                z: absolute.z.div_euclid(16),
+            }) {
+                deferred.push((order, scheduled));
+                continue;
+            }
             let Some(relative) = subtract(absolute, self.origin) else {
                 deferred.push((order, scheduled));
                 continue;

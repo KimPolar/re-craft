@@ -293,6 +293,78 @@ fn spawning_collection_and_shuffle_match_java_26_3() {
 #[cfg(windows)]
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn scheduled_tick_simulation_filter_matches_java_26_3() {
+    use native_session::worldgen::chunk_ticks::{ChunkTicks, IndexedRegionQueue, SavedTick};
+
+    fn prepare(kind: &str) -> IndexedRegionQueue {
+        let mut queue = IndexedRegionQueue::default();
+        for x in -2..=2 {
+            let pos = ChunkPos { x, z: 0 };
+            let ticks = ChunkTicks::from_saved(
+                pos,
+                vec![SavedTick {
+                    kind: kind.into(),
+                    position: [x * 16 + 4, 2, 4],
+                    delay: 0,
+                    priority: 0,
+                }],
+            )
+            .unwrap();
+            queue.add_container(pos, ticks).unwrap();
+            queue.unpack_container(pos, 42).unwrap();
+        }
+        queue
+    }
+
+    fn emit(
+        output: &mut Vec<String>,
+        name: &str,
+        step: i32,
+        time: i64,
+        queue: &mut IndexedRegionQueue,
+        player: &PlayerSimulation,
+    ) {
+        let mut line = format!("{name} {step}");
+        for tick in queue.collect_due(time, 65_536, |pos| {
+            player.tracker().in_block_ticking_range(pos)
+        }) {
+            line.push_str(&format!(" {}", tick.position[0].div_euclid(16)));
+        }
+        output.push(line);
+    }
+
+    let stdout = run_java_oracle(
+        "SimulationScheduledTicksOracle",
+        include_str!("java/SimulationScheduledTicksOracle.java"),
+    );
+    let mut player = PlayerSimulation::new(SimulationTickets::default(), 0);
+    player.observe_player(PlayerSection { x: 0, y: 4, z: 0 }, false, true);
+    player.run_updates();
+    let mut blocks = prepare("minecraft:sand");
+    let mut fluids = prepare("minecraft:water");
+    let mut expected = Vec::new();
+    emit(&mut expected, "BLOCK", 0, 42, &mut blocks, &player);
+    emit(&mut expected, "FLUID", 0, 42, &mut fluids, &player);
+    player.observe_player(PlayerSection { x: 1, y: 4, z: 0 }, false, true);
+    player.run_updates();
+    emit(&mut expected, "BLOCK", 1, 43, &mut blocks, &player);
+    emit(&mut expected, "FLUID", 1, 43, &mut fluids, &player);
+    player.remove_player();
+    player.add_ticket(ChunkPos { x: -2, z: 0 }, TicketKind::Forced, 31);
+    player.run_updates();
+    emit(&mut expected, "BLOCK", 2, 44, &mut blocks, &player);
+    emit(&mut expected, "FLUID", 2, 44, &mut fluids, &player);
+    let actual: Vec<_> = stdout
+        .lines()
+        .map(|line| line.split_once("[STDOUT]: ").map_or(line, |(_, line)| line))
+        .filter(|line| line.starts_with("BLOCK ") || line.starts_with("FLUID "))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
 fn loading_and_simulation_dependencies_match_java_26_3() {
     let stdout = run_java_oracle(
         "LoadingTickDependenciesOracle",

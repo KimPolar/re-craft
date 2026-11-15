@@ -839,6 +839,14 @@ pub struct QueuedGenerationLightEngine {
     sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
 }
 
+/// Drain boundaries observed while loading saved light and registering the
+/// chunk's nonempty sections. The activation callback is drained afterwards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SavedLightLoadOrder {
+    SeparateDrains,
+    SameDrain,
+}
+
 impl QueuedGenerationLightEngine {
     /// Bind a fully observed revision using the active generated block registry.
     pub fn new_with_registry(
@@ -1021,8 +1029,138 @@ impl QueuedGenerationLightEngine {
         Ok(())
     }
 
+    /// Load one saved chunk at the caller-observed drain boundaries. Other
+    /// operations in those drains must already be accounted for; all three
+    /// steps commit together only after the activation callback has drained.
+    /// This does not infer streaming order or authorize a live-world save.
+    pub fn load_saved_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        position: native_world::loaded::ChunkPos,
+        order: SavedLightLoadOrder,
+        is_air: impl FnMut(&native_world::loaded::BlockState) -> Option<bool>,
+    ) -> Result<()> {
+        use native_world::{
+            block_light::LightBounds,
+            generation_light::{QueuedLightEvent, QueuedSectionLightTracker},
+        };
+
+        self.validate_terrain(terrain)?;
+        ensure!(
+            !self.registered.contains_key(&position),
+            "saved light chunk is already registered"
+        );
+        let chunk = terrain
+            .world
+            .chunks
+            .get(&position)
+            .context("saved light chunk is missing")?;
+        ensure!(
+            chunk.position == position
+                && chunk.status.as_deref() == Some("minecraft:full")
+                && chunk.block_light_correct,
+            "saved light chunk is not a light-correct full chunk"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = LightBounds::new(self.min_y, max_y).context("unsupported light bounds")?;
+        let saved = QueuedSectionLightTracker::saved_chunk_events(
+            &terrain.world,
+            position,
+            bounds,
+            self.has_skylight,
+        )
+        .context("saved light data is incomplete or unsupported")?;
+        let statuses = QueuedSectionLightTracker::initialization_events(
+            &terrain.world,
+            position,
+            bounds,
+            is_air,
+        )
+        .context("saved light sections are incomplete or unsupported")?;
+        let sources = if self.has_skylight {
+            Some(Arc::<[i32; 256]>::from(
+                native_world::sky_light::generated_chunk_sky_sources(
+                    &terrain.world,
+                    bounds,
+                    position,
+                )
+                .context("saved sky sources are incomplete or unsupported")?,
+            ))
+        } else {
+            None
+        };
+        let mut tracker = self.tracker.clone();
+        tracker
+            .cover_chunk_halo(position)
+            .context("saved light halo is out of range")?;
+        ensure!(
+            !tracker.active_chunks().contains(&position)
+                && tracker.has_queued_data(position) == Some(false)
+                && !tracker
+                    .data_sections()
+                    .iter()
+                    .any(|(chunk, _)| *chunk == position),
+            "saved light chunk already has observed engine state"
+        );
+        match order {
+            SavedLightLoadOrder::SeparateDrains => {
+                tracker
+                    .apply_events(&saved)
+                    .context("saved light queue could not be drained")?;
+                tracker
+                    .apply_events(&statuses)
+                    .context("saved light sections could not be registered")?;
+            }
+            SavedLightLoadOrder::SameDrain => {
+                let mut events = saved;
+                events.extend(statuses);
+                tracker
+                    .apply_events(&events)
+                    .context("saved light load could not be drained")?;
+            }
+        }
+        tracker
+            .apply_events(&[
+                QueuedLightEvent::Enable {
+                    position,
+                    enabled: true,
+                    highest_source_y: sources
+                        .as_ref()
+                        .map(|heights| *heights.iter().max().expect("256 sky heights")),
+                },
+                QueuedLightEvent::Retain {
+                    position,
+                    retain: false,
+                },
+            ])
+            .context("saved light activation could not be drained")?;
+        self.tracker = tracker;
+        self.observed_world = Arc::clone(&terrain.world);
+        self.registered.insert(position, Arc::clone(chunk));
+        if let Some(sources) = sources {
+            self.sky_sources.insert(position, sources);
+        }
+        Ok(())
+    }
+
+    /// Load saved light using the frozen generation registry's air states.
+    pub fn load_saved_chunk_with_registry(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        position: native_world::loaded::ChunkPos,
+        order: SavedLightLoadOrder,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        self.load_saved_chunk(terrain, position, order, |state| {
+            generated_state_is_air(registry, state)
+        })
+    }
+
     /// Register a newly generated feature-complete chunk. Saved chunks need
-    /// their own load and retain events before this engine is constructed.
+    /// their own load and retain events, as handled by `load_saved_chunk`.
     pub fn initialize_chunk(
         &mut self,
         terrain: &CarvedTerrainWorld,
@@ -4805,6 +4943,10 @@ impl TerrainGenerator {
     }
 }
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "worldgen/queued_saved_light_test.rs"]
+mod queued_saved_light_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5103,6 +5245,48 @@ mod tests {
                     .any(|(pos, _)| *pos == west)
             );
             assert!(engine.unload_chunk(&terrain, west).is_err());
+            for order in [
+                SavedLightLoadOrder::SeparateDrains,
+                SavedLightLoadOrder::SameDrain,
+            ] {
+                let mut reloaded = engine.clone();
+                let before_failure = reloaded.tracker().snapshot().clone();
+                assert!(
+                    reloaded
+                        .load_saved_chunk(&stale, west, order, is_air)
+                        .is_err()
+                );
+                assert_eq!(
+                    before_failure.same_complete_column(reloaded.tracker().snapshot(), west),
+                    Some(true)
+                );
+                assert!(!reloaded.registered.contains_key(&west));
+                reloaded
+                    .load_saved_chunk(&terrain, west, order, is_air)
+                    .unwrap();
+                assert!(reloaded.tracker().active_chunks().contains(&west));
+                assert!(reloaded.registered.contains_key(&west));
+                assert_eq!(reloaded.sky_sources.contains_key(&west), has_sky);
+                assert_eq!(
+                    reloaded
+                        .tracker()
+                        .data_layer(LightChannel::Block, west, 0)
+                        .unwrap()
+                        .unwrap()
+                        .bytes()[0],
+                    0x33
+                );
+                let before_duplicate = reloaded.tracker().snapshot().clone();
+                assert!(
+                    reloaded
+                        .load_saved_chunk(&terrain, west, order, is_air)
+                        .is_err()
+                );
+                assert_eq!(
+                    before_duplicate.same_complete_column(reloaded.tracker().snapshot(), west),
+                    Some(true)
+                );
+            }
             let changed_neighbor = engine.validate_terrain(&stale).unwrap_err();
             assert!(format!("{changed_neighbor:#}").contains("active light neighborhood changed"));
             let mut changed_light = terrain.clone();
@@ -6520,7 +6704,9 @@ mod tests {
             };
             assert_eq!(
                 tag.get("id"),
-                Some(&native_persistence::nbt::Tag::String("minecraft:turtle".into()))
+                Some(&native_persistence::nbt::Tag::String(
+                    "minecraft:turtle".into()
+                ))
             );
             assert_eq!(
                 tag.get("home_pos"),

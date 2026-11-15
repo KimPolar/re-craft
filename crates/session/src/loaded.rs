@@ -6,6 +6,10 @@
 mod frosted_ice_save_tests;
 
 #[cfg(test)]
+#[path = "loaded_bubble_save_tests.rs"]
+mod bubble_save_tests;
+
+#[cfg(test)]
 #[path = "loaded_leaf_save_tests.rs"]
 mod leaf_save_tests;
 
@@ -20510,10 +20514,10 @@ impl LoadedSession {
 
                     continue;
                 }
-                // A stale tick has no callback. Matching ticks may change blocks,
-                // fluids, and other effects that are not fully saved yet.
-                self.unresolved_bubble_tick = true;
+                // A matching callback is staged before deciding whether it
+                // produces effects that cannot yet be saved as a complete unit.
                 let Some(tags) = self.bubble_column_tags.as_ref() else {
+                    self.unresolved_bubble_tick = true;
                     self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
@@ -20533,11 +20537,15 @@ impl LoadedSession {
                     }),
                 };
                 if process.is_err() {
+                    self.unresolved_bubble_tick = true;
                     self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 }
                 let actions = stage.actions;
+                if !actions.is_empty() {
+                    self.unresolved_bubble_tick = true;
+                }
                 let mut prepared = Vec::with_capacity(actions.len());
                 let mut valid = true;
                 for action in &actions {

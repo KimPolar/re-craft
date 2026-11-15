@@ -337,6 +337,48 @@ impl QueuedSectionLightTracker {
         )
     }
 
+    /// Events from `ThreadedLevelLightEngine.updateChunkStatus` when a chunk
+    /// leaves the engine. The caller must preserve their position within the
+    /// actual pre-update batch and drain boundary, including other chunks.
+    pub fn unload_events(position: ChunkPos, bounds: LightBounds) -> Option<Vec<QueuedLightEvent>> {
+        if !(-2_097_152..=2_097_151).contains(&position.x)
+            || !(-2_097_152..=2_097_151).contains(&position.z)
+        {
+            return None;
+        }
+        let build = bounds.build_range();
+        let light = bounds.light_range();
+        let mut events = vec![
+            QueuedLightEvent::Retain {
+                position,
+                retain: false,
+            },
+            QueuedLightEvent::Enable {
+                position,
+                enabled: false,
+                highest_source_y: None,
+            },
+        ];
+        for section_y in light.start.div_euclid(16)..light.end.div_euclid(16) {
+            for channel in [LightChannel::Block, LightChannel::Sky] {
+                events.push(QueuedLightEvent::Queue {
+                    channel,
+                    position,
+                    section_y,
+                    bytes: None,
+                });
+            }
+        }
+        for section_y in build.start.div_euclid(16)..build.end.div_euclid(16) {
+            events.push(QueuedLightEvent::SectionStatus {
+                position,
+                section_y,
+                nonempty: false,
+            });
+        }
+        Some(events)
+    }
+
     /// Replay one task batch and publish it atomically. Missing coverage or
     /// invalid coordinates reject the complete batch without changing state.
     pub fn apply_events(&mut self, events: &[QueuedLightEvent]) -> Option<()> {
@@ -1186,6 +1228,67 @@ mod tests {
     }
 
     #[test]
+    fn unload_clears_only_the_departing_chunk_and_rolls_back_incomplete_batches() {
+        let bounds = LightBounds::new(0, 80).unwrap();
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let mut tracker = fresh(true, true);
+        tracker
+            .apply_events(&[
+                QueuedLightEvent::Retain {
+                    position: center(),
+                    retain: true,
+                },
+                queue(LightChannel::Block, 2, 1),
+                queue(LightChannel::Sky, 4, 2),
+                status(2, true),
+                QueuedLightEvent::SectionStatus {
+                    position: neighbor,
+                    section_y: 2,
+                    nonempty: true,
+                },
+                QueuedLightEvent::Enable {
+                    position: center(),
+                    enabled: true,
+                    highest_source_y: Some(i32::MIN),
+                },
+            ])
+            .unwrap();
+        let events = QueuedSectionLightTracker::unload_events(center(), bounds).unwrap();
+        let before = tracker.snapshot().clone();
+        let invalid = QueuedLightEvent::SectionStatus {
+            position: ChunkPos { x: 2, z: 2 },
+            section_y: 1,
+            nonempty: true,
+        };
+        let mut failed = events.clone();
+        failed.push(invalid);
+        assert!(tracker.apply_events(&failed).is_none());
+        assert_eq!(
+            before.same_complete_column(tracker.snapshot(), center()),
+            Some(true)
+        );
+        assert!(tracker.active_chunks().contains(&center()));
+        assert!(tracker.data_sections().contains(&(center(), 2)));
+        tracker.apply_events(&events).unwrap();
+        assert!(!tracker.active_chunks().contains(&center()));
+        assert!(!tracker.data_sections().contains(&(center(), 2)));
+        assert!(tracker.data_sections().contains(&(neighbor, 2)));
+        assert_eq!(tracker.has_queued_data(center()), Some(false));
+        assert_eq!(
+            tracker.snapshot().block_section_allocated(center(), 2),
+            Some(true)
+        );
+        assert_eq!(
+            tracker.snapshot().block_section_allocated(neighbor, 2),
+            Some(true)
+        );
+        assert!(
+            QueuedSectionLightTracker::unload_events(ChunkPos { x: i32::MAX, z: 0 }, bounds)
+                .is_none()
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn saved_queue_drains_and_serialization_match_java() {
@@ -1276,6 +1379,42 @@ Q B 0 2 0 0
 T 0 2 0 1
 D
 C no_sky
+N 1 1
+R 0 0 1
+Q B 0 2 0 1
+Q S 0 2 0 2
+T 0 2 0 1
+T 1 2 0 1
+E 0 0 1
+D
+Q B 0 5 0 3
+D
+C unload_before
+U 0 0
+D
+C unload_shared_neighbor
+U 1 0
+D
+C unload_all
+N 1 1
+R 0 0 1
+Q B 0 2 0 1
+T 0 2 0 1
+D
+U 0 0
+Q B 0 2 0 3
+T 0 2 0 1
+D
+C unload_and_reload_same_batch
+N 1 0
+R 0 0 1
+Q B 0 2 0 1
+T 0 2 0 1
+E 0 0 1
+D
+U 0 0
+D
+C unload_no_sky
 ";
 
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1386,6 +1525,16 @@ C no_sky
                     },
                     retain: p[3] == "1",
                 }),
+                "U" => events.extend(
+                    QueuedSectionLightTracker::unload_events(
+                        ChunkPos {
+                            x: parse(p[1]),
+                            z: parse(p[2]),
+                        },
+                        LightBounds::new(0, 80).unwrap(),
+                    )
+                    .unwrap(),
+                ),
                 "D" => {
                     tracker.apply_events(&events).unwrap();
                     events.clear();

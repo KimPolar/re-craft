@@ -91,6 +91,16 @@ public class QueuedSectionLightOracle implements LightChunkGetter, BlockGetter {
                     Integer.parseInt(p[2]), Integer.parseInt(p[3])), p[4].equals("0"));
                 case "E" -> engine.setLightEnabled(new ChunkPos(Integer.parseInt(p[1]), Integer.parseInt(p[2])), p[3].equals("1"));
                 case "R" -> engine.retainData(new ChunkPos(Integer.parseInt(p[1]), Integer.parseInt(p[2])), p[3].equals("1"));
+                case "U" -> {
+                    var chunk = new ChunkPos(Integer.parseInt(p[1]), Integer.parseInt(p[2]));
+                    engine.retainData(chunk, false);
+                    engine.setLightEnabled(chunk, false);
+                    for (int y = engine.getMinLightSection(); y < engine.getMaxLightSection(); y++) {
+                        engine.queueSectionData(LightLayer.BLOCK, SectionPos.of(chunk, y), null);
+                        engine.queueSectionData(LightLayer.SKY, SectionPos.of(chunk, y), null);
+                    }
+                    for (int y = 0; y < 5; y++) engine.updateSectionStatus(SectionPos.of(chunk, y), true);
+                }
                 case "D" -> engine.runLightUpdates();
                 case "S" -> {
                     var layer = engine.getLayerListener(channel(p[1])).getDataLayerData(

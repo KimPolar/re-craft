@@ -3508,6 +3508,7 @@ fn finish_decoration_with_light(
             tracker.min_y,
             tracker.height,
             &region.world,
+            false,
         )?;
         for (pos, before) in &tracker.registered {
             let after = region
@@ -3577,6 +3578,7 @@ fn finish_decoration_with_light(
             engine.min_y,
             engine.height,
             &region.world,
+            true,
         )?;
         for (pos, before) in &engine.registered {
             let after = region
@@ -3692,6 +3694,7 @@ fn finish_decoration_with_light(
         };
         engine.tracker = tracker;
         engine.sky_sources = sources;
+        engine.observed_world = Arc::clone(&committed);
         for (pos, current) in &mut engine.registered {
             *current = Arc::clone(
                 committed

@@ -834,6 +834,7 @@ pub struct QueuedGenerationLightEngine {
     height: i32,
     has_skylight: bool,
     tracker: native_world::generation_light::QueuedSectionLightTracker,
+    observed_world: Arc<native_world::loaded::World>,
     registered: BTreeMap<native_world::loaded::ChunkPos, Arc<native_world::loaded::Chunk>>,
     sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
 }
@@ -945,6 +946,7 @@ impl QueuedGenerationLightEngine {
             height: terrain.height,
             has_skylight,
             tracker,
+            observed_world: Arc::clone(&terrain.world),
             registered: chunks,
             sky_sources,
         })
@@ -973,6 +975,49 @@ impl QueuedGenerationLightEngine {
                 "registered light chunk changed at {position:?}"
             );
         }
+        StagedGenerationLightEngine::validate_active_world_parts(
+            Some(&self.observed_world),
+            self.tracker.active_chunks(),
+            self.min_y,
+            self.height,
+            &terrain.world,
+            true,
+        )?;
+        Ok(())
+    }
+
+    /// Unregister a streamed-out chunk at a known, isolated light drain.
+    /// Callers must not omit other operations in the same Java task batch.
+    pub fn unload_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use native_world::{block_light::LightBounds, generation_light::QueuedSectionLightTracker};
+
+        self.validate_terrain(terrain)?;
+        ensure!(
+            self.registered.contains_key(&position),
+            "light chunk is not registered"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = LightBounds::new(self.min_y, max_y).context("unsupported light bounds")?;
+        let events = QueuedSectionLightTracker::unload_events(position, bounds)
+            .context("unloaded light position is out of range")?;
+        let mut tracker = self.tracker.clone();
+        tracker
+            .cover_chunk_halo(position)
+            .context("unloaded light halo is out of range")?;
+        tracker
+            .apply_events(&events)
+            .context("unloaded light state is incomplete")?;
+        self.tracker = tracker;
+        self.observed_world = Arc::clone(&terrain.world);
+        self.registered.remove(&position);
+        self.sky_sources.remove(&position);
         Ok(())
     }
 
@@ -1046,6 +1091,7 @@ impl QueuedGenerationLightEngine {
             .apply_events(&statuses)
             .context("generated light registration is incomplete")?;
         self.tracker = tracker;
+        self.observed_world = Arc::clone(&terrain.world);
         self.registered.insert(position, Arc::clone(chunk));
         if let Some(sources) = sources {
             self.sky_sources.insert(position, Arc::from(sources));
@@ -1086,6 +1132,7 @@ impl QueuedGenerationLightEngine {
             native_world::generation_light::VisibleLightSnapshot::new(true, self.has_skylight);
         visible.insert_complete_column(position, column);
         self.tracker = tracker;
+        self.observed_world = Arc::clone(&terrain.world);
         Ok(visible)
     }
 }
@@ -1137,6 +1184,32 @@ fn unchanged_chunk_light_behavior(
     Ok(true)
 }
 
+/// Check externally stored layers separately from their block behavior. A
+/// continuously observed engine cannot silently accept new saved light bytes.
+fn unchanged_chunk_light_storage(
+    before: &native_world::loaded::Chunk,
+    current: &native_world::loaded::Chunk,
+) -> bool {
+    if before.block_light_correct != current.block_light_correct {
+        return false;
+    }
+    for (&y, section) in &before.sections {
+        let after = current.sections.get(&y);
+        if after.is_some_and(|after| Arc::ptr_eq(section, after)) {
+            continue;
+        }
+        if section.block_light.as_deref() != after.and_then(|after| after.block_light.as_deref())
+            || section.sky_light.as_deref() != after.and_then(|after| after.sky_light.as_deref())
+        {
+            return false;
+        }
+    }
+    current.sections.iter().all(|(y, section)| {
+        before.sections.contains_key(y)
+            || (section.block_light.is_none() && section.sky_light.is_none())
+    })
+}
+
 impl StagedGenerationLightEngine {
     pub fn new(fresh: FreshGenerationLightTracker) -> Self {
         Self {
@@ -1181,6 +1254,7 @@ impl StagedGenerationLightEngine {
             self.fresh.min_y,
             self.fresh.height,
             world,
+            false,
         )
     }
 
@@ -1190,6 +1264,7 @@ impl StagedGenerationLightEngine {
         min_y: i32,
         height: i32,
         world: &native_world::loaded::World,
+        check_stored_light: bool,
     ) -> Result<()> {
         if let Some(frozen) = frozen {
             if !std::ptr::eq(frozen.as_ref(), world) {
@@ -1204,9 +1279,11 @@ impl StagedGenerationLightEngine {
                                 match (frozen.chunks.get(&neighbor), world.chunks.get(&neighbor)) {
                                     (Some(before), Some(after)) => {
                                         Arc::ptr_eq(before, after)
-                                            || unchanged_chunk_light_behavior(
-                                                frozen, world, before, after, min_y, height,
-                                            )?
+                                            || ((!check_stored_light
+                                                || unchanged_chunk_light_storage(before, after))
+                                                && unchanged_chunk_light_behavior(
+                                                    frozen, world, before, after, min_y, height,
+                                                )?)
                                     }
                                     (None, None) => true,
                                     _ => false,
@@ -4972,6 +5049,48 @@ mod tests {
                     .bytes()[0],
                 0x33
             );
+            let before_unload = engine.tracker().snapshot().clone();
+            assert!(engine.unload_chunk(&stale, west).is_err());
+            assert_eq!(
+                before_unload.same_complete_column(engine.tracker().snapshot(), west),
+                Some(true)
+            );
+            assert!(engine.tracker().active_chunks().contains(&west));
+            engine.unload_chunk(&terrain, west).unwrap();
+            assert!(!engine.tracker().active_chunks().contains(&west));
+            assert!(engine.tracker().active_chunks().contains(&center));
+            assert!(!engine.registered.contains_key(&west));
+            assert!(!engine.sky_sources.contains_key(&west));
+            assert!(
+                !engine
+                    .tracker()
+                    .data_sections()
+                    .iter()
+                    .any(|(pos, _)| *pos == west)
+            );
+            assert!(engine.unload_chunk(&terrain, west).is_err());
+            let changed_neighbor = engine.validate_terrain(&stale).unwrap_err();
+            assert!(format!("{changed_neighbor:#}").contains("active light neighborhood changed"));
+            let mut changed_light = terrain.clone();
+            let world = Arc::make_mut(&mut changed_light.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&west).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.block_light.as_mut().unwrap()[0] = 0x44;
+            let error = engine.validate_terrain(&changed_light).unwrap_err();
+            assert!(format!("{error:#}").contains("active light neighborhood changed"));
+            let mut equivalent_neighbor = terrain.clone();
+            let world = Arc::make_mut(&mut equivalent_neighbor.world);
+            let dirt = world.intern_state(state("dirt"));
+            world.set_block_id(-16, 1, 0, dirt).unwrap();
+            engine.validate_terrain(&equivalent_neighbor).unwrap();
+            let mut distant = terrain.clone();
+            let world = Arc::make_mut(&mut distant.world);
+            let far = ChunkPos { x: 3, z: 3 };
+            let mut added = world.chunks[&center].as_ref().clone();
+            added.position = far;
+            world.chunks.insert(far, Arc::new(added));
+            engine.validate_terrain(&distant).unwrap();
+            engine.validate_terrain(&terrain).unwrap();
         }
     }
 

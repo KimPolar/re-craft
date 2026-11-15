@@ -1090,6 +1090,12 @@ impl QueuedGenerationLightEngine {
         tracker
             .apply_events(&statuses)
             .context("generated light registration is incomplete")?;
+        // Java runs these post-update callbacks after the section-status drain.
+        // This new chunk has no saved light, so it starts disabled and no
+        // longer retains layers from an earlier load of the same column.
+        tracker
+            .finish_unlit_initialization(position)
+            .context("generated light initialization could not release retained data")?;
         self.tracker = tracker;
         self.observed_world = Arc::clone(&terrain.world);
         self.registered.insert(position, Arc::clone(chunk));
@@ -4936,6 +4942,14 @@ mod tests {
                     ])
                     .unwrap();
             }
+            // A previous load may have retained this column without leaving
+            // queued layers. Java clears that flag after initialization.
+            tracker
+                .apply_events(&[QueuedLightEvent::Retain {
+                    position: center,
+                    retain: true,
+                }])
+                .unwrap();
             assert_eq!(
                 tracker
                     .data_layer(LightChannel::Block, west, 0)
@@ -5031,6 +5045,26 @@ mod tests {
             schedule
                 .run_queued_light_initialization(&terrain, center, &mut engine, is_air)
                 .unwrap();
+            let mut after_removal = engine.tracker().clone();
+            after_removal
+                .apply_events(&[QueuedLightEvent::SectionStatus {
+                    position: center,
+                    section_y: 1,
+                    nonempty: false,
+                }])
+                .unwrap();
+            for channel in [LightChannel::Block, LightChannel::Sky] {
+                if channel == LightChannel::Sky && !has_sky {
+                    continue;
+                }
+                assert!(
+                    after_removal
+                        .data_layer(channel, center, 2)
+                        .unwrap()
+                        .is_none(),
+                    "initialization retained a removed {channel:?} layer"
+                );
+            }
             let visible = schedule
                 .run_queued_light(&terrain, center, &mut engine)
                 .unwrap();

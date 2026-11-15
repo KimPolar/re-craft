@@ -337,6 +337,17 @@ impl QueuedSectionLightTracker {
         )
     }
 
+    /// Complete the post-update callback for a newly generated, unlit chunk.
+    /// The initialization events must already have drained, and callers must
+    /// preserve the actual task order. This callback does not trigger a drain.
+    pub fn finish_unlit_initialization(&mut self, position: ChunkPos) -> Option<()> {
+        self.valid_position(position, 0)?;
+        self.tracker.visible.columns.get(&position)?;
+        self.tracker.active.remove(&position);
+        self.retained.remove(&position);
+        Some(())
+    }
+
     /// Events from `ThreadedLevelLightEngine.updateChunkStatus` when a chunk
     /// leaves the engine. The caller must preserve their position within the
     /// actual pre-update batch and drain boundary, including other chunks.
@@ -1415,6 +1426,22 @@ D
 U 0 0
 D
 C unload_no_sky
+N 1 1
+R 0 0 1
+T 0 1 0 1
+D
+F 0 0
+T 0 1 0 0
+D
+C initialized_without_retention
+N 1 0
+R 0 0 1
+T 0 1 0 1
+D
+F 0 0
+T 0 1 0 0
+D
+C initialized_without_retention_no_sky
 ";
 
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1518,6 +1545,15 @@ C unload_no_sky
                     enabled: p[3] == "1",
                     highest_source_y: Some(i32::MIN),
                 }),
+                "F" => {
+                    assert!(events.is_empty());
+                    tracker
+                        .finish_unlit_initialization(ChunkPos {
+                            x: parse(p[1]),
+                            z: parse(p[2]),
+                        })
+                        .unwrap();
+                }
                 "R" => events.push(QueuedLightEvent::Retain {
                     position: ChunkPos {
                         x: parse(p[1]),

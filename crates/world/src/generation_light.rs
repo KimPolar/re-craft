@@ -4,7 +4,10 @@
 //! reads the light engine's published data, which can differ from a fresh
 //! calculation of the generated terrain. Missing *allocated* sections and
 //! columns not included in a snapshot must not be conflated.
-use crate::loaded::{BlockState, ChunkPos, LIGHT_BYTES, World};
+use crate::{
+    block_light::LightBounds,
+    loaded::{BlockState, ChunkPos, LIGHT_BYTES, World},
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
@@ -190,6 +193,25 @@ pub struct SectionLightTracker {
     data_sections: BTreeSet<(ChunkPos, i32)>,
     references: BTreeMap<(ChunkPos, i32), u8>,
     active: BTreeSet<ChunkPos>,
+    known_chunks: Option<BTreeSet<ChunkPos>>,
+}
+
+/// Inputs for restoring one previously published light-engine revision.
+///
+/// `registration` must describe whether each chunk's section statuses were
+/// registered in that same engine. Every covered column needs a complete
+/// one-chunk registration halo; absent entries are unknown, not unregistered.
+/// Only registrations in that halo are included in the restored tracker.
+/// The caller must also establish that the saved arrays and block sections
+/// come from one drained revision, without queued layers or later live edits.
+pub struct SavedSectionLightInputs<'a> {
+    pub world: &'a World,
+    pub bounds: LightBounds,
+    pub covered: &'a BTreeSet<ChunkPos>,
+    pub registration: &'a BTreeMap<ChunkPos, bool>,
+    pub active: BTreeSet<ChunkPos>,
+    pub has_block: bool,
+    pub has_sky: bool,
 }
 
 fn section_position_supported(center: ChunkPos, y: i32) -> bool {
@@ -224,6 +246,103 @@ fn section_neighborhood(center: ChunkPos, y: i32) -> Option<Vec<(ChunkPos, i32)>
 }
 
 impl SectionLightTracker {
+    /// Restore saved layers using a separately verified registration history.
+    /// Java omits both unallocated layers and allocated homogeneous-zero
+    /// layers, so the complete registration halo determines which missing
+    /// layers must be restored as zero. Contradictory or incomplete inputs
+    /// are rejected without changing the world. The snapshot preserves values
+    /// and allocation, not whether Java materialized a zero-valued DataLayer;
+    /// it cannot by itself prove the next serialized omission or reload order.
+    pub fn from_saved(
+        input: SavedSectionLightInputs<'_>,
+        is_air: impl FnMut(&BlockState) -> Option<bool>,
+    ) -> Option<Self> {
+        if input.covered.is_empty() {
+            return None;
+        }
+        let mut relevant = BTreeSet::new();
+        for &pos in input.covered {
+            if !section_position_supported(pos, 0) {
+                return None;
+            }
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let neighbor = ChunkPos {
+                        x: pos.x.checked_add(dx)?,
+                        z: pos.z.checked_add(dz)?,
+                    };
+                    input.registration.get(&neighbor)?;
+                    relevant.insert(neighbor);
+                }
+            }
+        }
+        if input
+            .active
+            .iter()
+            .any(|pos| input.registration.get(pos) != Some(&true))
+        {
+            return None;
+        }
+        let build = input.bounds.build_range();
+        let light = input.bounds.light_range();
+        let registered = relevant
+            .iter()
+            .copied()
+            .filter(|pos| input.registration.get(pos) == Some(&true))
+            .collect::<Vec<_>>();
+        for &pos in &registered {
+            let chunk = input.world.chunks.get(&pos)?;
+            if !section_position_supported(pos, 0)
+                || chunk.position != pos
+                || chunk.status.as_deref() != Some("minecraft:full")
+                || !chunk.block_light_correct
+            {
+                return None;
+            }
+        }
+        let data_sections = initialized_nonempty_sections(
+            input.world,
+            build.start.div_euclid(16)..build.end.div_euclid(16),
+            registered,
+            is_air,
+        )?;
+        let mut visible = VisibleLightSnapshot::fresh_after_section_updates(
+            input.has_block,
+            input.has_sky,
+            data_sections.iter().copied(),
+            input.covered.iter().copied(),
+        )?;
+        let light_sections = light.start.div_euclid(16)..light.end.div_euclid(16);
+        for &pos in input.covered {
+            let chunk = input.world.chunks.get(&pos)?;
+            if chunk.position != pos
+                || chunk.status.as_deref() != Some("minecraft:full")
+                || !chunk.block_light_correct
+            {
+                return None;
+            }
+            let column = visible.columns.get_mut(&pos)?;
+            for (&y, section) in &chunk.sections {
+                let y = i32::from(y);
+                for (saved, enabled, layers) in [
+                    (&section.block_light, input.has_block, &mut column.block),
+                    (&section.sky_light, input.has_sky, &mut column.sky),
+                ] {
+                    let Some(saved) = saved else { continue };
+                    if !enabled || !light_sections.contains(&y) || !layers.contains_key(&y) {
+                        return None;
+                    }
+                    if saved.iter().any(|&byte| byte != 0) {
+                        layers.insert(y, Arc::new(**saved));
+                    }
+                }
+            }
+        }
+        let mut tracker = Self::new(visible, data_sections, input.active)?;
+        tracker.known_chunks = Some(relevant);
+        Some(tracker)
+    }
+
     /// Attach section-status history to an already published snapshot. The
     /// caller must provide every registered nonempty section, including those
     /// outside covered columns whose allocation halo reaches the snapshot.
@@ -292,6 +411,7 @@ impl SectionLightTracker {
             data_sections: registered,
             references,
             active,
+            known_chunks: None,
         })
     }
 
@@ -299,8 +419,23 @@ impl SectionLightTracker {
         &self.visible
     }
 
+    /// Whether a section is registered in this tracker. Outside the restored
+    /// registration halo, `false` does not prove that a section is empty.
     pub fn is_data_section(&self, position: ChunkPos, y: i32) -> bool {
         self.data_sections.contains(&(position, y))
+    }
+
+    /// Return None when the tracker's registration coverage does not include
+    /// this chunk, instead of treating an unobserved section as empty.
+    pub fn data_section_status(&self, position: ChunkPos, y: i32) -> Option<bool> {
+        if self
+            .known_chunks
+            .as_ref()
+            .is_some_and(|known| !known.contains(&position))
+        {
+            return None;
+        }
+        Some(self.is_data_section(position, y))
     }
 
     /// Replay status callbacks in order, then publish one drained revision.
@@ -310,46 +445,115 @@ impl SectionLightTracker {
     /// Failure leaves this tracker and previous snapshots unchanged.
     pub fn apply_statuses(&mut self, changes: &[(ChunkPos, i32, bool)]) -> Option<()> {
         let mut draft = self.clone();
+        draft.apply_statuses_inner(changes)?;
+        *self = draft;
+        Some(())
+    }
+
+    fn apply_statuses_inner(&mut self, changes: &[(ChunkPos, i32, bool)]) -> Option<()> {
         let mut removed = BTreeSet::new();
         for &(position, y, nonempty) in changes {
             let neighborhood = section_neighborhood(position, y)?;
-            if draft.data_sections.contains(&(position, y)) == nonempty {
+            if self.data_section_status(position, y)? == nonempty {
                 continue;
             }
             if neighborhood
                 .iter()
-                .any(|(position, _)| !draft.visible.columns.contains_key(position))
+                .any(|(position, _)| !self.visible.columns.contains_key(position))
             {
                 return None;
             }
             if nonempty {
-                draft.visible = draft
+                self.visible = self
                     .visible
-                    .allocate_nonempty_sections(&[(position, y)], &draft.active)?;
-                draft.data_sections.insert((position, y));
+                    .allocate_nonempty_sections(&[(position, y)], &self.active)?;
+                self.data_sections.insert((position, y));
                 for section in neighborhood {
-                    let count = draft.references.entry(section).or_default();
+                    let count = self.references.entry(section).or_default();
                     *count = count.checked_add(1)?;
                     removed.remove(&section);
                 }
             } else {
-                draft.data_sections.remove(&(position, y));
+                self.data_sections.remove(&(position, y));
                 for section in neighborhood {
-                    let count = draft.references.get_mut(&section)?;
+                    let count = self.references.get_mut(&section)?;
                     *count = count.checked_sub(1)?;
                     if *count == 0 {
-                        draft.references.remove(&section);
+                        self.references.remove(&section);
                         removed.insert(section);
                     }
                 }
             }
         }
         for (position, y) in removed {
-            let column = draft.visible.columns.get_mut(&position)?;
+            let column = self.visible.columns.get_mut(&position)?;
             column.block.remove(&y);
             column.sky.remove(&y);
         }
+        Some(())
+    }
+
+    /// Drain ordered section callbacks and block checks as one transaction.
+    /// Section storage is updated first, matching the Java light engine.
+    pub fn apply_changes(
+        &mut self,
+        world: &World,
+        bounds: LightBounds,
+        statuses: &[(ChunkPos, i32, bool)],
+        positions: &[[i32; 3]],
+        sky_sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    ) -> Option<()> {
+        let build = bounds.build_range();
+        let sections = build.start.div_euclid(16)..build.end.div_euclid(16);
+        if statuses.iter().any(|(_, y, _)| !sections.contains(y)) {
+            return None;
+        }
+        let mut draft = self.clone();
+        draft.apply_statuses_inner(statuses)?;
+        draft.apply_checks(world, bounds, positions, sky_sources)?;
         *self = draft;
+        Some(())
+    }
+
+    /// Drain block checks against the registered, already-updated section
+    /// storage. The caller supplies the final block revision and exact sky
+    /// source heights after those writes, with no other queued light work.
+    /// Both channels commit together; incomplete inputs leave the tracker
+    /// and all earlier snapshots unchanged.
+    pub fn apply_checks(
+        &mut self,
+        world: &World,
+        bounds: LightBounds,
+        positions: &[[i32; 3]],
+        sky_sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    ) -> Option<()> {
+        if positions.is_empty() {
+            return Some(());
+        }
+        let mut next = if self.visible.has_block {
+            Some(crate::generation_block_light::check_generated_block_light(
+                world,
+                bounds,
+                &self.visible,
+                &self.active,
+                positions,
+            )?)
+        } else {
+            None
+        };
+        if self.visible.has_sky {
+            next = Some(crate::generation_sky_light::check_generated_sky_blocks(
+                world,
+                bounds,
+                next.as_ref().unwrap_or(&self.visible),
+                &self.active,
+                positions,
+                sky_sources,
+            )?);
+        }
+        if let Some(visible) = next {
+            self.visible = visible;
+        }
         Some(())
     }
 }
@@ -713,8 +917,626 @@ impl VisibleLightSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loaded::{BLOCK_COUNT, Chunk, Section};
+
     fn layer(n: u8) -> Arc<[u8; LIGHT_BYTES]> {
         Arc::new([n | (n << 4); LIGHT_BYTES])
+    }
+
+    fn saved_fixture(height: i8) -> (World, BTreeSet<ChunkPos>, BTreeMap<ChunkPos, bool>) {
+        let mut world = World::new("minecraft:overworld");
+        let state = |name: &str| BlockState {
+            name: format!("minecraft:{name}"),
+            properties: BTreeMap::new(),
+        };
+        let air = world.intern_state(state("air"));
+        let stone = world.intern_state(state("stone"));
+        let mut registration = BTreeMap::new();
+        for z in -2..=2 {
+            for x in -2..=3 {
+                let position = ChunkPos { x, z };
+                let mut sections = BTreeMap::new();
+                for y in 0..height {
+                    let mut blocks = Box::new([air; BLOCK_COUNT]);
+                    if z == 0 && ((y == 0 && (x == 0 || x == 1)) || (y == 8 && x == 0)) {
+                        blocks[0] = stone;
+                    }
+                    sections.insert(
+                        y,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    );
+                }
+                registration.insert(position, true);
+                world.chunks.insert(
+                    position,
+                    Arc::new(Chunk {
+                        position,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+            }
+        }
+        let covered = (-1..=1)
+            .flat_map(|z| (-1..=2).map(move |x| ChunkPos { x, z }))
+            .collect();
+        (world, covered, registration)
+    }
+
+    #[test]
+    fn restored_saved_sections_keep_zero_layers_and_reject_incomplete_inputs() {
+        let (mut world, covered, registration) = saved_fixture(2);
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.block_light = Some(Box::new([0x21; LIGHT_BYTES]));
+        section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&east).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .block_light = Some(Box::new([0; LIGHT_BYTES]));
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let restore = |world: &World, registration: &BTreeMap<ChunkPos, bool>| {
+            SectionLightTracker::from_saved(
+                SavedSectionLightInputs {
+                    world,
+                    bounds,
+                    covered: &covered,
+                    registration,
+                    active: BTreeSet::from([center]),
+                    has_block: true,
+                    has_sky: true,
+                },
+                |state| match state.name.as_str() {
+                    "minecraft:air" => Some(true),
+                    "minecraft:stone" => Some(false),
+                    _ => None,
+                },
+            )
+        };
+        let before = world.chunks.clone();
+        let mut tracker = restore(&world, &registration).unwrap();
+        assert!(tracker.is_data_section(center, 0));
+        assert!(tracker.is_data_section(east, 0));
+        assert_eq!(tracker.snapshot().block_light([0, 0, 0]), Some(1));
+        assert_eq!(tracker.snapshot().sky_light([0, 0, 0]), Some(15));
+        assert_eq!(tracker.snapshot().block_light([16, 0, 0]), Some(0));
+        assert_eq!(
+            tracker.snapshot().block_section_allocated(east, 0),
+            Some(true)
+        );
+        assert_eq!(
+            tracker.snapshot().sky_section_allocated(east, 0),
+            Some(true)
+        );
+        tracker.apply_statuses(&[(center, 0, false)]).unwrap();
+        assert_eq!(
+            tracker
+                .snapshot()
+                .block_section_allocated(ChunkPos { x: -1, z: 0 }, 0),
+            Some(false)
+        );
+        assert_eq!(
+            tracker.snapshot().sky_section_allocated(center, 0),
+            Some(true)
+        );
+        assert!(
+            before
+                .iter()
+                .all(|(pos, chunk)| Arc::ptr_eq(chunk, &world.chunks[pos]))
+        );
+
+        let mut incomplete = registration.clone();
+        incomplete.remove(&ChunkPos { x: -2, z: -2 });
+        assert!(restore(&world, &incomplete).is_none());
+        let mut missing = world.clone();
+        missing.chunks.remove(&ChunkPos { x: 3, z: 2 });
+        assert!(restore(&missing, &registration).is_none());
+        let absent = ChunkPos { x: -2, z: -2 };
+        let mut absent_registration = registration.clone();
+        absent_registration.insert(absent, false);
+        let mut absent_world = world.clone();
+        absent_world.chunks.remove(&absent);
+        assert!(restore(&absent_world, &absent_registration).is_some());
+        let mut distant = registration.clone();
+        let unknown = ChunkPos { x: 500, z: 500 };
+        distant.insert(unknown, true);
+        let mut restored = restore(&world, &distant).unwrap();
+        assert_eq!(restored.data_section_status(unknown, 0), None);
+        assert!(restored.apply_statuses(&[(unknown, 0, false)]).is_none());
+        let mut contradictory = world.clone();
+        let chunk = Arc::make_mut(contradictory.chunks.get_mut(&center).unwrap());
+        chunk.sections.insert(
+            2,
+            Arc::new(Section {
+                blocks: None,
+                biomes: None,
+                block_light: None,
+                sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+            }),
+        );
+        assert!(restore(&contradictory, &registration).is_none());
+    }
+
+    #[test]
+    fn restored_skyless_light_processes_emission_and_section_status() {
+        let (mut world, covered, registration) = saved_fixture(2);
+        world.dimension = "minecraft:the_nether".into();
+        let center = ChunkPos { x: 0, z: 0 };
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut tracker = SectionLightTracker::from_saved(
+            SavedSectionLightInputs {
+                world: &world,
+                bounds,
+                covered: &covered,
+                registration: &registration,
+                active: BTreeSet::from([center]),
+                has_block: true,
+                has_sky: false,
+            },
+            |state| match state.name.as_str() {
+                "minecraft:air" => Some(true),
+                "minecraft:stone" => Some(false),
+                _ => None,
+            },
+        )
+        .unwrap();
+        let torch = world.intern_state(BlockState {
+            name: "minecraft:torch".into(),
+            properties: BTreeMap::new(),
+        });
+        world.set_block_id(8, 20, 8, torch).unwrap();
+        tracker
+            .apply_changes(
+                &world,
+                bounds,
+                &[(center, 1, true)],
+                &[[8, 20, 8]],
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(tracker.is_data_section(center, 1));
+        assert_eq!(tracker.snapshot().block_light([8, 20, 8]), Some(14));
+        assert_eq!(tracker.snapshot().sky_light([8, 20, 8]), Some(0));
+        let before = tracker.snapshot().clone();
+        assert!(
+            tracker
+                .apply_changes(&world, bounds, &[(center, 2, true)], &[], &BTreeMap::new())
+                .is_none()
+        );
+        for &pos in &covered {
+            assert_eq!(
+                before.same_complete_column(tracker.snapshot(), pos),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn restored_saved_sections_and_later_callbacks_match_java() {
+        use std::{path::PathBuf, process::Command};
+
+        struct Row {
+            block: bool,
+            position: ChunkPos,
+            y: i32,
+            saved: bool,
+            bytes: Box<[u8; LIGHT_BYTES]>,
+        }
+        fn rows<'a>(lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) -> Vec<Row> {
+            fn digit(value: u8) -> u8 {
+                match value {
+                    b'0'..=b'9' => value - b'0',
+                    b'a'..=b'f' => value - b'a' + 10,
+                    _ => panic!("invalid Java light byte"),
+                }
+            }
+            let mut result = Vec::new();
+            while lines.peek().is_some_and(|line| line.starts_with("L ")) {
+                let mut parts = lines.next().unwrap().split_whitespace();
+                assert_eq!(parts.next(), Some("L"));
+                let block = match parts.next().unwrap() {
+                    "B" => true,
+                    "S" => false,
+                    _ => panic!("invalid Java light channel"),
+                };
+                let x = parts.next().unwrap().parse().unwrap();
+                let y = parts.next().unwrap().parse().unwrap();
+                let z = parts.next().unwrap().parse().unwrap();
+                let saved = match parts.next().unwrap() {
+                    "0" => false,
+                    "1" => true,
+                    _ => panic!("invalid Java saved-light marker"),
+                };
+                let encoded = parts.next().unwrap().as_bytes();
+                assert_eq!(encoded.len(), LIGHT_BYTES * 2);
+                assert!(parts.next().is_none());
+                let mut bytes = Box::new([0; LIGHT_BYTES]);
+                for (byte, pair) in bytes.iter_mut().zip(encoded.chunks_exact(2)) {
+                    *byte = digit(pair[0]) * 16 + digit(pair[1]);
+                }
+                result.push(Row {
+                    block,
+                    position: ChunkPos { x, z },
+                    y,
+                    saved,
+                    bytes,
+                });
+            }
+            result
+        }
+        fn compare(rows: &[Row], snapshot: &VisibleLightSnapshot, covered: &BTreeSet<ChunkPos>) {
+            let mut seen = BTreeSet::new();
+            for row in rows {
+                assert!(seen.insert((row.block, row.position, row.y)));
+                let column = snapshot.complete_column(row.position).unwrap();
+                let layer = if row.block {
+                    column.block_layers()
+                } else {
+                    column.sky_layers()
+                }
+                .get(&row.y)
+                .expect("Java allocated layer missing");
+                assert_eq!(
+                    layer.as_ref(),
+                    row.bytes.as_ref(),
+                    "{:?} {}",
+                    row.position,
+                    row.y
+                );
+            }
+            let actual: usize = covered
+                .iter()
+                .map(|&pos| {
+                    let column = snapshot.complete_column(pos).unwrap();
+                    column.block_layers().len() + column.sky_layers().len()
+                })
+                .sum();
+            assert_eq!(rows.len(), actual, "extra restored light layers");
+        }
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SavedSectionLightOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SavedSectionLightOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("SavedSectionLightOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut lines = text
+            .lines()
+            .filter(|line| line.starts_with("H ") || line.starts_with("L "))
+            .peekable();
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let changes = [
+            vec![(center, 8, false)],
+            vec![(center, 8, false), (center, 8, true)],
+            vec![(east, 4, true), (east, 4, false)],
+            vec![(center, 0, false)],
+            vec![(center, 0, false), (east, 0, false)],
+            vec![(east, 4, true)],
+        ];
+        for (case, changes) in changes.iter().enumerate() {
+            assert_eq!(lines.next(), Some(format!("H {case} before").as_str()));
+            let before = rows(&mut lines);
+            assert!(
+                before
+                    .iter()
+                    .any(|row| !row.saved && row.bytes.iter().all(|&b| b == 0))
+            );
+            assert!(
+                before
+                    .iter()
+                    .any(|row| row.saved && row.bytes.iter().all(|&b| b == 0))
+            );
+            assert!(
+                before
+                    .iter()
+                    .any(|row| row.saved && row.bytes.iter().any(|&b| b != 0))
+            );
+            let (mut world, covered, registration) = saved_fixture(10);
+            for row in before.iter().filter(|row| row.saved) {
+                let chunk = Arc::make_mut(world.chunks.get_mut(&row.position).unwrap());
+                let section = chunk
+                    .sections
+                    .entry(i8::try_from(row.y).unwrap())
+                    .or_insert_with(|| {
+                        Arc::new(Section {
+                            blocks: None,
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        })
+                    });
+                let section = Arc::make_mut(section);
+                if row.block {
+                    section.block_light = Some(row.bytes.clone());
+                } else {
+                    section.sky_light = Some(row.bytes.clone());
+                }
+            }
+            let mut tracker = SectionLightTracker::from_saved(
+                SavedSectionLightInputs {
+                    world: &world,
+                    bounds: LightBounds::new(0, 160).unwrap(),
+                    covered: &covered,
+                    registration: &registration,
+                    active: BTreeSet::from([center, ChunkPos { x: 2, z: 0 }]),
+                    has_block: true,
+                    has_sky: true,
+                },
+                |state| match state.name.as_str() {
+                    "minecraft:air" => Some(true),
+                    "minecraft:stone" => Some(false),
+                    _ => None,
+                },
+            )
+            .expect("saved Java revision must be restorable");
+            compare(&before, tracker.snapshot(), &covered);
+            tracker.apply_statuses(changes).unwrap();
+            assert_eq!(lines.next(), Some(format!("H {case} after").as_str()));
+            compare(&rows(&mut lines), tracker.snapshot(), &covered);
+        }
+        assert!(lines.next().is_none());
+
+        let live_source = temp.path().join("SavedLiveLightOracle.java");
+        std::fs::write(
+            &live_source,
+            include_str!("../tests/java/SavedLiveLightOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&live_source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for has_sky in [true, false] {
+            let mut command = Command::new(java.join("java.exe"));
+            command
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SavedLiveLightOracle");
+            if !has_sky {
+                command.arg("no-sky");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            let mut lines = text
+                .lines()
+                .filter(|line| line.starts_with("H ") || line.starts_with("L "))
+                .peekable();
+            assert_eq!(lines.next(), Some("H 0"));
+            let before = rows(&mut lines);
+            let mut world = World::new(if has_sky {
+                "minecraft:overworld"
+            } else {
+                "minecraft:the_nether"
+            });
+            let state = |name: &str| BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            let air = world.intern_state(state("air"));
+            let stone = world.intern_state(state("stone"));
+            let torch = world.intern_state(state("torch"));
+            let glass = world.intern_state(state("glass"));
+            let mut registration = BTreeMap::new();
+            for z in -3..=3 {
+                for x in -3..=3 {
+                    let position = ChunkPos { x, z };
+                    let mut sections = BTreeMap::new();
+                    for y in 0..2 {
+                        let mut blocks = Box::new([air; BLOCK_COUNT]);
+                        if y == 0 {
+                            blocks[256] = stone;
+                        }
+                        sections.insert(
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        );
+                    }
+                    registration.insert(position, true);
+                    world.chunks.insert(
+                        position,
+                        Arc::new(Chunk {
+                            position,
+                            status: Some("minecraft:full".into()),
+                            block_light_correct: true,
+                            sections,
+                        }),
+                    );
+                }
+            }
+            let covered: BTreeSet<_> = (-2..=2)
+                .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
+                .collect();
+            for row in before.iter().filter(|row| row.saved) {
+                let chunk = Arc::make_mut(world.chunks.get_mut(&row.position).unwrap());
+                let section = chunk
+                    .sections
+                    .entry(i8::try_from(row.y).unwrap())
+                    .or_insert_with(|| {
+                        Arc::new(Section {
+                            blocks: None,
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        })
+                    });
+                let section = Arc::make_mut(section);
+                if row.block {
+                    section.block_light = Some(row.bytes.clone());
+                } else {
+                    section.sky_light = Some(row.bytes.clone());
+                }
+            }
+            let bounds = LightBounds::new(0, 32).unwrap();
+            let mut tracker = SectionLightTracker::from_saved(
+                SavedSectionLightInputs {
+                    world: &world,
+                    bounds,
+                    covered: &covered,
+                    registration: &registration,
+                    active: BTreeSet::from([center]),
+                    has_block: true,
+                    has_sky,
+                },
+                |state| match state.name.as_str() {
+                    "minecraft:air" => Some(true),
+                    "minecraft:stone" => Some(false),
+                    _ => None,
+                },
+            )
+            .expect("saved live light must be restorable");
+            compare(&before, tracker.snapshot(), &covered);
+            let mut sources = BTreeMap::new();
+            if has_sky {
+                let mut scanner = crate::sky_light::SkySourceScanner::new(&world, bounds);
+                for &pos in registration.keys() {
+                    let mut heights = [0; 256];
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            heights[(x + 16 * z) as usize] = scanner
+                                .load(pos.x * 16 + x, pos.z * 16 + z)
+                                .unwrap()
+                                .lowest_source_y();
+                        }
+                    }
+                    sources.insert(pos, Arc::new(heights));
+                }
+            }
+            let position = [8, 20, 8];
+            for (stage, (id, nonempty, check)) in [
+                (torch, true, true),
+                (air, false, true),
+                (glass, true, false),
+                (air, false, false),
+                (stone, true, true),
+                (air, false, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                world
+                    .set_block_id(position[0], position[1], position[2], id)
+                    .unwrap();
+                if check && has_sky {
+                    let height = sources[&center][8 + 8 * 16];
+                    let mut column =
+                        crate::sky_light::SkyColumn::from_lowest_source(bounds, 8, 8, height)
+                            .unwrap();
+                    column.update(&world, position[1]).unwrap();
+                    Arc::make_mut(sources.get_mut(&center).unwrap())[8 + 8 * 16] =
+                        column.lowest_source_y();
+                }
+                let statuses = [(center, 1, nonempty)];
+                let checks = if check {
+                    std::slice::from_ref(&position)
+                } else {
+                    &[]
+                };
+                if stage == 0 && has_sky {
+                    let previous = tracker.snapshot().clone();
+                    assert!(
+                        tracker
+                            .apply_changes(&world, bounds, &statuses, checks, &BTreeMap::new())
+                            .is_none()
+                    );
+                    assert!(!tracker.is_data_section(center, 1));
+                    for &pos in &covered {
+                        assert_eq!(
+                            previous.same_complete_column(tracker.snapshot(), pos),
+                            Some(true)
+                        );
+                    }
+                }
+                tracker
+                    .apply_changes(&world, bounds, &statuses, checks, &sources)
+                    .unwrap();
+                assert_eq!(lines.next(), Some(format!("H {}", stage + 1).as_str()));
+                compare(&rows(&mut lines), tracker.snapshot(), &covered);
+            }
+            assert!(lines.next().is_none());
+        }
     }
 
     #[test]

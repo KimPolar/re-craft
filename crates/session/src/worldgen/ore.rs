@@ -3339,36 +3339,15 @@ fn finish_decoration_with_light(
                     }
                 }
                 let before = engine.snapshot(region.target, covered.iter().copied(), registry)?;
-                let updating = if guard.section_statuses.is_empty() {
-                    before
+                let mut current_sources = if tracker.has_skylight {
+                    sources.clone()
                 } else {
-                    let mut sections = native_world::generation_light::SectionLightTracker::new(
-                        before,
-                        tracker.data_sections.iter().copied(),
-                        active.clone(),
-                    )
-                    .context("incremental light section history differs")?;
-                    sections.apply_statuses(&guard.section_statuses).context(
-                        "incremental section allocation inputs are incomplete or unsupported",
-                    )?;
-                    sections.snapshot().clone()
+                    BTreeMap::new()
                 };
-                let after_block =
-                    native_world::generation_block_light::check_generated_block_light(
-                        &world,
-                        bounds,
-                        &updating,
-                        active,
-                        &guard.light_check_order,
-                    )
-                    .context(
-                        "incremental feature block light inputs are incomplete or unsupported",
-                    )?;
-                let after = if tracker.has_skylight {
+                if tracker.has_skylight {
                     // Only an active check's own and adjacent columns can
                     // influence its source update. Do not clone the entire
                     // batch's source map for every decoration transaction.
-                    let mut current_sources = sources.clone();
                     for &p in &guard.light_check_order {
                         if !active.contains(&chunk(p)) {
                             continue;
@@ -3384,17 +3363,53 @@ fn finish_decoration_with_light(
                             }
                         }
                     }
-                    native_world::generation_sky_light::check_generated_sky_blocks(
-                        &world,
-                        bounds,
-                        &after_block,
-                        active,
-                        &guard.light_check_order,
-                        &current_sources,
-                    )
-                    .context("incremental feature sky light inputs are incomplete or unsupported")?
+                }
+                let after = if guard.section_statuses.is_empty() {
+                    let after_block =
+                        native_world::generation_block_light::check_generated_block_light(
+                            &world,
+                            bounds,
+                            &before,
+                            active,
+                            &guard.light_check_order,
+                        )
+                        .context(
+                            "incremental feature block light inputs are incomplete or unsupported",
+                        )?;
+                    if tracker.has_skylight {
+                        native_world::generation_sky_light::check_generated_sky_blocks(
+                            &world,
+                            bounds,
+                            &after_block,
+                            active,
+                            &guard.light_check_order,
+                            &current_sources,
+                        )
+                        .context(
+                            "incremental feature sky light inputs are incomplete or unsupported",
+                        )?
+                    } else {
+                        after_block
+                    }
                 } else {
-                    after_block
+                    let mut sections = native_world::generation_light::SectionLightTracker::new(
+                        before,
+                        tracker.data_sections.iter().copied(),
+                        active.clone(),
+                    )
+                    .context("incremental light section history differs")?;
+                    sections
+                        .apply_changes(
+                            &world,
+                            bounds,
+                            &guard.section_statuses,
+                            &guard.light_check_order,
+                            &current_sources,
+                        )
+                        .context(
+                            "incremental feature light inputs are incomplete or unsupported",
+                        )?;
+                    sections.snapshot().clone()
                 };
                 let mut columns = BTreeMap::new();
                 for pos in covered {

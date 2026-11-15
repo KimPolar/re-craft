@@ -502,7 +502,15 @@ mod tests {
             Some(path) => PathBuf::from(path),
             None => native_resources::default_minecraft_dir()?,
         };
-        let parent = tempfile::tempdir()?;
+        // Some Windows sandboxes disallow the no-replace rename used by world
+        // publication in the system temporary directory. Use the same
+        // workspace-local test root as the persistence publication tests.
+        let test_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+        std::fs::create_dir_all(&test_root)?;
+        let parent = tempfile::Builder::new()
+            .prefix("initial-world-")
+            .tempdir_in(test_root)?;
         let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
         settings.seed = crate::chat_input::ChatInput::field(&seed.to_string());
         settings.generate_structures = true;

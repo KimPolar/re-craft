@@ -388,24 +388,46 @@ impl World {
             .cloned()
             .map(|biome| self.intern_biome(biome))
             .collect();
-        let mut sections: BTreeMap<_, _> = chunk
-            .sections
+        let same_states = states
             .iter()
-            .map(|(&y, section)| {
-                let mut section = (**section).clone();
-                if let Some(blocks) = &mut section.blocks {
-                    for id in blocks.iter_mut() {
-                        *id = states[id.0 as usize];
+            .enumerate()
+            .all(|(old, new)| new.0 as usize == old);
+        let same_biomes = biomes
+            .iter()
+            .enumerate()
+            .all(|(old, new)| new.0 as usize == old);
+        let mut sections: BTreeMap<_, _> =
+            chunk
+                .sections
+                .iter()
+                .map(|(&y, section)| {
+                    // A streamed section can be shared when every ID it uses has
+                    // the same meaning in both registries. Later edits use COW.
+                    let blocks_unchanged = same_states
+                        || section.blocks.as_ref().is_none_or(|blocks| {
+                            blocks.iter().all(|id| states[id.0 as usize] == *id)
+                        });
+                    let biomes_unchanged = same_biomes
+                        || section.biomes.as_ref().is_none_or(|values| {
+                            values.iter().all(|id| biomes[id.0 as usize] == *id)
+                        });
+                    if blocks_unchanged && biomes_unchanged {
+                        return (y, Arc::clone(section));
                     }
-                }
-                if let Some(values) = &mut section.biomes {
-                    for id in values.iter_mut() {
-                        *id = biomes[id.0 as usize];
+                    let mut section = (**section).clone();
+                    if !blocks_unchanged && let Some(blocks) = &mut section.blocks {
+                        for id in blocks.iter_mut() {
+                            *id = states[id.0 as usize];
+                        }
                     }
-                }
-                (y, Arc::new(section))
-            })
-            .collect();
+                    if !biomes_unchanged && let Some(values) = &mut section.biomes {
+                        for id in values.iter_mut() {
+                            *id = biomes[id.0 as usize];
+                        }
+                    }
+                    (y, Arc::new(section))
+                })
+                .collect();
         for edit in &pending_edits {
             let replacement = self.intern_state(edit.replacement.clone());
             let section_y = i8::try_from(edit.position.y.div_euclid(16))
@@ -852,6 +874,107 @@ mod tests {
         assert!(!dest.chunks.contains_key(&pos));
         assert!(dest.import_chunk(&fresh, pos).unwrap());
         assert_eq!(dest.block_id(-32, 0, 64), Some(dest_air));
+    }
+
+    #[test]
+    fn imported_sections_share_only_when_ids_match_and_edits_remain_isolated() {
+        let block = |name: &str| BlockState {
+            name: format!("minecraft:{name}"),
+            properties: BTreeMap::new(),
+        };
+        let mut source = World::new("minecraft:overworld");
+        let air = source.intern_state(block("air"));
+        let stone = source.intern_state(block("stone"));
+        source.intern_state(block("dirt"));
+        let plains = source.intern_biome("minecraft:plains".into());
+        let forest = source.intern_biome("minecraft:forest".into());
+        let section = |state, biome| {
+            Arc::new(Section {
+                blocks: Some(Box::new([state; BLOCK_COUNT])),
+                biomes: Some(Box::new([biome; BIOME_COUNT])),
+                block_light: Some(Box::new([0x21; LIGHT_BYTES])),
+                sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+            })
+        };
+        let pos = ChunkPos { x: -1, z: 0 };
+        source.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:full".into()),
+                block_light_correct: true,
+                sections: BTreeMap::from([
+                    (0, section(air, plains)),
+                    (1, section(stone, forest)),
+                    (2, section(air, forest)),
+                ]),
+            }),
+        );
+
+        // Only the first section's IDs retain their original meanings.
+        let mut partial = World::new("minecraft:overworld");
+        partial.intern_state(block("air"));
+        partial.intern_state(block("dirt"));
+        partial.intern_biome("minecraft:plains".into());
+        partial.intern_biome("minecraft:desert".into());
+        assert!(partial.import_chunk(&source, pos).unwrap());
+        assert!(Arc::ptr_eq(
+            &source.chunks[&pos].sections[&0],
+            &partial.chunks[&pos].sections[&0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &source.chunks[&pos].sections[&1],
+            &partial.chunks[&pos].sections[&1]
+        ));
+        assert!(!Arc::ptr_eq(
+            &source.chunks[&pos].sections[&2],
+            &partial.chunks[&pos].sections[&2]
+        ));
+        assert_eq!(partial.block(-16, 16, 0), source.block(-16, 16, 0));
+        assert_eq!(partial.biome(-16, 16, 0), source.biome(-16, 16, 0));
+        assert_eq!(partial.block(-16, 32, 0), source.block(-16, 32, 0));
+        assert_eq!(partial.biome(-16, 32, 0), source.biome(-16, 32, 0));
+        assert_eq!(partial.light(-16, 16, 0, false), Some(1));
+
+        // Replayed edits detach only their own section, leaving the source and
+        // all other imported sections shared and unchanged.
+        let mut edited = World::new("minecraft:overworld");
+        edited.intern_state(block("air"));
+        edited.intern_state(block("stone"));
+        edited.intern_state(block("dirt"));
+        edited.intern_biome("minecraft:plains".into());
+        edited.intern_biome("minecraft:forest".into());
+        edited.record_block_edit(
+            BlockPosition { x: -16, y: 0, z: 0 },
+            Some(block("air")),
+            block("dirt"),
+        );
+        assert!(edited.import_chunk(&source, pos).unwrap());
+        assert!(!Arc::ptr_eq(
+            &source.chunks[&pos].sections[&0],
+            &edited.chunks[&pos].sections[&0]
+        ));
+        assert!(Arc::ptr_eq(
+            &source.chunks[&pos].sections[&1],
+            &edited.chunks[&pos].sections[&1]
+        ));
+        assert_eq!(edited.block(-16, 0, 0).unwrap().name, "minecraft:dirt");
+        assert_eq!(source.block(-16, 0, 0).unwrap().name, "minecraft:air");
+
+        let mut invalid = source.clone();
+        let chunk = Arc::make_mut(invalid.chunks.get_mut(&pos).unwrap());
+        Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+            .biomes
+            .as_mut()
+            .unwrap()[0] = BiomeId(u32::MAX);
+        let mut target = World::new("minecraft:overworld");
+        assert_eq!(
+            target.import_chunk(&invalid, pos),
+            Err(ChunkImportError::UnknownBiome)
+        );
+        assert_eq!(target.state_count(), 0);
+        assert_eq!(target.biome_count(), 0);
+        assert!(target.chunks.is_empty());
     }
 
     #[test]

@@ -21,6 +21,10 @@ mod leaf_save_tests;
 #[path = "loaded_lava_tests.rs"]
 mod lava_tests;
 
+#[cfg(test)]
+#[path = "loaded_sulfur_tests.rs"]
+mod sulfur_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -16498,11 +16502,26 @@ impl LoadedSession {
                         .world
                         .block(absolute.x, absolute.y, absolute.z)
                         .filter(|state| random_tick_kind(state) == 8)
+                        .cloned()
                 {
-                    self.unresolved_other_random_tick = true;
-                    self.unresolved_other_random_tick_detail =
-                        Some(format!("{} at {absolute:?}", state.name));
-                    other_active = false;
+                    let error = if state.name == "minecraft:sulfur_spike" {
+                        let mut random = self.level_random.clone();
+                        let result = crate::sulfur_random_tick::random_tick(
+                            &mut SessionSulfur { session: self },
+                            &state,
+                            absolute,
+                            &mut random,
+                        );
+                        self.level_random = random;
+                        result.err().map(|error| format!("{error:#}"))
+                    } else {
+                        Some(format!("{} at {absolute:?}", state.name))
+                    };
+                    if let Some(error) = error {
+                        self.unresolved_other_random_tick = true;
+                        self.unresolved_other_random_tick_detail = Some(error);
+                        other_active = false;
+                    }
                 }
                 if lava_active
                     && self
@@ -28526,6 +28545,55 @@ impl crate::lava_fire::LavaFireWorld for SessionLavaFire<'_> {
         _: &mut native_core::random::LegacyRandom,
     ) -> anyhow::Result<()> {
         anyhow::bail!("lava ignition at {position:?} (fire state at {state_position:?}) is not yet implemented")
+    }
+}
+
+struct SessionSulfur<'a> {
+    session: &'a mut LoadedSession,
+}
+
+impl crate::sulfur_random_tick::SulfurWorld for SessionSulfur<'_> {
+    fn spike_is_tagged(&mut self) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:speleothems").expect("static tag")
+        });
+        self.session
+            .speleothem_tags
+            .as_ref()
+            .context("speleothem block tag is unavailable")?
+            .contains(tag, "minecraft:sulfur_spike")
+    }
+
+    fn sulfur_above(&mut self, position: IVec3) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        let above = add(position, IVec3::Y).context("sulfur spike position overflow")?;
+        let relative =
+            subtract(above, self.session.origin).context("sulfur spike position overflow")?;
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            relative,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("sulfur spike support is unavailable at {above:?}")
+        };
+        let state = self
+            .session
+            .world
+            .state(id)
+            .context("sulfur spike support state is unavailable")?;
+        anyhow::ensure!(
+            self.session
+                .vanilla_block_ids
+                .as_ref()
+                .context("block registry is unavailable")?
+                .contains(&state.name),
+            "sulfur spike support is not in the block registry"
+        );
+        Ok(state.name == "minecraft:sulfur")
     }
 }
 

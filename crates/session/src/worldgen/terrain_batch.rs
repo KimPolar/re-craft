@@ -1337,6 +1337,9 @@ impl FreshTerrainBatch {
         if let Some(value) = &config.bubble_tags {
             session.set_bubble_column_tags(Arc::clone(value));
         }
+        if let Some(value) = &config.speleothem_tags {
+            session.set_speleothem_tags(Arc::clone(value));
+        }
         if let Some(value) = &config.washed_blocks {
             session.set_washed_away_blocks(Arc::clone(value));
         }

@@ -75,6 +75,7 @@ pub mod snow;
 mod spawn_entities;
 pub mod spawn_heightmaps;
 pub mod spreading_soil;
+mod sulfur_random_tick;
 mod stair_items;
 mod stair_mining;
 pub mod stair_placement;

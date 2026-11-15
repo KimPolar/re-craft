@@ -192,6 +192,18 @@ pub struct SkyLevel {
 }
 
 impl SkyLevel {
+    /// Load a named dimension type from the active data-pack stack.
+    pub fn load(provider: &mut impl ResourceProvider, dimension_type: &str) -> Result<Self> {
+        let id = ResourceId::parse(dimension_type)?;
+        let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing dimension type {dimension_type}"))?;
+        let definition = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid dimension type {dimension_type}"))?;
+        Self::from_definition(provider, &definition)
+    }
+
     pub fn new(attributes: Option<&Value>) -> Result<Self> {
         let mut base = 15.0;
         if let Some(attributes) = attributes {

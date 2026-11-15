@@ -1086,6 +1086,23 @@ fn prepare_world_with_session(
                 None
             }
         });
+        let gameplay_sky_level = if let Some(definition) = &inline_dimension {
+            Some(native_resources::sky_light::SkyLevel::from_definition(
+                &mut resources,
+                definition,
+            ))
+        } else {
+            world.dimension_type.as_deref().map(|dimension_type| {
+                native_resources::sky_light::SkyLevel::load(&mut resources, dimension_type)
+            })
+        }
+        .and_then(|result| match result {
+            Ok(level) => Some(Arc::new(level)),
+            Err(error) => {
+                eprintln!("Gameplay sky light is unavailable: {error:#}");
+                None
+            }
+        });
         let mut sky_background = if let Some(definition) = &inline_dimension {
             Some(sky_background::SkyBackground::from_definition(
                 &mut resources,
@@ -1190,6 +1207,9 @@ fn prepare_world_with_session(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
+        if let Some(level) = gameplay_sky_level {
+            session.set_gameplay_sky_level(level);
+        }
         session.bind_saved_world_session(
             reader
                 .session_guard()

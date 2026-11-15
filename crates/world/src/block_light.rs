@@ -887,6 +887,27 @@ pub(crate) fn light_properties(state: &BlockState) -> Option<LightProperties> {
     })
 }
 
+/// Java's light dampening into a neighboring block, including merged
+/// occlusion faces. Unsupported states and non-cardinal directions are unknown.
+pub fn light_dampening_into(
+    from: &BlockState,
+    to: &BlockState,
+    direction: [i32; 3],
+) -> Option<u8> {
+    let index = DIRECTIONS
+        .iter()
+        .position(|&(x, y, z)| direction == [x, y, z])?;
+    let from = light_properties(from)?;
+    let to = light_properties(to)?;
+    if (from.has_faces || to.has_faces)
+        && faces_occlude(&from.faces[index], &to.faces[index ^ 1])
+    {
+        Some(16)
+    } else {
+        Some(to.opacity)
+    }
+}
+
 /// Whether supported block states have identical emission, attenuation and
 /// occluding faces for both block and sky light. Unknown states return None.
 pub fn same_light_behavior(a: &BlockState, b: &BlockState) -> Option<bool> {

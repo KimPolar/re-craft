@@ -1607,6 +1607,8 @@ pub struct LoadedSession {
     random_tick_revision: Option<u64>,
     random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, RandomTickCounts)>,
     active_random_tick_sections: Vec<(ChunkPos, i8, RandomTickCounts)>,
+    gameplay_sky_level: Option<Arc<native_resources::sky_light::SkyLevel>>,
+    gameplay_sky_darken: Option<u8>,
     flight_speed: f32,
     walking_speed: f32,
     flight: crate::physics::FlightState,
@@ -1705,6 +1707,7 @@ pub struct LoadedSession {
     unresolved_fence_shape: bool,
     unresolved_leaf_decay: bool,
     unresolved_crop_tick: bool,
+    unresolved_spreading_soil_tick: bool,
     unresolved_crop_shape: bool,
     unresolved_speleothem_shape: bool,
     unresolved_stalactite_lifecycle: bool,
@@ -2386,6 +2389,7 @@ struct RandomTickCounts {
     leaves: Arc<[usize]>,
     crops: usize,
     crop_positions: Arc<[usize]>,
+    spreading_soil: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3299,6 +3303,14 @@ impl LoadedSession {
 
     pub fn set_random_tick_speed(&mut self, speed: u32) {
         self.random_tick_speed = speed;
+    }
+
+    /// Install the active dimension's sky-light timeline for simulation.
+    pub fn set_gameplay_sky_level(&mut self, level: Arc<native_resources::sky_light::SkyLevel>) {
+        self.gameplay_sky_level = Some(level);
+        if self.tick == 0 {
+            self.refresh_gameplay_sky_darken();
+        }
     }
 
     /// Configure the dimension's sky-light engine before simulation begins.
@@ -5267,6 +5279,10 @@ impl LoadedSession {
             "a crop random tick could not be resolved for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_spreading_soil_tick,
+            "a spreading soil random tick could not be resolved for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_crop_shape,
             "a crop neighbor update could not be resolved for saving"
         );
@@ -6763,6 +6779,7 @@ impl LoadedSession {
                 && !self.unresolved_speleothem_shape
                 && !self.unresolved_stalactite_lifecycle
                 && !self.unresolved_crop_tick
+                && !self.unresolved_spreading_soil_tick
                 && !self.unresolved_ice_tick
                 && !self.unresolved_bubble_tick,
             "a block update could not be resolved before generation"
@@ -7672,6 +7689,7 @@ impl LoadedSession {
         self.advance_weather = advance_weather;
         if self.tick == 0 {
             self.refresh_respawn_darkness();
+            self.refresh_gameplay_sky_darken();
         }
         let visual = self.weather_visual();
         Arc::make_mut(&mut self.snapshot).weather = visual;
@@ -8761,6 +8779,8 @@ impl LoadedSession {
             random_tick_revision: None,
             random_tick_sections: BTreeMap::new(),
             active_random_tick_sections: Vec::new(),
+            gameplay_sky_level: None,
+            gameplay_sky_darken: None,
             flight_speed: 0.05,
             walking_speed: 0.1,
             flight: crate::physics::FlightState::default(),
@@ -8858,6 +8878,7 @@ impl LoadedSession {
             unresolved_fence_shape: false,
             unresolved_leaf_decay: false,
             unresolved_crop_tick: false,
+            unresolved_spreading_soil_tick: false,
             unresolved_crop_shape: false,
             unresolved_speleothem_shape: false,
             unresolved_stalactite_lifecycle: false,
@@ -11921,6 +11942,10 @@ impl LoadedSession {
             "a crop random tick could not be resolved for saving"
         );
         ensure!(
+            !self.unresolved_spreading_soil_tick,
+            "a spreading soil random tick could not be resolved for saving"
+        );
+        ensure!(
             !self.unresolved_crop_shape,
             "a crop neighbor update could not be resolved for saving"
         );
@@ -12603,6 +12628,26 @@ impl LoadedSession {
     }
 
     // ServerLevel caches sky darkening after weather and shared clocks advance.
+    fn refresh_gameplay_sky_darken(&mut self) {
+        self.gameplay_sky_darken = (|| {
+            let level = self.gameplay_sky_level.as_ref()?;
+            let weather = self.weather_visual()?;
+            let value = level.sample(
+                |id| {
+                    self.world_clocks
+                        .iter()
+                        .find(|(clock, _)| {
+                            clock.namespace == id.namespace && clock.path == id.path
+                        })
+                        .map(|(_, clock)| clock.total_ticks)
+                },
+                weather.rain_at(1.0),
+                weather.thunder_at(1.0),
+            )?;
+            Some((15.0_f32 - value) as u8)
+        })();
+    }
+
     fn refresh_respawn_darkness(&mut self) {
         let previous = self.respawn_darkness;
         self.respawn_darkness = self.respawn_support.as_ref().and_then(|support| {
@@ -13210,6 +13255,7 @@ impl LoadedSession {
         self.advance_time = advance_time;
         if self.tick == 0 {
             self.refresh_respawn_darkness();
+            self.refresh_gameplay_sky_darken();
         }
     }
 
@@ -16188,6 +16234,11 @@ impl LoadedSession {
                     5
                 } else if crop_state(state).is_some_and(|(crop, age)| age < crop.max_age()) {
                     6
+                } else if matches!(
+                    state.name.as_str(),
+                    "minecraft:grass_block" | "minecraft:mycelium"
+                ) {
+                    7
                 } else {
                     0
                 }
@@ -16234,6 +16285,7 @@ impl LoadedSession {
                                 active.crops += 1;
                                 crop_positions.push(index);
                             }
+                            Some(7) => active.spreading_soil += 1,
                             _ => {}
                         }
                     }
@@ -16256,6 +16308,7 @@ impl LoadedSession {
                     || !active.snow.is_empty()
                     || active.has_farmland
                     || active.crops > 0
+                    || active.spreading_soil > 0
                     || !active.leaves.is_empty())
                 .then_some((chunk, section, active.clone()))
             })
@@ -16299,6 +16352,7 @@ impl LoadedSession {
                     && !farmland_active
                     && !leaves_active
                     && !crops_active
+                    && active.spreading_soil == 0
                 {
                     self.random_block_position
                         .skip(self.random_tick_speed - index);
@@ -16352,6 +16406,8 @@ impl LoadedSession {
                             crops_active = active.crops > 0;
                         }
                         grew
+                    } else if let Some(changed) = self.random_tick_spreading_soil_at(relative) {
+                        changed
                     } else {
                         false
                     };
@@ -16553,6 +16609,49 @@ impl LoadedSession {
             .map(|sky| sky.max(block))
     }
 
+    /// Java's max-local brightness subtracts the cached dimension sky
+    /// darkening, unlike the raw light value used by crop growth.
+    fn spreading_soil_brightness(&self, relative: IVec3) -> Option<u8> {
+        let absolute = add(self.origin, relative)?;
+        if !(-30_000_000..30_000_000).contains(&absolute.x)
+            || !(-30_000_000..30_000_000).contains(&absolute.z)
+        {
+            return Some(15);
+        }
+        let position = BlockPosition {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+        };
+        if pending_light_affects(&self.pending_light, position) {
+            return None;
+        }
+        let chunk = self.world.chunks.get(&ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        })?;
+        if !chunk.block_light_correct {
+            return None;
+        }
+        let block = self.world.light(absolute.x, absolute.y, absolute.z, false)?;
+        if block >= 9 || self.sky_lighting.capability() == Some(false) {
+            return Some(block);
+        }
+        if self.sky_lighting.capability() != Some(true) {
+            return None;
+        }
+        let bounds =
+            native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
+        if !(self.sky_lighting.settled()
+            || self.sky_lighting.is_current_at(position, bounds)
+            || self.sky_lighting.light_unchanged(&self.world, bounds))
+        {
+            return None;
+        }
+        let sky = self.world.light(absolute.x, absolute.y, absolute.z, true)?;
+        Some(block.max(sky.saturating_sub(self.gameplay_sky_darken?)))
+    }
+
     fn crop_can_survive(&self, relative: IVec3) -> Option<bool> {
         let light = self.crop_brightness(relative, 8);
         let supported = (|| {
@@ -16720,6 +16819,31 @@ impl LoadedSession {
             neighbors[index] = self.world.state(id)?.name == crop;
         }
         Some(crate::crop::growth_speed(soils, neighbors))
+    }
+
+    /// Returns `None` when the sampled block is not spreading soil.
+    fn random_tick_spreading_soil_at(&mut self, relative: IVec3) -> Option<bool> {
+        let absolute = add(self.origin, relative)?;
+        let source = self.world.block(absolute.x, absolute.y, absolute.z)?.clone();
+        if !matches!(
+            source.name.as_str(),
+            "minecraft:grass_block" | "minecraft:mycelium"
+        ) {
+            return None;
+        }
+        let before = self.revision;
+        let mut random = self.level_random.clone();
+        let result = crate::spreading_soil::random_tick(
+            &mut SessionSpreadingSoil { session: self },
+            relative,
+            &source,
+            &mut random,
+        );
+        self.level_random = random;
+        if result.is_err() {
+            self.unresolved_spreading_soil_tick = true;
+        }
+        Some(self.revision != before)
     }
 
     /// Returns `None` when this is not an immature crop.
@@ -23522,6 +23646,7 @@ impl LoadedSession {
             }
         }
         self.refresh_respawn_darkness();
+        self.refresh_gameplay_sky_darken();
         if let Some(environment) = &self.fast_lava_environment
             && let Some(value) = environment.sample(|id| {
                 self.world_clocks
@@ -28078,6 +28203,113 @@ impl native_resources::enchantments::disk_predicate::PredicateWorld for DiskWorl
             }
         }
         Ok(true)
+    }
+}
+
+struct SessionSpreadingSoil<'a> {
+    session: &'a mut LoadedSession,
+}
+
+impl crate::spreading_soil::SpreadingWorld for SessionSpreadingSoil<'_> {
+    fn has_dirt(&mut self) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        Ok(self
+            .session
+            .vanilla_block_ids
+            .as_ref()
+            .context("block registry is unavailable")?
+            .contains("minecraft:dirt"))
+    }
+
+    fn block(&mut self, position: IVec3) -> anyhow::Result<BlockState> {
+        use anyhow::{Context, ensure};
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            position,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("soil neighbor is unavailable at {position:?}")
+        };
+        let state = self
+            .session
+            .world
+            .state(id)
+            .context("soil block is unavailable")?;
+        ensure!(
+            self.session
+                .vanilla_block_ids
+                .as_ref()
+                .context("block registry is unavailable")?
+                .contains(&state.name),
+            "soil neighbor is not in the active block registry"
+        );
+        if let Some(value) = state.properties.get("waterlogged") {
+            ensure!(
+                matches!(value.as_str(), "true" | "false"),
+                "invalid waterlogged state"
+            );
+        }
+        if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+            let level = state
+                .properties
+                .get("level")
+                .context("liquid level is missing")?;
+            let parsed = level.parse::<u8>()?;
+            ensure!(
+                state.properties.len() == 1 && parsed <= 15 && parsed.to_string() == *level,
+                "invalid liquid state"
+            );
+        }
+        Ok(state.clone())
+    }
+
+    fn brightness(&mut self, position: IVec3) -> anyhow::Result<u8> {
+        use anyhow::Context;
+        self.session
+            .spreading_soil_brightness(position)
+            .context("soil brightness is unavailable")
+    }
+
+    fn water_tagged(&mut self, state: &BlockState) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        let tag = self
+            .session
+            .farmland_water_tag
+            .context("water fluid tag is unavailable")?;
+        let fluid = FluidState::from_block(state).map_err(anyhow::Error::msg)?;
+        let bit = match fluid {
+            None => 1,
+            Some(FluidState { kind: FluidKind::Water, source: true, .. }) => 1 << 1,
+            Some(FluidState { kind: FluidKind::Water, source: false, .. }) => 1 << 2,
+            Some(FluidState { kind: FluidKind::Lava, source: true, .. }) => 1 << 3,
+            Some(FluidState { kind: FluidKind::Lava, source: false, .. }) => 1 << 4,
+        };
+        Ok(tag & bit != 0)
+    }
+
+    fn snowy(&mut self, state: &BlockState) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        self.session
+            .snowy_setting(&state.name)
+            .context("snow block tag is unavailable")
+    }
+
+    fn set_block(
+        &mut self,
+        position: IVec3,
+        state: BlockState,
+        random: &mut native_core::random::LegacyRandom,
+    ) -> anyhow::Result<()> {
+        let id = self.session.intern_block(state);
+        // Block updates can invoke callbacks using the level RNG before the
+        // soil tick makes its next candidate selection.
+        self.session.level_random = random.clone();
+        let applied = self.session.set(position, id);
+        *random = self.session.level_random.clone();
+        anyhow::ensure!(applied, "soil block update could not be applied");
+        Ok(())
     }
 }
 
@@ -33216,6 +33448,142 @@ pub(crate) mod tests {
         eprintln!(
             "64 sidecars of 64 KiB, {iterations} checks: full comparison {before:?}, guarded revalidation {after:?}"
         );
+    }
+
+    fn spreading_test_session(sky_level: Option<f32>) -> LoadedSession {
+        let (mut world, origin, player) = fixture();
+        let dirt = world.intern_state(state("minecraft:dirt", &[]));
+        let grass = world.intern_state(state("minecraft:grass_block", &[("snowy", "false")]));
+        for x in 7..=9 {
+            for z in 7..=9 {
+                world.set_block_id(origin.x + x, 7, origin.z + z, dirt).unwrap();
+            }
+        }
+        world
+            .set_block_id(origin.x + 8, 8, origin.z + 8, grass)
+            .unwrap();
+        let chunk = Arc::make_mut(world.chunks.values_mut().next().unwrap());
+        chunk.block_light_correct = true;
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.block_light = Some(Box::new([0; LIGHT_BYTES]));
+        section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_vanilla_block_ids(Arc::new(
+            [
+                "minecraft:air",
+                "minecraft:stone",
+                "minecraft:dirt",
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ));
+        session.set_snowy_tag(Arc::new(BTreeSet::new()));
+        session.set_farmland_water_tag(Arc::new(BTreeSet::from([
+            "minecraft:water".into(),
+            "minecraft:flowing_water".into(),
+        ])));
+        session.set_has_skylight(true).unwrap();
+        session.set_weather(Some(false), None, false);
+        if let Some(level) = sky_level {
+            let sky = native_resources::sky_light::SkyLevel::new(Some(&serde_json::json!({
+                "minecraft:gameplay/sky_light_level": level
+            })))
+            .unwrap();
+            session.set_gameplay_sky_level(Arc::new(sky));
+        }
+        session.level_random = native_core::random::LegacyRandom::new(0);
+        session
+    }
+
+    #[test]
+    fn spreading_soil_uses_cached_sky_darkening_and_guards_unknown_light() {
+        let origin = IVec3::new(8, 8, 8);
+        let target = IVec3::new(9, 7, 9);
+        for (sky, expected, unresolved) in [
+            (Some(15.0), "minecraft:grass_block", false),
+            (Some(4.0), "minecraft:dirt", false),
+            (None, "minecraft:dirt", true),
+        ] {
+            let mut session = spreading_test_session(sky);
+            assert!(session.random_tick_spreading_soil_at(origin).is_some());
+            let absolute = session.origin + target;
+            assert_eq!(
+                session.world.block(absolute.x, absolute.y, absolute.z).unwrap().name,
+                expected
+            );
+            assert_eq!(session.unresolved_spreading_soil_tick, unresolved);
+            if sky == Some(4.0) {
+                assert_eq!(
+                    session.level_random.next_int(),
+                    native_core::random::LegacyRandom::new(0).next_int()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spreading_soil_participates_in_the_section_random_tick() {
+        let seed = (0..10_000)
+            .find(|seed| {
+                let [x, y, z] = native_core::random::BlockRandomPosition::new(*seed)
+                    .next_section_offset();
+                (2..14).contains(&x) && (2..14).contains(&z) && (2..14).contains(&y)
+            })
+            .unwrap();
+        let [x, y, z] =
+            native_core::random::BlockRandomPosition::new(seed).next_section_offset();
+        let position = IVec3::new(x, y, z);
+        let (mut world, origin, player) = fixture();
+        let grass = world.intern_state(state("minecraft:grass_block", &[("snowy", "false")]));
+        let stone = world.intern_state(state("minecraft:stone", &[]));
+        let absolute = origin + position;
+        world
+            .set_block_id(absolute.x, absolute.y, absolute.z, grass)
+            .unwrap();
+        world
+            .set_block_id(absolute.x, absolute.y + 1, absolute.z, stone)
+            .unwrap();
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_vanilla_block_ids(Arc::new(
+            [
+                "minecraft:air",
+                "minecraft:stone",
+                "minecraft:dirt",
+                "minecraft:grass_block",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ));
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(1);
+        session.advance_random_block_ticks();
+        assert_eq!(
+            session.world.block(absolute.x, absolute.y, absolute.z).unwrap().name,
+            "minecraft:dirt"
+        );
+        assert!(!session.unresolved_spreading_soil_tick);
     }
 
     fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {

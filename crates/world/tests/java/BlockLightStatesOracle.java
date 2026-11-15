@@ -6,6 +6,8 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.core.Direction;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.lighting.LightEngine;
 
 public class BlockLightStatesOracle {
     public static void main(String[] args) throws Exception {
@@ -30,11 +32,13 @@ public class BlockLightStatesOracle {
             } else names.add(request.getAsString());
         }
         var result = new JsonArray();
+        var leaves = new ArrayList<BlockState>();
         for (var name : names) {
             var id = Identifier.parse(name);
             if (!BuiltInRegistries.BLOCK.containsKey(id)) throw new IllegalArgumentException("unknown block: " + name);
             var block = BuiltInRegistries.BLOCK.getValue(id);
             for (var state : block.getStateDefinition().getPossibleStates()) {
+                if (name.endsWith("_leaves")) leaves.add(state);
                 var entry = new JsonObject();
                 var properties = new JsonObject();
                 state.getValues().forEach(value -> properties.addProperty(value.property().getName(), value.valueName()));
@@ -109,6 +113,10 @@ public class BlockLightStatesOracle {
                 entry.add("faces", faces);
                 result.add(entry);
             }
+        }
+        for (var old : leaves) for (var next : leaves) {
+            if (old.isAir() || next.isAir() || LightEngine.hasDifferentLightProperties(old, next))
+                throw new AssertionError("leaf transition needs a light callback: " + old + " -> " + next);
         }
         Files.writeString(Path.of(args[1]), result.toString());
     }

@@ -46,6 +46,10 @@ public class SkyLightEngineOracle implements LightChunkGetter, BlockGetter {
             case "stone" -> Blocks.STONE.defaultBlockState();
             case "water" -> Blocks.WATER.defaultBlockState();
             case "glass" -> Blocks.GLASS.defaultBlockState();
+            case "leaf_1" -> Blocks.OAK_LEAVES.defaultBlockState().setValue(LeavesBlock.DISTANCE, 1);
+            case "leaf_2" -> Blocks.OAK_LEAVES.defaultBlockState().setValue(LeavesBlock.DISTANCE, 2);
+            case "leaf_3" -> Blocks.OAK_LEAVES.defaultBlockState().setValue(LeavesBlock.DISTANCE, 3).setValue(LeavesBlock.WATERLOGGED, true);
+            case "leaf_4" -> Blocks.BIRCH_LEAVES.defaultBlockState().setValue(LeavesBlock.DISTANCE, 4);
             case "slab_bottom" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM);
             case "slab_top" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.TOP);
             case "wet_slab" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, true);
@@ -73,10 +77,15 @@ public class SkyLightEngineOracle implements LightChunkGetter, BlockGetter {
         for (var element : actions) {
             var item = element.getAsJsonObject();
             var p = new BlockPos(item.get("x").getAsInt(), item.get("y").getAsInt(), item.get("z").getAsInt());
-            world.blocks.put(p, state(item.get("state").getAsString()));
+            var old = world.getBlockState(p);
+            var next = state(item.get("state").getAsString());
+            world.blocks.put(p, next);
             var chunk = world.chunks.get(new ChunkPos(Math.floorDiv(p.getX(), 16), Math.floorDiv(p.getZ(), 16)));
-            chunk.sources.update(chunk, Math.floorMod(p.getX(), 16), p.getY(), Math.floorMod(p.getZ(), 16));
-            engine.checkBlock(p);
+            if (!item.has("vanillaChecks") || !item.get("vanillaChecks").getAsBoolean()
+                    || LightEngine.hasDifferentLightProperties(old, next)) {
+                chunk.sources.update(chunk, Math.floorMod(p.getX(), 16), p.getY(), Math.floorMod(p.getZ(), 16));
+                engine.checkBlock(p);
+            }
             if (item.has("defer") && item.get("defer").getAsBoolean()) continue;
             while (engine.hasLightWork()) engine.runLightUpdates();
             var grid = new JsonArray();

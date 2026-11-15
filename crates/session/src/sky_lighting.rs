@@ -247,8 +247,21 @@ impl SkyLighting {
         old: Option<BlockStateId>,
         new: BlockStateId,
         original: &Arc<Chunk>,
+        world: &World,
     ) {
         if !self.enabled {
+            return;
+        }
+        // Java skips both section-emptiness and checkBlock callbacks for
+        // these transitions. Keep a same-position edit if an older update
+        // still needs its exact state sequence for replay.
+        if world.block_id(position.x, position.y, position.z) == old
+            && old
+                .and_then(|id| world.state(id))
+                .zip(world.state(new))
+                .is_some_and(|(before, after)| edit_needs_no_sky_work(before, after))
+            && self.pending.iter().all(|edit| edit.position != position)
+        {
             return;
         }
         self.originals
@@ -489,6 +502,25 @@ impl SkyLighting {
         assert!(tx.send(reply).is_ok());
         self.worker = Some((generation, rx));
     }
+}
+
+/// A checkBlock-free edit is inert only if it also cannot change the
+/// section's hasOnlyAir status. The supported light-check pairs are known
+/// vanilla states, including the three air blocks.
+fn edit_needs_no_sky_work(
+    before: &native_world::loaded::BlockState,
+    after: &native_world::loaded::BlockState,
+) -> bool {
+    if before == after {
+        return true;
+    }
+    let air = |state: &native_world::loaded::BlockState| {
+        matches!(
+            state.name.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        )
+    };
+    air(before) == air(after) && skips_light_check_for_edit(before, after) == Some(true)
 }
 
 fn extend_required_chunks(required: &mut BTreeSet<ChunkPos>, position: BlockPosition) {
@@ -1173,7 +1205,7 @@ mod tests {
         let old = world.block_id(p.x, p.y, p.z);
         let id = Arc::make_mut(world).intern_state(new);
         let original = Arc::clone(world.chunks.get(&p.chunk()).unwrap());
-        sky.record(p, old, id, &original);
+        sky.record(p, old, id, &original, world);
         let world = Arc::make_mut(world);
         world.set_block_id(p.x, p.y, p.z, id).unwrap();
         sky.discard_trivial(world, p);
@@ -1279,6 +1311,153 @@ mod tests {
         assert!(!sky.is_current_at_brightness(two_away, Some(bounds), 16));
         edit(&mut sky, &mut world, two_away, state("stone", &[]));
         assert!(!sky.is_current_at_brightness(two_away, Some(bounds), 15));
+    }
+
+    fn leaf(name: &str, distance: u8, waterlogged: bool) -> BlockState {
+        state(
+            name,
+            &[
+                ("distance", &distance.to_string()),
+                ("persistent", "false"),
+                ("waterlogged", if waterlogged { "true" } else { "false" }),
+            ],
+        )
+    }
+
+    #[test]
+    fn light_neutral_edits_skip_only_callbacks_proven_unnecessary() {
+        let mut world = fixture();
+        let leaf_pos = BlockPosition { x: 8, y: 8, z: 8 };
+        let leaf_id = Arc::make_mut(&mut world).intern_state(leaf("oak_leaves", 1, false));
+        Arc::make_mut(&mut world)
+            .set_block_id(leaf_pos.x, leaf_pos.y, leaf_pos.z, leaf_id)
+            .unwrap();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+
+        edit(
+            &mut sky,
+            &mut world,
+            leaf_pos,
+            leaf("birch_leaves", 7, true),
+        );
+        assert!(sky.settled());
+        let solid_pos = BlockPosition { x: 9, ..leaf_pos };
+        let stone = Arc::make_mut(&mut world).intern_state(state("stone", &[]));
+        Arc::make_mut(&mut world)
+            .set_block_id(solid_pos.x, solid_pos.y, solid_pos.z, stone)
+            .unwrap();
+        edit(&mut sky, &mut world, solid_pos, state("dirt", &[]));
+        assert!(sky.settled());
+        let other = BlockPosition { x: 10, ..leaf_pos };
+        edit(&mut sky, &mut world, other, state("stone", &[]));
+        let generation = sky.generation;
+        edit(&mut sky, &mut world, leaf_pos, leaf("oak_leaves", 3, false));
+        assert_eq!(sky.pending.len(), 1);
+        assert_eq!(sky.generation, generation);
+
+        // Air-to-glass does not need checkBlock, but can create a section.
+        let glass = BlockPosition { x: 11, ..leaf_pos };
+        edit(&mut sky, &mut world, glass, state("glass", &[]));
+        assert_eq!(sky.pending.len(), 2);
+        assert_eq!(sky.pending[1].position, glass);
+
+        let mut invalid = leaf("oak_leaves", 3, false);
+        invalid.properties.insert("distance".into(), "8".into());
+        edit(&mut sky, &mut world, leaf_pos, invalid);
+        assert_eq!(sky.pending.len(), 3);
+        assert_eq!(sky.pending[2].position, leaf_pos);
+
+        let stale_pos = BlockPosition { x: 12, ..leaf_pos };
+        let other_leaf = Arc::make_mut(&mut world).intern_state(leaf("oak_leaves", 2, false));
+        let original = Arc::clone(&world.chunks[&stale_pos.chunk()]);
+        sky.record(stale_pos, Some(leaf_id), other_leaf, &original, &world);
+        assert_eq!(sky.pending.len(), 4);
+        assert_eq!(sky.pending[3].position, stale_pos);
+    }
+
+    #[test]
+    fn neutral_edit_keeps_same_position_history_for_replay() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let position = BlockPosition { x: 8, y: 16, z: 8 };
+        edit(&mut sky, &mut world, position, leaf("oak_leaves", 1, false));
+        sky.advance(&mut world, Some(bounds));
+        assert!(sky.worker.is_some());
+        let generation = sky.generation;
+        edit(&mut sky, &mut world, position, leaf("oak_leaves", 2, true));
+        assert_ne!(sky.generation, generation);
+        assert_eq!(sky.pending.len(), 2);
+        assert_eq!(sky.pending[0].position, position);
+        assert_eq!(sky.pending[1].position, position);
+        assert!(finish(&mut sky, &mut world, bounds).is_empty());
+        assert_eq!(sky.pending.len(), 2);
+        finish(&mut sky, &mut world, bounds);
+        assert!(sky.settled());
+        assert_eq!(world.light(8, 15, 8, true), Some(14));
+    }
+
+    #[test]
+    fn in_flight_light_work_survives_unrelated_neutral_leaf_edit() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let leaf_pos = BlockPosition { x: 4, y: 20, z: 4 };
+        let stone_pos = BlockPosition {
+            x: 12,
+            y: 20,
+            z: 12,
+        };
+        edit(&mut sky, &mut world, leaf_pos, leaf("oak_leaves", 1, false));
+        finish(&mut sky, &mut world, bounds);
+        let mut reference_world = Arc::clone(&world);
+        let mut reference_sky = SkyLighting::default();
+        reference_sky.set_enabled(true);
+        reference_sky.sources = sky.sources.clone();
+        edit(&mut sky, &mut world, stone_pos, state("stone", &[]));
+        edit(
+            &mut reference_sky,
+            &mut reference_world,
+            stone_pos,
+            state("stone", &[]),
+        );
+        sky.advance(&mut world, Some(bounds));
+        assert!(sky.worker.is_some());
+        let generation = sky.generation;
+        edit(
+            &mut sky,
+            &mut world,
+            leaf_pos,
+            leaf("birch_leaves", 2, true),
+        );
+        assert_eq!(sky.generation, generation);
+        assert_eq!(sky.pending.len(), 1);
+        finish(&mut sky, &mut world, bounds);
+        finish(&mut reference_sky, &mut reference_world, bounds);
+        edit(
+            &mut reference_sky,
+            &mut reference_world,
+            leaf_pos,
+            leaf("birch_leaves", 2, true),
+        );
+        assert!(sky.settled());
+        assert!(reference_sky.settled());
+        assert_eq!(sky.sources, reference_sky.sources);
+        for (pos, chunk) in &world.chunks {
+            for (y, section) in &chunk.sections {
+                assert_eq!(
+                    section.sky_light, reference_world.chunks[pos].sections[y].sky_light,
+                    "{pos:?} section {y}"
+                );
+            }
+        }
+        assert_eq!(
+            world.block(leaf_pos.x, leaf_pos.y, leaf_pos.z),
+            Some(&leaf("birch_leaves", 2, true))
+        );
     }
 
     #[test]
@@ -1896,6 +2075,7 @@ mod tests {
             world.block_id(target.x, target.y, target.z),
             glass,
             &original,
+            &world,
         );
         Arc::make_mut(&mut world)
             .set_block_id(target.x, target.y, target.z, glass)
@@ -2851,8 +3031,16 @@ mod tests {
             (15, 24, 15, "air", false),
             (14, 24, 15, "air", true),
             (16, 24, 15, "air", false),
+            (6, 20, 6, "leaf_1", false),
+            (6, 20, 6, "leaf_2", false),
+            (7, 20, 6, "stone", true),
+            (6, 20, 6, "leaf_3", true),
+            (9, 20, 6, "stone", false),
+            (6, 20, 6, "air", true),
+            (6, 20, 6, "leaf_4", false),
+            (6, 20, 6, "leaf_2", false),
         ]);
-        let entries: Vec<_> = actions.iter().map(|(x,y,z,name,defer)| serde_json::json!({"x":x,"y":y,"z":z,"state":name,"defer":defer})).collect();
+        let entries: Vec<_> = actions.iter().map(|(x,y,z,name,defer)| serde_json::json!({"x":x,"y":y,"z":z,"state":name,"defer":defer,"vanillaChecks":name.starts_with("leaf_")})).collect();
         let input = temp.path().join("input.json");
         let output = temp.path().join("output.json");
         std::fs::write(&input, serde_json::to_vec(&entries).unwrap()).unwrap();
@@ -2888,6 +3076,10 @@ mod tests {
                     "stone_slab",
                     &[("type", "bottom"), ("waterlogged", "false")],
                 ),
+                "leaf_1" => leaf("oak_leaves", 1, false),
+                "leaf_2" => leaf("oak_leaves", 2, false),
+                "leaf_3" => leaf("oak_leaves", 3, true),
+                "leaf_4" => leaf("birch_leaves", 4, false),
                 _ => state(name, &[]),
             };
             edit(&mut sky, &mut world, BlockPosition { x, y, z }, block);
@@ -2923,7 +3115,11 @@ mod tests {
                     }
                 }
             }
-            finish(&mut sky, &mut world, bounds);
+            if !sky.pending.is_empty() {
+                finish(&mut sky, &mut world, bounds);
+            } else {
+                assert!(sky.worker.is_none());
+            }
             if x == 32 {
                 assert_eq!(sky.pending.len(), 1);
                 assert_eq!(sky.pending[0].position, BlockPosition { x, y, z });

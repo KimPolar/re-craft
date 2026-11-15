@@ -610,6 +610,9 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:mangrove_leaves"
         | "minecraft:cherry_leaves"
         | "minecraft:pale_oak_leaves"
+        | "minecraft:red_poplar_leaves"
+        | "minecraft:orange_poplar_leaves"
+        | "minecraft:yellow_poplar_leaves"
         | "minecraft:azalea_leaves"
         | "minecraft:flowering_azalea_leaves"
             if state.properties.len() == 3 =>
@@ -940,6 +943,7 @@ pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool
                 | "minecraft:suspicious_gravel"
                 | "minecraft:iron_chain"
         ) || crate::collision::full_glass(state)
+            || native_core::leaf::LeafKind::from_id(&state.name).is_some()
     }
     if !known_without_shape(a) || !known_without_shape(b) {
         return None;
@@ -2783,6 +2787,9 @@ mod tests {
             "mangrove_leaves",
             "cherry_leaves",
             "pale_oak_leaves",
+            "red_poplar_leaves",
+            "orange_poplar_leaves",
+            "yellow_poplar_leaves",
             "azalea_leaves",
             "flowering_azalea_leaves",
             "cobbled_deepslate",
@@ -2987,6 +2994,7 @@ mod tests {
         let mut pots_checked = 0;
         let mut concrete_checked = 0;
         let mut brushable_checked = 0;
+        let mut leaf_states = Vec::new();
         for row in rows {
             let s = BlockState {
                 name: row["name"].as_str().unwrap().into(),
@@ -3002,6 +3010,9 @@ mod tests {
             concrete_checked += usize::from(crate::collision::full_concrete(&s));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
+            if native_core::leaf::LeafKind::from_id(&s.name).is_some() {
+                leaf_states.push(s.clone());
+            }
             if row["flower_pot"] == true {
                 assert!(
                     crate::collision::flower_pot(&s),
@@ -3124,6 +3135,12 @@ mod tests {
         assert_eq!(pots_checked, 40);
         assert_eq!(concrete_checked, 16);
         assert_eq!(brushable_checked, 8);
+        assert_eq!(leaf_states.len(), 14 * 28);
+        for before in &leaf_states {
+            for after in &leaf_states {
+                assert_eq!(skips_light_check_for_edit(before, after), Some(true));
+            }
+        }
     }
 
     #[test]

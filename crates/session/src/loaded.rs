@@ -18654,6 +18654,7 @@ impl LoadedSession {
             original,
             id,
             chunk,
+            &self.world,
         );
         let relight = native_world::block_light::light_change_for_edit(
             original_state.as_ref(),
@@ -33645,6 +33646,7 @@ pub(crate) mod tests {
             Some(session.states[3]),
             session.states[0],
             &original,
+            &session.world,
         );
         assert!(!session.sky_lighting.settled());
         assert!(session.capture_generation_terrain(&source, [pos]).is_err());

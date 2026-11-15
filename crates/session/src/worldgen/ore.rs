@@ -54,6 +54,8 @@ use super::{
 
 mod buried_treasure;
 #[cfg(test)]
+mod chest_edge_tests;
+#[cfg(test)]
 mod double_plant_tests;
 mod jigsaw;
 #[cfg(test)]
@@ -6492,6 +6494,38 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                 pos,
                 &ResourceId::parse("minecraft:water")?,
             )?;
+        } else if state.name == "minecraft:chest" {
+            ensure!(
+                state.properties.len() == 3
+                    && matches!(
+                        state.properties.get("facing").map(String::as_str),
+                        Some("north" | "south" | "east" | "west")
+                    )
+                    && state.properties.get("type").map(String::as_str) == Some("single")
+                    && matches!(
+                        state.properties.get("waterlogged").map(String::as_str),
+                        Some("true" | "false")
+                    ),
+                "unsupported tree edge chest state: {state:?}"
+            );
+            ensure!(
+                matches!(
+                    direction,
+                    [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1] | [-1, 0, 0] | [1, 0, 0]
+                ),
+                "invalid chest edge direction"
+            );
+            ensure!(
+                direction[1] != 0 || neighbor.name != "minecraft:chest",
+                "adjacent tree edge chest updates are not yet supported"
+            );
+            if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
+                SpringWorld::schedule_spring_tick(
+                    self,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
         } else if let Some(kind) = tree_edge_plant(state)? {
             if matches!(kind, SimplePlantKind::Double) {
                 let half = state.properties["half"].as_str();

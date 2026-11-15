@@ -1376,6 +1376,18 @@ fn potent_sulfur_state(state: &BlockState) -> bool {
         )
 }
 
+/// Valid vanilla archaeology blocks, including every brushing stage.
+pub fn brushable_state(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
+    ) && state.properties.len() == 1
+        && matches!(
+            state.properties.get("dusted").map(String::as_str),
+            Some("0" | "1" | "2" | "3")
+        )
+}
+
 fn block_offset_indices(pos: IVec3) -> (usize, usize, usize) {
     let seed =
         i64::from(pos.x.wrapping_mul(3_129_871)) ^ i64::from(pos.z).wrapping_mul(116_129_781);
@@ -1769,7 +1781,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if rail_ascending(state).is_some() || bubble_column_state(state) {
         return Some(EMPTY.to_vec());
     }
-    if potent_sulfur_state(state) {
+    if potent_sulfur_state(state) || brushable_state(state) {
         return Some(FULL.to_vec());
     }
     if tripwire_attached(state).is_some() || tripwire_hook_facing(state).is_some() {

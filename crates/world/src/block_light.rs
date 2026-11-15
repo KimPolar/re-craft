@@ -638,11 +638,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             boolean("snowy")?;
             (15, 0)
         }
-        "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
-            if state.properties.len() == 1 && bounded("dusted", 3).is_some() =>
-        {
-            (15, 0)
-        }
+        _ if crate::collision::brushable_state(state) => (15, 0),
         "minecraft:mangrove_roots" if state.properties.len() == 1 => {
             boolean("waterlogged")?;
             (1, 0)
@@ -1498,12 +1494,23 @@ mod tests {
                 assert_eq!(properties(&brushable), Some((15, 0)));
                 assert_eq!(same_light_behavior(&sand, &brushable), Some(true));
                 assert_eq!(skips_light_check_for_edit(&sand, &brushable), Some(true));
+                assert_eq!(
+                    crate::collision::block_shape(&brushable),
+                    crate::collision::block_shape(&sand)
+                );
+                assert_eq!(
+                    crate::collision::block_outline(&brushable),
+                    crate::collision::block_outline(&sand)
+                );
             }
             brushable.properties.insert("dusted".into(), "4".into());
             assert_eq!(properties(&brushable), None);
+            assert_eq!(crate::collision::block_shape(&brushable), None);
+            assert_eq!(crate::collision::block_outline(&brushable), None);
             brushable.properties.insert("dusted".into(), "0".into());
             brushable.properties.insert("extra".into(), "true".into());
             assert_eq!(properties(&brushable), None);
+            assert_eq!(crate::collision::block_shape(&brushable), None);
         }
     }
 
@@ -2953,6 +2960,7 @@ mod tests {
         assert_eq!(shaped_names.len(), 198);
         let mut pots_checked = 0;
         let mut concrete_checked = 0;
+        let mut brushable_checked = 0;
         for row in rows {
             let s = BlockState {
                 name: row["name"].as_str().unwrap().into(),
@@ -3040,9 +3048,14 @@ mod tests {
                 || crate::collision::barrel_state(&s)
                 || crate::collision::trial_spawner_state(&s).is_some()
                 || crate::collision::full_concrete(&s)
+                || crate::collision::brushable_state(&s)
             {
                 if s.name == "minecraft:frosted_ice" {
                     assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
+                }
+                if crate::collision::brushable_state(&s) {
+                    assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.6_f32);
+                    brushable_checked += 1;
                 }
                 let shape = crate::collision::block_shape(&s).unwrap();
                 assert_eq!(shape.len(), 1);
@@ -3084,6 +3097,7 @@ mod tests {
         }
         assert_eq!(pots_checked, 40);
         assert_eq!(concrete_checked, 16);
+        assert_eq!(brushable_checked, 8);
     }
 
     #[test]

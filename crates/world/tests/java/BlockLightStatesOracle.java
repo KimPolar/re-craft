@@ -67,7 +67,7 @@ public class BlockLightStatesOracle {
                         entry.add((String)shape[0], boxes);
                     }
                 }
-                if (block instanceof net.minecraft.world.level.block.FlowerPotBlock || name.endsWith("_concrete") || name.equals("minecraft:decorated_pot") || name.equals("minecraft:barrel") || name.equals("minecraft:trial_spawner") || name.equals("minecraft:frosted_ice") || name.equals("minecraft:vault") || name.endsWith("copper_bulb") || name.endsWith("copper_grate") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?") || name.matches("minecraft:(tuff|polished_tuff|tuff_bricks|chiseled_tuff|chiseled_tuff_bricks)")) {
+                if (block instanceof net.minecraft.world.level.block.FlowerPotBlock || name.endsWith("_concrete") || name.equals("minecraft:decorated_pot") || name.equals("minecraft:barrel") || name.equals("minecraft:trial_spawner") || name.equals("minecraft:frosted_ice") || name.equals("minecraft:vault") || name.equals("minecraft:suspicious_sand") || name.equals("minecraft:suspicious_gravel") || name.endsWith("copper_bulb") || name.endsWith("copper_grate") || name.matches("minecraft:(waxed_)?(exposed_|weathered_|oxidized_)?(cut_|chiseled_)?copper(_block)?") || name.matches("minecraft:(tuff|polished_tuff|tuff_bricks|chiseled_tuff|chiseled_tuff_bricks)")) {
                     entry.addProperty("friction", block.getFriction());
                     var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
                     var pos = net.minecraft.core.BlockPos.ZERO;

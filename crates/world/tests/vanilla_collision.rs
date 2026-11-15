@@ -394,6 +394,8 @@ fn implemented_collision_shapes_match_vanilla_states() {
         ("minecraft:sulfur", 1),
         ("minecraft:spawner", 1),
         ("minecraft:potent_sulfur", 5),
+        ("minecraft:suspicious_sand", 4),
+        ("minecraft:suspicious_gravel", 4),
         ("minecraft:cobweb", 1),
         ("minecraft:raw_iron_block", 1),
         ("minecraft:raw_copper_block", 1),

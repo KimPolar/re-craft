@@ -5098,11 +5098,7 @@ fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) -> Result<boo
         "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
     ) {
         ensure!(
-            state.properties.len() == 1
-                && matches!(
-                    state.properties.get("dusted").map(String::as_str),
-                    Some("0" | "1" | "2" | "3")
-                ),
+            native_world::collision::brushable_state(state),
             "invalid brushable support state"
         );
         return Ok(true);

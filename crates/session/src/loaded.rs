@@ -1168,6 +1168,99 @@ fn light_regions_touch(a: BlockPosition, ar: i32, b: BlockPosition, br: i32) -> 
         <= i64::from(ar + br + 1)
 }
 
+/// Find the exact connected set of pending light regions. Small groups avoid
+/// building an index; larger groups only inspect nearby, unvisited positions.
+/// The returned order is the same position order used by the relight pass.
+fn pending_light_group(
+    pending: &BTreeMap<BlockPosition, PendingLight>,
+    first: BlockPosition,
+) -> BTreeSet<BlockPosition> {
+    if !pending.contains_key(&first) {
+        return BTreeSet::new();
+    }
+    let mut group = BTreeSet::from([first]);
+    let mut frontier = vec![first];
+    for _ in 0..8 {
+        let Some(position) = frontier.pop() else {
+            return group;
+        };
+        let radius = pending[&position].change.radius();
+        for (&candidate, entry) in pending {
+            if !group.contains(&candidate)
+                && light_regions_touch(position, radius, candidate, entry.change.radius())
+            {
+                group.insert(candidate);
+                frontier.push(candidate);
+            }
+        }
+    }
+    if frontier.is_empty() {
+        return group;
+    }
+
+    // Two regions can touch only within one neighboring cell on each axis:
+    // their maximum possible separation is twice the largest radius plus one.
+    let width = pending
+        .values()
+        .map(|entry| entry.change.radius())
+        .max()
+        .unwrap_or(0)
+        * 2
+        + 1;
+    let cell = |position: BlockPosition| {
+        (
+            position.x.div_euclid(width),
+            position.y.div_euclid(width),
+            position.z.div_euclid(width),
+        )
+    };
+    let mut remaining = HashMap::<(i32, i32, i32), Vec<(BlockPosition, i32)>>::new();
+    for (&position, entry) in pending {
+        if !group.contains(&position) {
+            remaining
+                .entry(cell(position))
+                .or_default()
+                .push((position, entry.change.radius()));
+        }
+    }
+    if remaining.is_empty() {
+        return group;
+    }
+    while let Some(position) = frontier.pop() {
+        let radius = pending[&position].change.radius();
+        let (x, y, z) = cell(position);
+        for dx in -1i32..=1 {
+            for dy in -1i32..=1 {
+                for dz in -1i32..=1 {
+                    let Some(key) = x
+                        .checked_add(dx)
+                        .zip(y.checked_add(dy))
+                        .zip(z.checked_add(dz))
+                        .map(|((x, y), z)| (x, y, z))
+                    else {
+                        continue;
+                    };
+                    let Some(candidates) = remaining.get_mut(&key) else {
+                        continue;
+                    };
+                    let mut index = 0;
+                    while index < candidates.len() {
+                        let (candidate, candidate_radius) = candidates[index];
+                        if light_regions_touch(position, radius, candidate, candidate_radius) {
+                            candidates.swap_remove(index);
+                            group.insert(candidate);
+                            frontier.push(candidate);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    group
+}
+
 struct RainView<'a> {
     raining: Option<bool>,
     origin: IVec3,
@@ -17800,27 +17893,9 @@ impl LoadedSession {
     }
 
     fn try_pending_light(&mut self, first: BlockPosition) {
-        if !self.pending_light.contains_key(&first) {
+        let group = pending_light_group(&self.pending_light, first);
+        if group.is_empty() {
             return;
-        }
-        let mut group = BTreeSet::from([first]);
-        let mut frontier = vec![first];
-        while let Some(position) = frontier.pop() {
-            let other = self.pending_light[&position];
-            for (&candidate, entry) in &self.pending_light {
-                if group.contains(&candidate) {
-                    continue;
-                }
-                if light_regions_touch(
-                    candidate,
-                    entry.change.radius(),
-                    position,
-                    other.change.radius(),
-                ) {
-                    group.insert(candidate);
-                    frontier.push(candidate);
-                }
-            }
         }
         let changes: Vec<_> = group
             .iter()
@@ -45479,6 +45554,150 @@ pub(crate) mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn indexed_pending_light_groups_match_full_scan() {
+        fn full_scan(
+            pending: &BTreeMap<BlockPosition, PendingLight>,
+            first: BlockPosition,
+        ) -> BTreeSet<BlockPosition> {
+            if !pending.contains_key(&first) {
+                return BTreeSet::new();
+            }
+            let mut group = BTreeSet::from([first]);
+            let mut frontier = vec![first];
+            while let Some(position) = frontier.pop() {
+                let radius = pending[&position].change.radius();
+                for (&candidate, entry) in pending {
+                    if !group.contains(&candidate)
+                        && light_regions_touch(position, radius, candidate, entry.change.radius())
+                    {
+                        group.insert(candidate);
+                        frontier.push(candidate);
+                    }
+                }
+            }
+            group
+        }
+
+        let air = state("minecraft:air", &[]);
+        let small =
+            native_world::block_light::light_change(&air, &state("minecraft:brown_mushroom", &[]))
+                .unwrap();
+        let medium =
+            native_world::block_light::light_change(&air, &state("minecraft:torch", &[])).unwrap();
+        let large = native_world::block_light::LightChange::unknown();
+        assert_eq!(
+            (small.radius(), medium.radius(), large.radius()),
+            (0, 13, 14)
+        );
+        let entry = |change| PendingLight {
+            change,
+            last_attempt: Some(3),
+        };
+
+        // A long chain forces the spatial index to discover more than the
+        // initial full scans; negative coordinates cross multiple cell edges.
+        let mut chain = BTreeMap::new();
+        for i in 0..80 {
+            chain.insert(
+                BlockPosition {
+                    x: i * 24 - 900,
+                    y: 4,
+                    z: -31,
+                },
+                entry(large),
+            );
+        }
+        chain.insert(
+            BlockPosition {
+                x: -900,
+                y: 34,
+                z: -31,
+            },
+            entry(small),
+        );
+        let chain_first = BlockPosition {
+            x: -900,
+            y: 4,
+            z: -31,
+        };
+        assert_eq!(full_scan(&chain, chain_first).len(), 80);
+
+        // Mixed radii and diagonals include nearby cells whose regions do
+        // not actually touch. Keep a separate disconnected component too.
+        let mut mixed = BTreeMap::new();
+        for x in -12i32..12 {
+            for z in -8i32..8 {
+                let change = match (x + z).rem_euclid(3) {
+                    0 => small,
+                    1 => medium,
+                    _ => large,
+                };
+                mixed.insert(
+                    BlockPosition {
+                        x: x * 5,
+                        y: (x - z).rem_euclid(4) * 7 - 14,
+                        z: z * 5,
+                    },
+                    entry(change),
+                );
+            }
+        }
+        let isolated = BlockPosition {
+            x: 1000,
+            y: 1000,
+            z: 1000,
+        };
+        mixed.insert(isolated, entry(small));
+
+        // Radius-zero changes produce one-block cells; neighbor lookup must
+        // remain safe at both limits of the coordinate representation.
+        let mut limits = BTreeMap::new();
+        for i in 0..32 {
+            for position in [
+                BlockPosition {
+                    x: i32::MIN + i,
+                    y: i32::MIN,
+                    z: i32::MAX,
+                },
+                BlockPosition {
+                    x: i32::MAX - i,
+                    y: i32::MAX,
+                    z: i32::MIN,
+                },
+            ] {
+                limits.insert(position, entry(small));
+            }
+        }
+
+        let missing = BlockPosition { x: 7, y: 7, z: 7 };
+        for (pending, starts) in [
+            (
+                &chain,
+                vec![chain_first, *chain.last_key_value().unwrap().0, missing],
+            ),
+            (
+                &mixed,
+                vec![*mixed.first_key_value().unwrap().0, isolated, missing],
+            ),
+            (
+                &limits,
+                vec![
+                    *limits.first_key_value().unwrap().0,
+                    *limits.last_key_value().unwrap().0,
+                    missing,
+                ],
+            ),
+        ] {
+            for first in starts {
+                assert_eq!(
+                    pending_light_group(pending, first),
+                    full_scan(pending, first)
+                );
+            }
+        }
     }
 
     #[test]

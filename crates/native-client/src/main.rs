@@ -35,6 +35,8 @@ mod fresh_generation;
 mod game_ui;
 mod generated_item;
 mod generation_pipeline;
+#[cfg(all(test, target_os = "windows"))]
+mod generated_save_integration_tests;
 mod generation_staging;
 mod generation_worker;
 mod ground_items;

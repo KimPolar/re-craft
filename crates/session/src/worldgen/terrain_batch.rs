@@ -522,6 +522,7 @@ struct GeneratedSessionBlockTags {
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     farmland_water: Option<Arc<BTreeSet<String>>>,
     lava_fluid: Option<Arc<BTreeSet<String>>>,
+    lava_fire_spread: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     snow_support: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
     snowy: Option<Arc<BTreeSet<String>>>,
     mining: Option<Arc<native_resources::mining_tags::MiningTags>>,
@@ -547,6 +548,16 @@ impl GeneratedSessionBlockTags {
                 .map(Arc::new),
             farmland_water: fluid_tags::load_water(provider).ok().map(Arc::new),
             lava_fluid: fluid_tags::load_lava(provider).ok().map(Arc::new),
+            lava_fire_spread: native_resources::ore_feature::OreBlockTags::load(
+                provider,
+                registry,
+                &BTreeSet::from([
+                    ResourceId::parse("minecraft:blocks_lava_fire_spread")
+                        .expect("valid block tag"),
+                ]),
+            )
+            .ok()
+            .map(Arc::new),
             snow_support: respawn_tags::SnowSupportTags::load(provider, registry)
                 .ok()
                 .map(Arc::new),
@@ -1301,6 +1312,9 @@ impl FreshTerrainBatch {
         }
         if let Some(value) = &tags.lava_fluid {
             session.set_lava_fluid_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.lava_fire_spread {
+            session.set_lava_fire_spread_tags(Arc::clone(value));
         }
         if let Some(value) = &tags.snow_support {
             session.set_snow_support_tags(Arc::clone(value));
@@ -6422,6 +6436,10 @@ mod session_block_support_tests {
             "farmland water tag unavailable"
         );
         ensure!(tags.lava_fluid.is_some(), "lava fluid tag unavailable");
+        ensure!(
+            tags.lava_fire_spread.is_some(),
+            "lava fire spread tag unavailable"
+        );
         ensure!(tags.snow_support.is_some(), "snow support tags unavailable");
         ensure!(tags.snowy.is_some(), "snow tag unavailable");
         ensure!(tags.mining.is_some(), "mining tags unavailable");

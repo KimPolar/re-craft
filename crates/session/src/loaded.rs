@@ -17,6 +17,10 @@ mod block_tick_save_tests;
 #[path = "loaded_leaf_save_tests.rs"]
 mod leaf_save_tests;
 
+#[cfg(test)]
+#[path = "loaded_lava_tests.rs"]
+mod lava_tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -1485,6 +1489,7 @@ pub struct LoadedSession {
     biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
     generator_sea_level: Option<i32>,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
+    lava_fire_spread_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     vibration_event_tags: Option<Arc<native_resources::game_event_tags::GameEventTags>>,
     vibration_block_tags: Option<Arc<native_resources::game_event_tags::VibrationBlockTags>>,
     movement_climbable: Option<Arc<BTreeSet<String>>>,
@@ -1606,6 +1611,7 @@ pub struct LoadedSession {
     client_level_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     random_tick_speed: u32,
+    fire_spread_radius_around_player: i32,
     random_block_position: native_core::random::BlockRandomPosition,
     random_tick_revision: Option<u64>,
     random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, RandomTickCounts)>,
@@ -2398,6 +2404,7 @@ struct RandomTickCounts {
     crop_positions: Arc<[usize]>,
     spreading_soil: usize,
     other: bool,
+    lava: bool,
 }
 
 impl RandomTickCounts {
@@ -2409,6 +2416,7 @@ impl RandomTickCounts {
             || self.spreading_soil > 0
             || !self.leaves.is_empty()
             || self.other
+            || self.lava
     }
 }
 
@@ -2430,6 +2438,8 @@ pub(crate) fn random_tick_kind(state: &BlockState) -> u8 {
         "minecraft:grass_block" | "minecraft:mycelium"
     ) {
         7
+    } else if state.name == "minecraft:lava" {
+        9
     } else if crate::random_tick::is_randomly_ticking(state) {
         8
     } else {
@@ -3348,6 +3358,12 @@ impl LoadedSession {
 
     pub fn set_random_tick_speed(&mut self, speed: u32) {
         self.random_tick_speed = speed;
+    }
+
+    pub fn set_fire_spread_radius_around_player(&mut self, radius: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(radius >= -1, "fire spread radius must be at least -1");
+        self.fire_spread_radius_around_player = radius;
+        Ok(())
     }
 
     /// Install the Java simulation order for chunks whose ticking futures the
@@ -7700,6 +7716,13 @@ impl LoadedSession {
         self.leaf_deferred_revision = None;
     }
 
+    pub fn set_lava_fire_spread_tags(
+        &mut self,
+        tags: Arc<native_resources::ore_feature::OreBlockTags>,
+    ) {
+        self.lava_fire_spread_tags = Some(tags);
+    }
+
     pub fn set_fence_connection_tags(
         &mut self,
         tags: Arc<native_resources::ore_feature::OreBlockTags>,
@@ -8748,6 +8771,7 @@ impl LoadedSession {
             biome_climates: None,
             generator_sea_level: None,
             vanilla_block_ids: None,
+            lava_fire_spread_tags: None,
             vibration_event_tags: None,
             vibration_block_tags: None,
             movement_climbable: None,
@@ -8851,6 +8875,7 @@ impl LoadedSession {
                 native_core::random::LegacyRandom::new(crate::fresh_session_seed())
             }),
             random_tick_speed: 3,
+            fire_spread_radius_around_player: 128,
             random_block_position: native_core::random::BlockRandomPosition::new(
                 crate::fresh_session_seed() as i32,
             ),
@@ -16361,6 +16386,7 @@ impl LoadedSession {
                             }
                             Some(7) => active.spreading_soil += 1,
                             Some(8) => active.other = true,
+                            Some(9) => active.lava = true,
                             _ => {}
                         }
                     }
@@ -16425,13 +16451,19 @@ impl LoadedSession {
             // the world. Do not claim it can be saved. At extreme speeds,
             // reject conservatively instead of iterating billions of samples.
             let mut other_active = active.other && !self.unresolved_other_random_tick;
-            if other_active && self.random_tick_speed > 64 {
+            let fire_can_reach_player = self.fire_spread_radius_around_player == -1
+                || (self.fire_spread_radius_around_player > 0
+                    && self.game_mode != GameMode::Spectator);
+            let mut lava_active =
+                active.lava && !self.unresolved_other_random_tick && fire_can_reach_player;
+            if (other_active || lava_active) && self.random_tick_speed > 64 {
                 self.unresolved_other_random_tick = true;
                 self.unresolved_other_random_tick_detail = Some(format!(
                     "unverified section ({}, {}, {}) at random tick speed {}",
                     chunk.x, section, chunk.z, self.random_tick_speed
                 ));
                 other_active = false;
+                lava_active = false;
             }
             if leaves_active && self.random_tick_speed > 64 {
                 leaves_active = self.leaf_can_decay_in_section(chunk, section, &active.leaves);
@@ -16447,6 +16479,7 @@ impl LoadedSession {
                     && !crops_active
                     && active.spreading_soil == 0
                     && !other_active
+                    && !lava_active
                 {
                     self.random_block_position
                         .skip(self.random_tick_speed - index);
@@ -16470,6 +16503,31 @@ impl LoadedSession {
                     self.unresolved_other_random_tick_detail =
                         Some(format!("{} at {absolute:?}", state.name));
                     other_active = false;
+                }
+                if lava_active
+                    && self
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .is_some_and(|state| state.name == "minecraft:lava")
+                {
+                    let mut random = self.level_random.clone();
+                    for _ in 0..2 {
+                        let result = crate::lava_fire::random_tick(
+                            &mut SessionLavaFire { session: self },
+                            absolute,
+                            &mut random,
+                        );
+                        if let Err(error) = result {
+                            self.unresolved_other_random_tick = true;
+                            self.unresolved_other_random_tick_detail = Some(format!(
+                                "minecraft:lava at {absolute:?}: {error:#}"
+                            ));
+                            lava_active = false;
+                            other_active = false;
+                            break;
+                        }
+                    }
+                    self.level_random = random;
                 }
                 if let Some(relative) = subtract(absolute, self.origin) {
                     let changed = if self.set_redstone_ore_lit(relative, false) {
@@ -28343,6 +28401,129 @@ impl native_resources::enchantments::disk_predicate::PredicateWorld for DiskWorl
     }
 }
 
+struct SessionLavaFire<'a> {
+    session: &'a mut LoadedSession,
+}
+
+impl crate::lava_fire::LavaFireWorld for SessionLavaFire<'_> {
+    type State = BlockState;
+
+    fn can_spread_fire(&mut self, position: IVec3) -> anyhow::Result<bool> {
+        crate::lava_fire::can_spread_fire(
+            self.session.fire_spread_radius_around_player,
+            self.session.game_mode == GameMode::Spectator,
+            self.session.origin.as_dvec3() + self.session.motion.position,
+            position,
+        )
+    }
+
+    fn is_loaded(&mut self, position: IVec3) -> anyhow::Result<bool> {
+        use anyhow::{Context, ensure};
+        if position.y < self.session.bounds.min_y
+            || position.y >= self.session.bounds.max_y
+            || !crate::lava_fire::valid_horizontal(position)
+        {
+            return Ok(false);
+        }
+        // A missing client chunk does not prove that the server would have it
+        // unloaded. Do not silently skip an attempt in that case.
+        let chunk = self
+            .session
+            .world
+            .chunks
+            .get(&ChunkPos {
+                x: position.x.div_euclid(16),
+                z: position.z.div_euclid(16),
+            })
+            .with_context(|| format!("lava fire neighbor chunk is unavailable at {position:?}"))?;
+        ensure!(
+            chunk.status.as_deref() == Some("minecraft:full"),
+            "lava fire neighbor chunk is not full at {position:?}"
+        );
+        Ok(true)
+    }
+
+    fn block(&mut self, position: IVec3) -> anyhow::Result<BlockState> {
+        use anyhow::{Context, ensure};
+        if position.y < self.session.bounds.min_y
+            || position.y >= self.session.bounds.max_y
+            || !crate::lava_fire::valid_horizontal(position)
+        {
+            return Ok(BlockState {
+                name: "minecraft:void_air".into(),
+                properties: Default::default(),
+            });
+        }
+        self.is_loaded(position)?;
+        let relative =
+            subtract(position, self.session.origin).context("lava fire position overflow")?;
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            relative,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("lava fire block is unavailable at {position:?}");
+        };
+        let state = self
+            .session
+            .world
+            .state(id)
+            .context("lava fire block state is unavailable")?;
+        ensure!(
+            self.session
+                .vanilla_block_ids
+                .as_ref()
+                .context("block registry is unavailable")?
+                .contains(&state.name),
+            "lava fire block {} is absent from the active registry",
+            state.name
+        );
+        Ok(state.clone())
+    }
+
+    fn is_air(&mut self, state: &BlockState) -> anyhow::Result<bool> {
+        Ok(matches!(
+            state.name.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        ))
+    }
+
+    fn blocks_spread(&mut self, state: &BlockState) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        let tags = self
+            .session
+            .lava_fire_spread_tags
+            .as_ref()
+            .context("lava fire spread tag is unavailable")?;
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:blocks_lava_fire_spread")
+                .expect("valid lava fire spread tag")
+        });
+        tags.contains(tag, &state.name)
+    }
+
+    fn is_flammable(&mut self, position: IVec3) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        if position.y < self.session.bounds.min_y || position.y >= self.session.bounds.max_y {
+            return Ok(false);
+        }
+        let state = self.block(position)?;
+        crate::lava_fire::ignited_by_lava(&state.name).context("unknown lava ignition property")
+    }
+
+    fn set_fire(
+        &mut self,
+        position: IVec3,
+        state_position: IVec3,
+        _: &mut native_core::random::LegacyRandom,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("lava ignition at {position:?} (fire state at {state_position:?}) is not yet implemented")
+    }
+}
+
 struct SessionSpreadingSoil<'a> {
     session: &'a mut LoadedSession,
 }
@@ -29485,8 +29666,8 @@ pub(crate) mod tests {
         let first = expected.next_section_offset();
         let second = expected.next_section_offset();
         let mut session = session();
-        let lava = session.intern_block(state("minecraft:lava", &[("level", "0")]));
-        assert!(session.set(IVec3::from_array(second), lava));
+        let sapling = session.intern_block(state("minecraft:oak_sapling", &[("stage", "0")]));
+        assert!(session.set(IVec3::from_array(second), sapling));
         session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
         session.set_random_tick_speed(1);
         session.advance_random_block_ticks();
@@ -29505,15 +29686,15 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("unsupported random block or fluid tick")
         );
-        assert!(error.to_string().contains("minecraft:lava"));
+        assert!(error.to_string().contains("minecraft:oak_sapling"));
         assert!(session.validate_generation_block_readiness().is_err());
     }
 
     #[test]
     fn unsupported_random_ticks_skip_extreme_speeds_without_spinning() {
         let mut session = session();
-        let lava = session.intern_block(state("minecraft:lava", &[("level", "0")]));
-        assert!(session.set(IVec3::new(8, 4, 8), lava));
+        let sapling = session.intern_block(state("minecraft:oak_sapling", &[("stage", "0")]));
+        assert!(session.set(IVec3::new(8, 4, 8), sapling));
         let seed = 123;
         session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
         session.set_random_tick_speed(i32::MAX as u32);

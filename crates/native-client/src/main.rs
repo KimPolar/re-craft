@@ -1601,6 +1601,17 @@ fn prepare_world_with_session(
                     Ok(tags) => session.set_leaf_support_tags(Arc::new(tags)),
                     Err(error) => eprintln!("Leaf support tag is unavailable: {error:#}"),
                 }
+                let lava_fire_tag = native_resources::packs::ResourceId::parse(
+                    "minecraft:blocks_lava_fire_spread",
+                )?;
+                match native_resources::ore_feature::OreBlockTags::load(
+                    &mut resources,
+                    &registry,
+                    &std::collections::BTreeSet::from([lava_fire_tag]),
+                ) {
+                    Ok(tags) => session.set_lava_fire_spread_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Lava fire spread tag is unavailable: {error:#}"),
+                }
                 let fence_tags = [
                     "minecraft:fences",
                     "minecraft:wooden_fences",
@@ -1681,6 +1692,7 @@ fn prepare_world_with_session(
             fall_damage: rules.fall_damage,
         });
         session.set_random_tick_speed(rules.random_tick_speed as u32);
+        session.set_fire_spread_radius_around_player(rules.fire_spread_radius_around_player)?;
         session.set_death_rules(native_session::DeathRules {
             keep_inventory: rules.keep_inventory,
             immediate_respawn: rules.immediate_respawn,

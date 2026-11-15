@@ -16,7 +16,8 @@ public class RandomTickStateOracle {
                     properties.put(value.property().getName(), value.valueName()));
                 var line = new StringBuilder("STATE\t")
                     .append(BuiltInRegistries.BLOCK.getKey(block)).append('\t')
-                    .append(state.isRandomlyTicking() || state.getFluidState().isRandomlyTicking());
+                    .append(state.isRandomlyTicking() || state.getFluidState().isRandomlyTicking()).append('\t')
+                    .append(state.ignitedByLava());
                 properties.forEach((key, value) -> line.append('\t').append(key).append('=').append(value));
                 output.println(line);
             }

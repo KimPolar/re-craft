@@ -42,6 +42,7 @@ pub mod gamemode_command;
 mod interaction;
 pub mod inventory;
 pub mod items;
+mod lava_fire;
 mod knockback;
 mod known_movement;
 pub mod loaded;

@@ -195,6 +195,11 @@ mod tests {
                 Some("false") => false,
                 other => panic!("invalid Java random-tick result: {other:?}"),
             };
+            let expected_ignition = match fields.next() {
+                Some("true") => true,
+                Some("false") => false,
+                other => panic!("invalid Java lava-ignition result: {other:?}"),
+            };
             let properties = fields
                 .map(|field| {
                     let (key, value) = field.split_once('=').unwrap();
@@ -202,6 +207,11 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>();
             let state = BlockState { name, properties };
+            assert_eq!(
+                crate::lava_fire::ignited_by_lava(&state.name),
+                Some(expected_ignition),
+                "{state:?}"
+            );
             assert_eq!(is_randomly_ticking(&state), expected, "{state:?}");
             assert_eq!(
                 crate::loaded::random_tick_kind(&state) != 0,
@@ -211,6 +221,6 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 20_000, "only {checked} Java states were checked");
-        eprintln!("Compared random-tick eligibility for {checked} Java block states");
+        eprintln!("Compared random-tick and lava-ignition eligibility for {checked} Java block states");
     }
 }

@@ -1151,6 +1151,7 @@ impl GenerationReady {
                 fall_damage: rules.fall_damage,
             });
             session.set_random_tick_speed(rules.random_tick_speed as u32);
+            session.set_fire_spread_radius_around_player(rules.fire_spread_radius_around_player)?;
             session.set_death_rules(native_session::DeathRules {
                 keep_inventory: rules.keep_inventory,
                 immediate_respawn: rules.immediate_respawn,

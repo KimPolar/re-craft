@@ -5095,6 +5095,23 @@ pub(super) fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) ->
     );
     if matches!(
         state.name.as_str(),
+        "minecraft:kelp" | "minecraft:kelp_plant"
+    ) {
+        ensure!(valid_generated_kelp(state), "invalid kelp support state");
+        return Ok(false);
+    }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:seagrass" | "minecraft:tall_seagrass"
+    ) {
+        ensure!(
+            native_world::block_light::same_light_behavior(state, state) == Some(true),
+            "invalid seagrass support state"
+        );
+        return Ok(false);
+    }
+    if matches!(
+        state.name.as_str(),
         "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
     ) {
         ensure!(

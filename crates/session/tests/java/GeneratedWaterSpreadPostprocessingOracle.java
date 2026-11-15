@@ -244,6 +244,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         if(args.length>0 && args[0].equals("kelp_postprocessing")) {
             scenarios.clear();scenarios.addAll(List.of("kelp_live_side_body","kelp_live_side_head","kelp_live_over_body","kelp_live_over_head","kelp_live_under_body","kelp_live_under_head","kelp_live_marked_body","kelp_live_marked_body_tagged","kelp_live_marked_head","kelp_live_marked_head_tagged","kelp_live_marked_head_chain"));
         }
+        if(args.length>0 && args[0].equals("tall_seagrass_postprocessing")) {
+            scenarios.clear();scenarios.addAll(List.of("tall_live_side_lower","tall_live_side_upper","tall_live_side_upper_orphan","tall_live_side_lower_tagged","tall_live_under_lower","tall_live_over_lower_orphan","tall_live_over_upper","tall_live_marked_lower","tall_live_marked_upper","tall_live_marked_lower_orphan","tall_live_marked_upper_orphan","tall_live_marked_lower_tagged","tall_live_marked_upper_tagged","tall_live_marked_lower_untagged","tall_live_marked_lower_down"));
+        }
         if(args.length>0 && args[0].equals("sulfur")){scenarios.clear();scenarios.addAll(List.of("barrier_sulfur","barrier_cinnabar"));}
         if(args.length>0 && args[0].equals("building_barriers")){
             scenarios.clear();for(var name:List.of("oak_planks","deepslate_bricks","light_blue_concrete","white_wool","blue_ice"))scenarios.add("barrier_"+name);
@@ -297,6 +300,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         }
         for(String scenario:scenarios) {
             bind.invoke(Blocks.STONE.builtInRegistryHolder(),scenario.endsWith("_tagged")?List.of(scenario.startsWith("kelp_live_")?BlockTags.CANNOT_SUPPORT_KELP:BlockTags.CANNOT_SUPPORT_SEAGRASS):List.of());
+            bind.invoke(Fluids.WATER.builtInRegistryHolder(),scenario.endsWith("_untagged")?List.of(FluidTags.BUBBLE_COLUMN_CAN_OCCUPY):List.of(FluidTags.WATER,FluidTags.BUBBLE_COLUMN_CAN_OCCUPY));
             bind.invoke(Fluids.LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_flowing_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),scenario.equals("lava_touch_basalt_source_tag")?List.of():List.of(FluidTags.LAVA));
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
@@ -605,6 +609,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     if(scenario.endsWith("_chain"))blocks.put(pos.above(),Blocks.KELP_PLANT.defaultBlockState());
                 }
             }
+            if(scenario.startsWith("tall_live_")) {
+                boolean lower=scenario.contains("_lower");
+                var p=scenario.contains("_side_")?pos.below().east():scenario.contains("_over_")?pos.east().below():scenario.contains("_under_")?pos.east().above():pos;
+                var plant=Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF,lower?DoubleBlockHalf.LOWER:DoubleBlockHalf.UPPER);
+                if(scenario.contains("_side_"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                else if(scenario.contains("_over_") || scenario.contains("_under_"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.endsWith("_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                blocks.put(p,plant);
+                if(!scenario.contains("_orphan"))blocks.put(lower?p.above():p.below(),plant.setValue(DoublePlantBlock.HALF,lower?DoubleBlockHalf.UPPER:DoubleBlockHalf.LOWER));
+            }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
             var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
@@ -638,6 +652,12 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(scenario.startsWith("kelp_live_")) {
                 var p=scenario.contains("_side_")?pos.below().east():scenario.contains("_over_")?pos.east().below():scenario.contains("_under_")?pos.east().above():pos;
                 var s=get(p);out.printf("kelp %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.is(Blocks.KELP)?s.getValue(GrowingPlantHeadBlock.AGE):"-");
+            }
+            if(scenario.startsWith("tall_live_")) {
+                var p=scenario.contains("_side_")?pos.below().east():scenario.contains("_over_")?pos.east().below():scenario.contains("_under_")?pos.east().above():pos;
+                for(var q:List.of(p,scenario.contains("_lower")?p.above():p.below())){
+                    var s=get(q);out.printf("tall %d,%d,%d %s %s%n",q.getX(),q.getY(),q.getZ(),BuiltInRegistries.BLOCK.getKey(s.getBlock()),s.is(Blocks.TALL_SEAGRASS)?s.getValue(DoublePlantBlock.HALF):"-");
+                }
             }
             if(scenario.startsWith("bubble_"))for(int y=8;y<=9;y++){
                 var s=get(new BlockPos(8,y,8));

@@ -96,7 +96,7 @@ fn describe(state: &BlockState) -> String {
 }
 
 /// Use the same converted world and tick containers as the normal poll path.
-fn update_twice(
+pub(super) fn update_twice(
     stage: &mut GeneratedPostprocessing,
     chunk: ChunkPos,
     state: &BlockState,

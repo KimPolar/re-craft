@@ -45,6 +45,10 @@ fn support(index: usize) -> BlockState {
         7..=8 => state("stone_brick_stairs"),
         9..=12 => state("suspicious_sand"),
         13..=16 => state("suspicious_gravel"),
+        17 => state("kelp"),
+        18 => state("kelp_plant"),
+        19 => state("seagrass"),
+        20..=21 => state("tall_seagrass"),
         _ => panic!("unknown support"),
     };
     match index {
@@ -73,6 +77,15 @@ fn support(index: usize) -> BlockState {
                 .properties
                 .insert("dusted".into(), ((index - 9) % 4).to_string());
         }
+        17 => {
+            block.properties.insert("age".into(), "17".into());
+        }
+        20..=21 => {
+            block.properties.insert(
+                "half".into(),
+                if index == 20 { "lower" } else { "upper" }.into(),
+            );
+        }
         _ => {}
     }
     block
@@ -86,6 +99,24 @@ fn brushable_support_rejects_invalid_states() {
     assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
     invalid.properties.insert("dusted".into(), "0".into());
     invalid.properties.insert("other".into(), "true".into());
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+}
+
+#[test]
+fn aquatic_support_rejects_invalid_states() {
+    let mut invalid = state("kelp");
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    invalid.properties.insert("age".into(), "26".into());
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    let mut invalid = state("kelp_plant");
+    invalid.properties.insert("age".into(), "0".into());
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    let mut invalid = state("tall_seagrass");
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    invalid.properties.insert("half".into(), "middle".into());
+    assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    let mut invalid = state("seagrass");
+    invalid.properties.insert("half".into(), "lower".into());
     assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
 }
 
@@ -154,6 +185,9 @@ fn seagrass_edge_updates_match_java() -> Result<()> {
         "minecraft:water".into(),
         "minecraft:magma_block".into(),
         "minecraft:seagrass".into(),
+        "minecraft:tall_seagrass".into(),
+        "minecraft:kelp".into(),
+        "minecraft:kelp_plant".into(),
         "minecraft:stone_slab".into(),
         "minecraft:stone_brick_stairs".into(),
         "minecraft:suspicious_sand".into(),
@@ -245,6 +279,6 @@ fn seagrass_edge_updates_match_java() -> Result<()> {
         assert!(region.world.saved_block_ticks.is_empty(), "{line}");
         count += 1;
     }
-    assert_eq!(count, 4 * 17 * 3 * 6);
+    assert_eq!(count, 4 * 22 * 3 * 6);
     Ok(())
 }

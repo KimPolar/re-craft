@@ -1231,6 +1231,13 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn generated_tall_seagrass_loot_and_random_streams_match_java() {
+        generated_block_loot_and_random_streams_match_java("tall_seagrass");
+    }
+
+    #[cfg(target_os = "windows")]
     fn generated_block_loot_and_random_streams_match_java(block_name: &str) {
         use native_resources::packs::ResourceStack;
         use std::{path::PathBuf, process::Command};
@@ -1323,6 +1330,11 @@ mod tests {
                             name: "minecraft:seagrass".into(),
                             properties: BTreeMap::new(),
                         }
+                    } else if block_name == "tall_seagrass" {
+                        BlockState {
+                            name: "minecraft:tall_seagrass".into(),
+                            properties: BTreeMap::from([("half".into(), "lower".into())]),
+                        }
                     } else {
                         BlockState {
                             name: "minecraft:glow_lichen".into(),
@@ -1332,7 +1344,7 @@ mod tests {
                                 .collect(),
                         }
                     };
-                    if block_name != "seagrass" {
+                    if block_name != "seagrass" && block_name != "tall_seagrass" {
                         block
                             .properties
                             .insert("waterlogged".into(), (step % 2 == 0).to_string());

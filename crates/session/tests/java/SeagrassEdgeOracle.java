@@ -40,6 +40,10 @@ public class SeagrassEdgeOracle {
                         direction.getSerializedName(), state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, direction));
             }
         }
+        supports.addAll(List.of(Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,17),
+            Blocks.KELP_PLANT.defaultBlockState(),Blocks.SEAGRASS.defaultBlockState(),
+            Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF,DoubleBlockHalf.LOWER),
+            Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF,DoubleBlockHalf.UPPER)));
         var neighbors = List.of(Blocks.AIR.defaultBlockState(), Blocks.STONE.defaultBlockState(),
             Blocks.WATER.defaultBlockState());
         var pos = new BlockPos(8, 8, 8);

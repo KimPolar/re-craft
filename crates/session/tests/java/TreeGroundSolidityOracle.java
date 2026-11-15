@@ -83,5 +83,15 @@ public class TreeGroundSolidityOracle {
         }
       }
     }
+    for (var name : java.util.List.of("stone_brick_stairs", "mossy_stone_brick_stairs", "stone_slab", "stone_brick_slab", "mossy_stone_brick_slab")) {
+      var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
+      for(var state:block.getStateDefinition().getPossibleStates()) {
+        var properties=new java.util.TreeMap<String,String>(); state.getValues().forEach(v->properties.put(v.property().getName(),v.valueName()));
+        var pairs=new java.util.ArrayList<String>(); properties.forEach((k,v)->pairs.add(k+"="+v));
+        out.printf("Q %s %s %s",name,String.join(",",pairs),state.isSolidRender());
+        for(var direction:Direction.values()) out.printf(" %s",state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
+        out.println();
+      }
+    }
   }
 }

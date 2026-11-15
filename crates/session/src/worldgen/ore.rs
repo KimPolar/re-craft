@@ -4945,9 +4945,26 @@ fn generated_raw_ore_block(state: &BlockState) -> Result<bool> {
     Ok(true)
 }
 
+fn generated_portal_slab_stair(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:stone_brick_stairs"
+            | "minecraft:mossy_stone_brick_stairs"
+            | "minecraft:stone_slab"
+            | "minecraft:stone_brick_slab"
+            | "minecraft:mossy_stone_brick_slab"
+    ) && native_world::collision::slab_stair_solid(state).is_some()
+}
+
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if generated_raw_ore_block(state)? || ruined_portal::portal_full(state) {
         return Ok(true);
+    }
+    if generated_portal_slab_stair(state) {
+        return Ok(state
+            .properties
+            .get("type")
+            .is_some_and(|value| value == "double"));
     }
     if generation_non_sturdy_structure(state) {
         return Ok(false);
@@ -4988,6 +5005,10 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if generated_raw_ore_block(state)? || ruined_portal::portal_full(state) {
         return Ok(true);
+    }
+    if generated_portal_slab_stair(state) {
+        return native_world::collision::button_support_face(state, glam::IVec3::Y)
+            .context("unsupported portal step support shape");
     }
     if generation_non_sturdy_structure(state) {
         return Ok(false);
@@ -5040,6 +5061,13 @@ fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) -> Result<boo
         ),
         "invalid support direction"
     );
+    if generated_portal_slab_stair(state) {
+        return native_world::collision::button_support_face(
+            state,
+            glam::IVec3::from_array(direction),
+        )
+        .context("unsupported portal step support shape");
+    }
     if matches!(
         state.name.as_str(),
         "minecraft:azalea" | "minecraft:flowering_azalea"
@@ -9063,6 +9091,37 @@ mod tests {
     }
 
     #[test]
+    fn generated_portal_steps_use_directional_support() {
+        let mut stairs = state("stone_brick_stairs");
+        stairs.properties = BTreeMap::from([
+            ("facing".into(), "north".into()),
+            ("half".into(), "top".into()),
+            ("shape".into(), "straight".into()),
+            ("waterlogged".into(), "true".into()),
+        ]);
+        assert!(!tree_solid_render(&stairs).unwrap());
+        assert!(tree_sturdy_up(&stairs).unwrap());
+        assert!(generation_face_sturdy(&stairs, [0, 0, -1]).unwrap());
+        assert!(!generation_face_sturdy(&stairs, [0, -1, 0]).unwrap());
+        stairs.properties.insert("half".into(), "bottom".into());
+        assert!(!tree_sturdy_up(&stairs).unwrap());
+        assert!(generation_face_sturdy(&stairs, [0, -1, 0]).unwrap());
+        stairs.properties.insert("shape".into(), "invalid".into());
+        assert!(tree_sturdy_up(&stairs).is_err());
+
+        let mut slab = state("stone_brick_slab");
+        slab.properties = BTreeMap::from([
+            ("type".into(), "double".into()),
+            ("waterlogged".into(), "false".into()),
+        ]);
+        assert!(tree_solid_render(&slab).unwrap());
+        assert!(tree_sturdy_up(&slab).unwrap());
+        slab.properties.insert("type".into(), "bottom".into());
+        assert!(!tree_solid_render(&slab).unwrap());
+        assert!(!tree_sturdy_up(&slab).unwrap());
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tree_ground_solid_and_support_match_java() {
         use std::{path::PathBuf, process::Command};
@@ -9386,6 +9445,45 @@ mod tests {
                 }
             }
         }
+        let mut steps = 0;
+        for line in text.lines().filter_map(|line| line.strip_prefix("Q ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 9, "{line}");
+            let mut block = state(parts[0]);
+            for property in parts[1].split(',') {
+                let (key, value) = property.split_once('=').unwrap();
+                block.properties.insert(key.into(), value.into());
+            }
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                parts[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            assert_eq!(
+                tree_sturdy_up(&block).unwrap(),
+                parts[4].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            for (direction, expected) in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ]
+            .into_iter()
+            .zip(&parts[3..])
+            {
+                assert_eq!(
+                    generation_face_sturdy(&block, direction).unwrap(),
+                    expected.parse::<bool>().unwrap(),
+                    "{line} {direction:?}"
+                );
+            }
+            steps += 1;
+        }
+        assert_eq!(steps, 178);
         let mut crystals = 0;
         for line in text.lines().filter_map(|line| line.strip_prefix("A ")) {
             let parts: Vec<_> = line.split_whitespace().collect();

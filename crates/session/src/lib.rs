@@ -82,6 +82,7 @@ mod stair_items;
 mod stair_mining;
 pub mod stair_placement;
 pub mod survival;
+pub mod ticking_preparation;
 pub mod time_command;
 pub mod vibration;
 mod water_entry;

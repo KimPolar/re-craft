@@ -4,6 +4,7 @@
 //! state, light, entities, POIs, clocks and disk sources before publishing.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
@@ -23,14 +24,17 @@ use native_world::{
 use crate::{
     loaded::BuildBounds,
     saved_chunk_activation::{SavedTickInputs, read_saved_work},
+    ticking_preparation::{TickingFutureState, TickingPreparation, ticking_dependencies},
 };
 
 use super::{
     GeneratedPostprocessing,
     captured_postprocessing::CapturedPostprocessingTags,
-    chunk_ticks::{ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick},
+    chunk_ticks::{
+        ChunkTicks, ConvertedChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, TickRegistry,
+    },
     postprocessing::{ConvertedPostprocessingRegion, PostprocessingTask},
-    postprocessing_world::ConvertedBlockEntities,
+    postprocessing_world::{ConvertedBlockEntities, PostprocessedGeneratedRegion},
 };
 
 /// Inputs captured from the same world and active resource/data-pack stack.
@@ -46,6 +50,82 @@ pub struct SavedPostprocessingInputs<'a> {
     pub game_time: i64,
     pub next_sub_tick: i64,
     pub light: Option<VisibleLightSnapshot>,
+}
+
+/// One completed isolated callback and the LevelTicks indexes after unpacking
+/// only the center. Other converted chunks retain their pending saved ticks.
+pub struct SavedTickingResult {
+    pub region: PostprocessedGeneratedRegion,
+    pub block_ticks: IndexedRegionQueue,
+    pub fluid_ticks: IndexedRegionQueue,
+}
+
+/// Execute a queued ticking-future callback over the captured FULL source.
+/// The caller must sample the game time, registry, light and holder identities
+/// at dispatch, prevent interleaving, and later reconcile all live and disk
+/// state. Run this away from the UI thread. The send-sync future is treated as
+/// pending in this isolated pass; this result cannot authorize live attachment,
+/// a send notification, or a save.
+pub fn dispatch_saved_ticking(
+    future: &mut TickingPreparation,
+    provider: &mut impl ResourceProvider,
+    input: SavedPostprocessingInputs<'_>,
+    mut validate_state: impl FnMut(&BlockState) -> Result<()>,
+    mut configure: impl FnMut(&mut GeneratedPostprocessing) -> Result<()>,
+) -> Result<Option<SavedTickingResult>> {
+    let mut input = Some(input);
+    let region = RefCell::new(None::<PostprocessedGeneratedRegion>);
+    let queues = RefCell::new(None::<(IndexedRegionQueue, IndexedRegionQueue)>);
+    let dispatched = future.dispatch(
+        |center| {
+            let input = input
+                .take()
+                .context("saved ticking input was already consumed")?;
+            ensure!(
+                ticking_dependencies(center).iter().all(|position| {
+                    input
+                        .area
+                        .chunks
+                        .contains_key(&native_persistence::world::ChunkPos {
+                            x: position.x,
+                            z: position.z,
+                        })
+                }),
+                "saved ticking inputs lack a FULL neighbor"
+            );
+            let mut stage = begin_saved_postprocessing(provider, input, &mut validate_state)?;
+            stage.select_initial_targets(BTreeSet::from([center]))?;
+            configure(&mut stage)?;
+            while !stage.poll(center, 256)? {}
+            *region.borrow_mut() = Some(stage.finish()?);
+            Ok(())
+        },
+        |_| Ok(()),
+        |center| {
+            let region = region.borrow();
+            let ticks = region
+                .as_ref()
+                .context("saved ticking postprocessing is missing")?
+                .ticks();
+            let blocks = ticks.captured_indexed_queue_for(TickRegistry::Block, &[center])?;
+            let fluids = ticks.captured_indexed_queue_for(TickRegistry::Fluid, &[center])?;
+            *queues.borrow_mut() = Some((blocks, fluids));
+            Ok(())
+        },
+    )?;
+    if !dispatched || future.state() != TickingFutureState::Available {
+        return Ok(None);
+    }
+    let (block_ticks, fluid_ticks) = queues
+        .into_inner()
+        .context("saved ticking queues are missing")?;
+    Ok(Some(SavedTickingResult {
+        region: region
+            .into_inner()
+            .context("saved ticking result is missing")?,
+        block_ticks,
+        fluid_ticks,
+    }))
 }
 
 /// Restore an isolated postprocessing stage from original FULL chunk data.

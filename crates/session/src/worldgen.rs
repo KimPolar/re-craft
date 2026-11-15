@@ -70,6 +70,8 @@ pub(crate) use ore::directional_multiface_support;
 pub mod postprocessing;
 pub mod postprocessing_drops;
 mod postprocessing_world;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use postprocessing_world::tests::java_results_with_args as postprocessing_java_results;
 pub(crate) use postprocessing_world::{fence_connection, speleothem_thickness};
 pub mod saved_postprocessing;
 pub mod ruined_portal;

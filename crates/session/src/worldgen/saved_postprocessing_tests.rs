@@ -203,6 +203,300 @@ fn begin_with_registration(
     )
 }
 
+fn ticking_fixture() -> Result<(ChunkArea, BTreeSet<String>, Vec<ChunkPos>)> {
+    let (mut area, ids) = fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let registration = crate::ticking_preparation::ticking_dependencies(center).to_vec();
+    for &position in registration.iter().filter(|&&position| position != center) {
+        let mut chunk = area.chunks[&area.center].as_ref().clone();
+        chunk.position = SavedChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        let document = Arc::make_mut(&mut chunk.document);
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("xPos"))
+            .unwrap()
+            .1 = Tag::Int(position.x);
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("zPos"))
+            .unwrap()
+            .1 = Tag::Int(position.z);
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("PostProcessing"))
+            .unwrap()
+            .1 = native_persistence::postprocessing::encode(&PostProcessing::new(0, 16).unwrap());
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_ticks"))
+            .unwrap()
+            .1 = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("i".into(), Tag::String("minecraft:sand".into())),
+                ("x".into(), Tag::Int(position.x * 16 + 8)),
+                ("y".into(), Tag::Int(8)),
+                ("z".into(), Tag::Int(position.z * 16 + 8)),
+                ("t".into(), Tag::Int(7)),
+                ("p".into(), Tag::Int(0)),
+            ])],
+        };
+        area.chunks.insert(chunk.position, Arc::new(chunk));
+    }
+    Ok((area, ids, registration))
+}
+
+fn dispatch_fixture(
+    future: &mut TickingPreparation,
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    registration: &[ChunkPos],
+    game_time: i64,
+) -> Result<Option<SavedTickingResult>> {
+    let dimension = DimensionId::parse("overworld")?;
+    let defaults = BTreeMap::new();
+    dispatch_saved_ticking(
+        future,
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area,
+            dimension: &dimension,
+            defaults: &defaults,
+            block_ids: ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration,
+            game_time,
+            next_sub_tick: 2,
+            light: None,
+        },
+        |state| {
+            ensure!(
+                ids.contains(&state.name) && state.properties.is_empty(),
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+}
+
+#[test]
+fn saved_ticking_dispatch_postprocesses_then_unpacks_only_the_ready_center() -> Result<()> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+    let (area, ids, registration) = ticking_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut future = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(
+                registration
+                    .iter()
+                    .position(|&entry| entry == position)
+                    .unwrap() as u64,
+            ),
+            result: None,
+        })
+    })?;
+    for index in 0..8 {
+        future.complete(FullFutureId(index), FullFutureResult::Full)?;
+    }
+    assert!(dispatch_fixture(&mut future, &area, &ids, &registration, 100)?.is_none());
+    future.complete(FullFutureId(8), FullFutureResult::Full)?;
+    let completed = dispatch_fixture(&mut future, &area, &ids, &registration, 500)?
+        .context("queued ticking future was not dispatched")?;
+    assert_eq!(future.state(), TickingFutureState::Available);
+    assert_eq!(completed.region.chunks, BTreeSet::from([center]));
+    assert_eq!(completed.region.deferred_chunks().count(), 8);
+    let ticks = completed.block_ticks.container(center).unwrap().pack(500);
+    assert_eq!(
+        ticks
+            .iter()
+            .map(|tick| (tick.kind.as_str(), tick.delay))
+            .collect::<Vec<_>>(),
+        [
+            ("minecraft:sand", 0),
+            ("minecraft:red_sand", 2),
+            ("minecraft:gravel", 2)
+        ]
+    );
+    let neighbor = completed.block_ticks.container(registration[0]).unwrap();
+    assert_eq!(neighbor.pack(500)[0].delay, 7);
+    assert_eq!(neighbor.pack(1_000)[0].delay, 7);
+    assert!(dispatch_fixture(&mut future, &area, &ids, &registration, 501)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn saved_ticking_dispatch_rejects_missing_inputs_and_skips_cancelled_work() -> Result<()> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+    let (area, ids) = fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let registration = crate::ticking_preparation::ticking_dependencies(center);
+    let start = || {
+        TickingPreparation::start(center, |position| {
+            Some(FullFuture {
+                id: FullFutureId(
+                    registration
+                        .iter()
+                        .position(|&entry| entry == position)
+                        .unwrap() as u64,
+                ),
+                result: Some(FullFutureResult::Full),
+            })
+        })
+    };
+    let original = native_persistence::nbt::write(&area.chunks[&area.center].document)?;
+    let mut missing = start()?;
+    assert!(dispatch_fixture(&mut missing, &area, &ids, &[center], 100).is_err());
+    assert_eq!(missing.state(), TickingFutureState::Exceptional);
+    let mut cancelled = start()?;
+    assert!(cancelled.cancel());
+    assert!(dispatch_fixture(&mut cancelled, &area, &ids, &[center], 100)?.is_none());
+    assert_eq!(cancelled.state(), TickingFutureState::Unavailable);
+    assert_eq!(
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+        original
+    );
+    Ok(())
+}
+
+#[test]
+fn saved_ticking_dispatch_runs_from_the_shared_future_queue() -> Result<()> {
+    use crate::ticking_preparation::{
+        FullFuture, FullFutureId, FullFutureResult, TickingPreparations, TickingRequestId,
+    };
+    let (area, ids, registration) = ticking_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let request = TickingRequestId(41);
+    let mut futures = TickingPreparations::default();
+    futures.start(request, center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(
+                registration
+                    .iter()
+                    .position(|&entry| entry == position)
+                    .unwrap() as u64,
+            ),
+            result: None,
+        })
+    })?;
+    for index in 0..8 {
+        futures.complete(FullFutureId(index), FullFutureResult::Full)?;
+    }
+    assert_eq!(futures.queued_len(), 0);
+    futures.complete(FullFutureId(8), FullFutureResult::Full)?;
+    let (dispatched, result) = futures
+        .dispatch_next(|future| dispatch_fixture(future, &area, &ids, &registration, 500))?
+        .context("ticking callback was not queued")?;
+    assert_eq!(dispatched, request);
+    assert_eq!(
+        result
+            .context("ticking callback did not produce a region")?
+            .region
+            .chunks,
+        BTreeSet::from([center])
+    );
+    assert_eq!(futures.state(request), Some(TickingFutureState::Available));
+    assert!(futures.retire(request)?);
+    for index in 0..9 {
+        assert!(futures.forget_full_future(FullFutureId(index))?);
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn saved_ticking_dispatch_matches_java_full_future_and_unpacked_ticks() -> Result<()> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+    let (area, ids, registration) = ticking_fixture()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("chunk.nbt");
+    std::fs::write(
+        &path,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    let java = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedTickingDispatchOracle",
+        include_str!("../../tests/java/SavedTickingDispatchOracle.java"),
+        &[path.to_str().context("invalid NBT path")?],
+    );
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut future = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(
+                registration
+                    .iter()
+                    .position(|&entry| entry == position)
+                    .unwrap() as u64,
+            ),
+            result: None,
+        })
+    })?;
+    for index in 0..8 {
+        future.complete(FullFutureId(index), FullFutureResult::Full)?;
+    }
+    assert!(dispatch_fixture(&mut future, &area, &ids, &registration, 100)?.is_none());
+    let saved_count = match area.chunks[&area.center].document.value.get("block_ticks") {
+        Some(Tag::List { values, .. }) => values.len(),
+        _ => unreachable!(),
+    };
+    let neighbor = area.chunks[&SavedChunkPos { x: -1, z: -1 }]
+        .document
+        .value
+        .get("block_ticks")
+        .unwrap();
+    let Tag::List { values, .. } = neighbor else {
+        unreachable!()
+    };
+    let Some(Tag::Int(neighbor_delay)) = values[0].get("t") else {
+        unreachable!()
+    };
+    let mut actual = vec![format!(
+        "before {} {saved_count} {neighbor_delay}",
+        future.state() != TickingFutureState::Waiting
+    )];
+    future.complete(FullFutureId(8), FullFutureResult::Full)?;
+    actual.push(format!(
+        "queued {} {saved_count} {}",
+        future.state() != TickingFutureState::Waiting,
+        usize::from(future.has_queued_callback())
+    ));
+    let result = dispatch_fixture(&mut future, &area, &ids, &registration, 500)?.unwrap();
+    actual.push(format!(
+        "success {}",
+        future.state() == TickingFutureState::Available
+    ));
+    for tick in result.block_ticks.container(center).unwrap().pack(500) {
+        actual.push(format!(
+            "{} {},{},{} {} {}",
+            tick.kind,
+            tick.position[0],
+            tick.position[1],
+            tick.position[2],
+            tick.delay,
+            tick.priority
+        ));
+    }
+    let neighbor_ticks = result.block_ticks.container(registration[0]).unwrap();
+    actual.push(format!(
+        "neighbor {} {}",
+        neighbor_ticks.pack(500)[0].delay,
+        neighbor_ticks.pack(1_000)[0].delay
+    ));
+    actual.push(format!("counter {}", result.region.ticks().next_sub_tick()));
+    assert_eq!(actual, java);
+    Ok(())
+}
+
 fn entity_fixture() -> Result<(ChunkArea, BTreeSet<String>)> {
     let (mut area, mut ids) = fixture()?;
     ids.extend(["minecraft:chest".into(), "minecraft:potent_sulfur".into()]);

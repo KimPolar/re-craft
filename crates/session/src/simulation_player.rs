@@ -173,16 +173,9 @@ impl PlayerSimulation {
             if !player_loads && !other_loading.contains(&center) {
                 continue;
             }
-            for dx in -1_i32..=1 {
-                for dz in -1_i32..=1 {
-                    let position = ChunkPos {
-                        x: center.x.wrapping_add(dx),
-                        z: center.z.wrapping_add(dz),
-                    };
-                    if position.x.checked_mul(16).is_some() && position.z.checked_mul(16).is_some()
-                    {
-                        result.insert(position);
-                    }
+            for position in crate::ticking_preparation::ticking_dependencies(center) {
+                if position.x.checked_mul(16).is_some() && position.z.checked_mul(16).is_some() {
+                    result.insert(position);
                 }
             }
         }

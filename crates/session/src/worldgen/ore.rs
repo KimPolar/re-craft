@@ -8897,6 +8897,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
                         && (lake_source
+                            || (matches!(
+                                old.name.as_str(),
+                                "minecraft:gravel" | "minecraft:sand" | "minecraft:red_sand"
+                            ) && old.properties.is_empty())
                             || generated_ore_state(&old)?
                             || super::generated_potent_sulfur::is_valid_state(&old))
                         && state.name == "minecraft:magma_block"
@@ -13957,6 +13961,29 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_underwater_magma_sediment_matches_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_gravel_magma_block",
+            "vine_active_self_gravel_magma_block",
+            "vine_active_sand_magma_block",
+            "vine_active_self_red_sand_magma_block",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn queued_underwater_magma_sediment_matches_java_light() {
+        check_generation_light_modes(
+            &[
+                "vine_active_gravel_magma_block",
+                "vine_active_self_gravel_magma_block",
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_magma_replaces_potent_sulfur_like_java_light() {
         check_staged_light_modes(&[
             "vine_active_potent_sulfur_magma_block",
@@ -14610,12 +14637,14 @@ mod tests {
                     world.set_block_id(16, 7, 8, id).unwrap();
                 } else if [
                     "sulfur", "cinnabar", "granite", "diorite", "andesite", "tuff", "calcite",
+                    "gravel", "red_sand", "sand",
                 ]
                 .into_iter()
                 .any(|name| mode.contains(&format!("_{name}_")))
                 {
                     let name = [
                         "sulfur", "cinnabar", "granite", "diorite", "andesite", "tuff", "calcite",
+                        "gravel", "red_sand", "sand",
                     ]
                     .into_iter()
                     .find(|name| mode.contains(&format!("_{name}_")))

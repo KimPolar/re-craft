@@ -1391,15 +1391,18 @@ impl RainView<'_> {
             z: pos.z.div_euclid(16),
         };
         let chunk = self.world.chunks.get(&chunk_pos)?;
+        let position = BlockPosition {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+        };
         if !chunk.block_light_correct
-            || !self.sky_lighting.is_current_at(
-                BlockPosition {
-                    x: pos.x,
-                    y: pos.y,
-                    z: pos.z,
-                },
-                self.sky_bounds,
-            )
+            || !(self.sky_lighting.is_current_at(position, self.sky_bounds)
+                || self.sky_lighting.direct_sky_unchanged_at(
+                    self.world,
+                    position,
+                    self.sky_bounds,
+                ))
         {
             return None;
         }
@@ -16558,14 +16561,12 @@ impl LoadedSession {
 
     fn crop_brightness(&self, relative: IVec3, minimum: u8) -> Option<u8> {
         let absolute = add(self.origin, relative)?;
-        if pending_light_affects(
-            &self.pending_light,
-            BlockPosition {
-                x: absolute.x,
-                y: absolute.y,
-                z: absolute.z,
-            },
-        ) {
+        let position = BlockPosition {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+        };
+        if pending_light_affects(&self.pending_light, position) {
             return None;
         }
         let chunk = self.world.chunks.get(&ChunkPos {
@@ -16592,15 +16593,11 @@ impl LoadedSession {
         let bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
         if !(self.sky_lighting.settled()
-            || self.sky_lighting.is_current_at(
-                BlockPosition {
-                    x: absolute.x,
-                    y: absolute.y,
-                    z: absolute.z,
-                },
-                bounds,
-            )
-            || self.sky_lighting.light_unchanged(&self.world, bounds))
+            || self.sky_lighting.is_current_at(position, bounds)
+            || self.sky_lighting.light_unchanged(&self.world, bounds)
+            || self
+                .sky_lighting
+                .direct_sky_unchanged_at(&self.world, position, bounds))
         {
             return None;
         }
@@ -16644,7 +16641,10 @@ impl LoadedSession {
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
         if !(self.sky_lighting.settled()
             || self.sky_lighting.is_current_at(position, bounds)
-            || self.sky_lighting.light_unchanged(&self.world, bounds))
+            || self.sky_lighting.light_unchanged(&self.world, bounds)
+            || self
+                .sky_lighting
+                .direct_sky_unchanged_at(&self.world, position, bounds))
         {
             return None;
         }
@@ -33469,6 +33469,7 @@ pub(crate) mod tests {
 
     fn spreading_test_session(sky_level: Option<f32>) -> LoadedSession {
         let (mut world, origin, player) = fixture();
+        let air = world.intern_state(state("minecraft:air", &[]));
         let dirt = world.intern_state(state("minecraft:dirt", &[]));
         let grass = world.intern_state(state("minecraft:grass_block", &[("snowy", "false")]));
         for x in 7..=9 {
@@ -33484,6 +33485,15 @@ pub(crate) mod tests {
         let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
         section.block_light = Some(Box::new([0; LIGHT_BYTES]));
         section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        chunk.sections.insert(
+            1,
+            Arc::new(Section {
+                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                biomes: None,
+                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+            }),
+        );
         let mut session = LoadedSession::new(
             world,
             origin,
@@ -33551,23 +33561,62 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn spreading_soil_reuses_distant_sky_but_rejects_nearby_edits() {
-        for (edit_x, expected, unresolved) in [
-            (0, "minecraft:grass_block", false),
-            (1, "minecraft:dirt", true),
+    fn spreading_soil_reuses_direct_sky_but_rejects_an_overhead_edit() {
+        for (position, expected, unresolved) in [
+            (IVec3::new(0, 5, 0), "minecraft:grass_block", false),
+            (IVec3::new(1, 5, 0), "minecraft:grass_block", false),
+            (IVec3::new(8, 10, 8), "minecraft:dirt", true),
         ] {
             let mut session = spreading_test_session(Some(15.0));
             let stone = session.intern_block(state("minecraft:stone", &[]));
-            assert!(session.set_with_notify(IVec3::new(edit_x, 5, 0), stone, false));
+            assert!(session.set_with_notify(position, stone, false));
+            // Both blocks have zero emission and the saved block light is
+            // zero; isolate the pending sky work in this test.
+            session.pending_light.clear();
             assert!(!session.sky_lighting.settled());
             assert!(session.random_tick_spreading_soil_at(IVec3::new(8, 8, 8)).is_some());
             let target = session.origin + IVec3::new(9, 7, 9);
             assert_eq!(
                 session.world.block(target.x, target.y, target.z).unwrap().name,
-                expected
+                expected,
+                "pending edit at {position:?}"
             );
             assert_eq!(session.unresolved_spreading_soil_tick, unresolved);
         }
+    }
+
+    #[test]
+    fn spreading_soil_reuses_dim_sky_outside_diagonal_light_reach() {
+        let mut session = spreading_test_session(Some(15.0));
+        let source = IVec3::new(8, 8, 8);
+        let sky = session.origin + source + IVec3::Y;
+        let chunk = Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(
+                    &BlockPosition {
+                        x: sky.x,
+                        y: sky.y,
+                        z: sky.z,
+                    }
+                    .chunk(),
+                )
+                .unwrap(),
+        );
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        let index = 8 + 8 * 16 + 9 * 256;
+        section.sky_light.as_mut().unwrap()[index / 2] = 0xfd;
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set_with_notify(IVec3::new(1, 1, 0), stone, false));
+        assert!(!session.sky_lighting.settled());
+        assert_eq!(session.spreading_soil_brightness(source + IVec3::Y), Some(13));
+        assert!(session.random_tick_spreading_soil_at(source).is_some());
+        let target = session.origin + IVec3::new(9, 7, 9);
+        assert_eq!(
+            session.world.block(target.x, target.y, target.z).unwrap().name,
+            "minecraft:grass_block"
+        );
+        assert!(!session.unresolved_spreading_soil_tick);
     }
 
     #[test]

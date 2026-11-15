@@ -994,6 +994,11 @@ impl LightBounds {
         (self.min_light_y..self.max_light_y).contains(&y) && !(self.min_y..self.max_y).contains(&y)
     }
 
+    /// Whether a block coordinate lies within the dimension's build height.
+    pub fn contains_build_y(self, y: i32) -> bool {
+        self.build_range().contains(&y)
+    }
+
     pub(crate) fn build_range(self) -> std::ops::Range<i32> {
         self.min_y..self.max_y
     }

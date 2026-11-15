@@ -133,14 +133,50 @@ impl SkyLighting {
             return true;
         }
         // An edit can change its own column's direct sky arbitrarily far
-        // below it. Horizontal propagation and upward propagation both lose
-        // at least one light level per block. A source can start one block
-        // above the edit, so retain an extra block of margin for upward light.
+        // below it. Horizontal and upward steps both lose at least one level.
+        // A source may begin one block above the edit, so include that margin.
         self.pending.iter().all(|edit| {
             let horizontal = (i64::from(position.x) - i64::from(edit.position.x)).abs()
                 + (i64::from(position.z) - i64::from(edit.position.z)).abs();
-            horizontal > 15 || i64::from(position.y) > i64::from(edit.position.y) + 16
+            let upward = (i64::from(position.y) - i64::from(edit.position.y) - 1).max(0);
+            horizontal + upward > 15
         })
+    }
+
+    /// A previously visible level 15 remains unchanged when the same column
+    /// has an unobstructed direct source in both its original and live
+    /// terrain, and no queued edit can alter that source at this height.
+    pub(crate) fn direct_sky_unchanged_at(
+        &self,
+        world: &World,
+        position: BlockPosition,
+        bounds: Option<LightBounds>,
+    ) -> bool {
+        let Some(bounds) = bounds else {
+            return false;
+        };
+        if !self.enabled
+            || !bounds.contains_build_y(position.y)
+            || world.light(position.x, position.y, position.z, true) != Some(15)
+            || self.sources.contains_key(&(position.x, position.z))
+            || self.pending.iter().any(|edit| {
+                edit.position.x == position.x
+                    && edit.position.z == position.z
+                    && i64::from(edit.position.y) + 1 >= i64::from(position.y)
+            })
+        {
+            return false;
+        }
+        // A source previously tracked by the engine may deliberately differ
+        // from a fresh scan. Leave those columns to the ordinary light job.
+        let mut original = SkySourceScanner::with_chunk_overrides(world, bounds, &self.originals);
+        let Some(original) = original.load(position.x, position.z) else {
+            return false;
+        };
+        let Some(current) = SkyColumn::load(world, bounds, position.x, position.z) else {
+            return false;
+        };
+        original.lowest_source_y() <= position.y && current.lowest_source_y() <= position.y
     }
 
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
@@ -1162,6 +1198,22 @@ mod tests {
         assert!(sky.is_current_at(BlockPosition { x: -16, ..near }, Some(bounds)));
         assert!(!sky.is_current_at(BlockPosition { y: 31, ..near }, Some(bounds)));
         assert!(sky.is_current_at(BlockPosition { y: 32, ..near }, Some(bounds)));
+        assert!(!sky.is_current_at(
+            BlockPosition {
+                x: 8,
+                y: 23,
+                ..near
+            },
+            Some(bounds)
+        ));
+        assert!(sky.is_current_at(
+            BlockPosition {
+                x: 8,
+                y: 24,
+                ..near
+            },
+            Some(bounds)
+        ));
         assert!(!sky.is_current_at(BlockPosition { y: -16, ..near }, Some(bounds)));
         assert!(sky.is_current_at(BlockPosition { x: 31, ..distant }, Some(bounds)));
         assert!(sky.is_current_at(distant, Some(bounds)));
@@ -1172,6 +1224,74 @@ mod tests {
         assert!(sky.is_current_at(BlockPosition { x: -33, ..near }, Some(bounds)));
         sky.set_enabled(false);
         assert!(!sky.is_current_at(BlockPosition { x: -33, ..near }, Some(bounds)));
+    }
+
+    #[test]
+    fn direct_sky_proof_rejects_obstructions_and_unknown_source_history() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let query = BlockPosition { x: 8, y: 10, z: 8 };
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { y: 0, ..query },
+            state("stone", &[]),
+        );
+        assert!(!sky.is_current_at(query, Some(bounds)));
+        assert!(sky.direct_sky_unchanged_at(&world, query, Some(bounds)));
+        assert!(!sky.direct_sky_unchanged_at(&world, query, None));
+        assert!(!sky.direct_sky_unchanged_at(
+            &world,
+            BlockPosition { y: -1, ..query },
+            Some(bounds),
+        ));
+        assert!(!sky.direct_sky_unchanged_at(
+            &world,
+            BlockPosition { y: 32, ..query },
+            Some(bounds),
+        ));
+
+        let chunk = Arc::make_mut(
+            Arc::make_mut(&mut world)
+                .chunks
+                .get_mut(&query.chunk())
+                .unwrap(),
+        );
+        let original_section = Arc::clone(&chunk.sections[&0]);
+        Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).sky_light = None;
+        assert!(!sky.direct_sky_unchanged_at(&world, query, Some(bounds)));
+        let chunk = Arc::make_mut(
+            Arc::make_mut(&mut world)
+                .chunks
+                .get_mut(&query.chunk())
+                .unwrap(),
+        );
+        chunk.sections.insert(0, original_section);
+        let upper = chunk.sections.remove(&1).unwrap();
+        assert!(!sky.direct_sky_unchanged_at(&world, query, Some(bounds)));
+        Arc::make_mut(
+            Arc::make_mut(&mut world)
+                .chunks
+                .get_mut(&query.chunk())
+                .unwrap(),
+        )
+        .sections
+        .insert(1, upper);
+
+        let source = SkyColumn::from_lowest_source(bounds, query.x, query.z, 20).unwrap();
+        sky.sources.insert((query.x, query.z), source);
+        assert!(!sky.direct_sky_unchanged_at(&world, query, Some(bounds)));
+        sky.sources.remove(&(query.x, query.z));
+
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition { y: 11, ..query },
+            state("stone", &[]),
+        );
+        assert!(!sky.direct_sky_unchanged_at(&world, query, Some(bounds)));
     }
 
     #[cfg(target_os = "windows")]
@@ -1245,26 +1365,112 @@ mod tests {
         const Y: usize = 34;
         const GRID: usize = X * Z * Y;
         let scenarios = [
-            (BlockPosition { x: 0, y: 15, z: 0 }, false, false),
-            (BlockPosition { x: 0, y: 15, z: 0 }, false, false),
-            (BlockPosition { x: 15, y: 0, z: -1 }, false, false),
-            (BlockPosition { x: -1, y: 24, z: 0 }, true, false),
-            (BlockPosition { x: 0, y: 24, z: 0 }, false, false),
-            (BlockPosition { x: 16, y: 8, z: 15 }, true, false),
-            (BlockPosition { x: 0, y: 0, z: 0 }, false, false),
-            (BlockPosition { x: 0, y: 16, z: 0 }, false, true),
-            (BlockPosition { x: -1, y: 8, z: 0 }, false, true),
+            (
+                BlockPosition { x: 0, y: 15, z: 0 },
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: 0, y: 15, z: 0 },
+                false,
+                false,
+                true,
+                false,
+            ),
+            (
+                BlockPosition { x: 15, y: 0, z: -1 },
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: -1, y: 24, z: 0 },
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: 0, y: 24, z: 0 },
+                false,
+                false,
+                true,
+                false,
+            ),
+            (
+                BlockPosition { x: 16, y: 8, z: 15 },
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: 0, y: 0, z: 0 },
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: 0, y: 16, z: 0 },
+                false,
+                true,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: -1, y: 8, z: 0 },
+                false,
+                true,
+                false,
+                false,
+            ),
+            (
+                BlockPosition { x: 1, y: 8, z: 0 },
+                false,
+                false,
+                false,
+                true,
+            ),
         ];
         assert_eq!(data.len(), GRID * 3 * scenarios.len());
         let bounds = Some(LightBounds::new(0, 32).unwrap());
         let mut inside_halo = 0;
         let mut directly_above = 0;
-        for (scenario, (position, water, roof)) in scenarios.into_iter().enumerate() {
+        let mut direct_sources = 0;
+        for (scenario, (position, water, roof, empty, cave)) in scenarios.into_iter().enumerate() {
             let mut world = fixture();
             let mut sky = SkyLighting::default();
             sky.set_enabled(true);
-            if roof {
-                let stone = Arc::make_mut(&mut world).intern_state(state("stone", &[]));
+            let stone = Arc::make_mut(&mut world).intern_state(state("stone", &[]));
+            for (&pos, chunk) in &mut Arc::make_mut(&mut world).chunks {
+                let chunk = Arc::make_mut(chunk);
+                if !empty || pos.x.abs() > 1 || pos.z.abs() > 1 {
+                    for section_y in 0..=1 {
+                        let section = Arc::make_mut(chunk.sections.get_mut(&section_y).unwrap());
+                        section.blocks.as_mut().unwrap()[15 + 15 * 16 + 256] = stone;
+                    }
+                }
+                if roof {
+                    let section = Arc::make_mut(
+                        chunk
+                            .sections
+                            .get_mut(&(position.y.div_euclid(16) as i8))
+                            .unwrap(),
+                    );
+                    let blocks = section.blocks.as_mut().unwrap();
+                    let y = position.y.rem_euclid(16) as usize;
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            blocks[x + z * 16 + y * 256] = stone;
+                        }
+                    }
+                }
+            }
+            if cave {
                 Arc::make_mut(&mut world)
                     .set_block_id(position.x, position.y, position.z, stone)
                     .unwrap();
@@ -1273,7 +1479,7 @@ mod tests {
                 &mut sky,
                 &mut world,
                 position,
-                if roof {
+                if roof || cave {
                     state("air", &[])
                 } else if water {
                     state("water", &[("level", "0")])
@@ -1312,6 +1518,15 @@ mod tests {
                 } else {
                     near_changes[0] += usize::from(before != placed);
                     near_changes[1] += usize::from(placed != removed);
+                    if !cave
+                        && index % 97 == 0
+                        && sky.direct_sky_unchanged_at(&world, query, bounds)
+                    {
+                        assert_eq!(before, 15, "initial direct sky differed at {x},{y},{z}");
+                        assert_eq!(placed, 15, "edited direct sky differed at {x},{y},{z}");
+                        assert_eq!(removed, 15, "restored direct sky differed at {x},{y},{z}");
+                        direct_sources += 1;
+                    }
                 }
             }
             assert!(
@@ -1342,10 +1557,25 @@ mod tests {
                     bounds,
                 ));
             }
+            if cave {
+                let near = BlockPosition { x: 8, y: 14, z: 0 };
+                let index = ((near.y + 1) as usize * Z + (near.z + 32) as usize) * X
+                    + (near.x + 32) as usize;
+                assert_ne!(
+                    first[index], second[index],
+                    "cave did not exercise upward and sideways propagation"
+                );
+                assert!(!sky.is_current_at(near, bounds));
+                let far = BlockPosition { y: 18, ..near };
+                let index =
+                    ((far.y + 1) as usize * Z + (far.z + 32) as usize) * X + (far.x + 32) as usize;
+                assert!(sky.is_current_at(far, bounds));
+                assert_eq!(first[index], second[index]);
+            }
         }
-        assert!(inside_halo > 0 && directly_above > 0);
+        assert!(inside_halo > 0 && directly_above > 0 && direct_sources > 0);
         eprintln!(
-            "Java sky checks accepted {inside_halo} positions inside the original chunk halo, including {directly_above} directly above edits"
+            "Java sky checks accepted {inside_halo} positions inside the original chunk halo, including {directly_above} directly above edits and {direct_sources} sampled direct sources"
         );
     }
 

@@ -14,6 +14,10 @@ mod bubble_save_tests;
 mod block_tick_save_tests;
 
 #[cfg(test)]
+#[path = "loaded_brushable_save_tests.rs"]
+mod brushable_save_tests;
+
+#[cfg(test)]
 #[path = "loaded_leaf_save_tests.rs"]
 mod leaf_save_tests;
 

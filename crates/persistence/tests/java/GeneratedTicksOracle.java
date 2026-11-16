@@ -53,5 +53,17 @@ public class GeneratedTicksOracle {
         var expectedLevelFluids = fluidCodec.encodeStart(NbtOps.INSTANCE,levelFluids.pack(100)).getOrThrow();
         if (!level.get("block_ticks").equals(expectedLevelBlocks) || !level.get("fluid_ticks").equals(expectedLevelFluids))
             throw new AssertionError("level ticks differ: " + level + " expected " + expectedLevelBlocks + " / " + expectedLevelFluids);
+        var brushable = NbtIo.read(Path.of(args[3]));
+        var brushableTicks = java.util.List.of(
+            new SavedTick<>(Blocks.SUSPICIOUS_SAND, new BlockPos(-31,15,48), -3, TickPriority.HIGH),
+            new SavedTick<>(Blocks.SUSPICIOUS_GRAVEL, new BlockPos(-30,15,48), 9, TickPriority.EXTREMELY_LOW),
+            new SavedTick<>(Blocks.SAND, new BlockPos(-17,0,48), 5, TickPriority.VERY_HIGH),
+            new SavedTick<>(Blocks.SUSPICIOUS_SAND, new BlockPos(-31,15,48), 2, TickPriority.NORMAL));
+        var expectedBrushable = blockCodec.encodeStart(NbtOps.INSTANCE, brushableTicks).getOrThrow();
+        if (!brushable.get("block_ticks").equals(expectedBrushable))
+            throw new AssertionError("brushable ticks differ: " + brushable + " expected " + expectedBrushable);
+        var consumed = NbtIo.read(Path.of(args[4]));
+        if (!blockCodec.parse(NbtOps.INSTANCE, consumed.get("block_ticks")).getOrThrow().isEmpty())
+            throw new AssertionError("consumed ticks were not cleared: " + consumed);
     }
 }

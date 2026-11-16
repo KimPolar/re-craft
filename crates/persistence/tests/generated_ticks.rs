@@ -2,7 +2,7 @@ use native_persistence::{
     generated_ticks::{
         encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks, encode_level_fluid_ticks,
     },
-    nbt::{self, NamedTag, Tag},
+    nbt::{self, NamedTag, Tag, TagType},
 };
 use native_world::loaded::{ChunkPos, SavedBlockTick, SavedFluidTick};
 use std::{path::PathBuf, process::Command};
@@ -185,11 +185,82 @@ fn generated_ticks_match_java_protochunk_packing() {
         ]),
     };
     std::fs::write(&level, nbt::write(&doc).unwrap()).unwrap();
+    let brushable_ticks = [
+        SavedBlockTick {
+            block: "minecraft:suspicious_sand".into(),
+            position: [-31, 15, 48],
+            delay: -3,
+            priority: -1,
+        },
+        SavedBlockTick {
+            block: "minecraft:suspicious_gravel".into(),
+            position: [-30, 15, 48],
+            delay: 9,
+            priority: 3,
+        },
+        SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: [-17, 0, 48],
+            delay: 5,
+            priority: -2,
+        },
+        SavedBlockTick {
+            block: "minecraft:suspicious_sand".into(),
+            position: [-31, 15, 48],
+            delay: 2,
+            priority: 0,
+        },
+    ];
+    let source = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            ("xPos".into(), Tag::Int(pos.x)),
+            ("zPos".into(), Tag::Int(pos.z)),
+            ("Status".into(), Tag::String("minecraft:full".into())),
+            (
+                "sections".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![],
+                },
+            ),
+            (
+                "block_ticks".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: brushable_ticks
+                        .iter()
+                        .map(|tick| {
+                            Tag::Compound(vec![
+                                ("i".into(), Tag::String(tick.block.as_str().into())),
+                                ("x".into(), Tag::Int(tick.position[0])),
+                                ("y".into(), Tag::Int(tick.position[1])),
+                                ("z".into(), Tag::Int(tick.position[2])),
+                                ("t".into(), Tag::Int(tick.delay)),
+                                ("p".into(), Tag::Int(tick.priority)),
+                            ])
+                        })
+                        .collect(),
+                },
+            ),
+        ]),
+    };
+    let position = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+    let mut draft = native_persistence::edit::draft_chunk_blocks(&source, position, &[]).unwrap();
+    draft.replace_block_ticks(&brushable_ticks).unwrap();
+    let brushable = temp.path().join("brushable.nbt");
+    std::fs::write(&brushable, nbt::write(draft.document()).unwrap()).unwrap();
+    draft.replace_block_ticks(&[]).unwrap();
+    let consumed = temp.path().join("consumed.nbt");
+    std::fs::write(&consumed, nbt::write(draft.document()).unwrap()).unwrap();
     run(Command::new(java.join("java.exe"))
         .arg("-cp")
         .arg(cp)
         .arg("GeneratedTicksOracle")
         .arg(input)
         .arg(empty)
-        .arg(level));
+        .arg(level)
+        .arg(brushable)
+        .arg(consumed));
 }

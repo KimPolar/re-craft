@@ -533,8 +533,8 @@ impl ChunkDraft {
         self.replace_block_ticks_inner(ticks, false)
     }
 
-    /// Replace supported falling-block, air, speleothem, button, lamp, soil,
-    /// ice, leaf and fluid block ticks.
+    /// Replace supported falling-block, brushable, air, speleothem, button,
+    /// lamp, soil, ice, leaf and fluid block ticks.
     /// Other chunk data, including lighting and entities, remains unvalidated.
     pub fn replace_block_ticks(
         &mut self,
@@ -564,7 +564,11 @@ impl ChunkDraft {
                     || native_core::block_tick::SpeleothemKind::from_id(name).is_some()
                     || matches!(
                         name,
-                        "minecraft:redstone_lamp"
+                        "minecraft:suspicious_sand"
+                            | "suspicious_sand"
+                            | "minecraft:suspicious_gravel"
+                            | "suspicious_gravel"
+                            | "minecraft:redstone_lamp"
                             | "redstone_lamp"
                             | "minecraft:dirt_path"
                             | "dirt_path"
@@ -1318,6 +1322,69 @@ mod tests {
         };
         assert!(draft.replace_falling_block_ticks(&[bad]).is_err());
         assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn brushable_ticks_preserve_sources_and_do_not_widen_falling_only_drafts() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let original = fixture(1, false);
+        let ticks: Vec<_> = [
+            "minecraft:suspicious_sand",
+            "suspicious_sand",
+            "minecraft:suspicious_gravel",
+            "suspicious_gravel",
+            "minecraft:sand",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| native_world::loaded::SavedBlockTick {
+            block: id.into(),
+            position: [-15, -60, 33],
+            delay: index as i32 * 3 - 4,
+            priority: index as i32 - 2,
+        })
+        .collect();
+        let mut first = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        assert!(first.replace_falling_block_ticks(&ticks).is_err());
+        first.replace_block_ticks(&ticks).unwrap();
+        assert!(first.matches_source(&original).unwrap());
+        assert_eq!(
+            first.document().value.get("unknown_chunk"),
+            original.value.get("unknown_chunk")
+        );
+        let source = first.document().clone();
+        let mut second = draft_chunk_blocks(&source, pos, &[]).unwrap();
+        second.replace_block_ticks(&ticks).unwrap();
+        assert_eq!(
+            source.value.get("block_ticks"),
+            second.document().value.get("block_ticks")
+        );
+        let before = crate::nbt::write(second.document()).unwrap();
+        assert!(second.replace_falling_block_ticks(&[]).is_err());
+        for invalid in [
+            native_world::loaded::SavedBlockTick {
+                block: "custom:suspicious_sand".into(),
+                ..ticks[0].clone()
+            },
+            native_world::loaded::SavedBlockTick {
+                priority: 4,
+                ..ticks[0].clone()
+            },
+            native_world::loaded::SavedBlockTick {
+                position: [0, -60, 33],
+                ..ticks[0].clone()
+            },
+        ] {
+            assert!(second.replace_block_ticks(&[invalid]).is_err());
+            assert_eq!(crate::nbt::write(second.document()).unwrap(), before);
+        }
+        second.replace_block_ticks(&[]).unwrap();
+        assert!(matches!(second.document().value.get("block_ticks"),
+            Some(Tag::List { values, .. }) if values.is_empty()));
+        assert_eq!(
+            second.document().value.get("unknown_chunk"),
+            source.value.get("unknown_chunk")
+        );
     }
 
     #[test]

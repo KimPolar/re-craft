@@ -1688,6 +1688,28 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         )
     }
 
+    /// Prepare saved-world decoration with the same complete block registry
+    /// used to resolve generated states, including template features.
+    pub fn load_with_registry(
+        provider: &mut impl ResourceProvider,
+        plan: &'p DecorationPlan<'s>,
+        block_registry: &BTreeSet<String>,
+        registry: &'p native_resources::block_registry::GeneratedBlockRegistry,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        needs_mineshaft: bool,
+    ) -> Result<Self> {
+        Self::load_with_jigsaw_features(
+            provider,
+            plan,
+            block_registry,
+            resolve,
+            needs_mineshaft,
+            false,
+            &[],
+            Some(registry),
+        )
+    }
+
     pub(super) fn load_with_jigsaw_features(
         provider: &mut impl ResourceProvider,
         plan: &'p DecorationPlan<'s>,
@@ -9174,6 +9196,8 @@ mod pending_chest_tests;
 mod scattered_tests;
 #[cfg(test)]
 mod simple_tests;
+#[cfg(test)]
+mod template_registry_tests;
 
 #[cfg(test)]
 mod tests {

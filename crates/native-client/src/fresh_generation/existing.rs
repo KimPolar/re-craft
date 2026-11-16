@@ -6462,10 +6462,11 @@ impl PreparedExistingGenerator {
             .as_ref()
             .expect("terrain assets initialized");
         let mut resolve = |value: &Value| resolve_generated_terrain_state(value, &assets.blocks);
-        let prepared = native_session::worldgen::PreparedDecoration::load_with_mineshaft(
+        let prepared = native_session::worldgen::PreparedDecoration::load_with_registry(
             &mut self.resources,
             &plan,
             &assets.block_ids,
+            &assets.blocks,
             &mut resolve,
             needs_mineshaft,
         )?;

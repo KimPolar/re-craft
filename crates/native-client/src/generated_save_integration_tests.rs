@@ -70,7 +70,8 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
     use crate::chunk_stream::{
         MissingGenerationAssemblyWorker, MissingGenerationBiomeWorker,
         MissingGenerationCaptureWorker, MissingGenerationPrepareWorker,
-        MissingGenerationStagedAssemblyWorker, MissingGenerationTerrainWorker,
+        MissingGenerationStagedAssemblyWorker, MissingGenerationStagedFeatureWorker,
+        MissingGenerationTerrainWorker, StagedMissingFeatureResult,
     };
 
     let path = private_play_save_world()?;
@@ -230,7 +231,7 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
         MissingGenerationStagedAssemblyWorker::start(rejected.terrain, &streamer, &session)
             .map_err(|failure| failure.error)?;
     let deadline = Instant::now() + Duration::from_secs(120);
-    let staged = loop {
+    let mut staged = loop {
         if let Some(result) = assembly.try_result(&streamer, &session)? {
             break result;
         }
@@ -245,8 +246,63 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
         .biome_chunk(target)
         .context("generated biomes missing")?;
     compare_private_generated_biomes_with_java(&game, target, &biomes)?;
+    let live = session.snapshot();
+    let live_world = std::sync::Arc::clone(live.world.loaded().context("world missing")?);
+    let unfinished = staged.unfinished_features();
+    ensure!(
+        unfinished.contains(&target),
+        "target features are not pending"
+    );
+    let mut completed = Vec::new();
+    let mut placed = 0;
+    while let Some(position) = staged.ready_features().first().copied() {
+        let mut worker =
+            MissingGenerationStagedFeatureWorker::start(staged, &streamer, &session, position)
+                .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let result = loop {
+            if let Some(result) = worker.try_result(&streamer, &session)? {
+                break result;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "staged feature generation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        match result {
+            StagedMissingFeatureResult::Completed {
+                terrain,
+                position: finished,
+                placements,
+            } => {
+                assert_eq!(finished, position);
+                assert!(!placements.is_empty());
+                placed += placements.iter().filter(|&&result| result).count();
+                completed.push(position);
+                staged = terrain;
+                assert_eq!(staged.feature_order(), completed);
+                assert_eq!(
+                    staged.completed_stage(position),
+                    Some(native_session::worldgen::schedule::GenerationStage::Features)
+                );
+            }
+            StagedMissingFeatureResult::Failed { error, .. } => {
+                return Err(error.context(format!("staged features failed for {position:?}")));
+            }
+        }
+    }
+    assert_eq!(completed.len(), unfinished.len());
+    assert!(staged.unfinished_features().is_empty());
+    assert!(completed.contains(&target));
+    assert!(placed > 0, "no selected feature returned success");
+    eprintln!(
+        "prepared features for {} chunks; {placed} selected features returned success",
+        completed.len()
+    );
     let snapshot = session.snapshot();
     let world = std::sync::Arc::clone(snapshot.world.loaded().context("world missing")?);
+    assert!(std::sync::Arc::ptr_eq(&live_world, &world));
     assert!(
         session
             .capture_generation_terrain(&world, [target])

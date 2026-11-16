@@ -81,6 +81,16 @@ impl Buckets {
         }
     }
 
+    fn get(&self, key: u64) -> Option<&[SavedChunkTicket]> {
+        if key == 0 {
+            self.zero.as_deref()
+        } else {
+            self.slots[self.find(key)]
+                .as_ref()
+                .map(|(_, tickets)| tickets.as_slice())
+        }
+    }
+
     fn get_or_insert(&mut self, key: u64) -> &mut Vec<SavedChunkTicket> {
         let exists = if key == 0 {
             self.zero.is_some()
@@ -257,6 +267,13 @@ impl SimulationTickets {
     /// Iterate active tickets in Java's active-map order.
     pub fn tickets(&self) -> impl Iterator<Item = &SavedChunkTicket> {
         self.buckets.iter()
+    }
+
+    /// Whether this chunk currently has any active ticket of the given kind.
+    pub fn has_ticket_kind(&self, pos: ChunkPos, kind: TicketKind) -> bool {
+        self.buckets
+            .get(pack(pos))
+            .is_some_and(|tickets| tickets.iter().any(|ticket| ticket.kind == kind))
     }
 
     /// Add a live ticket. Returns false if an existing ticket was refreshed.

@@ -3616,13 +3616,14 @@ impl LoadedSession {
             .player_section()
             .context("player section is outside the supported range")?;
         let mut player = crate::simulation_player::PlayerSimulation::new(tickets, distance);
+        let view_distance = view_distance.clamp(2, 32);
+        player.set_loading_view_distance(view_distance);
         player.observe_player(
             section,
             self.game_mode == GameMode::Spectator,
             spectators_generate_chunks,
         );
         player.run_updates();
-        let view_distance = view_distance.clamp(2, 32);
         let dependencies = Self::simulation_full_dependencies(&player, view_distance);
         self.player_simulation = Some(PlayerSimulationState {
             player,
@@ -3697,7 +3698,7 @@ impl LoadedSession {
             return;
         }
         state.player.set_distance(distance);
-        state.player.run_updates();
+        state.player.run_simulation_updates();
         let dependencies = Self::simulation_full_dependencies(&state.player, state.view_distance);
         if self.simulation_dependencies.as_ref() != &dependencies {
             self.simulation_dependencies = Arc::new(dependencies);
@@ -3714,6 +3715,7 @@ impl LoadedSession {
         let distance = distance.clamp(2, 32);
         if state.view_distance != distance {
             state.view_distance = distance;
+            state.player.set_loading_view_distance(distance);
             let dependencies = Self::simulation_full_dependencies(&state.player, distance);
             if self.simulation_dependencies.as_ref() != &dependencies {
                 self.simulation_dependencies = Arc::new(dependencies);

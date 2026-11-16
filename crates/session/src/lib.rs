@@ -55,6 +55,7 @@ mod movement_events;
 pub mod orbs;
 pub mod physics;
 pub mod player_data;
+mod player_loading;
 mod random_tick;
 pub mod redstone;
 pub mod respawn;

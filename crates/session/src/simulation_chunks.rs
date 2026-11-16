@@ -331,6 +331,11 @@ impl SimulationChunks {
         self.levels.get(pack(pos))
     }
 
+    /// Stored positions in the backing fastutil map's iteration order.
+    pub(crate) fn tracked_levels(&self) -> impl Iterator<Item = (ChunkPos, u8)> + '_ {
+        self.levels.iter().map(|(key, level)| (unpack(key), level))
+    }
+
     pub fn in_entity_ticking_range(&self, pos: ChunkPos) -> bool {
         self.level(pos) <= ENTITY_TICKING_LEVEL
     }

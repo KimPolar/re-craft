@@ -9,6 +9,9 @@ use native_core::random::LegacyRandom;
 use native_persistence::chunk_tickets::TicketKind;
 use native_world::loaded::ChunkPos;
 
+pub use crate::player_loading::{
+    PlayerLoadingFutureOutcome, PlayerLoadingRelease, PlayerLoadingTicketChange,
+};
 use crate::simulation_chunks::SimulationChunks;
 use crate::simulation_tickets::SimulationTickets;
 
@@ -42,12 +45,15 @@ struct TrackedPlayer {
 }
 
 /// TicketStorage and the player registration share one simulation graph.
-#[derive(Clone, Debug)]
+/// Live holder-future registrations are tied to this instance and are not
+/// clonable snapshots.
+#[derive(Debug)]
 pub struct PlayerSimulation {
     tickets: SimulationTickets,
     // The natural-spawn tracker has its own player-centered radius and hash
     // iteration order; forced simulation tickets do not contribute to it.
     natural_spawn: SimulationChunks,
+    loading: Option<crate::player_loading::PlayerLoading>,
     distance: u32,
     player: Option<TrackedPlayer>,
 }
@@ -56,9 +62,11 @@ impl PlayerSimulation {
     /// `distance` is the server's initial distance, set before saved inactive
     /// tickets are activated. No existing ticket is rewritten at this point.
     pub fn new(tickets: SimulationTickets, distance: u32) -> Self {
+        let loading = tickets.loading_tracker().map(|_| Default::default());
         Self {
             tickets,
             natural_spawn: SimulationChunks::default(),
+            loading,
             distance,
             player: None,
         }
@@ -89,6 +97,55 @@ impl PlayerSimulation {
         on_change: impl FnMut(crate::loading_chunks::LoadingLevelChange),
     ) -> Option<usize> {
         self.tickets.run_loading_updates(budget, on_change)
+    }
+
+    /// Configure the player-loading tracker independently of simulation distance.
+    pub fn set_loading_view_distance(&mut self, distance: u32) {
+        if let Some(loading) = &mut self.loading {
+            loading.set_view_distance(distance.clamp(2, 32) as u8);
+        }
+    }
+
+    /// Execute one dispatcher task in the caller's observed executor order.
+    pub fn step_player_loading_dispatcher(&mut self) -> bool {
+        self.loading
+            .as_mut()
+            .is_some_and(|loading| loading.step_dispatcher())
+    }
+
+    /// Execute one player-ticket task at its actual main-executor position.
+    pub fn step_player_loading_main(
+        &mut self,
+        observe: impl FnMut(PlayerLoadingTicketChange),
+    ) -> bool {
+        self.loading
+            .as_mut()
+            .is_some_and(|loading| loading.step_main(&mut self.tickets, observe))
+    }
+
+    /// Register actual holder entity-ticking futures before acknowledging
+    /// pending releases. A missing holder leaves the candidates pending.
+    pub fn register_player_loading_releases(
+        &mut self,
+        register: impl FnMut(PlayerLoadingRelease) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.loading
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("player loading tracking is not enabled"))?
+            .register_releases(&self.tickets, register)
+    }
+
+    /// Deliver the outcome of a previously registered holder future. Only a
+    /// normal completion releases the dispatcher's slot; exceptions do not.
+    pub fn player_loading_future_completed(
+        &mut self,
+        token: &PlayerLoadingRelease,
+        outcome: PlayerLoadingFutureOutcome,
+    ) -> anyhow::Result<()> {
+        self.loading
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("player loading tracking is not enabled"))?
+            .entity_future_completed(token, outcome)
     }
 
     /// Java's separate eight-chunk player-distance map, before holder and
@@ -139,7 +196,12 @@ impl PlayerSimulation {
     }
 
     pub fn has_pending_updates(&self) -> bool {
-        self.natural_spawn.has_pending_updates() || self.tracker().has_pending_updates()
+        self.natural_spawn.has_pending_updates()
+            || self.tracker().has_pending_updates()
+            || self
+                .loading
+                .as_ref()
+                .is_some_and(|loading| loading.has_pending_updates())
     }
 
     pub fn distance(&self) -> u32 {
@@ -224,6 +286,9 @@ impl PlayerSimulation {
                 return;
             }
             if !previous.ignored {
+                if let Some(loading) = &mut self.loading {
+                    loading.remove_player(previous.section.chunk());
+                }
                 self.tickets.remove_ticket(
                     previous.section.chunk(),
                     TicketKind::PlayerSimulation,
@@ -234,6 +299,9 @@ impl PlayerSimulation {
             }
         }
         if !ignored {
+            if let Some(loading) = &mut self.loading {
+                loading.add_player(section.chunk());
+            }
             self.tickets.add_ticket(
                 section.chunk(),
                 TicketKind::PlayerSimulation,
@@ -250,6 +318,9 @@ impl PlayerSimulation {
         if let Some(previous) = self.player.take()
             && !previous.ignored
         {
+            if let Some(loading) = &mut self.loading {
+                loading.remove_player(previous.section.chunk());
+            }
             self.tickets.remove_ticket(
                 previous.section.chunk(),
                 TicketKind::PlayerSimulation,
@@ -262,6 +333,15 @@ impl PlayerSimulation {
 
     /// Process graph changes only when the caller reaches a server update.
     pub fn run_updates(&mut self) {
+        self.run_simulation_updates();
+        if let Some(loading) = &mut self.loading {
+            loading.run_updates();
+        }
+    }
+
+    /// Some setting changes update the existing simulation graph outside a
+    /// server update. They must not advance player-loading dispatcher work.
+    pub(crate) fn run_simulation_updates(&mut self) {
         self.natural_spawn.run_updates();
         self.tickets.run_updates();
     }

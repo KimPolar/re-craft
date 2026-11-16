@@ -224,6 +224,15 @@ pub enum ScheduleOutcome {
     MissingChunk,
 }
 
+/// One ordered schedule request in a fork of the live level queues. Even
+/// rejected requests consume the shared level sub-tick counter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedTickAttempt {
+    pub registry: TickRegistry,
+    pub tick: ScheduledTick,
+    pub outcome: ScheduleOutcome,
+}
+
 /// Tick access for an isolated converted region. All block and fluid
 /// callbacks share the level's sub-tick counter, including schedules rejected
 /// as duplicates or sent to a chunk without a registered tick container.
@@ -234,6 +243,7 @@ pub struct RegionTicks {
     next_sub_tick: i64,
     registration: Vec<ChunkPos>,
     indexes: Option<RegionTickIndexes>,
+    live_attempts: Option<Vec<CapturedTickAttempt>>,
 }
 
 #[derive(Clone)]
@@ -594,6 +604,7 @@ impl RegionTicks {
             next_sub_tick,
             registration: registration.to_vec(),
             indexes: Some(indexes),
+            live_attempts: None,
         })
     }
 
@@ -650,6 +661,7 @@ impl RegionTicks {
                 blocks: blocks.index.clone(),
                 fluids: fluids.index.clone(),
             }),
+            live_attempts: Some(Vec::new()),
         })
     }
 
@@ -697,6 +709,11 @@ impl RegionTicks {
 
     pub fn next_sub_tick(&self) -> i64 {
         self.next_sub_tick
+    }
+
+    /// Attempts made since the live queue fork, in execution order.
+    pub(crate) fn live_attempts(&self) -> Option<&[CapturedTickAttempt]> {
+        self.live_attempts.as_deref()
     }
 
     /// World time shared by all schedules in this isolated pass.
@@ -887,47 +904,123 @@ impl RegionTicks {
         ensure!((-3..=3).contains(&priority), "invalid tick priority");
         let sub_tick = self.next_sub_tick;
         self.next_sub_tick = self.next_sub_tick.wrapping_add(1);
-        let pos = ChunkPos {
-            x: position[0].div_euclid(16),
-            z: position[2].div_euclid(16),
-        };
-        let Some(chunk) = self.chunks.get_mut(&pos) else {
-            return Ok(ScheduleOutcome::MissingChunk);
-        };
-        let ticks = match registry {
-            TickRegistry::Block => &mut chunk.blocks,
-            TickRegistry::Fluid => &mut chunk.fluids,
-        };
-        let before = ticks.peek().map(tick_order);
-        let added = ticks.schedule(ScheduledTick {
+        let tick = ScheduledTick {
             kind,
             position,
             trigger: self.game_time.wrapping_add(i64::from(delay)),
             priority,
             sub_tick,
-        })?;
-        let after = ticks.peek().map(tick_order);
-        if added
-            && after != before
-            && let Some(head) = after
-            && let Some(indexes) = &mut self.indexes
-        {
-            match registry {
-                TickRegistry::Block => indexes.blocks.insert(pos, head.0),
-                TickRegistry::Fluid => indexes.fluids.insert(pos, head.0),
+        };
+        let recorded = self.live_attempts.as_ref().map(|_| tick.clone());
+        let pos = ChunkPos {
+            x: position[0].div_euclid(16),
+            z: position[2].div_euclid(16),
+        };
+        let outcome = if let Some(chunk) = self.chunks.get_mut(&pos) {
+            let ticks = match registry {
+                TickRegistry::Block => &mut chunk.blocks,
+                TickRegistry::Fluid => &mut chunk.fluids,
+            };
+            let before = ticks.peek().map(tick_order);
+            let added = ticks.schedule(tick)?;
+            let after = ticks.peek().map(tick_order);
+            if added
+                && after != before
+                && let Some(head) = after
+                && let Some(indexes) = &mut self.indexes
+            {
+                match registry {
+                    TickRegistry::Block => indexes.blocks.insert(pos, head.0),
+                    TickRegistry::Fluid => indexes.fluids.insert(pos, head.0),
+                }
             }
-        }
-        Ok(if added {
-            ScheduleOutcome::Added
+            if added {
+                ScheduleOutcome::Added
+            } else {
+                ScheduleOutcome::Duplicate
+            }
         } else {
-            ScheduleOutcome::Duplicate
-        })
+            ScheduleOutcome::MissingChunk
+        };
+        if let (Some(attempts), Some(tick)) = (&mut self.live_attempts, recorded) {
+            attempts.push(CapturedTickAttempt {
+                registry,
+                tick,
+                outcome,
+            });
+        }
+        Ok(outcome)
     }
 }
 
 #[cfg(test)]
 mod live_capture_tests {
     use super::*;
+
+    #[test]
+    fn live_capture_records_added_duplicate_and_missing_schedules_in_order() -> Result<()> {
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut blocks = IndexedRegionQueue::default();
+        let mut fluids = IndexedRegionQueue::default();
+        blocks.add_container(
+            center,
+            ChunkTicks::from_saved(
+                center,
+                vec![SavedTick {
+                    kind: "minecraft:sand".into(),
+                    position: [1, 4, 1],
+                    delay: 8,
+                    priority: 0,
+                }],
+            )?,
+        )?;
+        fluids.add_container(center, ChunkTicks::from_saved(center, vec![])?)?;
+        let mut region = RegionTicks::from_indexed_queues(&blocks, &fluids, 100, i64::MAX - 1)?;
+        assert_eq!(
+            region.schedule(TickRegistry::Block, "sand", [1, 4, 1], 2, 0)?,
+            ScheduleOutcome::Duplicate
+        );
+        assert_eq!(
+            region.schedule(TickRegistry::Fluid, "water", [2, 4, 1], 5, 0)?,
+            ScheduleOutcome::Added
+        );
+        let before_retry = region.clone();
+        assert_eq!(
+            region.schedule(TickRegistry::Fluid, "water", [2, 4, 1], 7, 0)?,
+            ScheduleOutcome::Duplicate
+        );
+        assert_eq!(
+            region.schedule(TickRegistry::Block, "sand", [48, 4, 1], 2, 0)?,
+            ScheduleOutcome::MissingChunk
+        );
+        let attempts = region.live_attempts().unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|entry| entry.outcome)
+                .collect::<Vec<_>>(),
+            [
+                ScheduleOutcome::Duplicate,
+                ScheduleOutcome::Added,
+                ScheduleOutcome::Duplicate,
+                ScheduleOutcome::MissingChunk,
+            ]
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|entry| entry.tick.sub_tick)
+                .collect::<Vec<_>>(),
+            [i64::MAX - 1, i64::MAX, i64::MIN, i64::MIN + 1]
+        );
+        assert_eq!(attempts[1].tick.kind, "minecraft:water");
+        assert_eq!(attempts[1].tick.trigger, 105);
+        assert_eq!(region.next_sub_tick(), i64::MIN + 2);
+        assert_eq!(before_retry.live_attempts().unwrap().len(), 2);
+        assert!(fluids.container(center).unwrap().pack(100).is_empty());
+        assert_eq!(blocks.container(center).unwrap().pack(100).len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn captured_indexes_keep_registration_and_copy_only_changed_containers() -> Result<()> {

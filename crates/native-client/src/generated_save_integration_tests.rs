@@ -111,7 +111,7 @@ fn existing_generated_world_uses_captured_data_packs() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a generated 26.3 world with FULL ticking neighbors"]
+#[ignore = "requires the generated seed -1 portal fixture with FULL ticking neighbors"]
 fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() -> Result<()> {
     use crate::saved_ticking_worker::{SavedTickingRequest, SavedTickingWorker};
     use native_session::{
@@ -260,47 +260,54 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     eprintln!(
         "saved ticking worker prepared {center:?}: {edits} edits, {checks} light checks, sub-tick {before_sub_tick} -> {after_sub_tick}"
     );
+    assert_eq!(edits, 0);
+    assert_eq!(checks, 0);
+    assert_eq!(after_sub_tick.wrapping_sub(before_sub_tick), 12);
     assert!(Arc::ptr_eq(
         session.snapshot().world.loaded().unwrap(),
         &before_world
     ));
     assert_eq!(original.state(), TickingFutureState::Waiting);
-    let outcome = completed.apply_no_effect(&mut session, &mut original);
-    match outcome {
-        Ok(()) => {
-            eprintln!("applied no-effect saved ticking callback to the live session");
-            assert_eq!(edits, 0);
-            assert_eq!(checks, 0);
-            assert_eq!(original.state(), TickingFutureState::Available);
-        }
-        Err(failure) => {
-            let message = format!("{:#}", failure.error);
-            eprintln!("saved ticking callback needs further reconciliation: {message}");
-            ensure!(
-                message.contains("postprocessing has effects")
-                    || message.contains("postprocessing tick queues need live reconciliation")
-                    || message.contains("saved postprocessing has block entities"),
-                "unexpected live reconciliation failure: {message}"
-            );
-            assert_eq!(original.state(), TickingFutureState::Waiting);
-            assert!(original.has_queued_callback());
-            assert!(Arc::ptr_eq(
-                session.snapshot().world.loaded().unwrap(),
-                &before_world
-            ));
-            let retry = match failure
-                .prepared
-                .apply_no_effect(&mut session, &mut original)
-            {
-                Ok(()) => anyhow::bail!("unchanged callback unexpectedly succeeded on retry"),
-                Err(retry) => retry,
-            };
-            assert_eq!(format!("{:#}", retry.error), message);
-            assert_eq!(original.state(), TickingFutureState::Waiting);
-            assert!(original.has_queued_callback());
-            crate::generation_staging::discard_async(retry.prepared);
-        }
+    let failure = match completed.apply_no_effect(&mut session, &mut original) {
+        Ok(()) => anyhow::bail!("scheduled callback was accepted as a no-effect callback"),
+        Err(failure) => failure,
+    };
+    let message = format!("{:#}", failure.error);
+    ensure!(
+        message.contains("postprocessing tick queues need live reconciliation"),
+        "unexpected rejection: {message}"
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    assert!(original.has_queued_callback());
+    assert!(Arc::ptr_eq(
+        session.snapshot().world.loaded().unwrap(),
+        &before_world
+    ));
+    let retry = match failure
+        .prepared
+        .apply_no_effect(&mut session, &mut original)
+    {
+        Ok(()) => anyhow::bail!("unchanged callback unexpectedly succeeded on retry"),
+        Err(retry) => retry,
+    };
+    assert_eq!(format!("{:#}", retry.error), message);
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    assert!(original.has_queued_callback());
+    if let Err(failure) = retry.prepared.apply_scheduled(&mut session, &mut original) {
+        let error = failure.error;
+        crate::generation_staging::discard_async(failure.prepared);
+        return Err(error.context("could not apply generated saved ticking schedules"));
     }
+    eprintln!("applied scheduled saved ticking callback to the live session");
+    assert_eq!(original.state(), TickingFutureState::Available);
+    assert_eq!(
+        session.capture_saved_tick_queues()?.next_sub_tick(),
+        after_sub_tick
+    );
+    assert!(Arc::ptr_eq(
+        session.snapshot().world.loaded().unwrap(),
+        &before_world
+    ));
     assert_eq!(
         native_persistence::nbt::fingerprint(
             &reader

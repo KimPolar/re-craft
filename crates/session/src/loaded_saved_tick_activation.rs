@@ -3,20 +3,27 @@
 //! This does not establish the Java holder's ticking readiness or authorize a
 //! save. New schedules remain separate from the original pending entries.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    CollectedBlockTick, GeneratedTickOrder, GenerationTerrainStage, LoadedSession,
+    CollectedBlockTick, FluidTickKey, GeneratedTickOrder, GenerationTerrainStage, LoadedSession,
     PendingSavedTickActivation, ScheduledFluid, generated_block_key, generated_fluid_key,
 };
 use crate::worldgen::chunk_ticks::{
-    ChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, ScheduledTick,
+    CapturedTickAttempt, ChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, ScheduleOutcome,
+    ScheduledTick, TickRegistry,
 };
 use native_world::loaded::ChunkPos;
 
 type Order = (i128, i32, i64, u64);
+
+struct NewTickSchedules {
+    blocks: Vec<(Order, CollectedBlockTick)>,
+    fluids: Vec<(Order, FluidTickKey)>,
+    next_sub_tick: i64,
+}
 
 /// Immutable live LevelTicks indexes captured at one simulation boundary.
 /// Holder readiness, terrain, lighting, entities, POIs and disk state require
@@ -78,6 +85,48 @@ impl SavedTickQueueCapture {
         fluids.unpack_container(center, self.game_time)?;
         Ok((blocks, fluids))
     }
+
+    /// Replay every schedule attempt before the holder unpacks its saved
+    /// ticks. Duplicate and missing-container attempts still consume order.
+    /// This is deliberately a worker-side check of both complete indexes.
+    pub(crate) fn replay_postprocessing_schedules(
+        &self,
+        center: ChunkPos,
+        attempts: &[CapturedTickAttempt],
+        next_sub_tick: i64,
+        final_blocks: &IndexedRegionQueue,
+        final_fluids: &IndexedRegionQueue,
+    ) -> Result<()> {
+        let mut blocks = self.blocks.as_ref().clone();
+        let mut fluids = self.fluids.as_ref().clone();
+        let mut expected_sub_tick = self.next_sub_tick;
+        for attempt in attempts {
+            ensure!(
+                attempt.tick.sub_tick == expected_sub_tick,
+                "postprocessing schedule order differs from its captured level"
+            );
+            expected_sub_tick = expected_sub_tick.wrapping_add(1);
+            let queue = match attempt.registry {
+                TickRegistry::Block => &mut blocks,
+                TickRegistry::Fluid => &mut fluids,
+            };
+            ensure!(
+                queue.schedule(attempt.tick.clone())? == attempt.outcome,
+                "postprocessing schedule outcome differs from its captured level"
+            );
+        }
+        ensure!(
+            expected_sub_tick == next_sub_tick,
+            "postprocessing sub-tick counter does not match its schedule attempts"
+        );
+        blocks.unpack_container(center, self.game_time)?;
+        fluids.unpack_container(center, self.game_time)?;
+        ensure!(
+            &blocks == final_blocks && &fluids == final_fluids,
+            "postprocessing schedules do not reproduce the captured indexes"
+        );
+        Ok(())
+    }
 }
 
 impl LoadedSession {
@@ -113,6 +162,103 @@ impl LoadedSession {
         let _read_lease = stamp.lock_current()?;
         self.verify_generation_terrain_stage(terrain)?;
         self.verify_no_effect_tick_environment(capture)?;
+        let source = self.verify_ready_saved_ticking_input(future, terrain)?;
+        let dispatched = future.dispatch(
+            |position| {
+                self.activate_pending_saved_ticks(position)?;
+                self.mark_saved_ticking_completed(position, source);
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )?;
+        ensure!(dispatched, "saved ticking callback was not queued");
+        Ok(())
+    }
+
+    /// Apply a callback whose only effects are scheduled ticks. The caller
+    /// must run it at the holder's original executor position; the exact tick
+    /// and queues are required because delayed replay could reorder callbacks.
+    /// Completed marks still cannot be written to disk.
+    pub fn apply_scheduled_saved_ticking(
+        &mut self,
+        future: &mut crate::ticking_preparation::TickingPreparation,
+        terrain: &GenerationTerrainStage,
+        result: &crate::worldgen::saved_postprocessing::SavedTickingResult,
+    ) -> Result<()> {
+        let (capture, attempts) = result.verify_scheduled_live_callback(
+            terrain,
+            future,
+            self.water_source_conversion,
+            crate::worldgen::GeneratedLavaRules {
+                fast_lava: self.fast_lava,
+                source_conversion: self.lava_source_conversion,
+            },
+        )?;
+        let stamp = capture
+            .data_packs()
+            .context("captured data packs are unavailable")?
+            .stamp()
+            .clone();
+        let _read_lease = stamp.lock_current()?;
+        self.verify_generation_terrain_stage(terrain)?;
+        self.verify_saved_tick_queues(capture)?;
+        let source = self.verify_ready_saved_ticking_input(future, terrain)?;
+        let center = future.center();
+        let plan = self.plan_postprocessing_schedules(
+            capture,
+            center,
+            attempts,
+            result.region.ticks().next_sub_tick(),
+        )?;
+        let pending = self
+            .pending_saved_tick_activation
+            .get(&center)
+            .context("saved chunk ticks are not pending")?;
+        let (block_moves, fluid_moves, _, _) =
+            self.plan_pending_saved_tick_activation(center, pending, self.scheduled_tick())?;
+        let moved_blocks: BTreeSet<_> = block_moves.iter().map(|entry| entry.new).collect();
+        let moved_fluids: BTreeSet<_> = fluid_moves.iter().map(|entry| entry.new).collect();
+        ensure!(
+            plan.blocks
+                .iter()
+                .all(|(order, _)| !moved_blocks.contains(order))
+                && plan
+                    .fluids
+                    .iter()
+                    .all(|(order, _)| !moved_fluids.contains(order)),
+            "postprocessing schedule collides with a saved tick activation"
+        );
+        let dispatched = future.dispatch(
+            |position| {
+                // The background replay already computed the exact indexes.
+                // Move the typed pending entries before installing new ones,
+                // then swap in those indexes without cloning them on this thread.
+                self.activate_pending_saved_ticks_inner(position, false)?;
+                self.install_postprocessing_schedules(&plan);
+                self.generated_block_order
+                    .as_mut()
+                    .expect("validated block index")
+                    .queue = Arc::clone(&result.block_ticks);
+                self.generated_fluid_order
+                    .as_mut()
+                    .expect("validated fluid index")
+                    .queue = Arc::clone(&result.fluid_ticks);
+                self.mark_saved_ticking_completed(position, source);
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )?;
+        ensure!(dispatched, "saved ticking callback was not queued");
+        Ok(())
+    }
+
+    fn verify_ready_saved_ticking_input(
+        &self,
+        future: &crate::ticking_preparation::TickingPreparation,
+        terrain: &GenerationTerrainStage,
+    ) -> Result<[u8; 32]> {
         let center = future.center();
         let dependencies = crate::ticking_preparation::ticking_dependencies(center);
         ensure!(
@@ -168,28 +314,196 @@ impl LoadedSession {
             block_time == Some(self.game_time) && fluid_time == Some(self.game_time),
             "saved ticking clock changed"
         );
-        let dispatched = future.dispatch(
-            |position| {
-                self.activate_pending_saved_ticks(position)?;
-                self.checked_chunk_preparation.insert(position, source);
-                self.rejected_chunk_preparation.remove(&position);
-                // The completed marks must eventually be saved, even when no
-                // block or scheduled tick changed during postprocessing.
-                self.tick_dirty_chunks.insert(position);
-                if self.unresolved_chunk_preparation.is_none() {
-                    self.unresolved_chunk_preparation = Some(format!(
-                        "chunk {}, {}: completed postprocessing is not yet coordinated for saving",
-                        position.x, position.z
-                    ));
+        Ok(source)
+    }
+
+    fn mark_saved_ticking_completed(&mut self, position: ChunkPos, source: [u8; 32]) {
+        self.checked_chunk_preparation.insert(position, source);
+        self.rejected_chunk_preparation.remove(&position);
+        // Completed marks still need coordinated persistence.
+        self.tick_dirty_chunks.insert(position);
+        if self.unresolved_chunk_preparation.is_none() {
+            self.unresolved_chunk_preparation = Some(format!(
+                "chunk {}, {}: completed postprocessing is not yet coordinated for saving",
+                position.x, position.z
+            ));
+        }
+        self.random_tick_revision = None;
+    }
+
+    fn plan_postprocessing_schedules(
+        &self,
+        capture: &SavedTickQueueCapture,
+        center: ChunkPos,
+        attempts: &[CapturedTickAttempt],
+        next_sub_tick: i64,
+    ) -> Result<NewTickSchedules> {
+        let dependencies = crate::ticking_preparation::ticking_dependencies(center);
+        let mut block_sequence = self.block_tick_sequence;
+        let mut fluid_sequence = self.fluid_sequence;
+        let mut seen_blocks = BTreeSet::new();
+        let mut seen_fluids = BTreeSet::new();
+        let mut blocks = Vec::new();
+        let mut fluids = Vec::new();
+        for attempt in attempts {
+            if attempt.outcome == ScheduleOutcome::MissingChunk {
+                continue;
+            }
+            let tick = &attempt.tick;
+            let pos = ChunkPos {
+                x: tick.position[0].div_euclid(16),
+                z: tick.position[2].div_euclid(16),
+            };
+            ensure!(
+                dependencies.contains(&pos),
+                "postprocessing schedules a chunk outside the captured FULL neighbors"
+            );
+            let due = i128::from(tick.trigger) - i128::from(capture.base_time);
+            match attempt.registry {
+                TickRegistry::Block => {
+                    let entry = generated_block_key(tick)
+                        .context("unsupported postprocessing block tick")?;
+                    let pending = self.has_scheduled_block(entry);
+                    if attempt.outcome == ScheduleOutcome::Duplicate {
+                        ensure!(
+                            pending || seen_blocks.contains(&entry.identity()),
+                            "duplicate postprocessing block tick is absent from the session"
+                        );
+                        continue;
+                    }
+                    ensure!(
+                        !pending && seen_blocks.insert(entry.identity()),
+                        "postprocessing block tick conflicts with the session"
+                    );
+                    let order = (due, tick.priority, tick.sub_tick, block_sequence);
+                    ensure!(
+                        !self.has_block_order(entry, order),
+                        "postprocessing block order is occupied"
+                    );
+                    block_sequence = block_sequence.wrapping_add(1);
+                    blocks.push((order, entry));
                 }
-                self.random_tick_revision = None;
-                Ok(())
-            },
-            |_| Ok(()),
-            |_| Ok(()),
-        )?;
-        ensure!(dispatched, "saved ticking callback was not queued");
-        Ok(())
+                TickRegistry::Fluid => {
+                    let key = generated_fluid_key(tick)
+                        .context("unsupported postprocessing fluid tick")?;
+                    let pending = self.fluid_pending.contains(&key);
+                    if attempt.outcome == ScheduleOutcome::Duplicate {
+                        ensure!(
+                            pending || seen_fluids.contains(&key),
+                            "duplicate postprocessing fluid tick is absent from the session"
+                        );
+                        continue;
+                    }
+                    ensure!(
+                        !pending && seen_fluids.insert(key),
+                        "postprocessing fluid tick conflicts with the session"
+                    );
+                    let order = (due, tick.priority, tick.sub_tick, fluid_sequence);
+                    ensure!(
+                        !self.fluid_ticks.contains_key(&order),
+                        "postprocessing fluid order is occupied"
+                    );
+                    fluid_sequence = fluid_sequence.wrapping_add(1);
+                    fluids.push((order, key));
+                }
+            }
+        }
+        Ok(NewTickSchedules {
+            blocks,
+            fluids,
+            next_sub_tick,
+        })
+    }
+
+    fn has_scheduled_block(&self, entry: CollectedBlockTick) -> bool {
+        match entry {
+            CollectedBlockTick::Air(key) => self.air_pending.contains(&key),
+            CollectedBlockTick::Sand(key) => self.sand_pending.contains(&key),
+            CollectedBlockTick::Button(key) => self.button_pending.contains(&key),
+            CollectedBlockTick::Soil(pos, kind) => {
+                self.soil_pending.contains(&(pos.x, pos.y, pos.z, kind))
+            }
+            CollectedBlockTick::Lamp(key) => self.lamp_pending.contains(&key),
+            CollectedBlockTick::Ice(key) => self.ice_pending.contains(&key),
+            CollectedBlockTick::Bubble(key) => self.bubble_pending.contains(&key),
+            CollectedBlockTick::Sensor(key) => self.sensor_pending.contains(&key),
+            CollectedBlockTick::Leaf(key) => self.leaf_pending.contains(&key),
+            CollectedBlockTick::Speleothem(key) => self.speleothem_pending.contains(&key),
+        }
+    }
+
+    fn has_block_order(&self, entry: CollectedBlockTick, order: Order) -> bool {
+        match entry {
+            CollectedBlockTick::Air(_) => self.air_ticks.contains_key(&order),
+            CollectedBlockTick::Sand(_) => self.sand_ticks.contains_key(&order),
+            CollectedBlockTick::Button(_) => self.button_ticks.contains_key(&order),
+            CollectedBlockTick::Soil(..) => self.soil_ticks.contains_key(&order),
+            CollectedBlockTick::Lamp(_) => self.lamp_ticks.contains_key(&order),
+            CollectedBlockTick::Ice(_) => self.ice_ticks.contains_key(&order),
+            CollectedBlockTick::Bubble(_) => self.bubble_ticks.contains_key(&order),
+            CollectedBlockTick::Sensor(_) => self.sensor_ticks.contains_key(&order),
+            CollectedBlockTick::Leaf(_) => self.leaf_ticks.contains_key(&order),
+            CollectedBlockTick::Speleothem(_) => self.speleothem_ticks.contains_key(&order),
+        }
+    }
+
+    fn install_postprocessing_schedules(&mut self, plan: &NewTickSchedules) {
+        for &(order, entry) in &plan.blocks {
+            let (_, [x, _, z]) = entry.identity();
+            self.mark_tick_chunk_dirty(x, z);
+            match entry {
+                CollectedBlockTick::Air(key) => {
+                    self.air_pending.insert(key);
+                    self.air_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Sand(key) => {
+                    self.sand_pending.insert(key);
+                    self.sand_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Button(key) => {
+                    self.button_pending.insert(key);
+                    self.button_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Soil(pos, kind) => {
+                    self.soil_pending.insert((pos.x, pos.y, pos.z, kind));
+                    self.soil_ticks.insert(order, (pos, kind));
+                }
+                CollectedBlockTick::Lamp(key) => {
+                    self.lamp_pending.insert(key);
+                    self.lamp_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Ice(key) => {
+                    self.ice_pending.insert(key);
+                    self.ice_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Bubble(key) => {
+                    self.bubble_pending.insert(key);
+                    self.bubble_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Sensor(key) => {
+                    self.sensor_pending.insert(key);
+                    self.sensor_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Leaf(key) => {
+                    self.leaf_pending.insert(key);
+                    self.leaf_ticks.insert(order, key);
+                }
+                CollectedBlockTick::Speleothem(key) => {
+                    self.speleothem_pending.insert(key);
+                    self.speleothem_ticks.insert(order, key);
+                }
+            }
+        }
+        for &(order, key) in &plan.fluids {
+            self.mark_tick_chunk_dirty(key.x, key.z);
+            self.fluid_pending.insert(key);
+            self.fluid_ticks.insert(order, ScheduledFluid { key });
+        }
+        self.block_tick_sequence = self
+            .block_tick_sequence
+            .wrapping_add(plan.blocks.len() as u64);
+        self.fluid_sequence = self.fluid_sequence.wrapping_add(plan.fluids.len() as u64);
+        self.next_sub_tick = plan.next_sub_tick;
     }
 
     /// A callback proven to have no scheduled or world effects does not read
@@ -535,6 +849,14 @@ impl LoadedSession {
     }
 
     pub(super) fn activate_pending_saved_ticks(&mut self, pos: ChunkPos) -> Result<()> {
+        self.activate_pending_saved_ticks_inner(pos, true)
+    }
+
+    fn activate_pending_saved_ticks_inner(
+        &mut self,
+        pos: ChunkPos,
+        unpack_indexes: bool,
+    ) -> Result<()> {
         let Some(pending) = self.pending_saved_tick_activation.get(&pos) else {
             return Ok(());
         };
@@ -571,7 +893,7 @@ impl LoadedSession {
             let previous = self.fluid_ticks.insert(change.new, tick);
             debug_assert!(previous.is_none());
         }
-        if let Some(time) = block_time {
+        if let Some(time) = block_time.filter(|_| unpack_indexes) {
             Arc::make_mut(
                 &mut self
                     .generated_block_order
@@ -582,7 +904,7 @@ impl LoadedSession {
             .unpack_container(pos, time)
             .expect("validated saved block container");
         }
-        if let Some(time) = fluid_time {
+        if let Some(time) = fluid_time.filter(|_| unpack_indexes) {
             Arc::make_mut(
                 &mut self
                     .generated_fluid_order

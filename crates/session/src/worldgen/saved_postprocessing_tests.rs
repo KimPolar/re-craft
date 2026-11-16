@@ -1000,6 +1000,7 @@ fn live_callback_fixture(
         },
     )
     .map_err(anyhow::Error::msg)?;
+    session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
     let root = tempfile::tempdir()?;
     let level = NamedTag {
         name: "".into(),
@@ -1058,6 +1059,21 @@ fn live_no_effect_callback_activates_only_the_original_holder() -> Result<()> {
     let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
     let center = ChunkPos { x: 0, z: 0 };
     let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let mut result = batch.finish()?;
+    let mut other_worker = original.fork_queued_callback()?;
+    let mut other_batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(other_batch.dispatch(&mut other_worker, 100)?);
+    result.region = other_batch.finish()?.region;
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.verify_saved_tick_queues(&ticks)?;
     let mut worker = original.fork_queued_callback()?;
     let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
     assert!(batch.dispatch(&mut worker, 100)?);
@@ -1243,6 +1259,486 @@ fn live_callback_rejects_new_scheduling_until_it_is_reconciled() -> Result<()> {
     );
     assert_eq!(original.state(), TickingFutureState::Waiting);
     session.verify_saved_tick_queues(&ticks)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_tick_attempt_replay_preserves_duplicates_missing_chunks_and_index_history() -> Result<()> {
+    use super::super::chunk_ticks::{ScheduleOutcome, TickRegistry};
+
+    let (_root, _area, _ids, _registration, session, _terrain, ticks) = live_callback_fixture(9)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut region = ticks.isolated_region_ticks()?;
+    assert_eq!(
+        region.schedule(TickRegistry::Block, "sand", [8, 8, 8], 2, 0)?,
+        ScheduleOutcome::Duplicate
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Block, "red_sand", [9, 8, 8], 2, 0)?,
+        ScheduleOutcome::Added
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Fluid, "water", [10, 8, 8], 5, 0)?,
+        ScheduleOutcome::Added
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Fluid, "water", [10, 8, 8], 5, 0)?,
+        ScheduleOutcome::Duplicate
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Block, "sand", [48, 8, 8], 2, 0)?,
+        ScheduleOutcome::MissingChunk
+    );
+    region.unpack_chunk(center)?;
+    let blocks = region.captured_indexed_queue_for(TickRegistry::Block, &[])?;
+    let fluids = region.captured_indexed_queue_for(TickRegistry::Fluid, &[])?;
+    let attempts = region.live_attempts().unwrap();
+    ticks.replay_postprocessing_schedules(
+        center,
+        attempts,
+        region.next_sub_tick(),
+        &blocks,
+        &fluids,
+    )?;
+    session.verify_saved_tick_queues(&ticks)?;
+
+    let mut wrong = attempts.to_vec();
+    wrong[0].outcome = ScheduleOutcome::Added;
+    assert!(
+        ticks
+            .replay_postprocessing_schedules(
+                center,
+                &wrong,
+                region.next_sub_tick(),
+                &blocks,
+                &fluids
+            )
+            .is_err()
+    );
+    wrong = attempts.to_vec();
+    wrong[1].tick.sub_tick = wrong[1].tick.sub_tick.wrapping_add(1);
+    assert!(
+        ticks
+            .replay_postprocessing_schedules(
+                center,
+                &wrong,
+                region.next_sub_tick(),
+                &blocks,
+                &fluids
+            )
+            .is_err()
+    );
+    assert!(
+        ticks
+            .replay_postprocessing_schedules(
+                center,
+                attempts,
+                region.next_sub_tick().wrapping_add(1),
+                &blocks,
+                &fluids
+            )
+            .is_err()
+    );
+    let mut wrong_blocks = blocks.clone();
+    wrong_blocks.remove_container(center);
+    assert!(
+        ticks
+            .replay_postprocessing_schedules(
+                center,
+                attempts,
+                region.next_sub_tick(),
+                &wrong_blocks,
+                &fluids
+            )
+            .is_err()
+    );
+    session.verify_saved_tick_queues(&ticks)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_scheduled_callback_installs_added_ticks_for_the_original_holder() -> Result<()> {
+    use super::super::chunk_ticks::TickRegistry;
+    use crate::{GameSession, ticking_preparation::TickingFutureState};
+    use std::time::Duration;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(9)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    assert!(result.region.ticks().next_sub_tick() > ticks.next_sub_tick());
+    let mut unrelated = ready_future(center, &registration)?;
+    assert!(
+        session
+            .apply_scheduled_saved_ticking(&mut unrelated, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.verify_saved_tick_queues(&ticks)?;
+
+    session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    let after = session.capture_saved_tick_queues()?;
+    assert_eq!(after.next_sub_tick(), result.region.ticks().next_sub_tick());
+    let replayed = after.isolated_region_ticks()?;
+    assert!(replayed.captured_indexed_queue_for(TickRegistry::Block, &[])? == *result.block_ticks);
+    assert!(replayed.captured_indexed_queue_for(TickRegistry::Fluid, &[])? == *result.fluid_ticks);
+    let center_ticks = result.block_ticks.container(center).unwrap().activated(100);
+    assert!(
+        center_ticks
+            .iter()
+            .any(|tick| tick.kind == "minecraft:red_sand" && tick.position == [9, 8, 8])
+    );
+    assert!(session.verify_saved_tick_queues(&ticks).is_err());
+    assert!(session.draft_block_ticks(center).is_err());
+    for step in 1..=3 {
+        session.update(Duration::from_millis(50));
+        session.capture_saved_tick_queues().with_context(|| {
+            format!(
+                "tick index was lost after step {step}; attempts: {:?}",
+                result.region.ticks().live_attempts()
+            )
+        })?;
+    }
+    let after_ticks = session.capture_saved_tick_queues()?;
+    let remaining = after_ticks.isolated_region_ticks()?;
+    assert!(
+        remaining
+            .chunk(center)
+            .unwrap()
+            .blocks
+            .activated(after_ticks.game_time())
+            .iter()
+            .all(|tick| tick.kind != "minecraft:red_sand" || tick.position != [9, 8, 8])
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_scheduled_callback_consumes_duplicate_attempt_without_adding_a_tick() -> Result<()> {
+    use super::super::chunk_ticks::ScheduleOutcome;
+    use crate::ticking_preparation::TickingFutureState;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(8)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    let attempts = result.region.ticks().live_attempts().unwrap();
+    assert_eq!(attempts.len(), 6);
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.outcome == ScheduleOutcome::Duplicate)
+    );
+    session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    let after = session.capture_saved_tick_queues()?;
+    assert_eq!(after.next_sub_tick(), ticks.next_sub_tick().wrapping_add(6));
+    let region = after.isolated_region_ticks()?;
+    let actual = region.chunk(center).unwrap().blocks.pack(100);
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].kind, "minecraft:sand");
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_scheduled_callback_unpacks_after_an_earlier_tick_boundary() -> Result<()> {
+    use crate::{GameSession, ticking_preparation::TickingFutureState};
+    use std::time::Duration;
+
+    let (_root, area, ids, registration, mut session, terrain, _) = live_callback_fixture(9)?;
+    session.update(Duration::from_millis(150));
+    let ticks = session.capture_saved_tick_queues()?;
+    assert_eq!(ticks.game_time(), 103);
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let result = batch.finish()?;
+    session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    let current = session.capture_saved_tick_queues()?;
+    let region = current.isolated_region_ticks()?;
+    let entries = region.chunk(center).unwrap().blocks.activated(103);
+    assert!(
+        entries.iter().any(|tick| tick.kind == "minecraft:sand"
+            && tick.trigger == 103
+            && tick.sub_tick == -1)
+    );
+    assert!(entries.iter().any(|tick| tick.kind == "minecraft:red_sand"
+        && tick.trigger == 105
+        && tick.sub_tick == 0));
+    session.update(Duration::from_millis(150));
+    let after = session.capture_saved_tick_queues()?;
+    assert!(
+        after
+            .isolated_region_ticks()?
+            .chunk(center)
+            .unwrap()
+            .blocks
+            .activated(after.game_time())
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_scheduled_callback_installs_fluid_ticks_and_consumes_duplicates() -> Result<()> {
+    use super::super::chunk_ticks::{ScheduleOutcome, TickRegistry};
+    use crate::{GameSession, ticking_preparation::TickingFutureState};
+    use std::time::Duration;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    let region = &mut batch.stage.region.ticks;
+    assert_eq!(
+        region.schedule(TickRegistry::Fluid, "water", [9, 8, 8], 5, 0)?,
+        ScheduleOutcome::Added
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Fluid, "water", [9, 8, 8], 7, 0)?,
+        ScheduleOutcome::Duplicate
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Fluid, "water", [25, 8, 8], 5, 0)?,
+        ScheduleOutcome::Added
+    );
+    assert_eq!(
+        region.schedule(TickRegistry::Fluid, "water", [48, 8, 8], 5, 0)?,
+        ScheduleOutcome::MissingChunk
+    );
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    let after = session.capture_saved_tick_queues()?;
+    assert_eq!(after.next_sub_tick(), ticks.next_sub_tick().wrapping_add(4));
+    let replayed = after.isolated_region_ticks()?;
+    assert!(replayed.captured_indexed_queue_for(TickRegistry::Fluid, &[])? == *result.fluid_ticks);
+    let fluid = replayed.chunk(center).unwrap().fluids.activated(100);
+    assert_eq!(fluid.len(), 1);
+    assert_eq!(fluid[0].kind, "minecraft:water");
+    assert_eq!((fluid[0].trigger, fluid[0].sub_tick), (105, 0));
+    let neighbor = ChunkPos { x: 1, z: 0 };
+    let neighbor_fluid = replayed.chunk(neighbor).unwrap().fluids.activated(100);
+    assert_eq!(neighbor_fluid.len(), 1);
+    assert_eq!(neighbor_fluid[0].position, [25, 8, 8]);
+    assert_eq!(neighbor_fluid[0].sub_tick, 2);
+    for _ in 0..5 {
+        session.update(Duration::from_millis(50));
+    }
+    let after_ticks = session.capture_saved_tick_queues()?;
+    let remaining = after_ticks.isolated_region_ticks()?;
+    assert!(
+        remaining
+            .chunk(center)
+            .unwrap()
+            .fluids
+            .activated(after_ticks.game_time())
+            .is_empty()
+    );
+    assert!(
+        remaining
+            .chunk(neighbor)
+            .unwrap()
+            .fluids
+            .activated(after_ticks.game_time())
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_scheduled_callback_rejects_unsupported_tick_without_partial_changes() -> Result<()> {
+    use super::super::chunk_ticks::TickRegistry;
+    use crate::ticking_preparation::TickingFutureState;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    batch
+        .stage
+        .region
+        .ticks
+        .schedule(TickRegistry::Fluid, "water", [9, 8, 8], 5, 0)?;
+    batch
+        .stage
+        .region
+        .ticks
+        .schedule(TickRegistry::Fluid, "example:unknown", [10, 8, 8], 5, 0)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    let error = session
+        .apply_scheduled_saved_ticking(&mut original, &terrain, &result)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported postprocessing fluid tick")
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    assert!(original.has_queued_callback());
+    session.verify_saved_tick_queues(&ticks)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_inert_callback_keeps_tick_indexes_through_simulation() -> Result<()> {
+    use crate::GameSession;
+    use std::time::Duration;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+    for step in 1..=3 {
+        session.update(Duration::from_millis(50));
+        session
+            .capture_saved_tick_queues()
+            .with_context(|| format!("tick index lost after step {step}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_scheduled_callback_rejects_stale_clock_queues_and_modified_results() -> Result<()> {
+    use crate::{GameSession, ticking_preparation::TickingFutureState};
+    use std::time::Duration;
+
+    for change in 0..4 {
+        let (_root, area, ids, registration, mut session, terrain, ticks) =
+            live_callback_fixture(9)?;
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut original = ready_future(center, &registration)?;
+        let mut worker = original.fork_queued_callback()?;
+        let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+        assert!(batch.dispatch(&mut worker, 100)?);
+        let mut result = batch.finish()?;
+        match change {
+            0 => {
+                session.update(Duration::from_millis(50));
+            }
+            1 => session.schedule_sand_for_postprocessing_test(
+                glam::IVec3::new(9, 8, 8),
+                crate::falling_block::FallingKind::RedSand,
+            ),
+            2 => {
+                Arc::make_mut(&mut result.block_ticks).remove_container(center);
+            }
+            _ => {
+                let mut another_worker = original.fork_queued_callback()?;
+                let mut another = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+                assert!(another.dispatch(&mut another_worker, 100)?);
+                result.region = another.finish()?.region;
+            }
+        }
+        let before = session.capture_saved_tick_queues()?;
+        assert!(
+            session
+                .apply_scheduled_saved_ticking(&mut original, &terrain, &result)
+                .is_err()
+        );
+        assert_eq!(original.state(), TickingFutureState::Waiting);
+        assert!(original.has_queued_callback());
+        session.verify_saved_tick_queues(&before)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn live_scheduled_callback_matches_java_saved_ticks() -> Result<()> {
+    for (marked_x, elapsed) in [(8, 0), (9, 0), (9, 150)] {
+        compare_live_scheduled_callback_with_java(marked_x, elapsed)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn compare_live_scheduled_callback_with_java(marked_x: i32, elapsed: u64) -> Result<()> {
+    use crate::GameSession;
+    use std::time::Duration;
+
+    let (_root, area, ids, registration, mut session, terrain, mut ticks) =
+        live_callback_fixture(marked_x)?;
+    if elapsed != 0 {
+        session.update(Duration::from_millis(elapsed));
+        ticks = session.capture_saved_tick_queues()?;
+    }
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("chunk.nbt");
+    let output = directory.path().join("postprocessed.nbt");
+    std::fs::write(
+        &input,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    let game_time = ticks.game_time().to_string();
+    let counter = ticks.next_sub_tick().to_string();
+    let expected = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullPostprocessingOracle",
+        include_str!("../../tests/java/SavedFullPostprocessingOracle.java"),
+        &[
+            input.to_str().context("invalid NBT input path")?,
+            output.to_str().context("invalid NBT output path")?,
+            "unpack",
+            &game_time,
+            &counter,
+        ],
+    );
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let result = batch.finish()?;
+    session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+    let after = session.capture_saved_tick_queues()?;
+    let region = after.isolated_region_ticks()?;
+    let mut actual = region
+        .chunk(center)
+        .unwrap()
+        .blocks
+        .pack(ticks.game_time())
+        .into_iter()
+        .map(|tick| {
+            format!(
+                "{} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.push(format!("counter {}", after.next_sub_tick()));
+    assert_eq!(actual, expected);
     Ok(())
 }
 

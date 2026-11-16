@@ -52,8 +52,8 @@ struct Work {
     ticks: SavedTickQueueCapture,
 }
 
-/// A completed private pass. Only the no-effect case can currently be applied;
-/// other results still need block, light, entity and tick reconciliation.
+/// A completed private pass. Block, light and entity effects still need
+/// reconciliation; schedule-only results require the exact captured tick.
 pub(crate) struct PreparedSavedTicking {
     terrain: GenerationTerrainStage,
     result: SavedTickingResult,
@@ -79,6 +79,25 @@ impl PreparedSavedTicking {
         callback: &mut TickingPreparation,
     ) -> std::result::Result<(), SavedTickingApplyError> {
         match session.apply_no_effect_saved_ticking(callback, &self.terrain, &self.result) {
+            Ok(()) => {
+                crate::generation_staging::discard_async(self);
+                Ok(())
+            }
+            Err(error) => Err(SavedTickingApplyError {
+                prepared: self,
+                error,
+            }),
+        }
+    }
+
+    /// Apply schedule-only effects at the captured tick and callback position.
+    /// Save coordination and the remaining chunk-holder lifecycle are separate.
+    pub fn apply_scheduled(
+        self,
+        session: &mut LoadedSession,
+        callback: &mut TickingPreparation,
+    ) -> std::result::Result<(), SavedTickingApplyError> {
+        match session.apply_scheduled_saved_ticking(callback, &self.terrain, &self.result) {
             Ok(()) => {
                 crate::generation_staging::discard_async(self);
                 Ok(())

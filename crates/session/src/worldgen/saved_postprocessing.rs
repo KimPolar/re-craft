@@ -31,7 +31,8 @@ use super::{
     GeneratedPostprocessing,
     captured_postprocessing::CapturedPostprocessingTags,
     chunk_ticks::{
-        ChunkTicks, ConvertedChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, TickRegistry,
+        CapturedTickAttempt, ChunkTicks, ConvertedChunkTicks, IndexedRegionQueue, RegionTicks,
+        SavedTick, TickRegistry,
     },
     postprocessing::{ConvertedPostprocessingRegion, PostprocessingTask},
     postprocessing_world::{ConvertedBlockEntities, PostprocessedGeneratedRegion},
@@ -66,7 +67,9 @@ struct LiveTickingProvenance {
     ticks: SavedTickQueueCapture,
     callbacks: Vec<(ChunkPos, Arc<()>)>,
     packs_bound: bool,
+    region: Option<Arc<()>>,
     sealed_queues: Option<(Arc<IndexedRegionQueue>, Arc<IndexedRegionQueue>)>,
+    replayed_queues: Option<(Arc<IndexedRegionQueue>, Arc<IndexedRegionQueue>)>,
 }
 
 impl SavedTickingResult {
@@ -77,6 +80,63 @@ impl SavedTickingResult {
         water_source_conversion: bool,
         lava_rules: super::postprocessing_world::GeneratedLavaRules,
     ) -> Result<&SavedTickQueueCapture> {
+        let live = self.verify_live_callback_terrain(
+            terrain,
+            future,
+            water_source_conversion,
+            lava_rules,
+        )?;
+        ensure!(
+            live.sealed_queues.as_ref().is_some_and(|(blocks, fluids)| {
+                Arc::ptr_eq(blocks, &self.block_ticks) && Arc::ptr_eq(fluids, &self.fluid_ticks)
+            }),
+            "postprocessing tick queues need live reconciliation"
+        );
+        ensure!(
+            self.region.ticks().next_sub_tick() == live.ticks.next_sub_tick(),
+            "saved postprocessing has effects that need live reconciliation"
+        );
+        Ok(&live.ticks)
+    }
+
+    /// Verify an immutable, replayed set of schedule attempts. The live level
+    /// must still check its captured clock, queues, terrain and holder order.
+    pub(crate) fn verify_scheduled_live_callback(
+        &self,
+        terrain: &GenerationTerrainStage,
+        future: &TickingPreparation,
+        water_source_conversion: bool,
+        lava_rules: super::postprocessing_world::GeneratedLavaRules,
+    ) -> Result<(&SavedTickQueueCapture, &[CapturedTickAttempt])> {
+        let live = self.verify_live_callback_terrain(
+            terrain,
+            future,
+            water_source_conversion,
+            lava_rules,
+        )?;
+        ensure!(
+            live.replayed_queues
+                .as_ref()
+                .is_some_and(|(blocks, fluids)| {
+                    Arc::ptr_eq(blocks, &self.block_ticks) && Arc::ptr_eq(fluids, &self.fluid_ticks)
+                }),
+            "postprocessing schedules could not be replayed against the captured queues"
+        );
+        let attempts = self
+            .region
+            .ticks()
+            .live_attempts()
+            .context("saved postprocessing schedule history is missing")?;
+        Ok((&live.ticks, attempts))
+    }
+
+    fn verify_live_callback_terrain(
+        &self,
+        terrain: &GenerationTerrainStage,
+        future: &TickingPreparation,
+        water_source_conversion: bool,
+        lava_rules: super::postprocessing_world::GeneratedLavaRules,
+    ) -> Result<&LiveTickingProvenance> {
         let live = self
             .live
             .as_ref()
@@ -86,10 +146,10 @@ impl SavedTickingResult {
             "saved ticking result has no bound data-pack snapshot"
         );
         ensure!(
-            live.sealed_queues.as_ref().is_some_and(|(blocks, fluids)| {
-                Arc::ptr_eq(blocks, &self.block_ticks) && Arc::ptr_eq(fluids, &self.fluid_ticks)
-            }),
-            "postprocessing tick queues need live reconciliation"
+            live.region
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.region.identity)),
+            "saved postprocessing region was replaced"
         );
         ensure!(
             Arc::ptr_eq(&live.terrain, terrain.identity())
@@ -123,8 +183,7 @@ impl SavedTickingResult {
                 && region.lava_fizz_events().is_empty()
                 && region
                     .block_drops()
-                    .is_none_or(|drops| drops.operations() == 0)
-                && region.ticks().next_sub_tick() == live.ticks.next_sub_tick(),
+                    .is_none_or(|drops| drops.operations() == 0),
             "saved postprocessing has effects that need live reconciliation"
         );
         ensure!(
@@ -136,7 +195,7 @@ impl SavedTickingResult {
             matches!(region.block_entity_data(future.center())?, Tag::List { values, .. } if values.is_empty()),
             "saved postprocessing has block entities to reconcile"
         );
-        Ok(&live.ticks)
+        Ok(live)
     }
 
     /// Create marks-only drafts for completed callbacks, using the same saved
@@ -324,7 +383,9 @@ impl SavedTickingBatch {
                 ticks: ticks.clone(),
                 callbacks: Vec::new(),
                 packs_bound: false,
+                region: None,
                 sealed_queues: None,
+                replayed_queues: None,
             }),
         })
     }
@@ -476,6 +537,7 @@ impl SavedTickingBatch {
         );
         let mut live = self.live;
         if let Some(proof) = &mut live {
+            proof.region = Some(Arc::clone(&region.identity));
             if proof.packs_bound {
                 proof
                     .ticks
@@ -490,6 +552,29 @@ impl SavedTickingBatch {
                 {
                     if blocks == *block_ticks && fluids == *fluid_ticks {
                         proof.sealed_queues =
+                            Some((Arc::clone(&block_ticks), Arc::clone(&fluid_ticks)));
+                    }
+                }
+                if let Some(attempts) = region.ticks().live_attempts() {
+                    let replayed = if attempts.is_empty()
+                        && proof.sealed_queues.is_some()
+                        && region.ticks().next_sub_tick() == proof.ticks.next_sub_tick()
+                    {
+                        true
+                    } else {
+                        proof
+                            .ticks
+                            .replay_postprocessing_schedules(
+                                proof.callbacks[0].0,
+                                attempts,
+                                region.ticks().next_sub_tick(),
+                                &block_ticks,
+                                &fluid_ticks,
+                            )
+                            .is_ok()
+                    };
+                    if replayed {
+                        proof.replayed_queues =
                             Some((Arc::clone(&block_ticks), Arc::clone(&fluid_ticks)));
                     }
                 }

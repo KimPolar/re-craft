@@ -277,6 +277,10 @@ impl Default for PlayerLoading {
 }
 
 impl PlayerLoading {
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
     pub fn add_player(&mut self, position: ChunkPos) {
         if self.players.insert(position) {
             self.distance.add_ticket(position, PLAYER_SOURCE, 0);

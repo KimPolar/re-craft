@@ -3,7 +3,7 @@
 //! This only drives the ticket graph. Chunk loading, ticking-future completion,
 //! scheduled tick unpacking, and timed-ticket expiration remain caller duties.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use native_core::random::LegacyRandom;
 use native_persistence::chunk_tickets::TicketKind;
@@ -74,6 +74,10 @@ impl PlayerSimulation {
 
     pub fn tickets(&self) -> &SimulationTickets {
         &self.tickets
+    }
+
+    pub(crate) fn loading_identity(&self) -> Option<&Arc<()>> {
+        self.loading.as_ref().map(|loading| loading.identity())
     }
 
     /// Other game systems can add portal, forced, or entity tickets here.

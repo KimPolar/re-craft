@@ -25,6 +25,7 @@ pub mod chest_placement;
 mod combat;
 pub mod consume_particles;
 mod custom_tool;
+pub mod distance_updates;
 mod equipment_attributes;
 mod fire_contact;
 mod frosted_ice;

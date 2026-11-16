@@ -133,6 +133,108 @@ fn run_java_oracle(class: &str, java_source: &str) -> String {
 #[cfg(windows)]
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn loading_ticket_graph_matches_java_scheduling_order() {
+    use std::collections::BTreeMap;
+
+    let stdout = run_java_oracle(
+        "LoadingTicketGraphOracle",
+        include_str!("java/LoadingTicketGraphOracle.java"),
+    );
+    let max = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("MAX|"))
+        .expect("Java loading level missing")
+        .parse::<u8>()
+        .unwrap();
+    assert_eq!(native_session::loading_chunks::unloaded_level(), max);
+    let results: BTreeMap<_, _> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("RESULT|"))
+        .map(|line| {
+            let mut fields = line.splitn(3, '|');
+            let name = fields.next().unwrap();
+            let remaining = fields.next().unwrap().parse::<usize>().unwrap();
+            let changes = fields
+                .next()
+                .unwrap()
+                .split(';')
+                .filter(|change| !change.is_empty())
+                .collect::<Vec<_>>();
+            (name, (remaining, changes))
+        })
+        .collect();
+
+    fn compare(
+        tickets: &mut SimulationTickets,
+        results: &BTreeMap<&str, (usize, Vec<&str>)>,
+        name: &str,
+        budget: usize,
+    ) {
+        let (expected_remaining, expected) = &results[name];
+        let mut actual = Vec::new();
+        let remaining = tickets
+            .run_loading_updates(budget, |change| {
+                actual.push(format!(
+                    "{},{},{},{}",
+                    change.position.x, change.position.z, change.previous, change.level
+                ));
+            })
+            .unwrap();
+        assert_eq!(remaining, *expected_remaining, "remaining budget in {name}");
+        assert_eq!(actual.len(), expected.len(), "change count in {name}");
+        for (index, (observed, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(observed, expected, "change {index} in {name}");
+        }
+    }
+
+    let mut tickets = SimulationTickets::with_loading_tracker();
+    let origin = ChunkPos { x: 0, z: 0 };
+    let second = ChunkPos { x: 2, z: -2 };
+    let third = ChunkPos { x: -2, z: 3 };
+    let fourth = ChunkPos { x: 1, z: 1 };
+    tickets.add_ticket(origin, TicketKind::PlayerLoading, 31);
+    tickets.add_ticket(origin, TicketKind::Unknown, 33);
+    tickets.add_ticket(origin, TicketKind::Forced, 33);
+    tickets.add_ticket(second, TicketKind::Forced, 30);
+    tickets.add_ticket(ChunkPos { x: 4, z: 1 }, TicketKind::PlayerSimulation, 19);
+    tickets.add_ticket(third, TicketKind::Unknown, 31);
+    tickets.add_ticket(third, TicketKind::Unknown, 33);
+    tickets.add_ticket(origin, TicketKind::PlayerLoading, 31);
+    for (name, budget) in [("a0", 0), ("a1", 1), ("a2", 7)] {
+        compare(&mut tickets, &results, name, budget);
+    }
+    tickets.add_ticket(fourth, TicketKind::Unknown, 29);
+    tickets.remove_ticket(fourth, TicketKind::Unknown, 29);
+    for (name, budget) in [("a3", 37), ("a4", 4096)] {
+        compare(&mut tickets, &results, name, budget);
+    }
+    tickets.remove_ticket(origin, TicketKind::Unknown, 33);
+    tickets.remove_ticket(origin, TicketKind::PlayerLoading, 31);
+    for (name, budget) in [("b0", 13), ("b1", 4096)] {
+        compare(&mut tickets, &results, name, budget);
+    }
+    tickets.add_ticket(fourth, TicketKind::Unknown, 29);
+    tickets.remove_ticket(second, TicketKind::Forced, 30);
+    for (name, budget) in [("c0", 5), ("c1", 13), ("c2", 4096)] {
+        compare(&mut tickets, &results, name, budget);
+    }
+    tickets.add_ticket(fourth, TicketKind::PlayerLoading, 32);
+    tickets.remove_ticket(fourth, TicketKind::Unknown, 29);
+    for (name, budget) in [("d0", 15), ("d1", 4096)] {
+        compare(&mut tickets, &results, name, budget);
+    }
+    for _ in 0..2 {
+        tickets.purge_stale(|_| native_session::simulation_tickets::ChunkSaveReadiness::Pending);
+    }
+    for (name, budget) in [("e0", 7), ("e1", 4096)] {
+        compare(&mut tickets, &results, name, budget);
+    }
+    assert!(!tickets.loading_tracker().unwrap().has_pending_updates());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
 fn ticking_chunk_activation_runs_postprocessing_before_starting_ticks() {
     let stdout = run_java_oracle(
         "SavedChunkActivationOracle",

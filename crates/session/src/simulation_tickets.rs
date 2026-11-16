@@ -7,7 +7,10 @@
 use native_persistence::chunk_tickets::{SavedChunkTicket, SavedChunkTickets, TicketKind};
 use native_world::loaded::ChunkPos;
 
-use crate::simulation_chunks::SimulationChunks;
+use crate::{
+    loading_chunks::{LoadingChunks, LoadingLevelChange},
+    simulation_chunks::SimulationChunks,
+};
 
 /// The state consulted by Java's `TicketStorage.canTicketExpire`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,13 +174,32 @@ impl Buckets {
 pub struct SimulationTickets {
     buckets: Buckets,
     graph: SimulationChunks,
+    loading: Option<LoadingChunks>,
 }
 
 impl SimulationTickets {
+    /// Enable loading tracking before tickets are inserted. Ordinary sessions
+    /// avoid accumulating loading work until a holder coordinator consumes it.
+    pub fn with_loading_tracker() -> Self {
+        Self {
+            loading: Some(LoadingChunks::default()),
+            ..Self::default()
+        }
+    }
+
     /// Activate saved entries in Java's order. Duplicate type/level entries
     /// refresh the earlier entry's timeout as `TicketStorage.addTicket` does.
     pub fn from_saved(saved: &SavedChunkTickets) -> Self {
         let mut store = Self::default();
+        for ticket in saved.activation_order() {
+            store.insert(*ticket);
+        }
+        store
+    }
+
+    /// Track loading updates from the first saved ticket's activation.
+    pub fn from_saved_with_loading(saved: &SavedChunkTickets) -> Self {
+        let mut store = Self::with_loading_tracker();
         for ticket in saved.activation_order() {
             store.insert(*ticket);
         }
@@ -193,8 +215,35 @@ impl SimulationTickets {
         Ok(Self::from_saved(captured.tickets()))
     }
 
+    pub fn from_capture_with_loading(
+        captured: &native_persistence::world::CapturedChunkTickets,
+        session: &native_persistence::save::WorldSessionGuard,
+        dimension: &native_persistence::world::DimensionId,
+    ) -> anyhow::Result<Self> {
+        let _lease = captured.lock_current_for(session, dimension)?;
+        Ok(Self::from_saved_with_loading(captured.tickets()))
+    }
+
     pub fn tracker(&self) -> &SimulationChunks {
         &self.graph
+    }
+
+    /// Loading levels for tickets actually delivered to this store. The
+    /// player-loading tracker must deliver its tickets separately.
+    pub fn loading_tracker(&self) -> Option<&LoadingChunks> {
+        self.loading.as_ref()
+    }
+
+    /// Propagate loading levels at the caller's server-update position. The
+    /// observed level changes still require real chunk-holder processing.
+    pub fn run_loading_updates(
+        &mut self,
+        budget: usize,
+        on_change: impl FnMut(LoadingLevelChange),
+    ) -> Option<usize> {
+        self.loading
+            .as_mut()
+            .map(|loading| loading.run_updates_budget(budget, on_change))
     }
 
     pub fn run_updates(&mut self) {
@@ -238,6 +287,11 @@ impl SimulationTickets {
             self.graph
                 .add_ticket(pos, ticket.kind.simulation_key(), ticket.level);
         }
+        if ticket.kind.loads()
+            && let Some(loading) = &mut self.loading
+        {
+            loading.add_ticket(pos, ticket.kind.simulation_key(), ticket.level);
+        }
         true
     }
 
@@ -259,6 +313,12 @@ impl SimulationTickets {
         if kind.simulates() {
             let removed = self.graph.remove_ticket(pos, kind.simulation_key(), level);
             debug_assert!(removed, "simulation ticket source missing");
+        }
+        if kind.loads()
+            && let Some(loading) = &mut self.loading
+        {
+            let removed = loading.remove_ticket(pos, kind.simulation_key(), level);
+            debug_assert!(removed, "loading ticket source missing");
         }
         true
     }
@@ -294,7 +354,13 @@ impl SimulationTickets {
         let mut expired = 0;
         if let Some(tickets) = self.buckets.zero.as_mut() {
             remaining -= 1;
-            expired += purge_bucket(&mut self.graph, 0, tickets, &mut readiness);
+            expired += purge_bucket(
+                &mut self.graph,
+                &mut self.loading,
+                0,
+                tickets,
+                &mut readiness,
+            );
             if tickets.is_empty() {
                 self.buckets.zero = None;
                 self.buckets.len -= 1;
@@ -319,7 +385,13 @@ impl SimulationTickets {
                 .expect("ticket iterator entry is present");
             let key = *key;
             remaining -= 1;
-            expired += purge_bucket(&mut self.graph, key, tickets, &mut readiness);
+            expired += purge_bucket(
+                &mut self.graph,
+                &mut self.loading,
+                key,
+                tickets,
+                &mut readiness,
+            );
             if tickets.is_empty() {
                 if from_wrapped {
                     self.buckets.remove_bucket(key);
@@ -335,12 +407,15 @@ impl SimulationTickets {
 
 fn purge_bucket(
     graph: &mut SimulationChunks,
+    loading: &mut Option<LoadingChunks>,
     key: u64,
     tickets: &mut Vec<SavedChunkTicket>,
     readiness: &mut impl FnMut(ChunkPos) -> ChunkSaveReadiness,
 ) -> usize {
     let position = unpack(key);
     let mut removed = Vec::new();
+    let mut removed_loading = Vec::new();
+    let track_loading = loading.is_some();
     let mut count = 0;
     tickets.retain_mut(|ticket| {
         let can_expire = ticket.kind.timeout().is_some()
@@ -357,10 +432,18 @@ fn purge_bucket(
         if ticket.kind.simulates() {
             removed.push((ticket.kind.simulation_key(), ticket.level));
         }
+        if track_loading && ticket.kind.loads() {
+            removed_loading.push((ticket.kind.simulation_key(), ticket.level));
+        }
         false
     });
     if !removed.is_empty() {
         graph.remove_expired_tickets(position, &removed);
+    }
+    if !removed_loading.is_empty()
+        && let Some(loading) = loading
+    {
+        loading.remove_expired_tickets(position, &removed_loading);
     }
     count
 }

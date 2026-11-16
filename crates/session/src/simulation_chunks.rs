@@ -42,19 +42,25 @@ struct Levels {
     slots: Vec<Option<(u64, u8)>>,
     zero: Option<u8>,
     len: usize,
+    max_level: u8,
 }
 
 impl Default for Levels {
     fn default() -> Self {
-        Self {
-            slots: vec![None; 32],
-            zero: None,
-            len: 0,
-        }
+        Self::with_max_level(MAX_LEVEL)
     }
 }
 
 impl Levels {
+    fn with_max_level(max_level: u8) -> Self {
+        Self {
+            slots: vec![None; 32],
+            zero: None,
+            len: 0,
+            max_level,
+        }
+    }
+
     fn find(&self, key: u64) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = mix(key) as usize & mask;
@@ -66,14 +72,14 @@ impl Levels {
 
     fn get(&self, key: u64) -> u8 {
         if key == 0 {
-            self.zero.unwrap_or(MAX_LEVEL)
+            self.zero.unwrap_or(self.max_level)
         } else {
-            self.slots[self.find(key)].map_or(MAX_LEVEL, |(_, level)| level)
+            self.slots[self.find(key)].map_or(self.max_level, |(_, level)| level)
         }
     }
 
     fn set(&mut self, key: u64, level: u8) {
-        if level >= MAX_LEVEL {
+        if level >= self.max_level {
             self.remove(key);
             return;
         }
@@ -159,23 +165,32 @@ pub struct SimulationChunks {
     sources: BTreeMap<u64, BTreeSet<(u64, i32)>>,
     levels: Levels,
     pending: HashMap<u64, Pending>,
-    queues: [VecDeque<(u64, u64)>; MAX_LEVEL as usize + 1],
+    queues: Vec<VecDeque<(u64, u64)>>,
+    max_level: u8,
     next_serial: u64,
 }
 
 impl Default for SimulationChunks {
     fn default() -> Self {
-        Self {
-            sources: BTreeMap::new(),
-            levels: Levels::default(),
-            pending: HashMap::new(),
-            queues: std::array::from_fn(|_| VecDeque::new()),
-            next_serial: 0,
-        }
+        Self::with_max_level(MAX_LEVEL)
     }
 }
 
 impl SimulationChunks {
+    /// Reuse the same distance-propagation algorithm for the loading graph,
+    /// whose inaccessible level differs from the simulation graph's limit.
+    pub(crate) fn with_max_level(max_level: u8) -> Self {
+        assert!(max_level > 0);
+        Self {
+            sources: BTreeMap::new(),
+            levels: Levels::with_max_level(max_level),
+            pending: HashMap::new(),
+            queues: (0..=max_level).map(|_| VecDeque::new()).collect(),
+            max_level,
+            next_serial: 0,
+        }
+    }
+
     /// The player simulation ticket has entity-ticking level 31 minus the
     /// simulation distance, capped at zero by Java's DistanceManager.
     pub fn player_ticket_level(distance: u32) -> i32 {
@@ -277,6 +292,14 @@ impl SimulationChunks {
     /// Process at most `budget` graph nodes and return the unused budget.
     /// The remaining work can be resumed without changing its order.
     pub fn run_updates_budget(&mut self, budget: usize) -> usize {
+        self.run_updates_budget_observed(budget, |_, _, _| {})
+    }
+
+    pub(crate) fn run_updates_budget_observed(
+        &mut self,
+        budget: usize,
+        mut on_change: impl FnMut(ChunkPos, u8, u8),
+    ) -> usize {
         let mut remaining = budget;
         while remaining > 0 {
             let Some((key, next)) = self.pop() else {
@@ -286,10 +309,12 @@ impl SimulationChunks {
             let previous = self.levels.get(key);
             if next < previous {
                 self.levels.set(key, next);
+                on_change(unpack(key), previous, next);
                 self.check_neighbors(key, next, true);
             } else if next > previous {
-                self.levels.set(key, MAX_LEVEL);
-                if next != MAX_LEVEL {
+                self.levels.set(key, self.max_level);
+                on_change(unpack(key), previous, self.max_level);
+                if next != self.max_level {
                     self.enqueue(key, next, next);
                 }
                 self.check_neighbors(key, previous, false);
@@ -380,9 +405,12 @@ impl SimulationChunks {
                     continue;
                 }
                 let candidate = if neighbor == SOURCE {
-                    self.source_level(key).clamp(0, i32::from(MAX_LEVEL)) as u8
+                    self.source_level(key).clamp(0, i32::from(self.max_level)) as u8
                 } else {
-                    self.levels.get(neighbor).saturating_add(1).min(MAX_LEVEL)
+                    self.levels
+                        .get(neighbor)
+                        .saturating_add(1)
+                        .min(self.max_level)
                 };
                 result = result.min(candidate);
                 if result == 0 {
@@ -397,7 +425,7 @@ impl SimulationChunks {
         if target == SOURCE {
             return;
         }
-        let level = level.clamp(0, i32::from(MAX_LEVEL)) as u8;
+        let level = level.clamp(0, i32::from(self.max_level)) as u8;
         let current = self.levels.get(target);
         let old = self.pending.get(&target).copied();
         let computed = old.map_or(current, |pending| pending.level);
@@ -449,7 +477,7 @@ impl SimulationChunks {
     }
 
     fn check_neighbors(&mut self, key: u64, level: u8, decreasing: bool) {
-        if decreasing && level >= MAX_LEVEL - 1 {
+        if decreasing && level >= self.max_level - 1 {
             return;
         }
         let pos = unpack(key);
@@ -462,7 +490,7 @@ impl SimulationChunks {
                 if target == key {
                     continue;
                 }
-                let candidate = level.saturating_add(1).min(MAX_LEVEL);
+                let candidate = level.saturating_add(1).min(self.max_level);
                 if decreasing {
                     self.check_edge(key, target, i32::from(candidate), true);
                 } else {
@@ -471,7 +499,7 @@ impl SimulationChunks {
                         .get(&target)
                         .map_or_else(|| self.levels.get(target), |pending| pending.level);
                     if candidate == observed {
-                        self.check_edge(key, target, i32::from(MAX_LEVEL), false);
+                        self.check_edge(key, target, i32::from(self.max_level), false);
                     }
                 }
             }

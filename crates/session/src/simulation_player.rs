@@ -81,6 +81,16 @@ impl PlayerSimulation {
         self.tickets.tracker()
     }
 
+    /// Apply loading-ticket graph work at the caller's actual server-update
+    /// position. Player-loading tickets must have been delivered separately.
+    pub fn run_loading_updates(
+        &mut self,
+        budget: usize,
+        on_change: impl FnMut(crate::loading_chunks::LoadingLevelChange),
+    ) -> Option<usize> {
+        self.tickets.run_loading_updates(budget, on_change)
+    }
+
     /// Java's separate eight-chunk player-distance map, before holder and
     /// spectator-distance filtering. Its order affects the spawning shuffle.
     /// No order is exposed while this tracker is still propagating.

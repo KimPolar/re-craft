@@ -53,6 +53,32 @@ fn captured_ticket_activation_checks_world_dimension_and_epoch() {
     let guard = reader.session_guard().unwrap();
     let capture = reader.capture_chunk_tickets().unwrap();
     let mut live_tickets = SimulationTickets::from_capture(&capture, &guard, &dimension).unwrap();
+    let mut loading =
+        SimulationTickets::from_capture_with_loading(&capture, &guard, &dimension).unwrap();
+    assert!(loading.loading_tracker().unwrap().has_pending_updates());
+    loading.run_loading_updates(usize::MAX, |_| {}).unwrap();
+    assert_eq!(
+        loading
+            .loading_tracker()
+            .unwrap()
+            .level(ChunkPos { x: -3, z: 4 }),
+        31
+    );
+    assert_eq!(
+        loading
+            .loading_tracker()
+            .unwrap()
+            .level(ChunkPos { x: -2, z: 4 }),
+        32
+    );
+    assert!(
+        SimulationTickets::from_capture_with_loading(
+            &capture,
+            &guard,
+            &DimensionId::parse("the_nether").unwrap()
+        )
+        .is_err()
+    );
     live_tickets.run_updates();
     assert!(
         live_tickets
@@ -82,6 +108,7 @@ fn captured_ticket_activation_checks_world_dimension_and_epoch() {
     assert_eq!(tracker.entity_ticking_order().collect::<Vec<_>>(), before);
     drop(guard.acquire_write().unwrap());
     assert!(SimulationTickets::from_capture(&capture, &guard, &dimension).is_err());
+    assert!(SimulationTickets::from_capture_with_loading(&capture, &guard, &dimension).is_err());
     assert!(
         tracker
             .activate_captured_tickets(&capture, &guard, &dimension)

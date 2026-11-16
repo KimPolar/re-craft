@@ -28,6 +28,339 @@ fn generated_portal_world_saves_after_forty_ticks_without_random_ticks() -> Resu
     verify_generated_portal_play_save(40, false)
 }
 
+/// Reuse an already generated private fixture to diagnose the gameplay and
+/// save path without regenerating distant chunks on every attempt.
+#[test]
+#[ignore = "requires a private generated 26.3 test world"]
+fn existing_generated_portal_world_saves_after_forty_ticks() -> Result<()> {
+    let path = private_play_save_world()?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let reader = WorldReader::open_for_session(&path, DimensionId::parse("overworld")?)?;
+    ensure!(reader.saved_world_seed()? == Some(-1), "wrong test seed");
+    ensure!(
+        reader.fluid_game_rules()?.random_tick_speed == 0,
+        "test world must have random ticks disabled"
+    );
+    let lock = reader
+        .session_guard()
+        .context("test world session lock is missing")?;
+    drop(reader);
+    verify_portal_play_save(&path, &game, lock, 40)
+}
+
+fn private_play_save_world() -> Result<PathBuf> {
+    let path = std::env::var_os("RECRAFT_PLAY_SAVE_TEST_WORLD")
+        .context("RECRAFT_PLAY_SAVE_TEST_WORLD is not set")?;
+    let root = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+    )?;
+    let path = std::fs::canonicalize(path)?;
+    ensure!(
+        path != root && path.starts_with(&root),
+        "test world is outside the private test directory"
+    );
+    Ok(path)
+}
+
+#[test]
+#[ignore = "requires a private generated 26.3 test world"]
+fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<()> {
+    use crate::chunk_stream::{
+        MissingGenerationAssemblyWorker, MissingGenerationBiomeWorker,
+        MissingGenerationCaptureWorker, MissingGenerationPrepareWorker,
+        MissingGenerationStagedAssemblyWorker, MissingGenerationTerrainWorker,
+    };
+
+    let path = private_play_save_world()?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let reader = WorldReader::open_for_session(&path, DimensionId::parse("overworld")?)?;
+    ensure!(reader.saved_world_seed()? == Some(-1), "wrong test seed");
+    let lock = reader
+        .session_guard()
+        .context("test world session lock is missing")?;
+    drop(reader);
+    let options = crate::ViewOptions {
+        dimension: None,
+        chunk: None,
+        radius: 1,
+        smoke_test: false,
+        block_report: None,
+        play: true,
+        video: crate::menu_settings::VideoSettings::default(),
+    };
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock.clone()))?
+    else {
+        anyhow::bail!("generated world did not open for play")
+    };
+    let crate::PreparedPlayWorld {
+        mut session,
+        mut streamer,
+        ..
+    } = *prepared;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let targets = loop {
+        streamer.service(&mut session)?;
+        session.update(Duration::from_millis(50));
+        streamer.service(&mut session)?;
+        let snapshot = session.snapshot();
+        let world = std::sync::Arc::clone(snapshot.world.loaded().context("world missing")?);
+        let center = session.player_chunk().context("player chunk missing")?;
+        let blocked = session
+            .capture_generation_terrain(&world, [center])
+            .is_err_and(|error| error.to_string().contains("saved chunk preparation"));
+        if blocked
+            && session.pending_stream_data_positions().is_empty()
+            && let Some(targets) = streamer.missing_generation_targets(&session, 1)
+            && !targets.targets().is_empty()
+        {
+            break targets;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "saved preparation or missing target not observed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let target = targets.targets()[0];
+    eprintln!("preparing missing chunk {target:?} beside the generated world");
+    let reader = WorldReader::open_with_session(&path, DimensionId::parse("overworld")?, lock)?;
+    let mut capture = MissingGenerationCaptureWorker::start(targets, &streamer, &session, reader)?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let captured = loop {
+        if let Some(result) = capture.try_result(&streamer, &session)? {
+            break result;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "missing generation capture timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let mut prepare =
+        MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+            .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let prepared = loop {
+        if let Some(result) = prepare.try_result(&streamer, &session)? {
+            break result;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "missing generation setup timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let mut biomes = MissingGenerationBiomeWorker::start(prepared, &streamer, &session)
+        .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let biomed = loop {
+        if let Some(result) = biomes.try_result(&streamer, &session)? {
+            break result;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "missing biome generation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(biomed.targets(), &[target]);
+    let mut terrain = MissingGenerationTerrainWorker::start(
+        biomed,
+        &streamer,
+        &session,
+        1,
+        std::collections::BTreeMap::new(),
+    )
+    .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut generated = loop {
+        if let Some(result) = terrain.try_result(&streamer, &session)? {
+            break result;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "missing terrain generation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(generated.generated(), &[target]);
+    while generated.remaining() > 0 {
+        let remaining = generated.remaining();
+        eprintln!("preparing {remaining} additional terrain chunks");
+        let state = generated.into_checked_state(&streamer, &session)?;
+        let mut worker = MissingGenerationTerrainWorker::start(
+            state,
+            &streamer,
+            &session,
+            4,
+            std::collections::BTreeMap::new(),
+        )
+        .map_err(|failure| failure.error)?;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        generated = loop {
+            if let Some(result) = worker.try_result(&streamer, &session)? {
+                break result;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "neighbor terrain generation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        ensure!(
+            generated.remaining() < remaining,
+            "terrain generation made no progress"
+        );
+    }
+    let rejected = match MissingGenerationAssemblyWorker::start(generated, &streamer, &session) {
+        Ok(_) => anyhow::bail!("pending saved preparation unexpectedly passed the complete guard"),
+        Err(failure) => failure,
+    };
+    ensure!(
+        format!("{:#}", rejected.error).contains("saved chunk preparation"),
+        "unexpected complete-guard error: {:#}",
+        rejected.error
+    );
+    let mut assembly =
+        MissingGenerationStagedAssemblyWorker::start(rejected.terrain, &streamer, &session)
+            .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let staged = loop {
+        if let Some(result) = assembly.try_result(&streamer, &session)? {
+            break result;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "staged terrain assembly timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(staged.snapshot().chunks.contains_key(&target));
+    let biomes = staged
+        .biome_chunk(target)
+        .context("generated biomes missing")?;
+    compare_private_generated_biomes_with_java(&game, target, &biomes)?;
+    let snapshot = session.snapshot();
+    let world = std::sync::Arc::clone(snapshot.world.loaded().context("world missing")?);
+    assert!(
+        session
+            .capture_generation_terrain(&world, [target])
+            .is_err()
+    );
+    Ok(())
+}
+
+fn compare_private_generated_biomes_with_java(
+    game: &std::path::Path,
+    target: ChunkPos,
+    actual: &native_session::worldgen::QuartBiomeChunk,
+) -> Result<()> {
+    use std::process::Command;
+    let oracle = tempfile::tempdir()?;
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+        .or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+            )
+        })
+        .join("bin");
+    let version = game.join("versions/26.3");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+    ensure!(manifest["id"] == "26.3", "wrong Minecraft version");
+    let mut paths = vec![version.join("26.3.jar"), oracle.path().to_path_buf()];
+    for library in manifest["libraries"]
+        .as_array()
+        .context("libraries missing")?
+    {
+        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let classpath = std::env::join_paths(paths)?;
+    let source = oracle.path().join("GeneratedMissingBiomeOracle.java");
+    std::fs::write(
+        &source,
+        include_str!("../tests/java/GeneratedMissingBiomeOracle.java"),
+    )?;
+    let compiled = Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&classpath)
+        .arg(source)
+        .output()?;
+    ensure!(
+        compiled.status.success(),
+        "Java biome oracle compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(classpath)
+        .arg("GeneratedMissingBiomeOracle")
+        .args(["-1".to_owned(), target.x.to_string(), target.z.to_string()])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Java biome oracle failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::str::from_utf8(&output.stdout)?;
+    let header = output
+        .lines()
+        .find_map(|line| line.strip_prefix("V "))
+        .context("Java biome height missing")?;
+    let mut bounds = header.split_whitespace();
+    let min_y: i32 = bounds.next().context("minimum height missing")?.parse()?;
+    let height: i32 = bounds.next().context("height missing")?.parse()?;
+    ensure!(
+        height > 0 && height % 4 == 0 && bounds.next().is_none(),
+        "invalid Java biome height"
+    );
+    ensure!(
+        actual.chunk_position() == [target.x, target.z]
+            && actual.min_y() == min_y
+            && actual.height() == height,
+        "generated biome bounds differ"
+    );
+    let mut columns = BTreeSet::new();
+    let quart_height = (height / 4) as usize;
+    for row in output.lines().filter_map(|line| line.strip_prefix("B ")) {
+        let mut fields = row.split_whitespace();
+        let x: usize = fields.next().context("biome X missing")?.parse()?;
+        let z: usize = fields.next().context("biome Z missing")?.parse()?;
+        ensure!(
+            x < 4 && z < 4 && columns.insert((x, z)),
+            "invalid biome column"
+        );
+        for y in 0..quart_height {
+            let expected = fields.next().context("Java biome missing")?;
+            let biome = &actual.values()[(z * 4 + x) * quart_height + y];
+            ensure!(
+                format!("{}:{}", biome.namespace, biome.path) == expected,
+                "biome differs at {target:?}, local ({x}, {y}, {z})"
+            );
+        }
+        ensure!(fields.next().is_none(), "extra Java biome values");
+    }
+    ensure!(columns.len() == 16, "Java biome columns are incomplete");
+    eprintln!(
+        "compared {} generated biome samples with Java for {target:?}",
+        16 * quart_height
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
 fn generated_world_saved_full_chunk_can_resume_postprocessing() -> Result<()> {
@@ -183,7 +516,12 @@ fn verify_generated_portal_play_save_inner(
         }
         return result;
     }
-    verify_portal_play_save(&path, &game, lock, additional_ticks)
+    let result = verify_portal_play_save(&path, &game, lock, additional_ticks);
+    if result.is_err() && std::env::var_os("RECRAFT_KEEP_FAILED_GENERATED_WORLD").is_some() {
+        let kept = parent.keep();
+        eprintln!("kept private failed test world: {}", kept.display());
+    }
+    result
 }
 
 fn verify_saved_ticking(

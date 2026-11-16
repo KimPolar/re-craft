@@ -7320,6 +7320,17 @@ impl LoadedSession {
 
     fn validate_generation_block_readiness(&self) -> anyhow::Result<()> {
         self.validate_saved_chunk_preparation()?;
+        self.validate_generation_stage_block_readiness()
+    }
+
+    /// Intermediate terrain exposes only the currently captured blocks and
+    /// biomes. Pending saved-chunk preparation remains a separate requirement
+    /// for a complete live generation guard and for saving.
+    fn validate_generation_stage_block_readiness(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.unresolved_brushable_lifecycle,
+            "a brushable block or falling entity could not be preserved"
+        );
         self.validate_simulation_ticket_progress()?;
         anyhow::ensure!(
             !self.unresolved_lichen_shape
@@ -7390,8 +7401,8 @@ impl LoadedSession {
     }
 
     /// Capture block and biome inputs for intermediate generation, retaining
-    /// exact pending light and blocked shape work on the live session. This is
-    /// not a lighting snapshot and cannot authorize publication or saving.
+    /// exact pending light, shape and saved-chunk preparation work on the live
+    /// session. This cannot authorize publication, ticking or saving.
     pub fn capture_generation_terrain_stage(
         &self,
         source: Arc<World>,
@@ -7409,7 +7420,7 @@ impl LoadedSession {
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> anyhow::Result<GenerationTerrainStageDraft> {
         use anyhow::Context;
-        self.validate_generation_block_readiness()?;
+        self.validate_generation_stage_block_readiness()?;
         anyhow::ensure!(
             source.dimension == self.world.dimension,
             "generation terrain dimension differs"
@@ -7490,7 +7501,7 @@ impl LoadedSession {
         &self,
         stage: &GenerationTerrainStage,
     ) -> anyhow::Result<()> {
-        self.validate_generation_block_readiness()?;
+        self.validate_generation_stage_block_readiness()?;
         anyhow::ensure!(
             Arc::ptr_eq(&self.generation_identity, &stage.session),
             "generation terrain belongs to another session"

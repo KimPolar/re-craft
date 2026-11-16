@@ -272,6 +272,75 @@ fn uncaptured_preparation_is_rejected_only_after_a_tick() {
 }
 
 #[test]
+fn intermediate_terrain_can_be_captured_with_pending_saved_preparation() {
+    let mut session = super::tests::session();
+    let home = session.player_chunk().unwrap();
+    let pending = ChunkPos {
+        x: home.x + 1,
+        z: home.z,
+    };
+    let world = Arc::make_mut(&mut session.world);
+    world.remember_saved_chunk_source_with_activation(home, [1; 32], SavedChunkActivation::Empty);
+    world
+        .saved_block_entities
+        .insert(home, SavedBlockEntities::Empty);
+    session.require_saved_chunk_sources().unwrap();
+    session.queue_chunk_window(home, 1);
+    session.queue_streamed_chunk(
+        pending,
+        Some(streamed_chunk(
+            pending,
+            Tag::List {
+                element_type: TagType::List,
+                values: vec![
+                    Tag::List {
+                        element_type: TagType::Short,
+                        values: vec![Tag::Short(0)],
+                    },
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ],
+            },
+        )),
+        Some(SavedEntityData::Empty),
+        Some(SavedPoiData::Missing),
+        None,
+        None,
+    );
+    session.update(TICK);
+    assert!(!session.saved_chunk_preparation_verified(pending));
+    assert!(session.validate_saved_chunk_preparation().is_err());
+    let source = Arc::clone(&session.world);
+    let stage = session
+        .capture_generation_terrain_stage(Arc::clone(&source), [home, pending])
+        .expect("unchanged block and biome inputs should remain available");
+    session.verify_generation_terrain_stage(&stage).unwrap();
+    assert!(
+        session
+            .capture_generation_terrain(&source, [home, pending])
+            .is_err()
+    );
+    assert!(session.validate_saved_chunk_preparation().is_err());
+
+    session.unresolved_other_random_tick = true;
+    assert!(session.verify_generation_terrain_stage(&stage).is_err());
+    assert!(
+        session
+            .capture_generation_terrain_stage(Arc::clone(&source), [home, pending])
+            .is_err()
+    );
+    session.unresolved_other_random_tick = false;
+    session.unresolved_brushable_lifecycle = true;
+    assert!(session.verify_generation_terrain_stage(&stage).is_err());
+    session.unresolved_brushable_lifecycle = false;
+
+    Arc::make_mut(&mut session.world).remember_saved_chunk_source(pending, [9; 32]);
+    assert!(session.verify_generation_terrain_stage(&stage).is_err());
+}
+
+#[test]
 fn pending_saved_preparation_defers_ticks_without_stopping_other_chunks() {
     for indexed in [false, true] {
         let template = super::tests::session();

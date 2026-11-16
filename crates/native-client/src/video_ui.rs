@@ -19,6 +19,7 @@ pub enum VideoControl {
     Inactivity,
     MenuBlur,
     RenderDistance,
+    SimulationDistance,
     BiomeBlend,
     WeatherRadius,
     AttackIndicator,
@@ -158,6 +159,19 @@ pub fn slider_from_distance(value: u8) -> f64 {
     }
 }
 
+pub fn simulation_distance_from_slider(value: f64) -> u8 {
+    let value = value.clamp(0.0, f64::from(0.99999_f32));
+    5 + (value * 28.0).floor() as u8
+}
+
+pub fn slider_from_simulation_distance(value: u8) -> f64 {
+    match value.clamp(5, 32) {
+        5 => 0.0,
+        32 => 1.0,
+        value => (f64::from(value - 5) + 0.5) / 28.0,
+    }
+}
+
 fn blend_from_slider(value: f64) -> u8 {
     let value = value.clamp(0.0, f64::from(0.99999_f32));
     (value * 8.0).floor() as u8
@@ -190,6 +204,8 @@ pub struct VideoUi {
     blur_slider: f64,
     distance_slider: f64,
     distance_pending: Option<Instant>,
+    simulation_slider: f64,
+    simulation_pending: Option<Instant>,
     blend_slider: f64,
     blend_pending: Option<Instant>,
     weather_slider: f64,
@@ -206,6 +222,8 @@ impl VideoUi {
             blur_slider: crate::blur_ui::to_slider(video.menu_blur),
             distance_slider: slider_from_distance(video.render_distance),
             distance_pending: None,
+            simulation_slider: slider_from_simulation_distance(video.simulation_distance),
+            simulation_pending: None,
             blend_slider: slider_from_blend(video.biome_blend),
             blend_pending: None,
             weather_slider: slider_from_weather(video.weather_radius),
@@ -225,7 +243,10 @@ impl VideoUi {
             x: width / 2
                 + if matches!(
                     control,
-                    VideoControl::Vsync | VideoControl::RenderDistance | VideoControl::GuiScale
+                    VideoControl::Vsync
+                        | VideoControl::RenderDistance
+                        | VideoControl::SimulationDistance
+                        | VideoControl::GuiScale
                 ) {
                     5
                 } else {
@@ -238,6 +259,7 @@ impl VideoUi {
                 VideoControl::WeatherRadius => 441,
                 VideoControl::AttackIndicator => 527,
                 VideoControl::RenderDistance | VideoControl::BiomeBlend => 241,
+                VideoControl::SimulationDistance => 266,
                 _ => 80,
             } - self.scroll as i32,
             w: 150,
@@ -259,6 +281,7 @@ impl VideoUi {
             VideoControl::GuiScale,
             VideoControl::MenuBlur,
             VideoControl::RenderDistance,
+            VideoControl::SimulationDistance,
             VideoControl::BiomeBlend,
             VideoControl::WeatherRadius,
             VideoControl::AttackIndicator,
@@ -317,6 +340,11 @@ impl VideoUi {
             self.distance_pending = Some(Instant::now() + Duration::from_millis(600));
             return false;
         }
+        if control == VideoControl::SimulationDistance {
+            self.simulation_slider = value;
+            self.simulation_pending = Some(Instant::now() + Duration::from_millis(600));
+            return false;
+        }
         if control == VideoControl::MenuBlur {
             self.blur_slider = value;
             let next = crate::blur_ui::from_slider(value);
@@ -351,6 +379,17 @@ impl VideoUi {
         };
         self.distance_slider = slider_from_distance(next);
         self.distance_pending = Some(Instant::now() + Duration::from_millis(600));
+    }
+
+    pub fn simulation_distance_arrow(&mut self, right: bool) {
+        let current = simulation_distance_from_slider(self.simulation_slider);
+        let next = if right {
+            current.saturating_add(1).min(32)
+        } else {
+            current.saturating_sub(1).max(5)
+        };
+        self.simulation_slider = slider_from_simulation_distance(next);
+        self.simulation_pending = Some(Instant::now() + Duration::from_millis(600));
     }
 
     pub fn blend_arrow(&mut self, right: bool) {
@@ -400,6 +439,15 @@ impl VideoUi {
             let next = distance_from_slider(self.distance_slider);
             changed |= video.render_distance != next;
             video.render_distance = next;
+        }
+        if self
+            .simulation_pending
+            .is_some_and(|deadline| force || now >= deadline)
+        {
+            self.simulation_pending = None;
+            let next = simulation_distance_from_slider(self.simulation_slider);
+            changed |= video.simulation_distance != next;
+            video.simulation_distance = next;
         }
         changed
     }
@@ -557,15 +605,19 @@ impl VideoUi {
                                 hovered || focused == Some(VideoControl::MenuBlur),
                             );
                         } else if label.key == "options.renderDistance"
+                            || label.key == "options.simulationDistance"
                             || label.key == "options.biomeBlendRadius"
                             || label.key == "options.weatherRadius"
                         {
                             let blend = label.key == "options.biomeBlendRadius";
                             let weather = label.key == "options.weatherRadius";
+                            let simulation = label.key == "options.simulationDistance";
                             let slider = if weather {
                                 self.weather_slider
                             } else if blend {
                                 self.blend_slider
+                            } else if simulation {
+                                self.simulation_slider
                             } else {
                                 self.distance_slider
                             };
@@ -573,6 +625,8 @@ impl VideoUi {
                                 VideoControl::WeatherRadius
                             } else if blend {
                                 VideoControl::BiomeBlend
+                            } else if simulation {
+                                VideoControl::SimulationDistance
                             } else {
                                 VideoControl::RenderDistance
                             };
@@ -612,6 +666,11 @@ impl VideoUi {
                                     format!("{side}x{side}")
                                 };
                                 assets.translate(&key, &fallback).to_owned()
+                            } else if simulation {
+                                crate::text_component::format_plain(
+                                    assets.translate("options.chunks", "%s Chunks"),
+                                    &[&simulation_distance_from_slider(slider).to_string()],
+                                )
                             } else {
                                 crate::text_component::format_plain(
                                     assets.translate("options.chunks", "%s Chunks"),
@@ -899,6 +958,37 @@ mod tests {
         assert!(ui.apply_pending_distance(&mut video, Instant::now(), true));
         assert_eq!(video.render_distance, 31);
     }
+
+    #[test]
+    fn simulation_distance_is_independent_and_delayed() {
+        let mut video = VideoSettings::default();
+        let mut ui = VideoUi::new(video);
+        assert_eq!(
+            ui.control_rect(426, VideoControl::SimulationDistance),
+            Rect {
+                x: 218,
+                y: 266,
+                w: 150,
+                h: 20
+            }
+        );
+        for distance in 5..=32 {
+            assert_eq!(
+                simulation_distance_from_slider(slider_from_simulation_distance(distance)),
+                distance
+            );
+        }
+        assert!(!ui.start_control_slider(426, 364, VideoControl::SimulationDistance, &mut video));
+        let deadline = ui.simulation_pending.unwrap();
+        assert_eq!(video.simulation_distance, 12);
+        assert!(!ui.apply_pending_distance(&mut video, deadline - Duration::from_millis(1), false));
+        assert!(ui.apply_pending_distance(&mut video, deadline, false));
+        assert_eq!(video.simulation_distance, 32);
+        assert_eq!(video.render_distance, 12);
+        ui.simulation_distance_arrow(false);
+        assert!(ui.apply_pending_distance(&mut video, Instant::now(), true));
+        assert_eq!(video.simulation_distance, 31);
+    }
     #[test]
     fn slider_endpoints_and_quantized_values_follow_java_range() {
         assert_eq!(fps_from_slider(0.0), 10);
@@ -1033,6 +1123,9 @@ public class VideoSliderOracle {
         var distance = new OptionInstance.IntRange(2, 32, false);
         for (int i=0; i<=10000; i++) System.out.println(distance.fromSliderValue(i/10000.0));
         for (int i=2; i<=32; i++) System.out.println(distance.toSliderValue(i));
+        var simulation = new OptionInstance.IntRange(5, 32, false);
+        for (int i=0; i<=10000; i++) System.out.println(simulation.fromSliderValue(i/10000.0));
+        for (int i=5; i<=32; i++) System.out.println(simulation.toSliderValue(i));
         var blend = new OptionInstance.IntRange(0, 7, false);
         for (int i=0; i<=10000; i++) System.out.println(blend.fromSliderValue(i/10000.0));
         for (int i=0; i<=7; i++) System.out.println(blend.toSliderValue(i));
@@ -1221,6 +1314,22 @@ public class VideoSliderOracle {
                 slider_from_distance(value),
                 expected,
                 "render distance {value}"
+            );
+        }
+        for i in 0..=10000 {
+            let expected: u8 = lines.next().unwrap().parse().unwrap();
+            assert_eq!(
+                simulation_distance_from_slider(f64::from(i) / 10000.0),
+                expected,
+                "simulation distance sample {i}"
+            );
+        }
+        for value in 5..=32 {
+            let expected: f64 = lines.next().unwrap().parse().unwrap();
+            assert_eq!(
+                slider_from_simulation_distance(value),
+                expected,
+                "simulation distance {value}"
             );
         }
         for i in 0..=10000 {

@@ -102,6 +102,7 @@ enum ButtonId {
     VideoAttackIndicator,
     VideoBlur,
     VideoDistance,
+    VideoSimulationDistance,
     VideoBlend,
     VideoWeather,
     Accessibility,
@@ -1619,6 +1620,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoAttackIndicator => Some(VideoControl::AttackIndicator),
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
             ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
+            ButtonId::VideoSimulationDistance => Some(VideoControl::SimulationDistance),
             ButtonId::VideoBlend => Some(VideoControl::BiomeBlend),
             ButtonId::VideoWeather => Some(VideoControl::WeatherRadius),
             _ => None,
@@ -2234,6 +2236,10 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoFullscreen, VideoControl::Fullscreen),
                     (ButtonId::VideoBlend, VideoControl::BiomeBlend),
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
+                    (
+                        ButtonId::VideoSimulationDistance,
+                        VideoControl::SimulationDistance,
+                    ),
                     (ButtonId::VideoBlur, VideoControl::MenuBlur),
                     (ButtonId::VideoWeather, VideoControl::WeatherRadius),
                     (
@@ -2252,6 +2258,7 @@ impl<'a> Menu<'a> {
                             id,
                             ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
+                                | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
                                 | ButtonId::VideoAttackIndicator
@@ -2697,6 +2704,15 @@ impl<'a> Menu<'a> {
                     &mut self.state.video,
                 );
             }
+            ButtonId::VideoSimulationDistance => {
+                let (width, _) = self.logical_size();
+                self.video_ui.start_control_slider(
+                    width,
+                    self.cursor.0,
+                    VideoControl::SimulationDistance,
+                    &mut self.state.video,
+                );
+            }
             ButtonId::Packs => {
                 self.state.refresh_packs();
                 self.state.screen = Screen::Packs;
@@ -2871,6 +2887,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoFps
                     | ButtonId::VideoBlur
                     | ButtonId::VideoDistance
+                    | ButtonId::VideoSimulationDistance
                     | ButtonId::VideoBlend
                     | ButtonId::VideoWeather
                     | ButtonId::VideoVsync
@@ -3443,6 +3460,9 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
                         Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
+                        Some(ButtonId::VideoSimulationDistance) => {
+                            Some(VideoControl::SimulationDistance)
+                        }
                         Some(ButtonId::VideoBlend) => Some(VideoControl::BiomeBlend),
                         Some(ButtonId::VideoWeather) => Some(VideoControl::WeatherRadius),
                         _ => None,
@@ -3629,6 +3649,7 @@ impl<'a> Menu<'a> {
                         | ButtonId::VideoAttackIndicator
                         | ButtonId::VideoBlur
                         | ButtonId::VideoDistance
+                        | ButtonId::VideoSimulationDistance
                         | ButtonId::VideoBlend
                         | ButtonId::VideoWeather
                         | ButtonId::ViewBobbing
@@ -4002,6 +4023,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::MouseWheelSensitivity
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
+                                | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
                                 | ButtonId::OptionsFov
@@ -4025,6 +4047,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoFps
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
+                                | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
                                 | ButtonId::VideoVsync
@@ -4564,6 +4587,13 @@ impl ApplicationHandler for Menu<'_> {
                 {
                     self.video_ui.blend_arrow(code == Some(KeyCode::ArrowRight));
                 } else if self.state.screen == Screen::Video
+                    && self.focused == Some(ButtonId::VideoSimulationDistance)
+                    && self.video_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.video_ui
+                        .simulation_distance_arrow(code == Some(KeyCode::ArrowRight));
+                } else if self.state.screen == Screen::Video
                     && self.focused == Some(ButtonId::VideoDistance)
                     && self.video_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -4648,6 +4678,7 @@ impl ApplicationHandler for Menu<'_> {
                                 Some(
                                     ButtonId::VideoBlur
                                         | ButtonId::VideoDistance
+                                        | ButtonId::VideoSimulationDistance
                                         | ButtonId::VideoBlend
                                         | ButtonId::VideoWeather
                                         | ButtonId::VideoAttackIndicator
@@ -4665,6 +4696,8 @@ impl ApplicationHandler for Menu<'_> {
                                     VideoControl::WeatherRadius
                                 } else if self.focused == Some(ButtonId::VideoAttackIndicator) {
                                     VideoControl::AttackIndicator
+                                } else if self.focused == Some(ButtonId::VideoSimulationDistance) {
+                                    VideoControl::SimulationDistance
                                 } else {
                                     VideoControl::RenderDistance
                                 },
@@ -4689,6 +4722,7 @@ impl ApplicationHandler for Menu<'_> {
                                 ButtonId::VideoFps
                                     | ButtonId::VideoBlur
                                     | ButtonId::VideoDistance
+                                    | ButtonId::VideoSimulationDistance
                                     | ButtonId::VideoBlend
                                     | ButtonId::VideoWeather
                             )
@@ -4750,6 +4784,7 @@ impl ApplicationHandler for Menu<'_> {
                             ButtonId::VideoFps
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
+                                | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
                         ) {
@@ -6592,12 +6627,23 @@ mod tests {
                 assert_eq!(self.menu.state.video.render_distance, 12);
                 self.menu
                     .video_ui
+                    .ensure_control_visible(height, VideoControl::SimulationDistance);
+                click(
+                    &mut self.menu,
+                    event_loop,
+                    ButtonId::VideoSimulationDistance,
+                    true,
+                );
+                assert_eq!(self.menu.state.video.simulation_distance, 12);
+                self.menu
+                    .video_ui
                     .ensure_control_visible(height, VideoControl::MenuBlur);
                 click(&mut self.menu, event_loop, ButtonId::VideoBlur, true);
                 assert_eq!(self.menu.state.video.menu_blur, 10);
                 click(&mut self.menu, event_loop, ButtonId::Done, false);
                 assert_eq!(self.menu.state.screen, Screen::Options);
                 assert_eq!(self.menu.state.video.render_distance, 32);
+                assert_eq!(self.menu.state.video.simulation_distance, 32);
                 assert_eq!(self.menu.state.video.biome_blend, 7);
                 assert!(!self.menu.state.video_dirty);
                 let path = self.menu.state.settings_path.as_ref().unwrap();

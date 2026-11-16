@@ -230,6 +230,8 @@ pub struct VideoSettings {
     pub japanese_glyph_variants: bool,
     /// Render distance in chunks; Java's default is 12.
     pub render_distance: u8,
+    /// Simulation ticket distance in chunks; Java's default is 12.
+    pub simulation_distance: u8,
     /// Radius of the square biome-color average, in blocks.
     pub biome_blend: u8,
     /// Java 26.3 precipitation effect radius, in blocks.
@@ -311,6 +313,7 @@ impl Default for VideoSettings {
             force_unicode_font: false,
             japanese_glyph_variants: japanese_glyph_variants_default(),
             render_distance: 12,
+            simulation_distance: 12,
             biome_blend: 2,
             weather_radius: 10,
             vsync: true,
@@ -391,6 +394,11 @@ impl VideoSettings {
             },
             render_distance: if (2..=32).contains(&self.render_distance) {
                 self.render_distance
+            } else {
+                12
+            },
+            simulation_distance: if (5..=32).contains(&self.simulation_distance) {
+                self.simulation_distance
             } else {
                 12
             },
@@ -679,6 +687,7 @@ mod tests {
             language: Some("ko_kr".into()),
             video: VideoSettings {
                 render_distance: 24,
+                simulation_distance: 9,
                 biome_blend: 7,
                 force_unicode_font: true,
                 japanese_glyph_variants: true,
@@ -743,6 +752,7 @@ mod tests {
         assert_eq!(
             VideoSettings {
                 render_distance: 1,
+                simulation_distance: 4,
                 biome_blend: 8,
                 vsync: false,
                 max_fps: 0,

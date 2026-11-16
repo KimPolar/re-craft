@@ -3622,6 +3622,7 @@ impl LoadedSession {
             view_distance,
         });
         self.simulation_dependencies = Arc::new(dependencies);
+        self.random_tick_revision = None;
         Ok(())
     }
 
@@ -3677,6 +3678,24 @@ impl LoadedSession {
                 })
     }
 
+    /// Change the local player's simulation tickets without changing the
+    /// independently configured render/loading distance.
+    pub fn set_simulation_distance(&mut self, distance: u32) {
+        let Some(state) = &mut self.player_simulation else {
+            return;
+        };
+        if state.player.distance() == distance {
+            return;
+        }
+        state.player.set_distance(distance);
+        state.player.run_updates();
+        let dependencies = Self::simulation_full_dependencies(&state.player, state.view_distance);
+        if self.simulation_dependencies.as_ref() != &dependencies {
+            self.simulation_dependencies = Arc::new(dependencies);
+        }
+        self.random_tick_revision = None;
+    }
+
     /// Update the loading window independently of the simulation distance.
     pub fn set_simulation_view_distance(&mut self, distance: u32) {
         let Some(state) = &mut self.player_simulation else {
@@ -3719,6 +3738,9 @@ impl LoadedSession {
             );
             if self.simulation_dependencies.as_ref() != &dependencies {
                 self.simulation_dependencies = Arc::new(dependencies);
+            }
+            if changed {
+                self.random_tick_revision = None;
             }
         }
     }
@@ -17319,6 +17341,17 @@ impl LoadedSession {
         };
         if let Some(order) = &self.random_tick_chunk_order {
             for &chunk in order.iter() {
+                if self.player_simulation.as_ref().is_some_and(|state| {
+                    !state.player.tracker().in_entity_ticking_range(chunk)
+                }) {
+                    continue;
+                }
+                self.random_tick_sections
+                    .range((chunk, i8::MIN)..=(chunk, i8::MAX))
+                    .for_each(&mut append);
+            }
+        } else if let Some(state) = &self.player_simulation {
+            for chunk in state.player.tracker().entity_ticking_order() {
                 self.random_tick_sections
                     .range((chunk, i8::MIN)..=(chunk, i8::MAX))
                     .for_each(&mut append);
@@ -32112,6 +32145,84 @@ pub(crate) mod tests {
             pose: PlayerPose::Standing,
         };
         (world, origin, player)
+    }
+
+    #[test]
+    fn changing_simulation_distance_updates_ticks_and_dependencies_independently() {
+        let mut session = session();
+        let section = session.player_section().unwrap();
+        let mut player = crate::simulation_player::PlayerSimulation::new(
+            crate::simulation_tickets::SimulationTickets::default(),
+            5,
+        );
+        player.observe_player(section, false, true);
+        player.run_updates();
+        session.simulation_dependencies = Arc::new(LoadedSession::simulation_full_dependencies(
+            &player, 12,
+        ));
+        session.player_simulation = Some(PlayerSimulationState {
+            player,
+            spectators_generate_chunks: true,
+            view_distance: 12,
+        });
+        let farther = ChunkPos {
+            x: section.x + 10,
+            z: section.z,
+        };
+        let near = ChunkPos {
+            x: section.x,
+            z: section.z,
+        };
+        let lit = session.intern_block(state("minecraft:redstone_ore", &[("lit", "true")]));
+        let mut distant_chunk = (**session.world.chunks.get(&near).unwrap()).clone();
+        distant_chunk.position = farther;
+        Arc::make_mut(distant_chunk.sections.get_mut(&0).unwrap())
+            .blocks
+            .as_mut()
+            .unwrap()[0] = lit;
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(farther, Arc::new(distant_chunk));
+        assert!(!session.simulation_allows_block_ticks(farther));
+        assert!(!session.simulation_dependencies().contains(&farther));
+        session.refresh_random_tick_sections();
+        assert!(
+            !session
+                .active_random_tick_sections
+                .iter()
+                .any(|entry| entry.0 == farther)
+        );
+        let before = Arc::clone(session.simulation_dependencies());
+        session.set_simulation_distance(5);
+        assert!(Arc::ptr_eq(&before, session.simulation_dependencies()));
+        session.set_simulation_distance(12);
+        assert!(session.simulation_allows_block_ticks(farther));
+        assert!(session.simulation_dependencies().contains(&farther));
+        session.refresh_random_tick_sections();
+        assert!(
+            session
+                .active_random_tick_sections
+                .iter()
+                .any(|entry| entry.0 == farther)
+        );
+        assert_eq!(session.player_simulation.as_ref().unwrap().view_distance, 12);
+        session.set_simulation_distance(32);
+        let outside_loading = ChunkPos {
+            x: section.x + 28,
+            z: section.z,
+        };
+        assert!(session.simulation_allows_block_ticks(outside_loading));
+        assert!(!session.simulation_dependencies().contains(&outside_loading));
+        session.set_simulation_distance(5);
+        assert!(!session.simulation_allows_block_ticks(farther));
+        assert!(!session.simulation_dependencies().contains(&farther));
+        session.refresh_random_tick_sections();
+        assert!(
+            !session
+                .active_random_tick_sections
+                .iter()
+                .any(|entry| entry.0 == farther)
+        );
     }
 
     #[test]

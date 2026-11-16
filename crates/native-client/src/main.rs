@@ -1543,7 +1543,12 @@ fn prepare_world_with_session(
         let saved_tickets = reader
             .capture_chunk_tickets()
             .context("cannot capture saved simulation tickets")?;
-        session.install_player_simulation(&saved_tickets, 12, radius, rules.spectators_generate_chunks)?;
+        session.install_player_simulation(
+            &saved_tickets,
+            u32::from(options.video.simulation_distance),
+            radius,
+            rules.spectators_generate_chunks,
+        )?;
         if matches!(
             mode,
             native_session::GameMode::Spectator | native_session::GameMode::Creative

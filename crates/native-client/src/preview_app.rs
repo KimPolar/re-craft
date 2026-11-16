@@ -605,6 +605,7 @@ impl Viewer {
             ui.advance_video_settings(Instant::now());
         }
         let old_distance = self.video.render_distance;
+        let old_simulation_distance = self.video.simulation_distance;
         let old_fov_effect = self.video.fov_effect_scale;
         let old_sprint_window = self.video.sprint_window;
         let old_fullscreen = self.video.fullscreen;
@@ -630,6 +631,12 @@ impl Viewer {
         {
             play.streamer
                 .set_radius(u32::from(self.video.render_distance));
+        }
+        if old_simulation_distance != self.video.simulation_distance
+            && let Some(play) = &mut self.play
+        {
+            play.session
+                .set_simulation_distance(u32::from(self.video.simulation_distance));
         }
         if old_sprint_window != self.video.sprint_window
             && let Some(play) = &mut self.play

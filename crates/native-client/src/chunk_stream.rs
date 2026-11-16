@@ -5936,6 +5936,156 @@ mod tests {
         }
     }
 
+    #[test]
+    fn streamer_reloads_released_tick_terrain_without_duplicating_ticks() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::{
+            SavedBlockEntities, SavedBlockTick, SavedChunkActivation, SavedFluidTick,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 1, z: 0 };
+        let tick_position = [target.x * 16 + 1, 2, target.z * 16 + 1];
+        let tick = |id: &str| {
+            Tag::Compound(vec![
+                ("i".into(), Tag::String(id.into())),
+                ("x".into(), Tag::Int(tick_position[0])),
+                ("y".into(), Tag::Int(tick_position[1])),
+                ("z".into(), Tag::Int(tick_position[2])),
+                ("t".into(), Tag::Int(10_000)),
+                ("p".into(), Tag::Int(0)),
+            ])
+        };
+        let list = |value| Tag::List {
+            element_type: TagType::Compound,
+            values: vec![value],
+        };
+        let activation = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("block_ticks".into(), list(tick("minecraft:sand"))),
+                ("fluid_ticks".into(), list(tick("minecraft:water"))),
+            ]),
+        })
+        .unwrap();
+        let mut source = chunk_world(target);
+        source.remember_saved_chunk_source_with_activation(
+            target,
+            [23; 32],
+            SavedChunkActivation::Encoded(activation.into()),
+        );
+        source
+            .saved_block_entities
+            .insert(target, SavedBlockEntities::Empty);
+        source.saved_block_ticks.insert(
+            target,
+            vec![SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position: tick_position,
+                delay: 10_000,
+                priority: 0,
+            }],
+        );
+        source.saved_fluid_ticks.insert(
+            target,
+            vec![SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: tick_position,
+                delay: 10_000,
+                priority: 0,
+            }],
+        );
+        let mut world = chunk_world(home);
+        world.remember_saved_chunk_source_with_activation(home, [17; 32], SavedChunkActivation::Empty);
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        world.import_chunk(&source, target).unwrap();
+        let mut session = LoadedSession::new(
+            world,
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            PlayerState {
+                position: Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            },
+        )
+        .unwrap();
+        for pos in [home, target] {
+            session
+                .set_initial_entity_chunk(pos, SavedEntityData::Empty)
+                .unwrap();
+            session
+                .set_initial_poi_chunk(pos, SavedPoiData::Missing)
+                .unwrap();
+        }
+        session.require_saved_chunk_sources().unwrap();
+        session.set_initial_game_time(100).unwrap();
+        assert_eq!(
+            session.install_saved_tick_orders(&[home, target]).unwrap(),
+            (true, true)
+        );
+        session.update(Duration::from_millis(50));
+        session.queue_chunk_window(ChunkPos { x: 50, z: 0 }, 0);
+        session.update(Duration::from_millis(50));
+        assert!(!session.has_resident_or_parked_chunk(target));
+        let before_blocks = session.draft_block_ticks(target).unwrap();
+        let before_fluids = session.draft_fluid_ticks(target).unwrap();
+        assert_eq!(before_blocks.len(), 1);
+        assert_eq!(before_fluids.len(), 1);
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader_count = Arc::clone(&reads);
+        let mut streamer = ChunkStreamer::with_entity_source(1, BTreeSet::new(), move |pos, _| {
+            if pos != target {
+                return Ok(None);
+            }
+            reader_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChunkPayload {
+                world: Some(source.clone()),
+                entities: SavedEntityData::Empty,
+                poi: SavedPoiData::Missing,
+                heightmaps: None,
+            }))
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut elapsed_ticks = 0;
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            elapsed_ticks += 1;
+            if session.has_resident_or_parked_chunk(target) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "released chunk was not reloaded");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(reads.load(Ordering::SeqCst) >= 1);
+        let after_blocks = session.draft_block_ticks(target).unwrap();
+        let after_fluids = session.draft_fluid_ticks(target).unwrap();
+        assert_eq!(after_blocks.len(), 1);
+        assert_eq!(after_fluids.len(), 1);
+        assert_eq!(after_blocks[0].position, tick_position);
+        assert_eq!(after_fluids[0].position, tick_position);
+        assert_eq!(
+            after_blocks[0].delay,
+            before_blocks[0].delay - elapsed_ticks
+        );
+        assert_eq!(
+            after_fluids[0].delay,
+            before_fluids[0].delay - elapsed_ticks
+        );
+    }
+
     fn chunk_world(pos: ChunkPos) -> World {
         let mut world = World::new("minecraft:overworld");
         let air = world.intern_state(BlockState {

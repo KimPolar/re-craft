@@ -1703,6 +1703,7 @@ pub struct LoadedSession {
     poi_edits: BTreeMap<ChunkPos, Vec<RecordedPoiEdit>>,
     poi_edited_positions: BTreeSet<BlockPosition>,
     parked_chunks: BTreeMap<ChunkPos, Arc<native_world::loaded::Chunk>>,
+    released_tick_terrain: BTreeMap<ChunkPos, ReleasedTickTerrain>,
     entity_chunks: BTreeMap<ChunkPos, SavedEntityData>,
     poi_chunks: BTreeMap<ChunkPos, SavedPoiData>,
     item_chunks_seen: BTreeSet<ChunkPos>,
@@ -2491,6 +2492,16 @@ struct GeneratedTickOrder {
     queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
     parked: BTreeMap<ChunkPos, crate::worldgen::chunk_ticks::ChunkTicks>,
 }
+
+#[derive(Clone, Copy)]
+struct ReleasedTickTerrain {
+    source: [u8; 32],
+    terrain: [u8; 32],
+}
+
+// Fingerprinting whole chunks on the simulation thread must stay bounded when
+// a large view-distance change or teleport unloads many chunks at once.
+const RELEASED_TICK_TERRAIN_BUDGET: usize = 2;
 
 impl GeneratedTickOrder {
     fn is_empty_at(&self, pos: ChunkPos) -> bool {
@@ -6352,12 +6363,37 @@ impl LoadedSession {
             .world
             .chunks
             .get(&position)
-            .or_else(|| self.parked_chunks.get(&position))
-            .context("dirty chunk is no longer available")?;
-        ensure!(
-            chunk.position == position,
-            "dirty chunk position does not match its key"
-        );
+            .or_else(|| self.parked_chunks.get(&position));
+        if let Some(chunk) = chunk {
+            ensure!(
+                chunk.position == position,
+                "dirty chunk position does not match its key"
+            );
+        } else {
+            let released = self
+                .released_tick_terrain
+                .get(&position)
+                .context("dirty chunk is no longer available")?;
+            ensure!(
+                self.world.saved_chunk_source(position) == Some(released.source)
+                    && native_persistence::nbt::fingerprint(original)? == released.source,
+                "released terrain source changed since loading"
+            );
+            ensure!(
+                !self.dirty_chunks.contains(&position)
+                    && !self.chest_dirty_chunks.contains(&position)
+                    && !self.block_edits.contains_key(&position)
+                    && !self.poi_edits.contains_key(&position)
+                    && self.world.block_edits_in_chunk(position).next().is_none()
+                    && !self.original_light_chunks.contains_key(&position)
+                    && !self.world.live_block_entities.contains_key(&position)
+                    && matches!(
+                        self.world.saved_block_entities.get(&position),
+                        Some(native_world::loaded::SavedBlockEntities::Empty)
+                    ),
+                "released terrain acquired changes that require its live chunk"
+            );
+        }
         native_persistence::edit::draft_chunk_blocks(
             original,
             native_persistence::world::ChunkPos {
@@ -6947,7 +6983,9 @@ impl LoadedSession {
         }
         let previously_checked = self.checked_chunk_preparation.len();
         self.checked_chunk_preparation.retain(|pos, _| {
-            self.world.chunks.contains_key(pos) || self.parked_chunks.contains_key(pos)
+            self.world.chunks.contains_key(pos)
+                || self.parked_chunks.contains_key(pos)
+                || self.released_tick_terrain.contains_key(pos)
         });
         self.rejected_chunk_preparation.retain(|pos, _| {
             self.world.chunks.contains_key(pos) || self.parked_chunks.contains_key(pos)
@@ -7101,6 +7139,72 @@ impl LoadedSession {
             .into_iter()
             .flatten()
             .all(|order| order.is_empty_at(position))
+    }
+
+    /// Keep tick queues and source metadata, but release unchanged terrain
+    /// that can be reloaded and checked against both its disk and live state.
+    fn releasable_tick_terrain(
+        &self,
+        position: ChunkPos,
+        world_block_edits: &BTreeSet<ChunkPos>,
+    ) -> Option<ReleasedTickTerrain> {
+        use native_world::loaded::SavedBlockEntities;
+
+        if !self.require_saved_chunk_sources
+            || !(self.tick_dirty_chunks.contains(&position)
+                || self.tick_chunks_needing_dirty.contains(&position))
+            || self.dirty_chunks.contains(&position)
+            || self.chest_dirty_chunks.contains(&position)
+            || self.block_edits.contains_key(&position)
+            || self.poi_edits.contains_key(&position)
+            || world_block_edits.contains(&position)
+            || self.original_light_chunks.contains_key(&position)
+            || !self.pending_light.is_empty()
+            || !self.sky_lighting.settled()
+            || !self.fluid_chunks_seen.contains(&position)
+            || self.world.live_block_entities.contains_key(&position)
+            || !matches!(
+                self.world.saved_block_entities.get(&position),
+                Some(SavedBlockEntities::Empty)
+            )
+            || !matches!(
+                self.entity_chunks.get(&position),
+                Some(SavedEntityData::Empty)
+            )
+            || !matches!(self.poi_chunks.get(&position), Some(SavedPoiData::Missing))
+            || self.retain_entity_chunk(position)
+            || self.incoming.iter().any(|entry| entry.pos == position)
+            || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z))
+        {
+            return None;
+        }
+        let (chunk, resident) = if let Some(chunk) = self.world.chunks.get(&position) {
+            (chunk, true)
+        } else {
+            (self.parked_chunks.get(&position)?, false)
+        };
+        if chunk.status.as_deref() != Some("minecraft:full") {
+            return None;
+        }
+        for order in [&self.generated_block_order, &self.generated_fluid_order] {
+            let order = order.as_ref()?;
+            let has_ticks = if resident {
+                order.queue.container(position).is_some()
+            } else {
+                order.parked.contains_key(&position)
+            };
+            if !has_ticks {
+                return None;
+            }
+        }
+        let source = self.world.saved_chunk_source(position)?;
+        if self.checked_chunk_preparation.get(&position) != Some(&source) {
+            return None;
+        }
+        Some(ReleasedTickTerrain {
+            source,
+            terrain: self.world.fingerprint_chunk_data(&self.world, chunk)?,
+        })
     }
 
     /// Forget a clean unloaded chunk so a future disk read registers its own
@@ -9296,6 +9400,7 @@ impl LoadedSession {
             poi_edits: BTreeMap::new(),
             poi_edited_positions: BTreeSet::new(),
             parked_chunks: BTreeMap::new(),
+            released_tick_terrain: BTreeMap::new(),
             entity_chunks: BTreeMap::new(),
             poi_chunks: BTreeMap::new(),
             item_chunks_seen: BTreeSet::new(),
@@ -13872,6 +13977,7 @@ impl LoadedSession {
         let mut changed = false;
         let mut respawn_changed = false;
         let mut sky_inputs_changed = false;
+        let mut release_budget = RELEASED_TICK_TERRAIN_BUDGET;
         let required_shapes = self.required_shape_update_chunks();
         let required_sky = self.sky_lighting.required_chunks();
         let required_simulation = Arc::clone(&self.simulation_dependencies);
@@ -13922,6 +14028,24 @@ impl LoadedSession {
                 .iter()
                 .any(|pos| !within_window(*pos, window));
             if !outside.is_empty() || !restore.is_empty() || old_missing {
+                let world_block_edits = self.world.dirty_chunk_positions();
+                let releasable: BTreeMap<_, _> = outside
+                    .iter()
+                    .copied()
+                    .filter(|pos| {
+                        !required_shapes.contains(pos)
+                            && !required_sky.contains(pos)
+                            && !required_simulation.contains(pos)
+                            && !self
+                                .respawn_window
+                                .is_some_and(|extra| within_window(*pos, extra))
+                    })
+                    .filter_map(|pos| {
+                        self.releasable_tick_terrain(pos, &world_block_edits)
+                            .map(|proof| (pos, proof))
+                    })
+                    .take(release_budget)
+                    .collect();
                 let seen = &self.fluid_chunks_seen;
                 for order in [
                     &mut self.generated_fluid_order,
@@ -13959,7 +14083,18 @@ impl LoadedSession {
                         .chunks
                         .remove(&pos)
                         .expect("resident chunk was checked");
-                    if unsaved.contains(&pos)
+                    let parked_ticks = [&self.generated_block_order, &self.generated_fluid_order]
+                        .into_iter()
+                        .all(|order| {
+                            order
+                                .as_ref()
+                                .is_some_and(|order| order.parked.contains_key(&pos))
+                        });
+                    if let Some(proof) = releasable.get(&pos).filter(|_| parked_ticks) {
+                        self.released_tick_terrain.insert(pos, *proof);
+                        release_budget -= 1;
+                        respawn_changed = true;
+                    } else if unsaved.contains(&pos)
                         || required_sky.contains(&pos)
                         || required_simulation.contains(&pos)
                         || self
@@ -14038,6 +14173,35 @@ impl LoadedSession {
                     self.enqueue_streamed_ticks(pos, &ticks, &sand_ticks);
                     self.register_saved_sculk_chunk(pos);
                 }
+            }
+        }
+        if release_budget > 0 && !self.parked_chunks.is_empty() {
+            let world_block_edits = self.world.dirty_chunk_positions();
+            let releasable: Vec<_> = self
+                .parked_chunks
+                .keys()
+                .copied()
+                .filter(|pos| {
+                    !required_shapes.contains(pos)
+                        && !required_sky.contains(pos)
+                        && !required_simulation.contains(pos)
+                        && !self
+                            .respawn_window
+                            .is_some_and(|window| within_window(*pos, window))
+                        && !self
+                            .stream_window
+                            .is_some_and(|window| within_window(*pos, window))
+                })
+                .filter_map(|pos| {
+                    self.releasable_tick_terrain(pos, &world_block_edits)
+                        .map(|proof| (pos, proof))
+                })
+                .take(release_budget)
+                .collect();
+            for (pos, proof) in releasable {
+                self.parked_chunks.remove(&pos);
+                self.released_tick_terrain.insert(pos, proof);
+                respawn_changed = true;
             }
         }
         let unused: Vec<_> = self
@@ -14202,6 +14366,32 @@ impl LoadedSession {
                         }
                         continue;
                     }
+                    if let Some(released) = self.released_tick_terrain.get(&pos) {
+                        let matches = self.world.saved_chunk_source(pos) == Some(released.source)
+                            && source.saved_chunk_source(pos) == Some(released.source)
+                            && self.world.saved_chunk_activation(pos)
+                                == source.saved_chunk_activation(pos)
+                            && self.world.saved_block_ticks.get(&pos)
+                                == source.saved_block_ticks.get(&pos)
+                            && self.world.saved_fluid_ticks.get(&pos)
+                                == source.saved_fluid_ticks.get(&pos)
+                            && self.world.saved_block_entities.get(&pos)
+                                == source.saved_block_entities.get(&pos)
+                            && !source.live_block_entities.contains_key(&pos)
+                            && matches!(self.entity_chunks.get(&pos), Some(SavedEntityData::Empty))
+                            && matches!(&entities, Some(SavedEntityData::Empty))
+                            && matches!(self.poi_chunks.get(&pos), Some(SavedPoiData::Missing))
+                            && matches!(&poi, Some(SavedPoiData::Missing))
+                            && self.world.chunk_fingerprint(&source, pos) == Some(released.terrain);
+                        if !matches {
+                            self.stale_streamed_chunks.insert(pos);
+                            self.stream_errors.push(format!(
+                                "chunk {}, {}: released terrain or tick source changed",
+                                pos.x, pos.z
+                            ));
+                            continue;
+                        }
+                    }
                     let old_count = self.world.state_count();
                     let saved_ticks = source
                         .saved_fluid_ticks
@@ -14230,6 +14420,7 @@ impl LoadedSession {
                     });
                     match Arc::make_mut(&mut self.world).import_chunk(&source, pos) {
                         Ok(true) => {
+                            self.released_tick_terrain.remove(&pos);
                             if let Some(data) = poi
                                 && let Err(error) = self.attach_poi_chunk(pos, data)
                             {

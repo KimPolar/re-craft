@@ -351,6 +351,113 @@ impl World {
             .collect()
     }
 
+    /// Hash a chunk from another world after resolving its registry identities
+    /// into this world's stable registry. This compares complete terrain,
+    /// biome and light contents without retaining the original chunk arrays.
+    /// Unknown identities and mismatched dimensions cannot be compared.
+    pub fn chunk_fingerprint(&self, source: &World, pos: ChunkPos) -> Option<[u8; 32]> {
+        let chunk = source.chunks.get(&pos)?;
+        if chunk.position != pos {
+            return None;
+        }
+        self.fingerprint_chunk_data(source, chunk)
+    }
+
+    /// Compare an already detached chunk using the registry it came from.
+    pub fn fingerprint_chunk_data(&self, source: &World, chunk: &Chunk) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        if self.dimension != source.dimension {
+            return None;
+        }
+        let pos = chunk.position;
+        let mut hash = Sha256::new();
+        hash.update(b"native-world-chunk-v1");
+        hash.update(pos.x.to_le_bytes());
+        hash.update(pos.z.to_le_bytes());
+        hash.update([u8::from(chunk.block_light_correct)]);
+        match &chunk.status {
+            Some(status) => {
+                hash.update([1]);
+                hash.update((status.len() as u64).to_le_bytes());
+                hash.update(status.as_bytes());
+            }
+            None => hash.update([0]),
+        }
+        hash.update((chunk.sections.len() as u64).to_le_bytes());
+        let same_registry = std::ptr::eq(self, source);
+        let mut states = if same_registry {
+            Vec::new()
+        } else {
+            vec![None; source.states.entries.len()]
+        };
+        let mut biomes = if same_registry {
+            Vec::new()
+        } else {
+            vec![None; source.biomes.entries.len()]
+        };
+        let mut blocks = [0u8; BLOCK_COUNT * 4];
+        let mut biome_bytes = [0u8; BIOME_COUNT * 4];
+        for (&y, section) in &chunk.sections {
+            hash.update([y as u8]);
+            if let Some(values) = &section.blocks {
+                hash.update([1]);
+                for (index, id) in values.iter().enumerate() {
+                    let state = source.state(*id)?;
+                    let mapped = if same_registry {
+                        id.0
+                    } else {
+                        let slot = states.get_mut(id.0 as usize)?;
+                        match *slot {
+                            Some(mapped) => mapped,
+                            None => {
+                                let mapped = *self.states.lookup.get(state)?;
+                                *slot = Some(mapped);
+                                mapped
+                            }
+                        }
+                    };
+                    blocks[index * 4..index * 4 + 4].copy_from_slice(&mapped.to_le_bytes());
+                }
+                hash.update(&blocks);
+            } else {
+                hash.update([0]);
+            }
+            if let Some(values) = &section.biomes {
+                hash.update([1]);
+                for (index, id) in values.iter().enumerate() {
+                    let biome = source.biome_by_id(*id)?;
+                    let mapped = if same_registry {
+                        id.0
+                    } else {
+                        let slot = biomes.get_mut(id.0 as usize)?;
+                        match *slot {
+                            Some(mapped) => mapped,
+                            None => {
+                                let mapped = *self.biomes.lookup.get(biome)?;
+                                *slot = Some(mapped);
+                                mapped
+                            }
+                        }
+                    };
+                    biome_bytes[index * 4..index * 4 + 4].copy_from_slice(&mapped.to_le_bytes());
+                }
+                hash.update(&biome_bytes);
+            } else {
+                hash.update([0]);
+            }
+            for layer in [&section.block_light, &section.sky_light] {
+                if let Some(bytes) = layer {
+                    hash.update([1]);
+                    hash.update(bytes.as_slice());
+                } else {
+                    hash.update([0]);
+                }
+            }
+        }
+        Some(hash.finalize().into())
+    }
+
     pub fn biomes(&self) -> impl Iterator<Item = &str> {
         self.biomes.entries.iter().map(String::as_str)
     }
@@ -694,6 +801,80 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_fingerprint_compares_terrain_across_registry_orders() {
+        let pos = ChunkPos { x: -2, z: 4 };
+        let state = |name: &str| BlockState {
+            name: name.into(),
+            properties: BTreeMap::new(),
+        };
+        let mut original = World::new("minecraft:overworld");
+        let air = original.intern_state(state("minecraft:air"));
+        let stone = original.intern_state(state("minecraft:stone"));
+        let forest = original.intern_biome("minecraft:forest".into());
+        let desert = original.intern_biome("minecraft:desert".into());
+        let mut source = World::new("minecraft:overworld");
+        let source_stone = source.intern_state(state("minecraft:stone"));
+        let source_air = source.intern_state(state("minecraft:air"));
+        let source_desert = source.intern_biome("minecraft:desert".into());
+        let source_forest = source.intern_biome("minecraft:forest".into());
+        let section = |a, b, f, d| {
+            let mut blocks = Box::new([a; BLOCK_COUNT]);
+            blocks[42] = b;
+            let mut biomes = Box::new([f; BIOME_COUNT]);
+            biomes[7] = d;
+            Arc::new(Section {
+                blocks: Some(blocks),
+                biomes: Some(biomes),
+                block_light: Some(Box::new([1; LIGHT_BYTES])),
+                sky_light: None,
+            })
+        };
+        let chunk = |section| {
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:full".into()),
+                block_light_correct: true,
+                sections: BTreeMap::from([(-1, section)]),
+            })
+        };
+        original
+            .chunks
+            .insert(pos, chunk(section(air, stone, forest, desert)));
+        source.chunks.insert(
+            pos,
+            chunk(section(
+                source_air,
+                source_stone,
+                source_forest,
+                source_desert,
+            )),
+        );
+        let expected = original.chunk_fingerprint(&original, pos).unwrap();
+        assert_eq!(original.chunk_fingerprint(&source, pos), Some(expected));
+        for kind in ["block", "biome", "light", "status", "light_flag", "missing"] {
+            let mut changed = source.clone();
+            let chunk = Arc::make_mut(changed.chunks.get_mut(&pos).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&-1).unwrap());
+            match kind {
+                "block" => section.blocks.as_mut().unwrap()[42] = source_air,
+                "biome" => section.biomes.as_mut().unwrap()[7] = source_forest,
+                "light" => section.block_light.as_mut().unwrap()[0] = 2,
+                "status" => chunk.status = None,
+                "light_flag" => chunk.block_light_correct = false,
+                "missing" => section.blocks = None,
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                original.chunk_fingerprint(&changed, pos),
+                Some(expected),
+                "{kind}"
+            );
+        }
+        source.dimension = "minecraft:the_nether".into();
+        assert!(original.chunk_fingerprint(&source, pos).is_none());
+    }
 
     #[test]
     fn block_biomes_use_the_saved_seed_while_noise_biomes_remain_direct() {

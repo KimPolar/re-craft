@@ -643,6 +643,45 @@ fn saved_ticking_batch_rejects_level_time_changes_before_dispatch() -> Result<()
     Ok(())
 }
 
+#[test]
+fn cancelled_background_ticking_leaves_original_callback_and_source_reusable() -> Result<()> {
+    let (area, ids, registration) = ticking_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let original_bytes = native_persistence::nbt::write(&area.chunks[&area.center].document)?;
+    for stop_after in 0..5 {
+        let original = ready_future(center, &registration)?;
+        let mut worker = original.fork_queued_callback()?;
+        let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+        let calls = std::cell::Cell::new(0);
+        let error = batch
+            .dispatch_checked(&mut worker, 500, || {
+                let call = calls.get();
+                calls.set(call + 1);
+                ensure!(call < stop_after, "postprocessing cancelled");
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(original.state(), TickingFutureState::Waiting);
+        assert!(original.has_queued_callback());
+        assert!(batch.finish().is_err());
+        assert_eq!(
+            native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+            original_bytes
+        );
+
+        let mut retry = original.fork_queued_callback()?;
+        let mut retry_batch = begin_ticking_batch(&area, &ids, &registration)?;
+        assert!(retry_batch.dispatch(&mut retry, 500)?);
+        assert_eq!(retry.state(), TickingFutureState::Available);
+        let completed = retry_batch.finish()?;
+        assert_eq!(completed.region.chunks, BTreeSet::from([center]));
+        assert!(completed.block_ticks.container(center).is_some());
+        assert!(completed.fluid_ticks.container(center).is_some());
+    }
+    Ok(())
+}
+
 fn dispatch_fixture(
     future: &mut TickingPreparation,
     area: &ChunkArea,

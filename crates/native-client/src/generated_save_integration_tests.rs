@@ -111,6 +111,209 @@ fn existing_generated_world_uses_captured_data_packs() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires a generated 26.3 world with FULL ticking neighbors"]
+fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() -> Result<()> {
+    use crate::saved_ticking_worker::{SavedTickingRequest, SavedTickingWorker};
+    use native_session::{
+        loaded::BuildBounds,
+        ticking_preparation::{
+            FullFuture, FullFutureId, FullFutureResult, TickingFutureState, TickingPreparation,
+            ticking_dependencies,
+        },
+        worldgen::GeneratedLavaRules,
+    };
+    use std::sync::Arc;
+
+    let root = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+    )?;
+    let path = std::fs::canonicalize(
+        std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD").context("test world not set")?,
+    )?;
+    ensure!(
+        path != root && path.starts_with(&root),
+        "test world is outside the private directory"
+    );
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let dimension = DimensionId::parse("overworld")?;
+    let mut reader = WorldReader::open_for_session(&path, dimension.clone())?;
+    ensure!(reader.saved_world_seed()? == Some(-1), "wrong test seed");
+    let lock = reader.session_guard().context("test world lock missing")?;
+    let center = ChunkPos { x: 20, z: 20 };
+    let options = crate::ViewOptions {
+        dimension: None,
+        chunk: Some((center.x, center.z)),
+        radius: 1,
+        smoke_test: false,
+        block_report: None,
+        play: true,
+        video: crate::menu_settings::VideoSettings::default(),
+    };
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock))?
+    else {
+        anyhow::bail!("generated world did not open for play")
+    };
+    let crate::PreparedPlayWorld {
+        mut session,
+        mut resources,
+        streamer,
+        ..
+    } = *prepared;
+    drop(streamer);
+    let packs = resources
+        .data_pack_snapshot()
+        .context("session packs missing")?;
+    let selection = resources
+        .data_pack_snapshot_selection()
+        .context("pack selection missing")?
+        .clone();
+    let defaults = resources
+        .vanilla_generated_block_registry()?
+        .default_states();
+    let rules = reader.fluid_game_rules()?;
+    let make_request = |reader: &mut WorldReader| -> Result<SavedTickingRequest> {
+        let area = reader.read_area(
+            native_persistence::world::ChunkPos {
+                x: center.x,
+                z: center.z,
+            },
+            1,
+        )?;
+        ensure!(
+            area.chunks.len() == 9 && area.chunks.values().all(|chunk| chunk.is_full()),
+            "FULL neighbors missing"
+        );
+        let saved_terrain = Arc::new(area.materialize_with_defaults(&dimension, &defaults)?);
+        Ok(SavedTickingRequest {
+            minecraft_dir: game.clone(),
+            dimension: dimension.clone(),
+            bounds: BuildBounds {
+                min_y: -64,
+                max_y: 320,
+            },
+            area,
+            saved_terrain,
+            packs: Arc::clone(&packs),
+            selection: selection.clone(),
+            water_source_conversion: rules.water_source_conversion,
+            lava_rules: GeneratedLavaRules {
+                fast_lava: false,
+                source_conversion: rules.lava_source_conversion,
+            },
+        })
+    };
+    let dependencies = ticking_dependencies(center);
+    let mut original = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(dependencies.iter().position(|&entry| entry == position)? as u64),
+            result: Some(FullFutureResult::Full),
+        })
+    })?;
+    let before = session.snapshot();
+    let before_world = Arc::clone(before.world.loaded().context("live world missing")?);
+    let before_chunk = reader
+        .read_chunk(center.x, center.z)?
+        .context("saved center missing")?;
+    let before_nbt = native_persistence::nbt::fingerprint(&before_chunk.document)?;
+    let before_sub_tick = session.capture_saved_tick_queues()?.next_sub_tick();
+
+    let mut cancelled = SavedTickingWorker::start(&original, &session, make_request(&mut reader)?)?;
+    cancelled.cancel();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match cancelled.try_result() {
+            Err(error) => {
+                ensure!(
+                    error.to_string().contains("cancelled"),
+                    "unexpected cancellation: {error:#}"
+                );
+                break;
+            }
+            Ok(None) => {}
+            Ok(Some(_)) => anyhow::bail!("cancelled work returned a result"),
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "cancelled saved ticking worker timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    assert!(original.has_queued_callback());
+
+    let mut worker = SavedTickingWorker::start(&original, &session, make_request(&mut reader)?)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let completed = loop {
+        if let Some(result) = worker.try_result()? {
+            break result;
+        }
+        ensure!(Instant::now() < deadline, "saved ticking worker timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(completed.result().region.chunks, BTreeSet::from([center]));
+    let edits = completed.result().region.edits.len();
+    let checks = completed.result().region.light_checks.len();
+    let after_sub_tick = completed.result().region.ticks().next_sub_tick();
+    eprintln!(
+        "saved ticking worker prepared {center:?}: {edits} edits, {checks} light checks, sub-tick {before_sub_tick} -> {after_sub_tick}"
+    );
+    assert!(Arc::ptr_eq(
+        session.snapshot().world.loaded().unwrap(),
+        &before_world
+    ));
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    let outcome = completed.apply_no_effect(&mut session, &mut original);
+    match outcome {
+        Ok(()) => {
+            eprintln!("applied no-effect saved ticking callback to the live session");
+            assert_eq!(edits, 0);
+            assert_eq!(checks, 0);
+            assert_eq!(original.state(), TickingFutureState::Available);
+        }
+        Err(failure) => {
+            let message = format!("{:#}", failure.error);
+            eprintln!("saved ticking callback needs further reconciliation: {message}");
+            ensure!(
+                message.contains("postprocessing has effects")
+                    || message.contains("postprocessing tick queues need live reconciliation")
+                    || message.contains("saved postprocessing has block entities"),
+                "unexpected live reconciliation failure: {message}"
+            );
+            assert_eq!(original.state(), TickingFutureState::Waiting);
+            assert!(original.has_queued_callback());
+            assert!(Arc::ptr_eq(
+                session.snapshot().world.loaded().unwrap(),
+                &before_world
+            ));
+            let retry = match failure
+                .prepared
+                .apply_no_effect(&mut session, &mut original)
+            {
+                Ok(()) => anyhow::bail!("unchanged callback unexpectedly succeeded on retry"),
+                Err(retry) => retry,
+            };
+            assert_eq!(format!("{:#}", retry.error), message);
+            assert_eq!(original.state(), TickingFutureState::Waiting);
+            assert!(original.has_queued_callback());
+            crate::generation_staging::discard_async(retry.prepared);
+        }
+    }
+    assert_eq!(
+        native_persistence::nbt::fingerprint(
+            &reader
+                .read_chunk(center.x, center.z)?
+                .context("saved center missing")?
+                .document
+        )?,
+        before_nbt
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a private generated 26.3 test world"]
 fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<()> {
     use crate::chunk_stream::{
@@ -753,12 +956,9 @@ fn verify_generated_portal_play_save_inner(
     }
     if check_saved_ticking {
         let result = verify_saved_ticking(&path, &game, lock);
-        if result.is_err() {
+        if result.is_err() || std::env::var_os("RECRAFT_KEEP_GENERATED_WORLD").is_some() {
             let kept = parent.keep();
-            eprintln!(
-                "kept private test world after failed ticking preparation: {}",
-                kept.display()
-            );
+            eprintln!("kept private ticking test world: {}", kept.display());
         }
         return result;
     }

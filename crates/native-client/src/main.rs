@@ -74,6 +74,7 @@ mod recipe_book_ui;
 mod renderer;
 mod screen_blur;
 mod screenshot;
+mod saved_ticking_worker;
 mod sky_background;
 mod sky_weather;
 mod smoke_particles;

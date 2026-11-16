@@ -390,16 +390,33 @@ impl SavedTickingBatch {
     /// Pending saved ticks are unpacked after its postprocessing and become
     /// visible to later callbacks in this same captured level state.
     pub fn dispatch(&mut self, future: &mut TickingPreparation, game_time: i64) -> Result<bool> {
+        self.dispatch_checked(future, game_time, || Ok(()))
+    }
+
+    /// Allow a background caller to cancel between bounded postprocessing
+    /// steps. A failed private batch must be discarded; its original holder
+    /// callback remains the caller's responsibility.
+    pub fn dispatch_checked(
+        &mut self,
+        future: &mut TickingPreparation,
+        game_time: i64,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<bool> {
         ensure!(!self.failed, "saved ticking batch has failed");
         if game_time != self.game_time {
             self.failed = true;
             bail!("level time changed during saved ticking preparation");
+        }
+        if let Err(error) = check() {
+            self.failed = true;
+            return Err(error);
         }
         let available = &self.available;
         let stage = RefCell::new(&mut self.stage);
         let started = std::cell::Cell::new(self.started);
         let result = future.dispatch(
             |center| {
+                check()?;
                 ensure!(
                     ticking_dependencies(center)
                         .iter()
@@ -416,11 +433,17 @@ impl SavedTickingBatch {
                     stage.select_initial_targets(BTreeSet::from([center]))?;
                     started.set(true);
                 }
-                while !stage.poll(center, 256)? {}
+                while !stage.poll(center, 256)? {
+                    check()?;
+                }
+                check()?;
                 Ok(())
             },
-            |center| stage.borrow_mut().unpack_saved_ticks(center),
-            |_| Ok(()),
+            |center| {
+                check()?;
+                stage.borrow_mut().unpack_saved_ticks(center)
+            },
+            |_| check(),
         );
         self.started = started.get();
         if result.is_err() {

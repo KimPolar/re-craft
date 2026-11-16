@@ -8923,7 +8923,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || generated_ore_state(&old)?)
                         && ruined_portal::portal_full(state)
                         && native_world::sky_light::same_sky_behavior(&old, state) == Some(true)
-                        && native_world::block_light::same_light_behavior(&old, state) == Some(false);
+                        && native_world::block_light::same_light_behavior(&old, state)
+                            == Some(false);
                     if guard.require_unchanged_light {
                         ensure!(
                             tree_light_update
@@ -15038,14 +15039,16 @@ mod tests {
                         wall_tags: &wall_tags,
                         temporary_jigsaws: BTreeSet::new(),
                     };
-                    assert!(super::super::jigsaw::StructurePlacementWorld::place_structure_block(
-                        &mut portal,
-                        p,
-                        &state("obsidian"),
-                        None,
-                        &mut DecorationRandom::new(0),
-                    )
-                    .unwrap());
+                    assert!(
+                        super::super::jigsaw::StructurePlacementWorld::place_structure_block(
+                            &mut portal,
+                            p,
+                            &state("obsidian"),
+                            None,
+                            &mut DecorationRandom::new(0),
+                        )
+                        .unwrap()
+                    );
                     continue;
                 }
                 if mode.contains("_portal_") {

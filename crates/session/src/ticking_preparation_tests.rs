@@ -153,6 +153,150 @@ fn overlap_trace(shared_x: i32, shared_z: i32, reverse: bool) -> Result<String> 
     ))
 }
 
+fn shared_future_trace(name: &str) -> Result<String> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let positions = ticking_dependencies(center);
+    let events = RefCell::new(Vec::new());
+    let mut preparation = TickingPreparation::start(center, |position| {
+        let index = positions.iter().position(|&pos| pos == position).unwrap();
+        events
+            .borrow_mut()
+            .push(format!("request:{},{}", position.x, position.z));
+        Some(FullFuture {
+            id: FullFutureId(if index == 7 { 1 } else { index } as u64),
+            result: (name == "ready-unavailable" && (index == 1 || index == 7))
+                .then_some(FullFutureResult::Unavailable),
+        })
+    })?;
+    let snapshot = |preparation: &TickingPreparation| {
+        let state = match preparation.state() {
+            TickingFutureState::Waiting => "waiting",
+            TickingFutureState::Available => "success",
+            TickingFutureState::Unavailable => "error",
+            TickingFutureState::Exceptional => "exception",
+        };
+        format!(
+            "{state}/{}/{}",
+            usize::from(preparation.has_queued_callback()),
+            events.borrow().join(",")
+        )
+    };
+    let initial = snapshot(&preparation);
+    events.borrow_mut().clear();
+    for index in 0..8 {
+        if index != 1 && index != 7 {
+            preparation.complete(FullFutureId(index), FullFutureResult::Full)?;
+        }
+    }
+    if name != "ready-unavailable" {
+        let result = match name {
+            "pending-success" => FullFutureResult::Full,
+            "pending-unavailable" => FullFutureResult::Unavailable,
+            "pending-exception" => FullFutureResult::Exceptional,
+            _ => unreachable!(),
+        };
+        preparation.complete(FullFutureId(1), result)?;
+    }
+    let before_last = snapshot(&preparation);
+    preparation.complete(FullFutureId(8), FullFutureResult::Full)?;
+    let queued = snapshot(&preparation);
+    preparation.dispatch(
+        |_| {
+            events.borrow_mut().push("post".into());
+            Ok(())
+        },
+        |_| {
+            events.borrow_mut().push("unpack".into());
+            Ok(())
+        },
+        |_| Ok(()),
+    )?;
+    Ok(format!(
+        "shared:{name}|{initial}|{before_last}|{queued}|{}",
+        snapshot(&preparation)
+    ))
+}
+
+fn shared_overlap_trace(name: &str, reverse: bool) -> Result<String> {
+    let token = |position: ChunkPos| {
+        if position.z == -1 && matches!(position.x, -1 | 0 | 2) {
+            FullFutureId(99)
+        } else {
+            FullFutureId(((position.z + 1) * 4 + position.x + 1) as u64)
+        }
+    };
+    let mut preparations = TickingPreparations::default();
+    let mut order = [
+        (TickingRequestId(1), ChunkPos { x: 0, z: 0 }),
+        (TickingRequestId(2), ChunkPos { x: 1, z: 0 }),
+    ];
+    if reverse {
+        order.reverse();
+    }
+    for (id, center) in order {
+        preparations.start(id, center, |position| {
+            Some(FullFuture {
+                id: token(position),
+                result: None,
+            })
+        })?;
+    }
+    for z in -1..=1 {
+        for x in -1..=2 {
+            let id = token(ChunkPos { x, z });
+            if id != FullFutureId(99) {
+                preparations.complete(id, FullFutureResult::Full)?;
+            }
+        }
+    }
+    let before = preparations.queued_len();
+    let result = match name {
+        "success" => FullFutureResult::Full,
+        "unavailable" => FullFutureResult::Unavailable,
+        "exception" => FullFutureResult::Exceptional,
+        _ => unreachable!(),
+    };
+    preparations.complete(FullFutureId(99), result)?;
+    let queued = preparations.queued_len();
+    let events = RefCell::new(Vec::new());
+    while preparations.queued_len() != 0 {
+        preparations.dispatch_next(|request| {
+            request.dispatch(
+                |position| {
+                    events
+                        .borrow_mut()
+                        .push(format!("post:{},{}", position.x, position.z));
+                    Ok(())
+                },
+                |position| {
+                    events
+                        .borrow_mut()
+                        .push(format!("unpack:{},{}", position.x, position.z));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+        })?;
+    }
+    let state = |id| match preparations.state(TickingRequestId(id)).unwrap() {
+        TickingFutureState::Available => "S",
+        TickingFutureState::Unavailable => "U",
+        TickingFutureState::Exceptional => "E",
+        TickingFutureState::Waiting => "W",
+    };
+    let output = format!(
+        "shared-overlap:{name}:{reverse}|{before}|{queued}|{}|{},{}",
+        events.borrow().join(","),
+        state(1),
+        state(2)
+    );
+    for id in [TickingRequestId(1), TickingRequestId(2)] {
+        assert!(preparations.retire(id)?);
+    }
+    assert!(preparations.forget_full_future(FullFutureId(99))?);
+    Ok(output)
+}
+
 fn shuffle(values: &mut [usize], seed: usize) {
     let mut state = seed as u64 + 1;
     for end in (1..values.len()).rev() {
@@ -332,13 +476,6 @@ fn ticking_request_checks_identity_and_wraps_chunk_coordinates() -> Result<()> {
             z: i32::MIN + 1
         }
     );
-    assert!(
-        TickingPreparation::start(center, |_| Some(FullFuture {
-            id: FullFutureId(1),
-            result: None,
-        }))
-        .is_err()
-    );
     let mut preparation = TickingPreparation::start(center, |position| {
         Some(FullFuture {
             id: FullFutureId(
@@ -370,6 +507,62 @@ fn ticking_request_checks_identity_and_wraps_chunk_coordinates() -> Result<()> {
     )?);
     assert_eq!(preparation.state(), TickingFutureState::Unavailable);
     assert!(!preparation.cancel());
+    Ok(())
+}
+
+#[test]
+fn shared_full_future_updates_all_dependencies_and_rejects_conflicts() -> Result<()> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let positions = ticking_dependencies(center);
+    let mut shared = TickingPreparation::start(center, |_| {
+        Some(FullFuture {
+            id: FullFutureId(77),
+            result: None,
+        })
+    })?;
+    assert_eq!(shared.dependencies().count(), 9);
+    assert!(shared.complete(FullFutureId(77), FullFutureResult::Full)?);
+    assert!(
+        shared
+            .dependencies()
+            .all(|(_, future)| future.result == Some(FullFutureResult::Full))
+    );
+    assert!(shared.has_queued_callback());
+    shared.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(()))?;
+    assert_eq!(shared.state(), TickingFutureState::Available);
+
+    let mixed = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(11),
+            result: (position == positions[4]).then_some(FullFutureResult::Unavailable),
+        })
+    })?;
+    assert!(
+        mixed
+            .dependencies()
+            .all(|(_, future)| future.result == Some(FullFutureResult::Unavailable))
+    );
+    assert!(mixed.has_queued_callback());
+    assert!(
+        TickingPreparation::start(center, |position| Some(FullFuture {
+            id: FullFutureId(11),
+            result: Some(if position == positions[4] {
+                FullFutureResult::Full
+            } else {
+                FullFutureResult::Unavailable
+            }),
+        }))
+        .is_err()
+    );
+    assert!(
+        shared_future_trace("pending-success")?
+            .ends_with("|waiting/0/|waiting/1/|success/0/post,unpack")
+    );
+    assert!(shared_future_trace("ready-unavailable")?.ends_with("|waiting/0/|waiting/1/|error/0/"));
+    assert!(
+        shared_overlap_trace("success", false)?
+            .ends_with("|0|2|post:1,0,unpack:1,0,post:0,0,unpack:0,0|S,S")
+    );
     Ok(())
 }
 
@@ -478,6 +671,19 @@ fn ticking_preparation_matches_java_chunk_map() -> Result<()> {
     }
     for number in 0..24 {
         actual.push(batch_trace(number)?);
+    }
+    for name in [
+        "ready-unavailable",
+        "pending-success",
+        "pending-unavailable",
+        "pending-exception",
+    ] {
+        actual.push(shared_future_trace(name)?);
+    }
+    for name in ["success", "unavailable", "exception"] {
+        for reverse in [false, true] {
+            actual.push(shared_overlap_trace(name, reverse)?);
+        }
     }
     assert_eq!(actual, java);
     Ok(())

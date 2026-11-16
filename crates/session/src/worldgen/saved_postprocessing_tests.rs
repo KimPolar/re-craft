@@ -763,6 +763,42 @@ fn saved_ticking_dispatch_rejects_missing_inputs_and_skips_cancelled_work() -> R
 }
 
 #[test]
+fn saved_ticking_shared_unavailable_future_leaves_the_saved_region_untouched() -> Result<()> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+
+    let (area, ids, registration) = ticking_fixture()?;
+    let originals = area
+        .chunks
+        .iter()
+        .map(|(&pos, chunk)| Ok((pos, native_persistence::nbt::write(&chunk.document)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut future = TickingPreparation::start(center, |position| {
+        let index = registration
+            .iter()
+            .position(|&pos| pos == position)
+            .unwrap();
+        Some(FullFuture {
+            id: FullFutureId(if index == 7 { 1 } else { index } as u64),
+            result: (index != 1 && index != 7).then_some(FullFutureResult::Full),
+        })
+    })?;
+    let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+    assert!(!batch.dispatch(&mut future, 500)?);
+    assert!(future.complete(FullFutureId(1), FullFutureResult::Unavailable)?);
+    assert!(batch.dispatch(&mut future, 500)?);
+    assert_eq!(future.state(), TickingFutureState::Unavailable);
+    assert!(batch.finish().is_err());
+    for (pos, original) in originals {
+        assert_eq!(
+            native_persistence::nbt::write(&area.chunks[&pos].document)?,
+            original
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn saved_ticking_dispatch_runs_from_the_shared_future_queue() -> Result<()> {
     use crate::ticking_preparation::{
         FullFuture, FullFutureId, FullFutureResult, TickingPreparations, TickingRequestId,

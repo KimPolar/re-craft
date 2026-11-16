@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, VecDeque};
 use anyhow::{Result, ensure};
 use native_world::loaded::ChunkPos;
 
-/// Identity of a specific FULL generation future, including its holder epoch.
+/// Identity of a specific FULL generation future. Holder futures include their
+/// epoch; Java can return the same unavailable future for different holders.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FullFutureId(pub u64);
 
@@ -81,17 +82,26 @@ impl TickingPreparation {
             state: TickingFutureState::Waiting,
         };
         for position in ticking_dependencies(center) {
-            let Some(future) = request(position) else {
+            let Some(mut future) = request(position) else {
                 preparation.queued = Some(Queued::Unavailable);
                 return Ok(preparation);
             };
-            ensure!(
-                preparation
-                    .dependencies
-                    .iter()
-                    .all(|entry| entry.future.id != future.id),
-                "FULL future identity is duplicated within a ticking request"
-            );
+            for entry in preparation
+                .dependencies
+                .iter_mut()
+                .filter(|entry| entry.future.id == future.id)
+            {
+                let observed = match (entry.future.result, future.result) {
+                    (Some(a), Some(b)) => {
+                        ensure!(a == b, "shared FULL future observations disagree");
+                        Some(a)
+                    }
+                    (Some(result), None) | (None, Some(result)) => Some(result),
+                    (None, None) => None,
+                };
+                entry.future.result = observed;
+                future.result = observed;
+            }
             preparation
                 .dependencies
                 .push(Dependency { position, future });
@@ -126,17 +136,23 @@ impl TickingPreparation {
         if self.state != TickingFutureState::Waiting || self.queued.is_some() {
             return Ok(false);
         }
-        let entry = self
+        let mut found = false;
+        let mut completed = false;
+        for entry in self
             .dependencies
             .iter_mut()
-            .find(|entry| entry.future.id == id);
-        let Some(entry) = entry else {
-            anyhow::bail!("FULL future is not part of this ticking request")
-        };
-        if entry.future.result.is_some() {
+            .filter(|entry| entry.future.id == id)
+        {
+            found = true;
+            if entry.future.result.is_none() {
+                entry.future.result = Some(result);
+                completed = true;
+            }
+        }
+        ensure!(found, "FULL future is not part of this ticking request");
+        if !completed {
             return Ok(false);
         }
-        entry.future.result = Some(result);
         self.check_completions();
         Ok(true)
     }
@@ -255,8 +271,14 @@ impl TickingPreparations {
         if preparation.has_queued_callback() {
             self.queued.push_back(id);
         } else if preparation.state() == TickingFutureState::Waiting {
+            // A request has at most nine dependencies, so deduplicate without
+            // allocating for every chunk entering the ticking range.
+            let mut subscribed = [FullFutureId(0); 9];
+            let mut count = 0;
             for (_, future) in preparation.dependencies() {
-                if future.result.is_none() {
+                if future.result.is_none() && !subscribed[..count].contains(&future.id) {
+                    subscribed[count] = future.id;
+                    count += 1;
                     self.subscribers.entry(future.id).or_default().push(id);
                 }
             }

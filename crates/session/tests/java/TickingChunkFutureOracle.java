@@ -166,6 +166,83 @@ public class TickingChunkFutureOracle {
                 + "|" + first.join().isSuccess() + "," + second.join().isSuccess());
     }
 
+    static void runSharedFuture(String name) throws Exception {
+        events.clear();
+        var fixture = new Fixture(-1);
+        CompletableFuture<ChunkResult<ChunkAccess>> shared;
+        if (name.equals("ready-unavailable")) {
+            var field = Class.forName("net.minecraft.server.level.GenerationChunkHolder")
+                    .getDeclaredField("UNLOADED_CHUNK_FUTURE");
+            field.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            var unloaded = (CompletableFuture<ChunkResult<ChunkAccess>>) field.get(null);
+            shared = unloaded;
+            if (!shared.isDone() || shared.join().isSuccess())
+                throw new AssertionError("expected Java's shared unavailable FULL future");
+        } else {
+            shared = new CompletableFuture<>();
+        }
+        fixture.holders[1].full = shared;
+        fixture.holders[7].full = shared;
+        var future = fixture.start();
+        var initial = fixture.snapshot(future);
+        events.clear();
+        for (int index = 0; index < 8; index++) {
+            if (index != 1 && index != 7) fixture.complete(index, true);
+        }
+        if (name.equals("pending-success")) shared.complete(ChunkResult.of(fixture.chunk));
+        if (name.equals("pending-unavailable")) shared.complete(ChunkResult.error("shared unavailable"));
+        if (name.equals("pending-exception")) shared.completeExceptionally(new IllegalStateException("shared failure"));
+        var beforeLast = fixture.snapshot(future);
+        fixture.complete(8, true);
+        var queued = fixture.snapshot(future);
+        fixture.executor.drain();
+        System.out.println("shared:" + name + "|" + initial + "|" + beforeLast + "|" + queued + "|" + fixture.snapshot(future));
+    }
+
+    static void runSharedOverlap(String name, boolean reverse) throws Exception {
+        events.clear();
+        var map = (Map) unsafe.allocateInstance(Map.class);
+        map.holders = new HashMap<>();
+        var executor = new Executor();
+        set(ChunkMap.class, map, "mainThreadExecutor", executor);
+        set(ChunkMap.class, map, "level", unsafe.allocateInstance(Level.class));
+        var shared = new CompletableFuture<ChunkResult<ChunkAccess>>();
+        var chunks = new LinkedHashMap<Holder, Chunk>();
+        for (int z = -1; z <= 1; z++) for (int x = -1; x <= 2; x++) {
+            var holder = (Holder) unsafe.allocateInstance(Holder.class);
+            holder.position = new ChunkPos(x, z);
+            holder.full = z == -1 && (x == -1 || x == 0 || x == 2) ? shared : new CompletableFuture<>();
+            holder.send = new CompletableFuture<>();
+            var chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
+            chunk.label = x + "," + z;
+            map.holders.put(holder.position.pack(), holder);
+            chunks.put(holder, chunk);
+        }
+        CompletableFuture<ChunkResult<LevelChunk>> first, second;
+        if (reverse) {
+            second = map.prepareTickingChunk(map.holders.get(ChunkPos.pack(1, 0)));
+            first = map.prepareTickingChunk(map.holders.get(ChunkPos.pack(0, 0)));
+        } else {
+            first = map.prepareTickingChunk(map.holders.get(ChunkPos.pack(0, 0)));
+            second = map.prepareTickingChunk(map.holders.get(ChunkPos.pack(1, 0)));
+        }
+        events.clear();
+        for (var entry : chunks.entrySet()) {
+            if (entry.getKey().full != shared) entry.getKey().full.complete(ChunkResult.of(entry.getValue()));
+        }
+        int before = executor.queued.size();
+        if (name.equals("success")) shared.complete(ChunkResult.of(chunks.values().iterator().next()));
+        if (name.equals("unavailable")) shared.complete(ChunkResult.error("shared unavailable"));
+        if (name.equals("exception")) shared.completeExceptionally(new IllegalStateException("shared failure"));
+        int queued = executor.queued.size();
+        executor.drain();
+        var firstState = first.isCompletedExceptionally() ? "E" : first.join().isSuccess() ? "S" : "U";
+        var secondState = second.isCompletedExceptionally() ? "E" : second.join().isSuccess() ? "S" : "U";
+        System.out.println("shared-overlap:" + name + ":" + reverse + "|" + before + "|" + queued + "|"
+                + String.join(",", events) + "|" + firstState + "," + secondState);
+    }
+
     static void shuffle(List<Integer> values, int seed) {
         long state = seed + 1L;
         for (int i = values.size() - 1; i > 0; i--) {
@@ -246,6 +323,11 @@ public class TickingChunkFutureOracle {
                 runOverlap(x, z, true);
             }
             for (int number = 0; number < 24; number++) runBatch(number);
+            for (var name : List.of("ready-unavailable", "pending-success", "pending-unavailable", "pending-exception")) runSharedFuture(name);
+            for (var name : List.of("success", "unavailable", "exception")) {
+                runSharedOverlap(name, false);
+                runSharedOverlap(name, true);
+            }
             out.println("END_RESULT");
         } catch (Throwable error) {
             error.printStackTrace(errors);

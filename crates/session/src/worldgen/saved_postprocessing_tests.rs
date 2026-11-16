@@ -680,6 +680,137 @@ fn dispatch_fixture(
     )
 }
 
+fn completed_ticking_fixture() -> Result<(ChunkArea, SavedTickingResult)> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+    let (area, ids, registration) = ticking_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut future = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(registration.iter().position(|&pos| pos == position)? as u64),
+            result: Some(FullFutureResult::Full),
+        })
+    })?;
+    let result = dispatch_fixture(&mut future, &area, &ids, &registration, 500)?
+        .context("saved ticking callback did not complete")?;
+    Ok((area, result))
+}
+
+#[test]
+fn completed_saved_marks_draft_checks_sources_and_keeps_other_chunks_untouched() -> Result<()> {
+    let (area, mut result) = completed_ticking_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let neighbor = ChunkPos { x: -1, z: -1 };
+    let original = native_persistence::nbt::write(&area.chunks[&area.center].document)?;
+    let drafts = result.draft_completed_postprocessing_marks(&area, [center])?;
+    let draft = &drafts[&center];
+    let empty = PostProcessing::new(0, 16).unwrap();
+    assert_eq!(
+        draft.document().value.get("PostProcessing"),
+        Some(&native_persistence::postprocessing::encode(&empty))
+    );
+    for name in ["sections", "Heightmaps", "block_ticks", "fluid_ticks"] {
+        assert_eq!(
+            draft.document().value.get(name),
+            area.chunks[&area.center].document.value.get(name)
+        );
+    }
+    assert!(draft.matches_source(&area.chunks[&area.center].document)?);
+    assert_eq!(
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+        original
+    );
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&area, [neighbor])
+            .is_err()
+    );
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&area, [center, center])
+            .is_err()
+    );
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&area, [])
+            .is_err()
+    );
+
+    let mut changed = ChunkArea {
+        center: area.center,
+        radius: area.radius,
+        chunks: area.chunks.clone(),
+        missing: area.missing.clone(),
+    };
+    let position = SavedChunkPos {
+        x: neighbor.x,
+        z: neighbor.z,
+    };
+    let chunk = Arc::make_mut(changed.chunks.get_mut(&position).unwrap());
+    let Tag::Compound(fields) = &mut Arc::make_mut(&mut chunk.document).value else {
+        unreachable!()
+    };
+    fields.push(("unrelated_but_changed".into(), Tag::Int(1)));
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&changed, [center])
+            .is_err()
+    );
+    changed.chunks.remove(&position);
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&changed, [center])
+            .is_err()
+    );
+
+    result.region.chunks.insert(neighbor);
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&area, [center])
+            .is_err()
+    );
+    result.region.chunks.remove(&neighbor);
+    result
+        .region
+        .light_checks
+        .push(native_world::loaded::BlockPosition { x: 0, y: 8, z: 0 });
+    assert!(
+        result
+            .draft_completed_postprocessing_marks(&area, [center])
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn completed_saved_marks_draft_matches_java_serialization() -> Result<()> {
+    let (area, result) = completed_ticking_fixture()?;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("before.nbt");
+    let output = directory.path().join("after.nbt");
+    std::fs::write(
+        &input,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullPostprocessingOracle",
+        include_str!("../../tests/java/SavedFullPostprocessingOracle.java"),
+        &[
+            input.to_str().context("invalid input path")?,
+            output.to_str().context("invalid output path")?,
+        ],
+    );
+    let java = native_persistence::nbt::read(&std::fs::read(output)?)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let drafts = result.draft_completed_postprocessing_marks(&area, [center])?;
+    assert_eq!(
+        drafts[&center].document().value.get("PostProcessing"),
+        java.value.get("PostProcessing")
+    );
+    Ok(())
+}
+
 #[test]
 fn saved_ticking_dispatch_postprocesses_then_unpacks_only_the_ready_center() -> Result<()> {
     use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};

@@ -60,6 +60,72 @@ pub struct SavedTickingResult {
     pub fluid_ticks: IndexedRegionQueue,
 }
 
+impl SavedTickingResult {
+    /// Create marks-only drafts for completed callbacks, using the same saved
+    /// inputs as the isolated pass. The drafts cannot be saved: block edits,
+    /// ticks, lighting, entities, POIs and live state still need reconciliation.
+    /// Run away from the UI thread because every captured source is checked.
+    pub fn draft_completed_postprocessing_marks(
+        &self,
+        area: &ChunkArea,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft>> {
+        let region = &self.region;
+        ensure!(
+            Arc::ptr_eq(&region.world, &region.sealed_world)
+                && region.edits == region.sealed_edits
+                && region.edits.len() == region.edit_states.len()
+                && region.read_chunks == region.sealed_read_chunks
+                && region.light_reads == region.sealed_light_reads
+                && region.light_checks == region.sealed_checks
+                && region.chunks == region.sealed_chunks,
+            "saved postprocessing result was modified"
+        );
+        ensure!(
+            !region.chunks.is_empty(),
+            "no completed saved postprocessing"
+        );
+        ensure!(
+            area.chunks.len() == region.source.chunks.len(),
+            "saved postprocessing source chunk set changed"
+        );
+        for &pos in region.source.chunks.keys() {
+            let saved_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let source = area
+                .chunks
+                .get(&saved_pos)
+                .context("saved postprocessing source chunk is missing")?;
+            ensure!(
+                source.position == saved_pos
+                    && region.source.saved_chunk_source(pos)
+                        == Some(native_persistence::nbt::fingerprint(&source.document)?),
+                "saved postprocessing source changed at {pos:?}"
+            );
+        }
+        let height = region
+            .max_y
+            .checked_sub(region.min_y)
+            .context("invalid postprocessing bounds")?;
+        let mut drafts = BTreeMap::new();
+        for pos in positions {
+            ensure!(region.chunks.contains(&pos), "chunk was not postprocessed");
+            ensure!(!drafts.contains_key(&pos), "duplicate postprocessed chunk");
+            let saved_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let source = area
+                .chunks
+                .get(&saved_pos)
+                .context("postprocessed source chunk is missing")?;
+            let expected = unique_field(&source.document.value, "PostProcessing")?;
+            let mut draft =
+                native_persistence::edit::draft_chunk_blocks(&source.document, saved_pos, &[])?;
+            draft.stage_completed_postprocessing(region.min_y, height, expected)?;
+            drafts.insert(pos, draft);
+        }
+        ensure!(!drafts.is_empty(), "no postprocessed chunks selected");
+        Ok(drafts)
+    }
+}
+
 /// An isolated sequence of holder callbacks at one unchanged level time.
 /// Send-sync is treated as pending, so no chunk notification is delivered.
 /// Run away from the UI thread; the caller must prevent live interleaving and

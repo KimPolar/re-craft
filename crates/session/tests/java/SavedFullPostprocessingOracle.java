@@ -105,6 +105,13 @@ public class SavedFullPostprocessingOracle {
         tickAccess = new LevelTicks<Block>(pos -> true);
         tickAccess.addContainer(new ChunkPos(0, 0), ticks);
         chunk.postProcessGeneration(level);
+        if (args.length > 1) {
+            var pack = SerializableChunkData.class.getDeclaredMethod("packOffsets",
+                    it.unimi.dsi.fastutil.shorts.ShortList[].class);
+            pack.setAccessible(true);
+            source.put("PostProcessing", (ListTag) pack.invoke(null, (Object) chunk.getPostProcessing()));
+            NbtIo.write(source, Path.of(args[1]));
+        }
         out.println("BEGIN_RESULT");
         for (var tick : ticks.pack(100L)) {
             var pos = tick.pos();

@@ -68,6 +68,7 @@ pub struct ChunkDraft {
     heightmaps_rebuilt: bool,
     changed_block_states: Vec<BlockChange>,
     uncoordinated_block_entities: bool,
+    uncoordinated_postprocessing: bool,
     checked_chest_inventories: Vec<CheckedChestInventory>,
     pub changed_blocks: usize,
     pub changed_sections: BTreeSet<i8>,
@@ -121,6 +122,10 @@ impl ChunkDraft {
             !self.uncoordinated_block_entities
                 && (chest_inventories_coordinated || self.checked_chest_inventories.is_empty()),
             "block entity edits require a coordinated world save"
+        );
+        ensure!(
+            !self.uncoordinated_postprocessing,
+            "postprocessing requires coordinated block, tick, light and entity reconciliation"
         );
         ensure!(
             self.changed_blocks == 0 || self.heightmaps_rebuilt,
@@ -188,6 +193,46 @@ impl ChunkDraft {
     /// Any eventual coordinated write must also compare the raw file bytes.
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
         Ok(crate::nbt::write(current)? == self.source_nbt)
+    }
+
+    /// Stage clearing a completed FULL chunk's postprocessing lists. This
+    /// intermediate draft cannot be saved until the pass's other effects are
+    /// reconciled with the live world and persistence transaction.
+    pub fn stage_completed_postprocessing(
+        &mut self,
+        min_y: i32,
+        height: i32,
+        expected: Option<&Tag>,
+    ) -> Result<()> {
+        let empty = native_core::postprocessing::PostProcessing::new(min_y, height)
+            .context("invalid postprocessing bounds")?;
+        let source = crate::nbt::read(&self.source_nbt)?;
+        ensure!(
+            unique_field(&source.value, "PostProcessing")? == expected,
+            "postprocessing source differs from the captured data"
+        );
+        ensure!(
+            unique_field(&self.document.value, "PostProcessing")? == expected,
+            "postprocessing draft changed before completion"
+        );
+        if let Some(tag) = expected {
+            // Empty outer lists are also accepted by the saved-chunk loader.
+            // Preserve them exactly; a nonempty section list must be losslessly
+            // decoded before any entries can be discarded.
+            let outer_empty = matches!(tag, Tag::List { element_type: TagType::End | TagType::List, values } if values.is_empty());
+            if !outer_empty {
+                let marks = crate::postprocessing::decode(tag, min_y, height)?;
+                if marks.sections().iter().any(|section| !section.is_empty()) {
+                    *unique_field_mut(&mut self.document.value, "PostProcessing")?
+                        .context("postprocessing field disappeared")? =
+                        crate::postprocessing::encode(&empty);
+                }
+            }
+        }
+        // Even an empty list can accompany tick unpacking, entity promotions
+        // or upgrade callbacks. A marks-only draft is never a complete save.
+        self.uncoordinated_postprocessing = true;
+        Ok(())
     }
 
     /// Stage only inventories of existing, unchanged chest blocks. The result
@@ -1128,6 +1173,7 @@ pub fn draft_chunk_blocks(
             heightmaps_rebuilt: false,
             changed_block_states,
             uncoordinated_block_entities: false,
+            uncoordinated_postprocessing: false,
             checked_chest_inventories: Vec::new(),
             changed_blocks,
             changed_sections,
@@ -1270,6 +1316,7 @@ pub fn draft_chunk_blocks(
         heightmaps_rebuilt: false,
         changed_block_states,
         uncoordinated_block_entities: false,
+        uncoordinated_postprocessing: false,
         checked_chest_inventories: Vec::new(),
         changed_blocks,
         changed_sections,
@@ -1284,6 +1331,130 @@ mod tests {
         BlockState {
             name: name.into(),
             properties: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completed_postprocessing_draft_preserves_source_and_blocks_uncoordinated_save() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let mut original = fixture(1, false);
+        let marks = native_core::postprocessing::PostProcessing::from_sections(
+            -64,
+            32,
+            vec![vec![-1, 17, 17], vec![i16::MIN]],
+        )
+        .unwrap();
+        let expected = crate::postprocessing::encode(&marks);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push(("PostProcessing".into(), expected.clone()));
+        let unchanged = original.clone();
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        draft
+            .stage_completed_postprocessing(-64, 32, Some(&expected))
+            .unwrap();
+        let empty = native_core::postprocessing::PostProcessing::new(-64, 32).unwrap();
+        assert_eq!(
+            draft.document().value.get("PostProcessing"),
+            Some(&crate::postprocessing::encode(&empty))
+        );
+        assert_eq!(
+            draft.document().value.get("unknown_chunk"),
+            original.value.get("unknown_chunk")
+        );
+        assert_eq!(original, unchanged);
+        assert!(draft.matches_source(&original).unwrap());
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
+        let before = draft.document().clone();
+        assert!(
+            draft
+                .stage_completed_postprocessing(-64, 32, Some(&expected))
+                .is_err()
+        );
+        assert_eq!(draft.document(), &before);
+    }
+
+    #[test]
+    fn completed_postprocessing_rejects_stale_or_lossy_data_atomically() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let mut original = fixture(1, false);
+        let mut marks = native_core::postprocessing::PostProcessing::new(-64, 32).unwrap();
+        marks.mark(-15, -60, 33);
+        let expected = crate::postprocessing::encode(&marks);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push(("PostProcessing".into(), expected.clone()));
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        for (min_y, height, source) in [
+            (-64, 16, Some(&expected)),
+            (-63, 32, Some(&expected)),
+            (-64, 32, None),
+        ] {
+            let before = draft.document().clone();
+            assert!(
+                draft
+                    .stage_completed_postprocessing(min_y, height, source)
+                    .is_err()
+            );
+            assert_eq!(draft.document(), &before);
+        }
+
+        let mut malformed = original.clone();
+        *unique_field_mut(&mut malformed.value, "PostProcessing")
+            .unwrap()
+            .unwrap() = Tag::Int(1);
+        let mut invalid = draft_chunk_blocks(&malformed, pos, &[]).unwrap();
+        let before = invalid.document().clone();
+        assert!(
+            invalid
+                .stage_completed_postprocessing(-64, 32, Some(&Tag::Int(1)))
+                .is_err()
+        );
+        assert_eq!(invalid.document(), &before);
+
+        let mut duplicate = original.clone();
+        let Tag::Compound(fields) = &mut duplicate.value else {
+            unreachable!()
+        };
+        fields.push(("PostProcessing".into(), expected.clone()));
+        let mut invalid = draft_chunk_blocks(&duplicate, pos, &[]).unwrap();
+        let before = invalid.document().clone();
+        assert!(
+            invalid
+                .stage_completed_postprocessing(-64, 32, Some(&expected))
+                .is_err()
+        );
+        assert_eq!(invalid.document(), &before);
+    }
+
+    #[test]
+    fn completed_postprocessing_with_no_marks_still_requires_reconciliation() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        for field in [
+            None,
+            Some(Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            }),
+            Some(crate::postprocessing::encode(
+                &native_core::postprocessing::PostProcessing::new(-64, 32).unwrap(),
+            )),
+        ] {
+            let mut original = fixture(1, false);
+            if let Some(value) = &field {
+                let Tag::Compound(fields) = &mut original.value else {
+                    unreachable!()
+                };
+                fields.push(("PostProcessing".into(), value.clone()));
+            }
+            let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+            draft
+                .stage_completed_postprocessing(-64, 32, field.as_ref())
+                .unwrap();
+            assert_eq!(draft.document(), &original);
+            assert!(draft.validate_for_write(|_| Ok(())).is_err());
         }
     }
 

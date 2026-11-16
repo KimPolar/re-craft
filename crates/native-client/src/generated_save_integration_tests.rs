@@ -34,9 +34,42 @@ fn generated_world_saved_full_chunk_can_resume_postprocessing() -> Result<()> {
     verify_generated_portal_play_save(0, true)
 }
 
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and long-running world generation"]
+fn generated_world_saved_ticking_future_uses_full_neighbors() -> Result<()> {
+    if let Some(path) = std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD") {
+        let root = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+        )?;
+        let path = std::fs::canonicalize(path)?;
+        ensure!(
+            path.starts_with(&root),
+            "test world is outside the private test directory"
+        );
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let reader = WorldReader::open_for_session(&path, DimensionId::parse("overworld")?)?;
+        let lock = reader
+            .session_guard()
+            .context("test world session lock is missing")?;
+        drop(reader);
+        return verify_saved_ticking(&path, &game, lock);
+    }
+    verify_generated_portal_play_save_inner(0, false, true)
+}
+
 fn verify_generated_portal_play_save(
     additional_ticks: u64,
     check_saved_postprocessing: bool,
+) -> Result<()> {
+    verify_generated_portal_play_save_inner(additional_ticks, check_saved_postprocessing, false)
+}
+
+fn verify_generated_portal_play_save_inner(
+    additional_ticks: u64,
+    check_saved_postprocessing: bool,
+    check_saved_ticking: bool,
 ) -> Result<()> {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
@@ -54,11 +87,26 @@ fn verify_generated_portal_play_save(
         // random ticks still need complete sky-light and neighboring chunks.
         settings.game_rules.random_tick_speed = 0;
     }
-    let targets = BTreeSet::from([
+    let mut targets = BTreeSet::from([
         ChunkPos { x: 20, z: 19 },
         ChunkPos { x: 21, z: 19 },
         ChunkPos { x: 28, z: 24 },
     ]);
+    if check_saved_ticking {
+        // Complete the eight surrounding chunks while leaving the center
+        // deferred. Unrequested generated neighbors are not necessarily FULL.
+        targets.clear();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx != 0 || dz != 0 {
+                    targets.insert(ChunkPos {
+                        x: 20 + dx,
+                        z: 20 + dz,
+                    });
+                }
+            }
+        }
+    }
     let options = InitialWorldOptions {
         staging_parent: parent_path.clone(),
         border: SavedWorldBorder::default(),
@@ -124,7 +172,176 @@ fn verify_generated_portal_play_save(
     if check_saved_postprocessing {
         return verify_saved_postprocessing(&path, &game, lock);
     }
+    if check_saved_ticking {
+        let result = verify_saved_ticking(&path, &game, lock);
+        if result.is_err() {
+            let kept = parent.keep();
+            eprintln!(
+                "kept private test world after failed ticking preparation: {}",
+                kept.display()
+            );
+        }
+        return result;
+    }
     verify_portal_play_save(&path, &game, lock, additional_ticks)
+}
+
+fn verify_saved_ticking(
+    path: &std::path::Path,
+    game: &std::path::Path,
+    lock: native_persistence::save::WorldSessionGuard,
+) -> Result<()> {
+    use native_session::{
+        loaded::BuildBounds,
+        ticking_preparation::{
+            FullFuture, FullFutureId, FullFutureResult, TickingFutureState, TickingPreparation,
+            ticking_dependencies,
+        },
+        worldgen::{
+            GeneratedLavaRules,
+            saved_postprocessing::{SavedPostprocessingInputs, dispatch_saved_ticking},
+        },
+    };
+    let dimension = DimensionId::parse("overworld")?;
+    let mut reader = WorldReader::open_with_session(path, dimension.clone(), lock)?;
+    let mut resources = native_resources::packs::ResourceStack::open(game)?;
+    let ids = resources.vanilla_block_ids()?;
+    let registry = resources.vanilla_generated_block_registry()?;
+    let defaults = registry.default_states();
+    let game_time = reader.game_time()?;
+    let rules = reader.fluid_game_rules()?;
+    let mut failures = Vec::new();
+    let mut marked = 0;
+    let mut incomplete = 0;
+    for saved in reader.saved_chunk_positions(RegionStore::Terrain)? {
+        let Some(chunk) = reader.read_chunk(saved.x, saved.z)? else {
+            continue;
+        };
+        if !chunk.is_full() {
+            continue;
+        }
+        let Some(post) = chunk.document.value.get("PostProcessing") else {
+            continue;
+        };
+        if matches!(post, native_persistence::nbt::Tag::List { values, .. } if values.is_empty()) {
+            continue;
+        }
+        let marks = native_persistence::postprocessing::decode(post, -64, 384)?;
+        if marks.sections().iter().all(Vec::is_empty) {
+            continue;
+        }
+        marked += 1;
+        let area = reader.read_area(saved, 1)?;
+        if area.chunks.len() != 9 || area.chunks.values().any(|chunk| !chunk.is_full()) {
+            incomplete += 1;
+            if failures.len() < 8 {
+                let full = area.chunks.values().filter(|chunk| chunk.is_full()).count();
+                failures.push(format!(
+                    "{saved:?}: {full}/9 FULL, {} absent",
+                    area.missing.len()
+                ));
+            }
+            continue;
+        }
+        let pos = ChunkPos {
+            x: saved.x,
+            z: saved.z,
+        };
+        let registration = ticking_dependencies(pos);
+        let fingerprints = area
+            .chunks
+            .iter()
+            .map(|(position, chunk)| {
+                Ok((
+                    *position,
+                    native_persistence::nbt::fingerprint(&chunk.document)?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let mut future = TickingPreparation::start(pos, |position| {
+            Some(FullFuture {
+                id: FullFutureId(
+                    registration
+                        .iter()
+                        .position(|&entry| entry == position)
+                        .unwrap() as u64,
+                ),
+                result: Some(FullFutureResult::Full),
+            })
+        })?;
+        let result = dispatch_saved_ticking(
+            &mut future,
+            &mut resources,
+            SavedPostprocessingInputs {
+                area: &area,
+                dimension: &dimension,
+                defaults: &defaults,
+                block_ids: &ids,
+                bounds: BuildBounds {
+                    min_y: -64,
+                    max_y: 320,
+                },
+                registration: &registration,
+                game_time,
+                next_sub_tick: 0,
+                light: None,
+            },
+            |state| {
+                ensure!(
+                    registry.is_canonical_state(&state.name, &state.properties),
+                    "unknown block state: {state:?}"
+                );
+                Ok(())
+            },
+            |stage| {
+                stage.set_water_source_conversion(rules.water_source_conversion)?;
+                stage.set_lava_rules(GeneratedLavaRules {
+                    fast_lava: false,
+                    source_conversion: rules.lava_source_conversion,
+                })?;
+                Ok(())
+            },
+        );
+        let completed = match result {
+            Ok(Some(completed)) => completed,
+            Ok(None) => {
+                failures.push(format!("{pos:?}: ticking callback did not run"));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{pos:?}: {error:#}"));
+                continue;
+            }
+        };
+        ensure!(
+            future.state() == TickingFutureState::Available,
+            "ticking future did not complete"
+        );
+        ensure!(
+            completed.region.chunks == BTreeSet::from([pos]),
+            "wrong postprocessed chunk"
+        );
+        ensure!(
+            completed.block_ticks.container(pos).is_some()
+                && completed.fluid_ticks.container(pos).is_some(),
+            "ticking queues are missing"
+        );
+        for (position, expected) in fingerprints {
+            let source = reader
+                .read_chunk(position.x, position.z)?
+                .context("saved chunk disappeared")?;
+            ensure!(
+                native_persistence::nbt::fingerprint(&source.document)? == expected,
+                "isolated ticking preparation modified its source"
+            );
+        }
+        eprintln!("prepared generated saved chunk {pos:?} with its 3x3 FULL neighbors");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no generated saved chunk could complete 3x3 ticking preparation ({marked} marked, {incomplete} incomplete): {}",
+        failures.join("; ")
+    )
 }
 
 fn verify_saved_postprocessing(

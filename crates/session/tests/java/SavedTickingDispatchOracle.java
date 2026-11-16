@@ -98,6 +98,89 @@ public class SavedTickingDispatchOracle {
         @Override public ChunkHolder getUpdatingChunkIfPresent(long pos) { return holders.get(pos); }
     }
 
+    static void runOverlapping(SerializableChunkData parsed, LevelChunkSection section,
+            sun.misc.Unsafe unsafe, java.io.PrintStream out) throws Exception {
+        states.clear();
+        for (int chunkX = 0; chunkX <= 1; chunkX++)
+            for (int y = 0; y < 16; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++)
+                states.put(new BlockPos(x + chunkX * 16, y, z), section.getBlockState(x, y, z));
+        var map = (Map) unsafe.allocateInstance(Map.class);
+        map.holders = new HashMap<>();
+        var executor = new Executor();
+        set(map, "mainThreadExecutor", executor);
+        set(map, "level", unsafe.allocateInstance(Level.class));
+        levelTicks = new LevelTicks<>(pos -> true);
+        var holders = new HashMap<ChunkPos, Holder>();
+        var chunks = new HashMap<ChunkPos, Chunk>();
+        var queues = new HashMap<ChunkPos, LevelChunkTicks<Block>>();
+        var originalMarks = parsed.postProcessingSections();
+        for (int z = -1; z <= 1; z++) for (int x = -1; x <= 2; x++) {
+            var pos = new ChunkPos(x, z);
+            var chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
+            chunk.position = pos;
+            var marks = new it.unimi.dsi.fastutil.shorts.ShortList[originalMarks.length];
+            if (z == 0 && (x == 0 || x == 1)) {
+                for (int i = 0; i < marks.length; i++) {
+                    if (originalMarks[i] != null)
+                        marks[i] = new it.unimi.dsi.fastutil.shorts.ShortArrayList(originalMarks[i]);
+                }
+            }
+            set(chunk, "postProcessing", marks);
+            set(chunk, "pendingBlockEntities", new HashMap<BlockPos, net.minecraft.nbt.CompoundTag>());
+            set(chunk, "upgradeData", unsafe.allocateInstance(Upgrade.class));
+            var saved = x == 0 && z == 0 ? parsed.packedTicks().blocks() : List.of(new SavedTick<>(
+                    Blocks.SAND, new BlockPos(x * 16 + 8, 8, z * 16 + 8), 7, TickPriority.NORMAL));
+            var ticks = new LevelChunkTicks<Block>(saved);
+            set(chunk, "blockTicks", ticks);
+            set(chunk, "fluidTicks", new LevelChunkTicks<Fluid>());
+            levelTicks.addContainer(pos, ticks);
+            var holder = (Holder) unsafe.allocateInstance(Holder.class);
+            holder.position = pos;
+            holder.full = new CompletableFuture<>();
+            holder.send = new CompletableFuture<>();
+            holders.put(pos, holder);
+            chunks.put(pos, chunk);
+            queues.put(pos, ticks);
+            map.holders.put(pos.pack(), holder);
+        }
+        var a = new ChunkPos(0, 0);
+        var b = new ChunkPos(1, 0);
+        var first = map.prepareTickingChunk(holders.get(a));
+        var second = map.prepareTickingChunk(holders.get(b));
+        gameTime = 500;
+        nextSubTick = 2;
+        for (int z = -1; z <= 1; z++) for (int x = -1; x <= 1; x++) {
+            var pos = new ChunkPos(x, z);
+            holders.get(pos).full.complete(ChunkResult.of(chunks.get(pos)));
+        }
+        executor.drain();
+        for (int z = -1; z <= 1; z++) {
+            var pos = new ChunkPos(2, z);
+            holders.get(pos).full.complete(ChunkResult.of(chunks.get(pos)));
+        }
+        executor.drain();
+        var again = map.prepareTickingChunk(holders.get(a));
+        executor.drain();
+        out.println("BEGIN_RESULT");
+        out.println("first " + first.join().isSuccess());
+        out.println("second " + second.join().isSuccess());
+        out.println("again " + again.join().isSuccess());
+        for (var entry : List.of(java.util.Map.entry("a", a), java.util.Map.entry("b", b))) {
+            for (var tick : queues.get(entry.getValue()).pack(500)) {
+                var pos = tick.pos();
+                out.printf("%s %s %d,%d,%d %d %d%n", entry.getKey(),
+                        BuiltInRegistries.BLOCK.getKey(tick.type()), pos.getX(), pos.getY(), pos.getZ(),
+                        tick.delay(), tick.priority().getValue());
+            }
+        }
+        var neighbor = queues.get(new ChunkPos(-1, -1));
+        out.printf("neighbor %d %d%n", neighbor.pack(500).get(0).delay(), neighbor.pack(1000).get(0).delay());
+        out.println("counter " + nextSubTick);
+        levelTicks.tick(502, 65536, (position, block) -> out.printf("run %s %d,%d,%d%n",
+                BuiltInRegistries.BLOCK.getKey(block), position.getX(), position.getY(), position.getZ()));
+        out.println("END_RESULT");
+    }
+
     static void run(String[] args, java.io.PrintStream out) throws Exception {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
@@ -121,6 +204,10 @@ public class SavedTickingDispatchOracle {
         var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
         field.setAccessible(true);
         var unsafe = (sun.misc.Unsafe) field.get(null);
+        if (args.length > 1 && args[1].equals("overlap")) {
+            runOverlapping(parsed, section, unsafe, out);
+            return;
+        }
         var map = (Map) unsafe.allocateInstance(Map.class);
         map.holders = new HashMap<>();
         var executor = new Executor();

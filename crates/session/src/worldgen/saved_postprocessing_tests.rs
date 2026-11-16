@@ -260,6 +260,389 @@ fn ticking_fixture() -> Result<(ChunkArea, BTreeSet<String>, Vec<ChunkPos>)> {
     Ok((area, ids, registration))
 }
 
+fn overlapping_ticking_fixture() -> Result<(ChunkArea, BTreeSet<String>, Vec<ChunkPos>)> {
+    let (mut area, ids, _) = ticking_fixture()?;
+    let marks = area.chunks[&area.center]
+        .document
+        .value
+        .get("PostProcessing")
+        .unwrap()
+        .clone();
+    for z in -1..=1 {
+        let mut chunk = area.chunks[&SavedChunkPos { x: 1, z }].as_ref().clone();
+        chunk.position = SavedChunkPos { x: 2, z };
+        let document = Arc::make_mut(&mut chunk.document);
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("xPos"))
+            .unwrap()
+            .1 = Tag::Int(2);
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_ticks"))
+            .unwrap()
+            .1 = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("i".into(), Tag::String("minecraft:sand".into())),
+                ("x".into(), Tag::Int(40)),
+                ("y".into(), Tag::Int(8)),
+                ("z".into(), Tag::Int(z * 16 + 8)),
+                ("t".into(), Tag::Int(7)),
+                ("p".into(), Tag::Int(0)),
+            ])],
+        };
+        area.chunks.insert(chunk.position, Arc::new(chunk));
+    }
+    let second = Arc::make_mut(area.chunks.get_mut(&SavedChunkPos { x: 1, z: 0 }).unwrap());
+    let Tag::Compound(fields) = &mut Arc::make_mut(&mut second.document).value else {
+        unreachable!()
+    };
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("PostProcessing"))
+        .unwrap()
+        .1 = marks;
+    let registration = (-1..=1)
+        .flat_map(|z| (-1..=2).map(move |x| ChunkPos { x, z }))
+        .collect();
+    Ok((area, ids, registration))
+}
+
+fn begin_ticking_batch(
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    registration: &[ChunkPos],
+) -> Result<SavedTickingBatch> {
+    SavedTickingBatch::begin(
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area,
+            dimension: &DimensionId::parse("overworld")?,
+            defaults: &BTreeMap::new(),
+            block_ids: ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration,
+            game_time: 500,
+            next_sub_tick: 2,
+            light: None,
+        },
+        |state| {
+            ensure!(
+                ids.contains(&state.name) && state.properties.is_empty(),
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+}
+
+fn water_ticking_fixture() -> Result<(ChunkArea, BTreeSet<String>, Vec<ChunkPos>)> {
+    let (mut area, mut ids, registration) = overlapping_ticking_fixture()?;
+    ids.extend(["minecraft:air".into(), "minecraft:water".into()]);
+    for (chunk_x, local_x, name) in [(0, 15, "minecraft:water"), (1, 0, "minecraft:air")] {
+        let pos = SavedChunkPos { x: chunk_x, z: 0 };
+        let chunk = Arc::make_mut(area.chunks.get_mut(&pos).unwrap());
+        let document = Arc::make_mut(&mut chunk.document);
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(chunk_x * 16 + local_x, 8, 8);
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("PostProcessing"))
+            .unwrap()
+            .1 = native_persistence::postprocessing::encode(&marks);
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("block_ticks"))
+            .unwrap()
+            .1 = Tag::List {
+            element_type: TagType::End,
+            values: vec![],
+        };
+        let Tag::List {
+            values: sections, ..
+        } = &mut fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("sections"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections[0] else {
+            unreachable!()
+        };
+        let mut indices = vec![0; 4096];
+        indices[(local_x + 8 * 16 + 8 * 256) as usize] = 1;
+        let data = palette::encode_indices(2, &indices, 4)?.unwrap();
+        section
+            .iter_mut()
+            .find(|(key, _)| key.matches("block_states"))
+            .unwrap()
+            .1 = Tag::Compound(vec![
+            (
+                "palette".into(),
+                Tag::List {
+                    element_type: TagType::String,
+                    values: vec![
+                        Tag::String("minecraft:stone".into()),
+                        Tag::String(name.into()),
+                    ],
+                },
+            ),
+            ("data".into(), Tag::LongArray(data)),
+        ]);
+        chunk.sections = palette::decode_sections(&document.value)?;
+    }
+    Ok((area, ids, registration))
+}
+
+fn begin_water_ticking_batch(
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    registration: &[ChunkPos],
+) -> Result<SavedTickingBatch> {
+    let defaults = BTreeMap::from([(
+        "minecraft:water".into(),
+        BTreeMap::from([("level".into(), "0".into())]),
+    )]);
+    SavedTickingBatch::begin(
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area,
+            dimension: &DimensionId::parse("overworld")?,
+            defaults: &defaults,
+            block_ids: ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration,
+            game_time: 100,
+            next_sub_tick: 2,
+            light: None,
+        },
+        |state| {
+            ensure!(
+                ids.contains(&state.name)
+                    && state.properties == defaults.get(&state.name).cloned().unwrap_or_default(),
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+        |stage| {
+            stage.set_water_source_conversion(true)?;
+            stage.set_fluid_tags(
+                Some(Arc::new(BTreeSet::from([
+                    "minecraft:air".into(),
+                    "minecraft:water".into(),
+                ]))),
+                Some(Arc::new(BTreeSet::from([
+                    "minecraft:lava".into(),
+                    "minecraft:flowing_lava".into(),
+                ]))),
+            );
+            stage.set_water_fluid_tags(Some(Arc::new(BTreeSet::from([
+                "minecraft:water".into(),
+                "minecraft:flowing_water".into(),
+            ]))));
+            stage.set_bubble_tags(Some(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::new(
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                ),
+            )));
+            Ok(())
+        },
+    )
+}
+
+fn water_ticking_trace() -> Result<Vec<String>> {
+    let (area, ids, registration) = water_ticking_fixture()?;
+    let a = ChunkPos { x: 0, z: 0 };
+    let b = ChunkPos { x: 1, z: 0 };
+    let mut batch = begin_water_ticking_batch(&area, &ids, &registration)?;
+    let mut first = ready_future(a, &registration)?;
+    let mut second = ready_future(b, &registration)?;
+    assert!(batch.dispatch(&mut first, 100)?);
+    let after_first = batch
+        .stage
+        .world
+        .block(16, 8, 8)
+        .context("missing neighbor block")?;
+    let mut trace = vec![format!(
+        "first {} {}",
+        after_first.name,
+        after_first
+            .properties
+            .get("level")
+            .map_or("-", String::as_str)
+    )];
+    assert!(batch.dispatch(&mut second, 100)?);
+    let result = batch.finish()?;
+    let after_second = result
+        .region
+        .world
+        .block(16, 8, 8)
+        .context("missing neighbor block")?;
+    trace.push(format!(
+        "second {} {}",
+        after_second.name,
+        after_second
+            .properties
+            .get("level")
+            .map_or("-", String::as_str)
+    ));
+    for (label, pos) in [("a", a), ("b", b)] {
+        for tick in result.fluid_ticks.container(pos).unwrap().pack(100) {
+            trace.push(format!(
+                "{label} {} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            ));
+        }
+    }
+    trace.push(format!("counter {}", result.region.ticks().next_sub_tick()));
+    Ok(trace)
+}
+
+#[test]
+fn overlapping_ticking_callbacks_read_previous_neighbor_edits() -> Result<()> {
+    let trace = water_ticking_trace()?;
+    assert!(trace.contains(&"first minecraft:water 1".to_owned()));
+    assert!(trace.contains(&"second minecraft:water 1".to_owned()));
+    assert!(
+        trace
+            .iter()
+            .any(|line| line.starts_with("b minecraft:flowing_water 16,8,8 "))
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn overlapping_ticking_callbacks_preserve_water_updates_like_java() -> Result<()> {
+    let java = super::super::postprocessing_world::tests::java_results_with_args(
+        "GeneratedWaterSpreadPostprocessingOracle",
+        include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+        &["edge_ticking_sequence"],
+    );
+    assert_eq!(water_ticking_trace()?, java);
+    Ok(())
+}
+
+fn ready_future(center: ChunkPos, registration: &[ChunkPos]) -> Result<TickingPreparation> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+    TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(registration.iter().position(|&pos| pos == position)? as u64),
+            result: Some(FullFutureResult::Full),
+        })
+    })
+}
+
+#[test]
+fn overlapping_saved_ticking_callbacks_keep_shared_world_and_tick_history() -> Result<()> {
+    let (area, ids, registration) = overlapping_ticking_fixture()?;
+    let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+    let first = ChunkPos { x: 0, z: 0 };
+    let second = ChunkPos { x: 1, z: 0 };
+    let mut a = ready_future(first, &registration)?;
+    let mut b = ready_future(second, &registration)?;
+    assert!(batch.dispatch(&mut a, 500)?);
+    assert!(batch.dispatch(&mut b, 500)?);
+    let mut again = ready_future(first, &registration)?;
+    assert!(batch.dispatch(&mut again, 500)?);
+    assert_eq!(a.state(), TickingFutureState::Available);
+    assert_eq!(b.state(), TickingFutureState::Available);
+    assert_eq!(again.state(), TickingFutureState::Available);
+    let result = batch.finish()?;
+    assert_eq!(result.region.chunks, BTreeSet::from([first, second]));
+    for pos in [first, second] {
+        let ticks = result.block_ticks.container(pos).unwrap();
+        assert_eq!(ticks.pack(500).len(), 3);
+        assert_eq!(ticks.pack(1_000)[0].delay, ticks.pack(500)[0].delay - 500);
+        assert_eq!(
+            result.region.ticks().chunk(pos).unwrap().blocks.pack(500),
+            ticks.pack(500)
+        );
+    }
+    let neighbor = result
+        .block_ticks
+        .container(ChunkPos { x: -1, z: -1 })
+        .unwrap();
+    assert_eq!(neighbor.pack(500)[0].delay, 7);
+    assert_eq!(neighbor.pack(1_000)[0].delay, 7);
+    assert_eq!(result.region.ticks().next_sub_tick(), 50);
+    Ok(())
+}
+
+#[test]
+fn saved_ticking_batch_skips_cancelled_and_rejects_incomplete_neighbors() -> Result<()> {
+    let (area, ids, registration) = ticking_fixture()?;
+    let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut cancelled = ready_future(center, &registration)?;
+    assert!(cancelled.cancel());
+    assert!(batch.dispatch(&mut cancelled, 500)?);
+    assert_eq!(cancelled.state(), TickingFutureState::Unavailable);
+    let mut ready = ready_future(center, &registration)?;
+    assert!(batch.dispatch(&mut ready, 500)?);
+    let result = batch.finish()?;
+    assert_eq!(result.region.chunks, BTreeSet::from([center]));
+
+    let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+    let source = native_persistence::nbt::write(&area.chunks[&area.center].document)?;
+    let mut ready = ready_future(center, &registration)?;
+    assert!(batch.dispatch(&mut ready, 500)?);
+    let other = ChunkPos { x: 1, z: 0 };
+    let claimed = ticking_dependencies(other);
+    let mut future = ready_future(other, &claimed)?;
+    assert!(batch.dispatch(&mut future, 500).is_err());
+    assert_eq!(future.state(), TickingFutureState::Exceptional);
+    assert!(batch.finish().is_err());
+    assert_eq!(
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+        source
+    );
+    Ok(())
+}
+
+#[test]
+fn saved_ticking_batch_rejects_level_time_changes_before_dispatch() -> Result<()> {
+    let (area, ids, registration) = ticking_fixture()?;
+    let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let source = native_persistence::nbt::write(&area.chunks[&area.center].document)?;
+    let mut first = ready_future(center, &registration)?;
+    assert!(batch.dispatch(&mut first, 500)?);
+    let mut next = ready_future(center, &registration)?;
+    assert!(batch.dispatch(&mut next, 501).is_err());
+    assert_eq!(next.state(), TickingFutureState::Waiting);
+    assert!(next.has_queued_callback());
+    assert!(batch.finish().is_err());
+    assert_eq!(
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+        source
+    );
+    Ok(())
+}
+
 fn dispatch_fixture(
     future: &mut TickingPreparation,
     area: &ChunkArea,
@@ -335,6 +718,9 @@ fn saved_ticking_dispatch_postprocesses_then_unpacks_only_the_ready_center() -> 
             ("minecraft:gravel", 2)
         ]
     );
+    let stored = &completed.region.ticks().chunk(center).unwrap().blocks;
+    assert_eq!(stored.pack(500), ticks);
+    assert_eq!(stored.pack(1_000)[0].delay, -500);
     let neighbor = completed.block_ticks.container(registration[0]).unwrap();
     assert_eq!(neighbor.pack(500)[0].delay, 7);
     assert_eq!(neighbor.pack(1_000)[0].delay, 7);
@@ -501,6 +887,113 @@ fn saved_ticking_dispatch_matches_java_full_future_and_unpacked_ticks() -> Resul
         neighbor_ticks.pack(1_000)[0].delay
     ));
     actual.push(format!("counter {}", result.region.ticks().next_sub_tick()));
+    assert_eq!(actual, java);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn overlapping_saved_ticking_callbacks_match_java() -> Result<()> {
+    use crate::ticking_preparation::{
+        FullFuture, FullFutureId, FullFutureResult, TickingPreparations, TickingRequestId,
+    };
+    let (area, ids, registration) = overlapping_ticking_fixture()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("chunk.nbt");
+    std::fs::write(
+        &path,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    let java = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedTickingDispatchOracle",
+        include_str!("../../tests/java/SavedTickingDispatchOracle.java"),
+        &[path.to_str().context("invalid NBT path")?, "overlap"],
+    );
+    let a = ChunkPos { x: 0, z: 0 };
+    let b = ChunkPos { x: 1, z: 0 };
+    let future_id =
+        |pos| FullFutureId(registration.iter().position(|&entry| entry == pos).unwrap() as u64);
+    let mut futures = TickingPreparations::default();
+    for (id, center) in [(TickingRequestId(0), a), (TickingRequestId(1), b)] {
+        futures.start(id, center, |pos| {
+            Some(FullFuture {
+                id: future_id(pos),
+                result: None,
+            })
+        })?;
+    }
+    let mut batch = begin_ticking_batch(&area, &ids, &registration)?;
+    for z in -1..=1 {
+        for x in -1..=1 {
+            futures.complete(future_id(ChunkPos { x, z }), FullFutureResult::Full)?;
+        }
+    }
+    assert_eq!(
+        futures.dispatch_next(|future| batch.dispatch(future, 500))?,
+        Some((TickingRequestId(0), true))
+    );
+    for z in -1..=1 {
+        futures.complete(future_id(ChunkPos { x: 2, z }), FullFutureResult::Full)?;
+    }
+    assert_eq!(
+        futures.dispatch_next(|future| batch.dispatch(future, 500))?,
+        Some((TickingRequestId(1), true))
+    );
+    futures.start(TickingRequestId(2), a, |pos| {
+        Some(FullFuture {
+            id: future_id(pos),
+            result: Some(FullFutureResult::Full),
+        })
+    })?;
+    assert_eq!(
+        futures.dispatch_next(|future| batch.dispatch(future, 500))?,
+        Some((TickingRequestId(2), true))
+    );
+    let mut result = batch.finish()?;
+    let mut actual = vec![
+        format!(
+            "first {}",
+            futures.state(TickingRequestId(0)) == Some(TickingFutureState::Available)
+        ),
+        format!(
+            "second {}",
+            futures.state(TickingRequestId(1)) == Some(TickingFutureState::Available)
+        ),
+        format!(
+            "again {}",
+            futures.state(TickingRequestId(2)) == Some(TickingFutureState::Available)
+        ),
+    ];
+    for (label, pos) in [("a", a), ("b", b)] {
+        for tick in result.block_ticks.container(pos).unwrap().pack(500) {
+            actual.push(format!(
+                "{label} {} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            ));
+        }
+    }
+    let neighbor = result
+        .block_ticks
+        .container(ChunkPos { x: -1, z: -1 })
+        .unwrap();
+    actual.push(format!(
+        "neighbor {} {}",
+        neighbor.pack(500)[0].delay,
+        neighbor.pack(1_000)[0].delay
+    ));
+    actual.push(format!("counter {}", result.region.ticks().next_sub_tick()));
+    for tick in result.block_ticks.collect_due(502, 65_536, |_| true) {
+        actual.push(format!(
+            "run {} {},{},{}",
+            tick.kind, tick.position[0], tick.position[1], tick.position[2]
+        ));
+    }
     assert_eq!(actual, java);
     Ok(())
 }

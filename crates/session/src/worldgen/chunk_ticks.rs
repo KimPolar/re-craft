@@ -609,6 +609,41 @@ impl RegionTicks {
         self.game_time
     }
 
+    /// Unpack both saved containers after this chunk's postprocessing, keeping
+    /// the recorded LevelTicks index mutations for subsequent callbacks.
+    pub(super) fn unpack_chunk(&mut self, pos: ChunkPos) -> Result<()> {
+        let indexes = self
+            .indexes
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("tick index history is unavailable"))?;
+        let chunk = self
+            .chunks
+            .get_mut(&pos)
+            .ok_or_else(|| anyhow::anyhow!("tick container is missing"))?;
+        match (
+            chunk.blocks.pending.is_some(),
+            chunk.fluids.pending.is_some(),
+        ) {
+            (false, false) => return Ok(()),
+            (true, true) => {}
+            _ => anyhow::bail!("saved tick containers have inconsistent activation"),
+        }
+        for (ticks, index) in [
+            (&mut chunk.blocks, &mut indexes.blocks),
+            (&mut chunk.fluids, &mut indexes.fluids),
+        ] {
+            let before = ticks.peek().map(tick_order);
+            ticks.unpack(self.game_time);
+            let after = ticks.peek().map(tick_order);
+            if after != before
+                && let Some(head) = after
+            {
+                index.insert(pos, head.0);
+            }
+        }
+        Ok(())
+    }
+
     /// Capture every converted queue as it would look after activation at the
     /// pass's game time. The original pending lists remain untouched.
     pub fn activated_snapshot(&self) -> ActivatedRegionTicks {

@@ -60,6 +60,109 @@ pub struct SavedTickingResult {
     pub fluid_ticks: IndexedRegionQueue,
 }
 
+/// An isolated sequence of holder callbacks at one unchanged level time.
+/// Send-sync is treated as pending, so no chunk notification is delivered.
+/// Run away from the UI thread; the caller must prevent live interleaving and
+/// revalidate every dependency before attaching the result to a session.
+pub struct SavedTickingBatch {
+    stage: GeneratedPostprocessing,
+    available: BTreeSet<ChunkPos>,
+    game_time: i64,
+    started: bool,
+    failed: bool,
+}
+
+impl SavedTickingBatch {
+    /// Capture all FULL inputs and configure the same environment for every
+    /// callback. No holder future has been completed by this operation.
+    pub fn begin(
+        provider: &mut impl ResourceProvider,
+        input: SavedPostprocessingInputs<'_>,
+        validate_state: impl FnMut(&BlockState) -> Result<()>,
+        configure: impl FnOnce(&mut GeneratedPostprocessing) -> Result<()>,
+    ) -> Result<Self> {
+        let available = input
+            .area
+            .chunks
+            .keys()
+            .map(|pos| ChunkPos { x: pos.x, z: pos.z })
+            .collect();
+        let game_time = input.game_time;
+        let mut stage = begin_saved_postprocessing(provider, input, validate_state)?;
+        configure(&mut stage)?;
+        Ok(Self {
+            stage,
+            available,
+            game_time,
+            started: false,
+            failed: false,
+        })
+    }
+
+    /// Dispatch one queued holder callback without interleaving another one.
+    /// Pending saved ticks are unpacked after its postprocessing and become
+    /// visible to later callbacks in this same captured level state.
+    pub fn dispatch(&mut self, future: &mut TickingPreparation, game_time: i64) -> Result<bool> {
+        ensure!(!self.failed, "saved ticking batch has failed");
+        if game_time != self.game_time {
+            self.failed = true;
+            bail!("level time changed during saved ticking preparation");
+        }
+        let available = &self.available;
+        let stage = RefCell::new(&mut self.stage);
+        let started = std::cell::Cell::new(self.started);
+        let result = future.dispatch(
+            |center| {
+                ensure!(
+                    ticking_dependencies(center)
+                        .iter()
+                        .all(|position| available.contains(position)),
+                    "saved ticking inputs lack a FULL neighbor"
+                );
+                let mut stage = stage.borrow_mut();
+                if stage.postprocessing_completed(center) {
+                    return Ok(());
+                }
+                if started.get() {
+                    stage.request_converted_chunk(center)?;
+                } else {
+                    stage.select_initial_targets(BTreeSet::from([center]))?;
+                    started.set(true);
+                }
+                while !stage.poll(center, 256)? {}
+                Ok(())
+            },
+            |center| stage.borrow_mut().unpack_saved_ticks(center),
+            |_| Ok(()),
+        );
+        self.started = started.get();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Finish the captured sequence. This alone does not authorize live use.
+    pub fn finish(self) -> Result<SavedTickingResult> {
+        ensure!(
+            !self.failed && self.started,
+            "no completed saved ticking callbacks"
+        );
+        let region = self.stage.finish()?;
+        let block_ticks = region
+            .ticks()
+            .captured_indexed_queue_for(TickRegistry::Block, &[])?;
+        let fluid_ticks = region
+            .ticks()
+            .captured_indexed_queue_for(TickRegistry::Fluid, &[])?;
+        Ok(SavedTickingResult {
+            region,
+            block_ticks,
+            fluid_ticks,
+        })
+    }
+}
+
 /// Execute a queued ticking-future callback over the captured FULL source.
 /// The caller must sample the game time, registry, light and holder identities
 /// at dispatch, prevent interleaving, and later reconcile all live and disk
@@ -74,8 +177,8 @@ pub fn dispatch_saved_ticking(
     mut configure: impl FnMut(&mut GeneratedPostprocessing) -> Result<()>,
 ) -> Result<Option<SavedTickingResult>> {
     let mut input = Some(input);
-    let region = RefCell::new(None::<PostprocessedGeneratedRegion>);
-    let queues = RefCell::new(None::<(IndexedRegionQueue, IndexedRegionQueue)>);
+    let stage = RefCell::new(None::<GeneratedPostprocessing>);
+    let result = RefCell::new(None::<SavedTickingResult>);
     let dispatched = future.dispatch(
         |center| {
             let input = input
@@ -93,39 +196,48 @@ pub fn dispatch_saved_ticking(
                 }),
                 "saved ticking inputs lack a FULL neighbor"
             );
-            let mut stage = begin_saved_postprocessing(provider, input, &mut validate_state)?;
-            stage.select_initial_targets(BTreeSet::from([center]))?;
-            configure(&mut stage)?;
-            while !stage.poll(center, 256)? {}
-            *region.borrow_mut() = Some(stage.finish()?);
+            let mut next = begin_saved_postprocessing(provider, input, &mut validate_state)?;
+            next.select_initial_targets(BTreeSet::from([center]))?;
+            configure(&mut next)?;
+            while !next.poll(center, 256)? {}
+            *stage.borrow_mut() = Some(next);
             Ok(())
         },
-        |_| Ok(()),
         |center| {
-            let region = region.borrow();
-            let ticks = region
-                .as_ref()
+            stage
+                .borrow_mut()
+                .as_mut()
                 .context("saved ticking postprocessing is missing")?
-                .ticks();
-            let blocks = ticks.captured_indexed_queue_for(TickRegistry::Block, &[center])?;
-            let fluids = ticks.captured_indexed_queue_for(TickRegistry::Fluid, &[center])?;
-            *queues.borrow_mut() = Some((blocks, fluids));
+                .unpack_saved_ticks(center)
+        },
+        |_| {
+            let region = stage
+                .borrow_mut()
+                .take()
+                .context("saved ticking postprocessing is missing")?
+                .finish()?;
+            let blocks = region
+                .ticks()
+                .captured_indexed_queue_for(TickRegistry::Block, &[])?;
+            let fluids = region
+                .ticks()
+                .captured_indexed_queue_for(TickRegistry::Fluid, &[])?;
+            *result.borrow_mut() = Some(SavedTickingResult {
+                region,
+                block_ticks: blocks,
+                fluid_ticks: fluids,
+            });
             Ok(())
         },
     )?;
     if !dispatched || future.state() != TickingFutureState::Available {
         return Ok(None);
     }
-    let (block_ticks, fluid_ticks) = queues
-        .into_inner()
-        .context("saved ticking queues are missing")?;
-    Ok(Some(SavedTickingResult {
-        region: region
+    Ok(Some(
+        result
             .into_inner()
             .context("saved ticking result is missing")?,
-        block_ticks,
-        fluid_ticks,
-    }))
+    ))
 }
 
 /// Restore an isolated postprocessing stage from original FULL chunk data.

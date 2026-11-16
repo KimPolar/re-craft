@@ -89,8 +89,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         }
     }
     static class FakeChunk extends LevelChunk {
+        ChunkPos position;
         FakeChunk(){super((Level)null,new ChunkPos(0,0));}
-        @Override public ChunkPos getPos(){return new ChunkPos(0,0);}
+        @Override public ChunkPos getPos(){return position == null ? new ChunkPos(0,0) : position;}
         @Override public int getMinY(){return 0;}
         @Override public int getHeight(){return 16;}
         @Override public BlockState getBlockState(BlockPos p){return get(p);}
@@ -128,6 +129,51 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
+        if(args.length>0 && args[0].equals("edge_ticking_sequence")) {
+            blocks.clear();lightChecks.clear();fizzEvents.clear();fallingEntities.clear();
+            var firstPos=new ChunkPos(0,0);var secondPos=new ChunkPos(1,0);
+            var first=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
+            var second=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
+            first.position=firstPos;second.position=secondPos;
+            for(var entry:List.of(Map.entry(first,new BlockPos(15,8,8)),Map.entry(second,new BlockPos(16,8,8)))) {
+                ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(entry.getValue()));
+                set(entry.getKey(),"postProcessing",marks);
+                set(entry.getKey(),"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
+                set(entry.getKey(),"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
+            }
+            blockAccess=new LevelTicks<Block>(p->true);fluidAccess=new LevelTicks<Fluid>(p->true);
+            var blockQueues=new HashMap<ChunkPos,LevelChunkTicks<Block>>();
+            var fluidQueues=new HashMap<ChunkPos,LevelChunkTicks<Fluid>>();
+            for(int z=-1;z<=1;z++)for(int x=-1;x<=2;x++) {
+                var chunkPos=new ChunkPos(x,z);
+                var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
+                blockQueues.put(chunkPos,bt);fluidQueues.put(chunkPos,ft);
+                blockAccess.addContainer(chunkPos,bt);fluidAccess.addContainer(chunkPos,ft);
+            }
+            set(first,"blockTicks",blockQueues.get(firstPos));set(first,"fluidTicks",fluidQueues.get(firstPos));
+            set(second,"blockTicks",blockQueues.get(secondPos));set(second,"fluidTicks",fluidQueues.get(secondPos));
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,true,null);
+            counter=2;random=RandomSource.create(42);set(level,"random",random);
+            updater=new CollectingNeighborUpdater(level,100000);
+            blocks.put(new BlockPos(15,8,8),Blocks.WATER.defaultBlockState());
+            blocks.put(new BlockPos(16,8,8),Blocks.AIR.defaultBlockState());
+            first.postProcessGeneration(level);first.unpackTicks(100);
+            var afterFirst=get(new BlockPos(16,8,8));
+            out.printf("first %s %s%n",BuiltInRegistries.BLOCK.getKey(afterFirst.getBlock()),
+                afterFirst.is(Blocks.WATER)?afterFirst.getValue(LiquidBlock.LEVEL):"-");
+            second.postProcessGeneration(level);second.unpackTicks(100);
+            var afterSecond=get(new BlockPos(16,8,8));
+            out.printf("second %s %s%n",BuiltInRegistries.BLOCK.getKey(afterSecond.getBlock()),
+                afterSecond.is(Blocks.WATER)?afterSecond.getValue(LiquidBlock.LEVEL):"-");
+            for(var entry:List.of(Map.entry("a",firstPos),Map.entry("b",secondPos))) {
+                for(var tick:fluidQueues.get(entry.getValue()).pack(100)) {
+                    var p=tick.pos();out.printf("%s %s %d,%d,%d %d %d%n",entry.getKey(),
+                        BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),
+                        tick.delay(),tick.priority().getValue());
+                }
+            }
+            out.println("counter "+counter);out.println("END_RESULT");return;
+        }
         if(args.length>0 && args[0].equals("stalactite_chain")) {
             var tickMethod=SpeleothemBlock.class.getDeclaredMethod("tick",BlockState.class,ServerLevel.class,BlockPos.class,RandomSource.class);tickMethod.setAccessible(true);
             var hurts=FallingBlockEntity.class.getDeclaredField("hurtEntities");hurts.setAccessible(true);

@@ -1263,6 +1263,20 @@ impl GeneratedPostprocessing {
         Ok(())
     }
 
+    pub(super) fn postprocessing_completed(&self, pos: ChunkPos) -> bool {
+        self.completed.contains(&pos)
+    }
+
+    /// Unpack saved ticks only after the corresponding callback has finished.
+    /// Later callbacks in the same isolated pass observe the activated queues.
+    pub(super) fn unpack_saved_ticks(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            !self.failed && self.active.is_none() && self.completed.contains(&pos),
+            "postprocessing must complete before saved ticks are unpacked"
+        );
+        self.region.ticks.unpack_chunk(pos)
+    }
+
     /// Capture a deferred chunk's block entities as a Java FULL chunk save does.
     /// Saving may promote pending entities; successful promotions remain in the
     /// stage for subsequent callbacks. Unsupported entities leave it unchanged.

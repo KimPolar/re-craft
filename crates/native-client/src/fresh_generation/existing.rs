@@ -89,6 +89,18 @@ impl KnownEntityIds {
     }
 }
 
+fn reserve_mineshaft_entity_id(
+    known: &BTreeSet<[i32; 4]>,
+    reserved: &mut BTreeSet<[i32; 4]>,
+    uuid: [i32; 4],
+) -> Result<()> {
+    ensure!(
+        !known.contains(&uuid) && reserved.insert(uuid),
+        "generated mineshaft minecart UUID conflicts with an observed entity"
+    );
+    Ok(())
+}
+
 struct ResumedFarmEnvironment<'a> {
     biome: &'a ResourceId,
     moon: Option<&'a native_resources::moon_phase::Environment>,
@@ -2034,6 +2046,14 @@ pub(crate) struct StagedLiveTerrainBatch {
 impl StagedLiveTerrainBatch {
     pub fn snapshot(&self) -> Arc<native_world::loaded::World> {
         self.batch.terrain.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_generated_entities(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<&[Tag]> {
+        self.batch.terrain.recorded_generated_entities(pos)
     }
 
     pub fn heightmaps(&self, pos: native_world::loaded::ChunkPos) -> Result<Tag> {
@@ -5635,7 +5655,36 @@ impl PreparedExistingGenerator {
         positions: impl Iterator<Item = native_world::loaded::ChunkPos>,
         uuid: [i32; 4],
     ) -> Result<()> {
-        let captured = self.captured_entity_ids.get_or_insert_with(|| {
+        self.refresh_terrain_entity_ids(terrain, revision, positions)?;
+        ensure!(
+            !self
+                .captured_entity_ids
+                .as_ref()
+                .context("captured entity identity index missing")?
+                .0
+                .contains(&uuid),
+            "generated creature UUID conflicts with a captured entity"
+        );
+        ensure!(
+            !self
+                .generated_entity_ids
+                .as_ref()
+                .context("generated entity identity index missing")?
+                .1
+                .0
+                .contains(&uuid),
+            "generated creature UUID conflicts with a generated feature entity"
+        );
+        Ok(())
+    }
+
+    fn refresh_terrain_entity_ids(
+        &mut self,
+        terrain: &native_session::worldgen::CarvedTerrainWorld,
+        revision: &Arc<()>,
+        positions: impl Iterator<Item = native_world::loaded::ChunkPos>,
+    ) -> Result<()> {
+        self.captured_entity_ids.get_or_insert_with(|| {
             let mut ids = KnownEntityIds::default();
             for chunk in self.context.inputs().sources().chunks().values() {
                 if let Some(terrain) = &chunk.terrain {
@@ -5647,10 +5696,6 @@ impl PreparedExistingGenerator {
             }
             ids
         });
-        ensure!(
-            !captured.0.contains(&uuid),
-            "generated creature UUID conflicts with a captured entity"
-        );
         if !self
             .generated_entity_ids
             .as_ref()
@@ -5662,16 +5707,6 @@ impl PreparedExistingGenerator {
             }
             self.generated_entity_ids = Some((Arc::clone(revision), ids));
         }
-        ensure!(
-            !self
-                .generated_entity_ids
-                .as_ref()
-                .context("generated entity identity index missing")?
-                .1
-                .0
-                .contains(&uuid),
-            "generated creature UUID conflicts with a generated feature entity"
-        );
         Ok(())
     }
 
@@ -7371,6 +7406,35 @@ impl PreparedExistingGenerator {
                 &blocks,
             )?);
         }
+        let needs_mineshaft = structures
+            .as_ref()
+            .is_some_and(|plan| !plan.mineshafts.is_empty());
+        let known_mineshaft_entities = if needs_mineshaft {
+            self.refresh_terrain_entity_ids(
+                &batch.terrain,
+                &batch.revision,
+                batch
+                    .sources
+                    .keys()
+                    .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z }),
+            )?;
+            let captured = &self
+                .captured_entity_ids
+                .as_ref()
+                .context("captured entity identity index missing")?
+                .0;
+            let generated = &self
+                .generated_entity_ids
+                .as_ref()
+                .context("generated entity identity index missing")?
+                .1
+                .0;
+            Some(Arc::new(
+                captured.union(generated).copied().collect::<BTreeSet<_>>(),
+            ))
+        } else {
+            None
+        };
         let previous_terrain = batch.terrain.clone();
         let previous_schedule = batch.schedule.clone();
         let priming = (|| -> Result<()> {
@@ -7385,9 +7449,6 @@ impl PreparedExistingGenerator {
             }
             Ok(())
         })();
-        let needs_mineshaft = structures
-            .as_ref()
-            .is_some_and(|plan| !plan.mineshafts.is_empty());
         let result = priming.and_then(|()| {
             self.with_saved_prepared_decoration_inner(
                 context,
@@ -7396,14 +7457,23 @@ impl PreparedExistingGenerator {
                     if let Some(structures) = &structures {
                         if needs_mineshaft {
                             let planned = structures.planned_mixed()?;
+                            let known = Arc::clone(
+                                known_mineshaft_entities
+                                    .as_ref()
+                                    .context("mineshaft entity identity index missing")?,
+                            );
+                            let mut reserved = BTreeSet::new();
                             let mut placement =
                                 native_session::worldgen::MixedMineshaftPlacementContext {
                                     other: UnavailableOceanPlacement,
                                     blocking_biomes: prepared
                                         .mineshaft_blocking_biomes()
                                         .context("mineshaft biome tags are missing")?,
-                                    uuid_factory: |_: [f64; 3]| -> Result<Option<[i32; 4]>> {
-                                        bail!("mineshaft minecart UUID source is not bound")
+                                    uuid_factory: move |_: [f64; 3]| -> Result<Option<[i32; 4]>> {
+                                        let uuid =
+                                            native_session::worldgen::fresh_entity_uuid_from_entropy()?;
+                                        reserve_mineshaft_entity_id(&known, &mut reserved, uuid)?;
+                                        Ok(Some(uuid))
                                     },
                                 };
                             let (features, updates) = match (light, queued.as_deref_mut()) {
@@ -15911,6 +15981,23 @@ mod tests {
                 [13, 14, 15, 16],
             ])
         );
+    }
+
+    #[test]
+    fn mineshaft_entity_ids_reject_known_and_new_duplicates() -> Result<()> {
+        let captured = [1, 2, 3, 4];
+        let existing_generated = [5, 6, 7, 8];
+        let fresh = [9, 10, 11, 12];
+        let known = BTreeSet::from([captured, existing_generated]);
+        let mut reserved = BTreeSet::new();
+
+        assert!(reserve_mineshaft_entity_id(&known, &mut reserved, captured).is_err());
+        assert!(reserve_mineshaft_entity_id(&known, &mut reserved, existing_generated).is_err());
+        assert!(reserved.is_empty());
+        reserve_mineshaft_entity_id(&known, &mut reserved, fresh)?;
+        assert!(reserve_mineshaft_entity_id(&known, &mut reserved, fresh).is_err());
+        assert_eq!(reserved, BTreeSet::from([fresh]));
+        Ok(())
     }
 
     #[test]

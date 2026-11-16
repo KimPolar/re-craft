@@ -296,9 +296,34 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
     assert!(staged.unfinished_features().is_empty());
     assert!(completed.contains(&target));
     assert!(placed > 0, "no selected feature returned success");
+    let mut cart_ids = BTreeSet::new();
+    for position in staged.snapshot().chunks.keys() {
+        for entity in staged.recorded_generated_entities(*position)? {
+            use native_persistence::nbt::Tag;
+            if !matches!(entity.get("id"), Some(Tag::String(id)) if id.matches("minecraft:chest_minecart"))
+            {
+                continue;
+            }
+            let Some(Tag::IntArray(uuid)) = entity.get("UUID") else {
+                anyhow::bail!("generated mineshaft minecart has no UUID")
+            };
+            let uuid: [i32; 4] = uuid.as_slice().try_into()?;
+            ensure!(uuid[1] as u32 & 0xf000 == 0x4000, "wrong UUID version");
+            ensure!(
+                uuid[2] as u32 & 0xc000_0000 == 0x8000_0000,
+                "wrong UUID variant"
+            );
+            ensure!(cart_ids.insert(uuid), "duplicate generated minecart UUID");
+            ensure!(
+                matches!(entity.get("LootTable"), Some(Tag::String(id)) if id.matches("minecraft:chests/abandoned_mineshaft")),
+                "generated mineshaft minecart has the wrong loot table"
+            );
+        }
+    }
     eprintln!(
-        "prepared features for {} chunks; {placed} selected features returned success",
-        completed.len()
+        "prepared features for {} chunks; {placed} selected features returned success; {} mineshaft minecarts recorded",
+        completed.len(),
+        cart_ids.len()
     );
     let snapshot = session.snapshot();
     let world = std::sync::Arc::clone(snapshot.world.loaded().context("world missing")?);

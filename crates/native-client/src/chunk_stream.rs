@@ -975,6 +975,14 @@ impl StagedMissingTerrain {
         self.batch.snapshot()
     }
 
+    #[cfg(test)]
+    pub(crate) fn recorded_generated_entities(
+        &self,
+        position: ChunkPos,
+    ) -> Result<&[native_persistence::nbt::Tag]> {
+        self.batch.recorded_generated_entities(position)
+    }
+
     pub fn heightmaps(&self, position: ChunkPos) -> Result<native_persistence::nbt::Tag> {
         self.batch.heightmaps(position)
     }

@@ -880,6 +880,218 @@ fn stale_background_fork_cannot_reserve_a_different_holder() -> Result<()> {
     Ok(())
 }
 
+fn ready_full_future(position: ChunkPos) -> Option<FullFuture> {
+    let positions = ticking_dependencies(ChunkPos { x: 0, z: 0 });
+    Some(FullFuture {
+        id: FullFutureId(positions.iter().position(|&pos| pos == position)? as u64),
+        result: Some(FullFutureResult::Full),
+    })
+}
+
+fn holder_lifecycle_trace() -> Result<Vec<String>> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut queue = TickingPreparations::default();
+    let mut holder = TickingHolder::new(center, 34, &queue);
+    let mut history = Vec::new();
+    let mut traces = Vec::new();
+    let apply = |holder: &mut TickingHolder,
+                 queue: &mut TickingPreparations,
+                 history: &mut Vec<TickingRequestId>| {
+        let id = holder
+            .needs_new_ticking_request()
+            .then(|| TickingRequestId(history.len() as u64));
+        let transition = holder.update(queue, id, ready_full_future)?;
+        if let TickingHolderTransition::Promoted(id) = transition {
+            history.push(id);
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let snapshot = |label: &str,
+                    holder: &TickingHolder,
+                    queue: &TickingPreparations,
+                    history: &[TickingRequestId]|
+     -> Result<String> {
+        let state_name = |state| match state {
+            TickingFutureState::Waiting => "waiting",
+            TickingFutureState::Available => "success",
+            TickingFutureState::Unavailable => "unavailable",
+            TickingFutureState::Exceptional => "exception",
+        };
+        let state = holder.state(queue)?;
+        let chunk = match state {
+            TickingFutureState::Available => "present",
+            TickingFutureState::Exceptional => "exception",
+            _ => "absent",
+        };
+        let saved = history
+            .iter()
+            .map(|id| state_name(queue.state(*id).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!("{label}|{}|{chunk}|{saved}", state_name(state)))
+    };
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("initial", &holder, &queue, &history)?);
+    holder.set_ticket_level(32);
+    traces.push(snapshot("before-promotion", &holder, &queue, &history)?);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("promoted", &holder, &queue, &history)?);
+    holder.set_ticket_level(31);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("entity-level", &holder, &queue, &history)?);
+    queue.dispatch_next(|callback| callback.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(())))?;
+    traces.push(snapshot("success", &holder, &queue, &history)?);
+    holder.set_ticket_level(33);
+    traces.push(snapshot("before-demotion", &holder, &queue, &history)?);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("demoted-success", &holder, &queue, &history)?);
+    holder.set_ticket_level(32);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("promoted-again", &holder, &queue, &history)?);
+    holder.set_ticket_level(33);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("demoted-waiting", &holder, &queue, &history)?);
+    holder.set_ticket_level(31);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("promoted-third", &holder, &queue, &history)?);
+    assert_eq!(queue.complete_exceptionally(history[2]), Some(true));
+    traces.push(snapshot("exception", &holder, &queue, &history)?);
+    holder.set_ticket_level(32);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("block-level", &holder, &queue, &history)?);
+    holder.set_ticket_level(34);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("demoted-exception", &holder, &queue, &history)?);
+    holder.set_ticket_level(32);
+    apply(&mut holder, &mut queue, &mut history)?;
+    assert_eq!(queue.cancel(history[3]), Some(true));
+    traces.push(snapshot("unavailable", &holder, &queue, &history)?);
+    holder.set_ticket_level(33);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("demoted-unavailable", &holder, &queue, &history)?);
+    holder.set_ticket_level(32);
+    apply(&mut holder, &mut queue, &mut history)?;
+    traces.push(snapshot("promoted-fifth", &holder, &queue, &history)?);
+    Ok(traces)
+}
+
+#[test]
+fn holder_keeps_exposed_future_until_ticket_update() -> Result<()> {
+    let actual = holder_lifecycle_trace()?;
+    assert_eq!(actual[1], "before-promotion|unavailable|absent|");
+    assert_eq!(actual[5], "before-demotion|success|present|success");
+    assert_eq!(actual[6], "demoted-success|unavailable|absent|success");
+    assert_eq!(
+        actual[8],
+        "demoted-waiting|unavailable|absent|success,unavailable"
+    );
+    assert_eq!(
+        actual[11],
+        "block-level|exception|exception|success,unavailable,exception"
+    );
+    Ok(())
+}
+
+#[test]
+fn holder_owns_current_future_and_preserves_running_old_epoch() -> Result<()> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut queue = TickingPreparations::default();
+    let mut holder = TickingHolder::new(center, 32, &queue);
+    assert!(holder.update(&mut queue, None, ready_full_future).is_err());
+    assert!(holder.needs_new_ticking_request());
+    let first = TickingRequestId(1);
+    holder.update(&mut queue, Some(first), ready_full_future)?;
+    let (_, worker) = queue.fork_next_background()?.context("missing callback")?;
+    queue.begin_next_background(&worker)?;
+    holder.set_ticket_level(33);
+    assert_eq!(
+        holder.update(&mut queue, None, ready_full_future)?,
+        TickingHolderTransition::Demoted {
+            previous: first,
+            completed_as_unavailable: true,
+        }
+    );
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Unavailable);
+    assert!(queue.retire(first).is_err());
+    holder.set_ticket_level(32);
+    let second = TickingRequestId(2);
+    holder.update(&mut queue, Some(second), ready_full_future)?;
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Waiting);
+    let events = RefCell::new(Vec::new());
+    queue.finish_background(|callback| {
+        callback.finish_background_callback(
+            |_| {
+                events.borrow_mut().push("post");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("unpack");
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+    })?;
+    assert_eq!(*events.borrow(), ["post", "unpack"]);
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Waiting);
+    assert!(queue.retire(first)?);
+    queue.dispatch_next(|callback| callback.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(())))?;
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Available);
+    assert!(queue.retire(second).is_err());
+    let mut other = TickingPreparations::default();
+    assert!(holder.state(&other).is_err());
+    assert!(holder.update(&mut other, None, ready_full_future).is_err());
+    holder.set_ticket_level(33);
+    assert_eq!(
+        holder.update(&mut queue, None, ready_full_future)?,
+        TickingHolderTransition::Demoted {
+            previous: second,
+            completed_as_unavailable: false,
+        }
+    );
+    assert!(queue.retire(second)?);
+    Ok(())
+}
+
+#[test]
+fn holder_promotion_failure_is_retryable_and_drop_does_not_leak_retention() -> Result<()> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut queue = TickingPreparations::default();
+    let occupied = TickingRequestId(1);
+    queue.start(occupied, center, ready_full_future)?;
+    let mut holder = TickingHolder::new(center, 32, &queue);
+    assert!(
+        holder
+            .update(&mut queue, Some(occupied), ready_full_future)
+            .is_err()
+    );
+    assert!(holder.needs_new_ticking_request());
+    assert_eq!(holder.current_request(), None);
+    assert_eq!(queue.queued_len(), 1);
+    let id = TickingRequestId(2);
+    holder.update(&mut queue, Some(id), ready_full_future)?;
+    queue.dispatch_next(|callback| callback.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(())))?;
+    queue.dispatch_next(|callback| callback.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(())))?;
+    assert!(queue.retire(id).is_err());
+    drop(holder);
+    assert!(queue.retire(id)?);
+    assert!(queue.retire(occupied)?);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn ticking_holder_ticket_transitions_match_java() -> Result<()> {
+    let java = crate::worldgen::postprocessing_java_results(
+        "TickingHolderLifecycleOracle",
+        include_str!("../tests/java/TickingHolderLifecycleOracle.java"),
+        &[],
+    );
+    assert_eq!(holder_lifecycle_trace()?, java);
+    Ok(())
+}
+
 #[test]
 #[cfg(target_os = "windows")]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]

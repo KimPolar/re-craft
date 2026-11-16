@@ -117,8 +117,9 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     use native_session::{
         loaded::BuildBounds,
         ticking_preparation::{
-            FullFuture, FullFutureId, FullFutureResult, TickingFutureState, TickingPreparation,
-            TickingPreparations, TickingRequestId, ticking_dependencies,
+            FullFuture, FullFutureId, FullFutureResult, TickingFutureState, TickingHolder,
+            TickingHolderTransition, TickingPreparation, TickingPreparations, TickingRequestId,
+            ticking_dependencies,
         },
         worldgen::GeneratedLavaRules,
     };
@@ -247,14 +248,17 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     let first = TickingRequestId(1);
     let second = TickingRequestId(2);
     let mut queue = TickingPreparations::default();
-    for id in [first, second] {
-        queue.start(id, center, |position| {
-            Some(FullFuture {
-                id: FullFutureId(dependencies.iter().position(|&entry| entry == position)? as u64),
-                result: Some(FullFutureResult::Full),
-            })
-        })?;
-    }
+    let mut holder = TickingHolder::new(center, 32, &queue);
+    let full_future = |position| {
+        Some(FullFuture {
+            id: FullFutureId(dependencies.iter().position(|&entry| entry == position)? as u64),
+            result: Some(FullFutureResult::Full),
+        })
+    };
+    assert_eq!(
+        holder.update(&mut queue, Some(first), full_future)?,
+        TickingHolderTransition::Promoted(first)
+    );
     let (expected, fork) = queue
         .fork_next_background()?
         .context("callback not queued")?;
@@ -264,8 +268,29 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         .begin_next_background(&fork)?
         .context("callback not queued")?;
     assert_eq!(running, first);
-    assert_eq!(queue.cancel(first), Some(true));
-    assert_eq!(queue.cancel(second), Some(true));
+    holder.set_ticket_level(33);
+    assert_eq!(
+        holder.update(&mut queue, None, full_future)?,
+        TickingHolderTransition::Demoted {
+            previous: first,
+            completed_as_unavailable: true,
+        }
+    );
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Unavailable);
+    holder.set_ticket_level(32);
+    assert_eq!(
+        holder.update(&mut queue, Some(second), full_future)?,
+        TickingHolderTransition::Promoted(second)
+    );
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Waiting);
+    holder.set_ticket_level(33);
+    assert_eq!(
+        holder.update(&mut queue, None, full_future)?,
+        TickingHolderTransition::Demoted {
+            previous: second,
+            completed_as_unavailable: true,
+        }
+    );
     assert!(queue.dispatch_next(|_| Ok(())).is_err());
     assert_eq!(queue.running_id(), Some(first));
     assert_eq!(queue.queued_len(), 1);
@@ -330,6 +355,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     eprintln!("applied scheduled saved ticking callback to the live session");
     assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
     assert_eq!(queue.running_id(), None);
+    assert_eq!(holder.state(&queue)?, TickingFutureState::Unavailable);
     let drained = queue
         .dispatch_next(|callback| {
             callback.dispatch(

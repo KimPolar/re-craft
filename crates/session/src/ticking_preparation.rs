@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use anyhow::{Result, ensure};
@@ -61,6 +61,7 @@ pub struct TickingPreparation {
     queued: Option<Queued>,
     running: bool,
     holder: bool,
+    retained_by_holder: Option<Weak<()>>,
     state: TickingFutureState,
 }
 
@@ -88,6 +89,7 @@ impl TickingPreparation {
             queued: None,
             running: false,
             holder: true,
+            retained_by_holder: None,
             state: TickingFutureState::Waiting,
         };
         for position in ticking_dependencies(center) {
@@ -150,6 +152,7 @@ impl TickingPreparation {
             queued: self.queued,
             running: false,
             holder: false,
+            retained_by_holder: None,
             state: self.state,
         })
     }
@@ -348,6 +351,7 @@ pub struct TickingRequestId(pub u64);
 /// FULL completion events must be supplied in their observed delivery order.
 #[derive(Default)]
 pub struct TickingPreparations {
+    identity: Arc<()>,
     futures: BTreeMap<FullFutureId, Option<FullFutureResult>>,
     subscribers: BTreeMap<FullFutureId, Vec<TickingRequestId>>,
     requests: BTreeMap<TickingRequestId, TickingPreparation>,
@@ -544,10 +548,14 @@ impl TickingPreparations {
             return Ok(false);
         };
         ensure!(
-            preparation.state() != TickingFutureState::Waiting
+            !preparation
+                .retained_by_holder
+                .as_ref()
+                .is_some_and(|holder| holder.strong_count() != 0)
+                && preparation.state() != TickingFutureState::Waiting
                 && !preparation.has_queued_callback()
                 && !preparation.is_running_callback(),
-            "ticking request still has work"
+            "ticking request is still owned or has work"
         );
         let future_ids: Vec<_> = preparation
             .dependencies()
@@ -574,6 +582,140 @@ impl TickingPreparations {
             "FULL future is still used by a ticking request"
         );
         Ok(self.futures.remove(&id).is_some())
+    }
+}
+
+/// A holder's loading-ticket transition and currently exposed ticking future.
+///
+/// The caller must provide the real loading-ticket level, not a simulation
+/// ticket or the presence of a chunk in memory. FULL-neighbor futures still
+/// come from the actual holders. This does not model accessible or entity
+/// futures, status notifications, send synchronization, or world persistence.
+pub struct TickingHolder {
+    center: ChunkPos,
+    queue_identity: Arc<()>,
+    holder_identity: Arc<()>,
+    applied_level: i32,
+    ticket_level: i32,
+    current: Option<TickingRequestId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TickingHolderTransition {
+    Unchanged,
+    Promoted(TickingRequestId),
+    Demoted {
+        previous: TickingRequestId,
+        completed_as_unavailable: bool,
+    },
+}
+
+impl TickingHolder {
+    /// Java starts each newly constructed holder with an inaccessible old
+    /// level; its initial ticket level is applied by a subsequent update.
+    pub fn new(center: ChunkPos, initial_level: i32, queue: &TickingPreparations) -> Self {
+        Self {
+            center,
+            queue_identity: Arc::clone(&queue.identity),
+            holder_identity: Arc::new(()),
+            applied_level: i32::MAX,
+            ticket_level: initial_level,
+            current: None,
+        }
+    }
+
+    /// Changing the level alone does not update the exposed future.
+    pub fn set_ticket_level(&mut self, level: i32) {
+        self.ticket_level = level;
+    }
+
+    pub fn needs_new_ticking_request(&self) -> bool {
+        self.applied_level > 32 && self.ticket_level <= 32
+    }
+
+    pub fn current_request(&self) -> Option<TickingRequestId> {
+        self.current
+    }
+
+    /// Return the currently exposed ticking future, not an older callback
+    /// that may still run after this holder has been demoted.
+    pub fn state(&self, queue: &TickingPreparations) -> Result<TickingFutureState> {
+        ensure!(
+            Arc::ptr_eq(&self.queue_identity, &queue.identity),
+            "ticking holder belongs to another executor"
+        );
+        match self.current {
+            Some(id) => queue
+                .state(id)
+                .ok_or_else(|| anyhow::anyhow!("holder ticking future is missing")),
+            None => Ok(TickingFutureState::Unavailable),
+        }
+    }
+
+    /// Apply one observed loading-ticket update. On promotion the caller must
+    /// supply a fresh request identity and the real neighboring FULL futures.
+    /// Demotion replaces the exposed future immediately, but an already
+    /// started or queued callback remains in its original executor position.
+    pub fn update(
+        &mut self,
+        queue: &mut TickingPreparations,
+        request_id: Option<TickingRequestId>,
+        request_full: impl FnMut(ChunkPos) -> Option<FullFuture>,
+    ) -> Result<TickingHolderTransition> {
+        ensure!(
+            Arc::ptr_eq(&self.queue_identity, &queue.identity),
+            "ticking holder belongs to another executor"
+        );
+        let old_ticking = self.applied_level <= 32;
+        let new_ticking = self.ticket_level <= 32;
+        let transition = match (old_ticking, new_ticking) {
+            (false, true) => {
+                ensure!(
+                    self.current.is_none(),
+                    "holder already has a ticking future"
+                );
+                let id = request_id
+                    .ok_or_else(|| anyhow::anyhow!("new ticking request identity is required"))?;
+                queue.start(id, self.center, request_full)?;
+                queue
+                    .requests
+                    .get_mut(&id)
+                    .expect("new ticking request")
+                    .retained_by_holder = Some(Arc::downgrade(&self.holder_identity));
+                self.current = Some(id);
+                TickingHolderTransition::Promoted(id)
+            }
+            (true, false) => {
+                let id = self
+                    .current
+                    .ok_or_else(|| anyhow::anyhow!("holder ticking future is missing"))?;
+                ensure!(
+                    queue
+                        .requests
+                        .get(&id)
+                        .and_then(|request| request.retained_by_holder.as_ref())
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|holder| Arc::ptr_eq(&holder, &self.holder_identity)),
+                    "holder ticking future is not retained"
+                );
+                let completed_as_unavailable = queue
+                    .cancel(id)
+                    .ok_or_else(|| anyhow::anyhow!("holder ticking future is missing"))?;
+                queue
+                    .requests
+                    .get_mut(&id)
+                    .expect("retained ticking request")
+                    .retained_by_holder = None;
+                self.current = None;
+                TickingHolderTransition::Demoted {
+                    previous: id,
+                    completed_as_unavailable,
+                }
+            }
+            _ => TickingHolderTransition::Unchanged,
+        };
+        self.applied_level = self.ticket_level;
+        Ok(transition)
     }
 }
 

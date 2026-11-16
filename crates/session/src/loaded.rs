@@ -41,6 +41,9 @@ mod stream_ticks_tests;
 #[path = "loaded_simulation_tests.rs"]
 mod simulation_tests;
 
+#[path = "loaded_saved_tick_activation.rs"]
+mod saved_tick_activation;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
@@ -1688,6 +1691,7 @@ pub struct LoadedSession {
     checked_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
     rejected_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
     unresolved_chunk_preparation: Option<String>,
+    pending_saved_tick_activation: BTreeMap<ChunkPos, PendingSavedTickActivation>,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     placed_chests: BTreeSet<(i32, i32, i32)>,
@@ -2491,6 +2495,13 @@ struct GeneratedTickOrder {
     base_time: i64,
     queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
     parked: BTreeMap<ChunkPos, crate::worldgen::chunk_ticks::ChunkTicks>,
+    saved_registration: Option<Vec<ChunkPos>>,
+}
+
+struct PendingSavedTickActivation {
+    registered_at: i128,
+    blocks: Vec<SavedBlockTick>,
+    fluids: Vec<SavedFluidTick>,
 }
 
 #[derive(Clone, Copy)]
@@ -2548,6 +2559,7 @@ impl GeneratedTickOrder {
         pos: ChunkPos,
         tick: i128,
         saved: Vec<crate::worldgen::chunk_ticks::SavedTick>,
+        pending: bool,
     ) -> bool {
         use crate::worldgen::chunk_ticks::ChunkTicks;
         if self.parked.contains_key(&pos) {
@@ -2566,13 +2578,15 @@ impl GeneratedTickOrder {
             return false;
         };
         if let Some(existing) = self.queue.container(pos) {
-            if existing.activated(time) != container.activated(time) {
+            if existing.activated(time) != container.activated(time)
+                || (pending && existing.pending_saved().is_none())
+            {
                 return false;
             }
         } else if !matches!(self.queue.add_container(pos, container), Ok(None)) {
             return false;
         }
-        self.queue.unpack_container(pos, time).is_ok()
+        pending || self.queue.unpack_container(pos, time).is_ok()
     }
 }
 
@@ -6967,11 +6981,127 @@ impl LoadedSession {
             self.tick == 0,
             "terrain source tracking must start before the first tick"
         );
-        if !self.require_saved_chunk_sources {
-            self.random_tick_revision = None;
+        if self.require_saved_chunk_sources {
+            return Ok(());
         }
+        if self.generated_ticks_installed {
+            // These schedules were already activated by generation rather
+            // than loaded as pending saved tick containers.
+            self.random_tick_revision = None;
+            self.require_saved_chunk_sources = true;
+            return Ok(());
+        }
+        let mut registration: Option<Vec<ChunkPos>> = None;
+        for order in [&self.generated_block_order, &self.generated_fluid_order]
+            .into_iter()
+            .flatten()
+        {
+            let saved = order
+                .saved_registration
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("generated tick ordering is already installed"))?;
+            anyhow::ensure!(
+                registration.as_ref().is_none_or(|previous| previous == saved),
+                "saved tick registrations differ"
+            );
+            registration = Some(saved.clone());
+        }
+        if let Some(saved) = &registration {
+            let positions: BTreeSet<_> = saved.iter().copied().collect();
+            anyhow::ensure!(
+                self.next_sub_tick == 0
+                    && self.accumulated == Duration::ZERO
+                    && self.initial_game_time_set
+                    && !self.generated_ticks_installed
+                    && positions.len() == saved.len()
+                    && positions.len() == self.world.chunks.len()
+                    && positions.iter().all(|pos| self.world.chunks.contains_key(pos)),
+                "saved tick ordering cannot be rebuilt after session changes"
+            );
+            self.generated_block_order = None;
+            self.generated_fluid_order = None;
+        }
+        let positions: Vec<_> = self.world.chunks.keys().copied().collect();
+        for pos in positions {
+            if self.world.chunks[&pos].status.as_deref() == Some("minecraft:full")
+                && self.check_saved_chunk_preparation(pos).is_ok()
+            {
+                continue;
+            }
+            self.pending_saved_tick_activation.insert(
+                pos,
+                PendingSavedTickActivation {
+                    registered_at: 0,
+                    blocks: self
+                        .world
+                        .saved_block_ticks
+                        .get(&pos)
+                        .cloned()
+                        .unwrap_or_default(),
+                    fluids: self
+                        .world
+                        .saved_fluid_ticks
+                        .get(&pos)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            );
+        }
+        self.random_tick_revision = None;
         self.require_saved_chunk_sources = true;
+        if let Some(registration) = registration {
+            self.install_saved_tick_orders(&registration)?;
+        }
         Ok(())
+    }
+
+    fn check_saved_chunk_preparation(&self, pos: ChunkPos) -> anyhow::Result<[u8; 32]> {
+        use anyhow::Context;
+        let fingerprint = self
+            .world
+            .saved_chunk_source(pos)
+            .context("saved chunk source is unavailable")?;
+        if self.checked_chunk_preparation.get(&pos) == Some(&fingerprint) {
+            return Ok(fingerprint);
+        }
+        let preparation = self
+            .world
+            .saved_chunk_activation(pos)
+            .context("saved chunk preparation was not captured")?;
+        let entities = self
+            .world
+            .saved_block_entities
+            .get(&pos)
+            .context("saved block entities were not captured")?;
+        crate::saved_chunk_activation::check_saved_work(
+            preparation,
+            entities,
+            self.bounds,
+            crate::saved_chunk_activation::SavedTickInputs {
+                position: pos,
+                blocks: self
+                    .world
+                    .saved_block_ticks
+                    .get(&pos)
+                    .map_or(&[], Vec::as_slice),
+                fluids: self
+                    .world
+                    .saved_fluid_ticks
+                    .get(&pos)
+                    .map_or(&[], Vec::as_slice),
+                supports_block: |id| {
+                    GeneratedBlockTickKind::from_id(id).is_some()
+                        || matches!(
+                            id,
+                            "redstone_lamp"
+                                | "frosted_ice"
+                                | "sculk_sensor"
+                                | "calibrated_sculk_sensor"
+                        )
+                },
+            },
+        )?;
+        Ok(fingerprint)
     }
 
     /// Record unresolved saved preparation before this experimental session
@@ -6991,6 +7121,7 @@ impl LoadedSession {
             self.world.chunks.contains_key(pos) || self.parked_chunks.contains_key(pos)
         });
         let mut changed = previously_checked != self.checked_chunk_preparation.len();
+        let mut accepted = Vec::new();
         // Parked chunks can also supply deferred shape or lighting updates.
         for (&pos, chunk) in self.world.chunks.iter().chain(&self.parked_chunks) {
             if chunk.status.as_deref() != Some("minecraft:full") {
@@ -7002,56 +7133,10 @@ impl LoadedSession {
             }) {
                 continue;
             }
-            let result = (|| -> anyhow::Result<[u8; 32]> {
-                use anyhow::Context;
-                let fingerprint = source.context("saved chunk source is unavailable")?;
-                if self.checked_chunk_preparation.get(&pos) == Some(&fingerprint) {
-                    return Ok(fingerprint);
-                }
-                let preparation = self
-                    .world
-                    .saved_chunk_activation(pos)
-                    .context("saved chunk preparation was not captured")?;
-                let entities = self
-                    .world
-                    .saved_block_entities
-                    .get(&pos)
-                    .context("saved block entities were not captured")?;
-                crate::saved_chunk_activation::check_saved_work(
-                    preparation,
-                    entities,
-                    self.bounds,
-                    crate::saved_chunk_activation::SavedTickInputs {
-                        position: pos,
-                        blocks: self
-                            .world
-                            .saved_block_ticks
-                            .get(&pos)
-                            .map_or(&[], Vec::as_slice),
-                        fluids: self
-                            .world
-                            .saved_fluid_ticks
-                            .get(&pos)
-                            .map_or(&[], Vec::as_slice),
-                        supports_block: |id| {
-                            GeneratedBlockTickKind::from_id(id).is_some()
-                                || matches!(
-                                    id,
-                                    "redstone_lamp"
-                                        | "frosted_ice"
-                                        | "sculk_sensor"
-                                        | "calibrated_sculk_sensor"
-                                )
-                        },
-                    },
-                )?;
-                Ok(fingerprint)
-            })();
+            let result = self.check_saved_chunk_preparation(pos);
             match result {
                 Ok(fingerprint) => {
-                    self.rejected_chunk_preparation.remove(&pos);
-                    changed |= self.checked_chunk_preparation.insert(pos, fingerprint)
-                        != Some(fingerprint);
+                    accepted.push((pos, fingerprint));
                 }
                 Err(error) => {
                     changed |= self.checked_chunk_preparation.remove(&pos).is_some();
@@ -7060,6 +7145,28 @@ impl LoadedSession {
                     } else {
                         self.rejected_chunk_preparation.remove(&pos);
                     }
+                    if self.unresolved_chunk_preparation.is_none() {
+                        self.unresolved_chunk_preparation =
+                            Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
+                    }
+                }
+            }
+        }
+        for (pos, fingerprint) in accepted {
+            if self.pending_saved_tick_activation.contains_key(&pos)
+                && !self.world.chunks.contains_key(&pos)
+            {
+                continue;
+            }
+            match self.activate_pending_saved_ticks(pos) {
+                Ok(()) => {
+                    self.rejected_chunk_preparation.remove(&pos);
+                    changed |= self.checked_chunk_preparation.insert(pos, fingerprint)
+                        != Some(fingerprint);
+                }
+                Err(error) => {
+                    changed |= self.checked_chunk_preparation.remove(&pos).is_some();
+                    self.rejected_chunk_preparation.insert(pos, fingerprint);
                     if self.unresolved_chunk_preparation.is_none() {
                         self.unresolved_chunk_preparation =
                             Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
@@ -7122,8 +7229,21 @@ impl LoadedSession {
     /// The first world tick changes the serialized delay of saved schedules.
     /// Track only chunks whose original scheduled ticks have not advanced yet.
     fn mark_advanced_saved_tick_chunks_dirty(&mut self) {
-        self.tick_dirty_chunks
-            .append(&mut self.tick_chunks_needing_dirty);
+        if self.pending_saved_tick_activation.is_empty() {
+            self.tick_dirty_chunks
+                .append(&mut self.tick_chunks_needing_dirty);
+            return;
+        }
+        let pending = &self.pending_saved_tick_activation;
+        let dirty = &mut self.tick_dirty_chunks;
+        self.tick_chunks_needing_dirty.retain(|pos| {
+            if pending.contains_key(pos) {
+                true
+            } else {
+                dirty.insert(*pos);
+                false
+            }
+        });
     }
 
     fn has_unsaved_chunk_changes(&self, position: ChunkPos) -> bool {
@@ -7222,6 +7342,7 @@ impl LoadedSession {
             order.forget_empty(position);
         }
         self.fluid_chunks_seen.remove(&position);
+        self.pending_saved_tick_activation.remove(&position);
         let world = Arc::make_mut(&mut self.world);
         world.saved_block_ticks.remove(&position);
         world.saved_fluid_ticks.remove(&position);
@@ -8408,6 +8529,7 @@ impl LoadedSession {
             base_time: self.game_time,
             queue: IndexedRegionQueue::default(),
             parked: BTreeMap::new(),
+            saved_registration: None,
         };
         let mut blocks = Some(new_order());
         let mut fluids = Some(new_order());
@@ -8432,7 +8554,14 @@ impl LoadedSession {
                         })
                         .collect()
                 };
-                if !supported || !order.register_saved(pos, 0, saved()) {
+                if !supported
+                    || !order.register_saved(
+                        pos,
+                        0,
+                        saved(),
+                        self.pending_saved_tick_activation.contains_key(&pos),
+                    )
+                {
                     blocks = None;
                 }
             }
@@ -8466,7 +8595,14 @@ impl LoadedSession {
                         })
                         .collect()
                 };
-                if !supported || !order.register_saved(pos, 0, saved()) {
+                if !supported
+                    || !order.register_saved(
+                        pos,
+                        0,
+                        saved(),
+                        self.pending_saved_tick_activation.contains_key(&pos),
+                    )
+                {
                     fluids = None;
                 }
             }
@@ -8483,11 +8619,11 @@ impl LoadedSession {
                     blocks: blocks
                         .as_ref()
                         .and_then(|order| order.queue.container(pos))
-                        .map_or_else(Vec::new, |ticks| ticks.activated(0)),
+                        .map_or_else(Vec::new, |ticks| ticks.activated(self.game_time)),
                     fluids: fluids
                         .as_ref()
                         .and_then(|order| order.queue.container(pos))
-                        .map_or_else(Vec::new, |ticks| ticks.activated(0)),
+                        .map_or_else(Vec::new, |ticks| ticks.activated(self.game_time)),
                 },
             );
         }
@@ -8499,6 +8635,15 @@ impl LoadedSession {
             self.install_fluid_tick_order(&snapshot, order.queue)
                 .is_ok()
         });
+        for order in [
+            &mut self.generated_block_order,
+            &mut self.generated_fluid_order,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            order.saved_registration = Some(registration.to_vec());
+        }
         Ok((blocks_installed, fluids_installed))
     }
 
@@ -8710,7 +8855,7 @@ impl LoadedSession {
                 .container(pos)
                 .context("generated block container is missing")?;
             ensure!(
-                captured.activated(0) == chunk.blocks,
+                captured.activated(ticks.game_time) == chunk.blocks,
                 "generated block container differs from the activated snapshot"
             );
             for tick in &chunk.blocks {
@@ -8757,6 +8902,7 @@ impl LoadedSession {
             base_time: ticks.game_time,
             queue,
             parked: BTreeMap::new(),
+            saved_registration: None,
         });
         Ok(())
     }
@@ -8799,7 +8945,7 @@ impl LoadedSession {
                 .container(pos)
                 .context("generated fluid container is missing")?;
             ensure!(
-                captured.activated(0) == chunk.fluids,
+                captured.activated(ticks.game_time) == chunk.fluids,
                 "generated fluid container differs from the activated snapshot"
             );
             for tick in &chunk.fluids {
@@ -8827,6 +8973,7 @@ impl LoadedSession {
             base_time: ticks.game_time,
             queue,
             parked: BTreeMap::new(),
+            saved_registration: None,
         });
         Ok(())
     }
@@ -9396,6 +9543,7 @@ impl LoadedSession {
             checked_chunk_preparation: BTreeMap::new(),
             rejected_chunk_preparation: BTreeMap::new(),
             unresolved_chunk_preparation: None,
+            pending_saved_tick_activation: BTreeMap::new(),
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
             placed_chests: BTreeSet::new(),
@@ -19600,6 +19748,17 @@ impl LoadedSession {
         blocks: &[SavedBlockTick],
     ) {
         use crate::worldgen::chunk_ticks::SavedTick;
+        let pending = self.require_saved_chunk_sources;
+        if pending {
+            let registered_at = self.scheduled_tick();
+            self.pending_saved_tick_activation
+                .entry(pos)
+                .or_insert_with(|| PendingSavedTickActivation {
+                    registered_at,
+                    blocks: blocks.to_vec(),
+                    fluids: fluids.to_vec(),
+                });
+        }
         let mut fluid_order = self.generated_fluid_order.take();
         let mut block_order = self.generated_block_order.take();
         self.enqueue_saved_fluids(pos, fluids);
@@ -19638,7 +19797,7 @@ impl LoadedSession {
                     })
                     .collect()
             };
-            if !supported || !order.register_saved(pos, self.scheduled_tick(), saved()) {
+            if !supported || !order.register_saved(pos, self.scheduled_tick(), saved(), pending) {
                 fluid_order = None;
             }
         }
@@ -19657,7 +19816,7 @@ impl LoadedSession {
                     })
                     .collect()
             };
-            if !supported || !order.register_saved(pos, self.scheduled_tick(), saved()) {
+            if !supported || !order.register_saved(pos, self.scheduled_tick(), saved(), pending) {
                 block_order = None;
             }
         }

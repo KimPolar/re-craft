@@ -90,6 +90,11 @@ impl ChunkTicks {
         Ok(self.identities.contains(&(pos, canonical(kind)?)))
     }
 
+    /// Saved entries that have not yet been unpacked by the ticking callback.
+    pub(crate) fn pending_saved(&self) -> Option<&[SavedTick]> {
+        self.pending.as_deref()
+    }
+
     /// A duplicate is ignored even if the old tick is still pending.
     pub fn schedule(&mut self, mut tick: ScheduledTick) -> Result<bool> {
         Self::validate(self.chunk, tick.position, tick.priority)?;

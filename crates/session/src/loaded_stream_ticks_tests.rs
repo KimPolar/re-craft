@@ -3,7 +3,7 @@ use super::{
     *,
 };
 use native_persistence::{
-    nbt::NamedTag,
+    nbt::{NamedTag, Tag},
     world::{ChunkArea, DimensionId, LoadedChunk},
 };
 use native_world::loaded::{SavedBlockEntities, SavedChunkActivation};
@@ -120,6 +120,102 @@ fn tracked_tick_session() -> (LoadedSession, ChunkPos, ChunkPos, NamedTag) {
     session.tick = 3;
     session.mark_advanced_saved_tick_chunks_dirty();
     (session, home, neighbor, original)
+}
+
+#[test]
+fn streamed_pending_ticks_keep_delays_across_unload_and_reload() {
+    for indexed in [false, true] {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let world = Arc::make_mut(&mut session.world);
+        world.remember_saved_chunk_source_with_activation(
+            home,
+            [17; 32],
+            SavedChunkActivation::Empty,
+        );
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        session.require_saved_chunk_sources().unwrap();
+        configure_index(&mut session, indexed);
+        let (_, original) = ticked_source(neighbor);
+        let clean = materialize_source(neighbor, &original)
+            .saved_chunk_activation(neighbor)
+            .unwrap()
+            .clone();
+        let mut marked = original.clone();
+        let saved = [neighbor.x * 16 + 1, 2, neighbor.z * 16 + 1];
+        let new = [neighbor.x * 16 + 2, 2, neighbor.z * 16 + 1];
+        let mut postprocessing = native_core::postprocessing::PostProcessing::new(0, 32).unwrap();
+        assert!(postprocessing.mark(saved[0], saved[1], saved[2]));
+        let Tag::Compound(fields) = &mut marked.value else {
+            panic!("expected chunk compound")
+        };
+        fields.push((
+            "PostProcessing".into(),
+            native_persistence::postprocessing::encode(&postprocessing),
+        ));
+        session.tick = 5;
+        session.queue_chunk_window(home, 1);
+        queue_tracked_source(
+            &mut session,
+            neighbor,
+            materialize_source(neighbor, &marked),
+        );
+        session.apply_streaming();
+        assert!(!session.saved_chunk_preparation_verified(neighbor));
+        assert_eq!(
+            session.pending_saved_tick_activation[&neighbor].registered_at,
+            5
+        );
+        session.tick = 15;
+        let saved_relative = IVec3::from_array(saved) - session.origin;
+        let new_relative = IVec3::from_array(new) - session.origin;
+        session.schedule_sand(saved_relative, FallingKind::Sand);
+        session.schedule_sand(new_relative, FallingKind::Sand);
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        session.schedule_fluid(saved_relative, water, 3);
+        session.schedule_fluid(new_relative, water, 3);
+        session.queue_chunk_window(home, 0);
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&neighbor));
+        session.tick = 20;
+        session.queue_chunk_window(home, 1);
+        session.apply_streaming();
+        assert_eq!(
+            session.pending_saved_tick_activation[&neighbor].registered_at,
+            5
+        );
+        session.tick = 25;
+        Arc::make_mut(&mut session.world)
+            .remember_saved_chunk_source_with_activation(neighbor, [18; 32], clean);
+        session.inspect_saved_chunk_preparation();
+        assert!(session.saved_chunk_preparation_verified(neighbor));
+        assert!(session.validate_saved_chunk_preparation().is_err());
+        let blocks: Vec<_> = session
+            .sand_ticks
+            .iter()
+            .map(|(order, key)| (order.0, key.x))
+            .collect();
+        let fluids: Vec<_> = session
+            .fluid_ticks
+            .iter()
+            .map(|(order, tick)| (order.0, tick.key.x))
+            .collect();
+        assert_eq!(blocks, [(17, new[0]), (45, saved[0])], "indexed={indexed}");
+        assert_eq!(fluids, [(18, new[0]), (55, saved[0])], "indexed={indexed}");
+        assert_eq!(session.generated_block_order.is_some(), indexed);
+        assert_eq!(session.generated_fluid_order.is_some(), indexed);
+    }
 }
 
 #[test]

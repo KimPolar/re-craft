@@ -471,6 +471,28 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+        let actual: Vec<_> = output
+            .lines()
+            .skip_while(|line| line.trim() != "BEGIN_FALL_RESULT")
+            .skip(1)
+            .take_while(|line| line.trim() != "END_FALL_RESULT")
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect();
+        let motion = AirborneMotion::from_block(IVec3::new(8, 8, 8));
+        let mut expected = Vec::new();
+        for name in ["sand", "gravel"] {
+            for dusted in 0..4 {
+                for has_entity in [false, true] {
+                    let next = native_core::random::LegacyRandom::new(42).next_long();
+                    expected.push(format!(
+                        "{name} {dusted} {has_entity} true 3 true true {:.1} {:.1} {:.1} true {next}",
+                        motion.position.x, motion.position.y, motion.position.z
+                    ));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -74,6 +74,40 @@ pub(crate) fn brushable_reset_is_inert(entities: &SavedBlockEntities, position: 
     true
 }
 
+/// Prepare a visible block-entity overlay for a freshly loaded brushable block
+/// that is being removed. The original payload and every other entity stay
+/// untouched. Unsupported or ambiguous payloads must not be partially applied.
+pub(crate) fn removed_brushable_entity(
+    entities: &SavedBlockEntities,
+    position: [i32; 3],
+) -> Result<Option<SavedBlockEntities>> {
+    ensure!(
+        brushable_reset_is_inert(entities, position),
+        "brushable block entity cannot be safely removed"
+    );
+    let SavedBlockEntities::Encoded(bytes) = entities else {
+        return Ok(None);
+    };
+    let mut document = nbt::read(bytes)?;
+    let Tag::List { values, .. } = &mut document.value else {
+        bail!("block entities are not a list");
+    };
+    let before = values.len();
+    values.retain(|entity| {
+        !matches!(
+            [entity.get("x"), entity.get("y"), entity.get("z")],
+            [Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))]
+                if [*x, *y, *z] == position
+        )
+    });
+    if values.len() == before {
+        return Ok(None);
+    }
+    Ok(Some(SavedBlockEntities::Encoded(
+        nbt::write(&document)?.into(),
+    )))
+}
+
 pub(crate) fn check_saved_work(
     saved: &SavedChunkActivation,
     entities: &SavedBlockEntities,
@@ -412,6 +446,54 @@ mod tests {
             &payload(vec![Tag::Compound(base.clone()), Tag::Compound(base)]),
             position,
         ));
+    }
+
+    #[test]
+    fn removing_brushable_entity_preserves_source_and_other_entities() {
+        let position = [1, 2, 3];
+        let brushable = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:brushable_block".into())),
+            ("x".into(), Tag::Int(1)),
+            ("y".into(), Tag::Int(2)),
+            ("z".into(), Tag::Int(3)),
+            ("LootTable".into(), Tag::String("example:loot".into())),
+        ]);
+        let other = Tag::Compound(vec![
+            ("id".into(), Tag::String("example:unknown".into())),
+            ("x".into(), Tag::Int(4)),
+            ("y".into(), Tag::Int(5)),
+            ("z".into(), Tag::Int(6)),
+            ("Custom".into(), Tag::ByteArray(vec![1, 2, 3])),
+        ]);
+        let source = SavedBlockEntities::Encoded(encode(Tag::List {
+            element_type: TagType::Compound,
+            values: vec![brushable.clone(), other.clone()],
+        }));
+        let original = source.clone();
+        let Some(SavedBlockEntities::Encoded(result)) =
+            removed_brushable_entity(&source, position).unwrap()
+        else {
+            panic!("expected updated block entity list");
+        };
+        assert_eq!(source, original);
+        assert_eq!(
+            nbt::read(&result).unwrap().value,
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![other],
+            }
+        );
+        assert_eq!(removed_brushable_entity(&source, [7, 8, 9]).unwrap(), None);
+        assert_eq!(
+            removed_brushable_entity(&SavedBlockEntities::Empty, position).unwrap(),
+            None
+        );
+        assert!(removed_brushable_entity(&SavedBlockEntities::Unavailable, position).is_err());
+        let duplicated = SavedBlockEntities::Encoded(encode(Tag::List {
+            element_type: TagType::Compound,
+            values: vec![brushable.clone(), brushable],
+        }));
+        assert!(removed_brushable_entity(&duplicated, position).is_err());
     }
 
     #[test]

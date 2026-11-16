@@ -2327,6 +2327,7 @@ fn shared_fluid_shapes() -> Arc<FluidShapeCache> {
 struct CreatedFallingSand {
     uuid: Option<[i32; 4]>,
     origin: IVec3,
+    brushable_state: Option<Arc<BlockState>>,
     verified_position: DVec3,
     visited: BTreeSet<ChunkPos>,
     checked: bool,
@@ -2346,6 +2347,7 @@ impl CreatedFallingSand {
         Self {
             uuid,
             origin,
+            brushable_state: None,
             verified_position: position,
             visited: BTreeSet::from([chunk]),
             checked: false,
@@ -20810,16 +20812,15 @@ impl LoadedSession {
                         x: key.x.div_euclid(16),
                         z: key.z.div_euclid(16),
                     };
-                    let inert = !self.world.live_block_entities.contains_key(&chunk)
-                        && self
-                            .world
-                            .visible_block_entities(&chunk)
-                            .is_some_and(|entities| {
-                                crate::saved_chunk_activation::brushable_reset_is_inert(
-                                    entities,
-                                    [key.x, key.y, key.z],
-                                )
-                            });
+                    let inert = self
+                        .world
+                        .visible_block_entities(&chunk)
+                        .is_some_and(|entities| {
+                            crate::saved_chunk_activation::brushable_reset_is_inert(
+                                entities,
+                                [key.x, key.y, key.z],
+                            )
+                        });
                     if !inert {
                         self.unresolved_brushable_lifecycle = true;
                         self.sand_pending.insert(key);
@@ -20840,27 +20841,58 @@ impl LoadedSession {
                     continue;
                 };
                 if free && key.y >= self.bounds.min_y {
-                    if key.kind.is_brushable() {
-                        // Brushable falling entities and block-entity removal
-                        // must be coordinated before this tick can execute.
-                        self.unresolved_brushable_lifecycle = true;
-                        self.sand_pending.insert(key);
-                        deferred_sand.push((order, key));
-                        continue;
-                    }
                     // The removed sand may support a banner in a chunk that
                     // has not streamed in yet. Keep the original scheduled
                     // tick until all neighboring state can be checked.
-                    if !self.banner_support_neighbors_available(relative)
-                        || !self.set(relative, self.states[0])
-                    {
+                    let checked = self
+                        .banner_support_neighbors_available(relative)
+                        .then(|| self.check_block_set(relative, self.states[0], true, false))
+                        .flatten();
+                    let Some(checked) = checked else {
+                        self.unresolved_brushable_lifecycle |= key.kind.is_brushable();
                         self.sand_pending.insert(key);
                         deferred_sand.push((order, key));
                         continue;
+                    };
+                    let mut brushable_state = None;
+                    if key.kind.is_brushable() {
+                        let chunk = ChunkPos {
+                            x: key.x.div_euclid(16),
+                            z: key.z.div_euclid(16),
+                        };
+                        let prepared =
+                            self.world
+                                .visible_block_entities(&chunk)
+                                .and_then(|entities| {
+                                    crate::saved_chunk_activation::removed_brushable_entity(
+                                        entities,
+                                        [key.x, key.y, key.z],
+                                    )
+                                    .ok()
+                                });
+                        let Some(prepared) = prepared else {
+                            self.unresolved_brushable_lifecycle = true;
+                            self.sand_pending.insert(key);
+                            deferred_sand.push((order, key));
+                            continue;
+                        };
+                        brushable_state = self.world.state(id).cloned().map(Arc::new);
+                        if let Some(entities) = prepared {
+                            Arc::make_mut(&mut self.world)
+                                .live_block_entities
+                                .insert(chunk, entities);
+                        }
+                        // Saving and further generation remain blocked until
+                        // the entity's complete lifecycle can be coordinated.
+                        self.unresolved_brushable_lifecycle = true;
                     }
+                    self.apply_block_set(relative, self.states[0], true, checked);
                     let motion = crate::falling_block::AirborneMotion::from_block(IVec3::new(
                         key.x, key.y, key.z,
                     ));
+                    let mut created =
+                        CreatedFallingSand::new(IVec3::new(key.x, key.y, key.z), motion.position);
+                    created.brushable_state = brushable_state;
                     self.falling_sand.push(FallingSand {
                         previous: motion.position,
                         fall_distance: 0.0,
@@ -20870,13 +20902,10 @@ impl LoadedSession {
                         motion,
                         kind: key.kind,
                         drop_item: true,
-                        cancel_drop: false,
+                        cancel_drop: key.kind.is_brushable(),
                         on_ground: false,
                         source: None,
-                        created: Some(CreatedFallingSand::new(
-                            IVec3::new(key.x, key.y, key.z),
-                            motion.position,
-                        )),
+                        created: Some(created),
                     });
                 }
             } else if let CollectedBlockTick::Button(key) = entry {
@@ -21620,7 +21649,13 @@ impl LoadedSession {
                     .world
                     .block(position.x, position.y, position.z)
                     .is_none_or(|block| {
-                        if let Some(stalactite) = &entity.stalactite {
+                        if let Some(state) = entity
+                            .created
+                            .as_ref()
+                            .and_then(|created| created.brushable_state.as_deref())
+                        {
+                            block != state
+                        } else if let Some(stalactite) = &entity.stalactite {
                             block != stalactite.block()
                         } else {
                             block.name != entity.kind.id() || !block.properties.is_empty()
@@ -21631,7 +21666,11 @@ impl LoadedSession {
                 previous_position: entity.previous,
                 position: entity.motion.position,
                 kind: entity.kind,
-                block_state: entity.stalactite.as_ref().map(|body| body.shared_block()),
+                block_state: entity
+                    .created
+                    .as_ref()
+                    .and_then(|created| created.brushable_state.clone())
+                    .or_else(|| entity.stalactite.as_ref().map(|body| body.shared_block())),
                 start_position: entity
                     .stalactite
                     .as_ref()
@@ -35825,7 +35864,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn generated_brushable_ticks_preserve_order_and_defer_unhandled_falls() {
+    fn generated_brushable_ticks_preserve_order_and_create_falling_blocks() {
         use crate::worldgen::chunk_ticks::{
             ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
         };
@@ -35889,23 +35928,63 @@ pub(crate) mod tests {
                         assert_eq!(pending[0].block, kind.id());
                         assert_eq!(pending[0].delay, 2);
                         assert_eq!(pending[0].priority, -1);
+                        let before = Arc::clone(&session.world);
                         session.tick = 2;
                         session.advance_block_ticks();
-                        assert_eq!(
-                            session
-                                .world
-                                .block(absolute.x, absolute.y, absolute.z)
-                                .unwrap()
-                                .name,
-                            kind.id()
-                        );
-                        assert!(session.falling_sand.is_empty());
                         assert_eq!(session.unresolved_brushable_lifecycle, falling);
                         if falling {
-                            assert_eq!(session.sand_deferred.len(), 1);
+                            assert_eq!(
+                                session
+                                    .world
+                                    .block(absolute.x, absolute.y, absolute.z)
+                                    .unwrap()
+                                    .name,
+                                "minecraft:air"
+                            );
+                            assert_eq!(session.falling_sand.len(), 1);
+                            let falling = &session.falling_sand[0];
+                            assert!(falling.drop_item);
+                            assert!(falling.cancel_drop);
+                            let visual = session.falling_sand_snapshot();
+                            assert_eq!(visual[0].kind, kind);
+                            assert_eq!(
+                                visual[0].position,
+                                absolute.as_dvec3() + DVec3::new(0.5, 0.0, 0.5)
+                            );
+                            assert_eq!(visual[0].start_position, Some(absolute));
+                            assert_eq!(
+                                visual[0].block_state.as_ref().unwrap().properties["dusted"],
+                                dusted
+                            );
+                            assert_eq!(
+                                before
+                                    .block(absolute.x, absolute.y, absolute.z)
+                                    .unwrap()
+                                    .name,
+                                kind.id()
+                            );
+                            assert!(session.sand_deferred.is_empty());
                             assert!(session.draft_block_ticks(home).is_err());
                             assert!(session.validate_generation_block_readiness().is_err());
+                            for _ in 0..40 {
+                                session.advance_falling_sand();
+                            }
+                            assert!(session.falling_sand.is_empty());
+                            assert_eq!(
+                                session.world.block(absolute.x, 1, absolute.z).unwrap().name,
+                                "minecraft:air"
+                            );
+                            assert!(session.dropped_items.snapshot().is_empty());
                         } else {
+                            assert_eq!(
+                                session
+                                    .world
+                                    .block(absolute.x, absolute.y, absolute.z)
+                                    .unwrap()
+                                    .name,
+                                kind.id()
+                            );
+                            assert!(session.falling_sand.is_empty());
                             assert!(session.sand_ticks.is_empty());
                             assert!(session.sand_deferred.is_empty());
                             assert!(session.draft_block_ticks(home).unwrap().is_empty());
@@ -35914,6 +35993,131 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn brushable_falls_remove_only_live_block_entities_and_preserve_snapshot() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+
+        let mut session = session();
+        let home = *session.world.chunks.keys().next().unwrap();
+        let positions =
+            [IVec3::new(8, 5, 8), IVec3::new(10, 5, 8)].map(|relative| session.origin + relative);
+        let entity = |pos: IVec3, id: &str| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("x".into(), Tag::Int(pos.x)),
+                ("y".into(), Tag::Int(pos.y)),
+                ("z".into(), Tag::Int(pos.z)),
+                ("unknown".into(), Tag::String("preserve".into())),
+            ])
+        };
+        let other = entity(session.origin + IVec3::new(12, 5, 8), "example:other");
+        let source = SavedBlockEntities::Encoded(
+            nbt::write(&NamedTag {
+                name: "block_entities".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![
+                        entity(positions[0], "minecraft:brushable_block"),
+                        other.clone(),
+                        entity(positions[1], "minecraft:brushable_block"),
+                    ],
+                },
+            })
+            .unwrap()
+            .into(),
+        );
+        let kinds = [FallingKind::SuspiciousSand, FallingKind::SuspiciousGravel];
+        for (position, kind) in positions.iter().zip(kinds) {
+            let id = session.intern_block(state(kind.id(), &[("dusted", "2")]));
+            Arc::make_mut(&mut session.world)
+                .set_block_id(position.x, position.y, position.z, id)
+                .unwrap();
+        }
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(home, source.clone());
+        let before = Arc::clone(&session.world);
+        let ticks: Vec<_> = positions
+            .iter()
+            .zip(kinds)
+            .map(|(pos, kind)| SavedBlockTick {
+                block: kind.id().into(),
+                position: pos.to_array(),
+                delay: 0,
+                priority: 0,
+            })
+            .collect();
+        session.enqueue_saved_sand(&ticks);
+        session.advance_sand_ticks();
+        assert_eq!(session.falling_sand.len(), 2);
+        assert_eq!(session.world.saved_block_entities.get(&home), Some(&source));
+        assert_eq!(before.visible_block_entities(&home), Some(&source));
+        let Some(SavedBlockEntities::Encoded(visible)) =
+            session.world.visible_block_entities(&home)
+        else {
+            panic!("missing live block entity overlay");
+        };
+        let document = nbt::read(visible).unwrap();
+        assert!(document.name.matches("block_entities"));
+        assert_eq!(
+            document.value,
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![other],
+            }
+        );
+        assert!(session.validate_saved_chunk_preparation().is_err());
+    }
+
+    #[test]
+    fn brushable_fall_defers_unsupported_block_entity_without_changes() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+
+        let mut session = session();
+        let home = *session.world.chunks.keys().next().unwrap();
+        let relative = IVec3::new(8, 5, 8);
+        let pos = session.origin + relative;
+        let id = session.intern_block(state("minecraft:suspicious_sand", &[("dusted", "1")]));
+        let source = SavedBlockEntities::Encoded(
+            nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:brushable_block".into())),
+                        ("x".into(), Tag::Int(pos.x)),
+                        ("y".into(), Tag::Int(pos.y)),
+                        ("z".into(), Tag::Int(pos.z)),
+                        ("hit_direction".into(), Tag::Int(2)),
+                    ])],
+                },
+            })
+            .unwrap()
+            .into(),
+        );
+        let world = Arc::make_mut(&mut session.world);
+        world.set_block_id(pos.x, pos.y, pos.z, id).unwrap();
+        world.saved_block_entities.insert(home, source.clone());
+        session.enqueue_saved_sand(&[SavedBlockTick {
+            block: "minecraft:suspicious_sand".into(),
+            position: pos.to_array(),
+            delay: 0,
+            priority: 0,
+        }]);
+        session.advance_sand_ticks();
+        assert_eq!(
+            session.world.block(pos.x, pos.y, pos.z).unwrap().name,
+            "minecraft:suspicious_sand"
+        );
+        assert_eq!(session.world.visible_block_entities(&home), Some(&source));
+        assert!(session.world.live_block_entities.is_empty());
+        assert!(session.falling_sand.is_empty());
+        assert_eq!(session.sand_deferred.len(), 1);
+        assert!(session.validate_saved_chunk_preparation().is_err());
     }
 
     #[test]

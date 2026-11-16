@@ -53,6 +53,13 @@ pub struct ChunkTicks {
 }
 
 impl ChunkTicks {
+    /// Whether the container has no saved, queued, or reserved tick identities.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.as_ref().is_none_or(Vec::is_empty)
+            && self.heap.is_empty()
+            && self.identities.is_empty()
+    }
+
     pub fn from_saved(chunk: ChunkPos, mut ticks: Vec<SavedTick>) -> Result<Self> {
         ensure!(ticks.len() <= i32::MAX as usize, "too many pending ticks");
         let mut identities = BTreeSet::new();

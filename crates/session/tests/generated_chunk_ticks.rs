@@ -167,9 +167,40 @@ fn trace() -> Vec<String> {
     out.extend(indexed_collection_trace());
     out.extend(callback_reschedule_trace());
     out.extend(streamed_containers_trace());
+    out.extend(reloaded_containers_trace());
     out.extend(captured_index_history_trace());
     out.extend(incremental_registration_trace());
     out
+}
+
+fn reloaded_containers_trace() -> Vec<String> {
+    let position = ChunkPos { x: 8, z: -1 };
+    let mut queue = IndexedRegionQueue::default();
+    queue
+        .add_container(position, ChunkTicks::from_saved(position, vec![]).unwrap())
+        .unwrap();
+    queue.remove_container(position).unwrap();
+    let ticks = ChunkTicks::from_saved(
+        position,
+        vec![
+            saved("sand", [129, 4, -15], 5, 0),
+            saved("water", [130, 4, -15], 2, -1),
+            saved("sand", [129, 4, -15], 7, 0),
+        ],
+    )
+    .unwrap();
+    queue.add_container(position, ticks).unwrap();
+    queue.unpack_container(position, 117).unwrap();
+    let mut output = Vec::new();
+    for time in [118, 119, 122, 124] {
+        for tick in queue.collect_due(time, 100, |_| true) {
+            output.push(format!(
+                "C{time} {} {},{},{}",
+                tick.kind, tick.position[0], tick.position[1], tick.position[2]
+            ));
+        }
+    }
+    output
 }
 
 fn incremental_registration_trace() -> Vec<String> {
@@ -523,7 +554,7 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 236);
+    assert_eq!(lines.len(), 239);
 }
 
 #[test]

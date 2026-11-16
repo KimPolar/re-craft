@@ -30,6 +30,10 @@ mod sulfur_tests;
 mod activation_tests;
 
 #[cfg(test)]
+#[path = "loaded_stream_ticks_tests.rs"]
+mod stream_ticks_tests;
+
+#[cfg(test)]
 #[path = "loaded_simulation_tests.rs"]
 mod simulation_tests;
 
@@ -2485,6 +2489,24 @@ struct GeneratedTickOrder {
 }
 
 impl GeneratedTickOrder {
+    fn is_empty_at(&self, pos: ChunkPos) -> bool {
+        self.queue
+            .container(pos)
+            .is_none_or(crate::worldgen::chunk_ticks::ChunkTicks::is_empty)
+            && self
+                .parked
+                .get(&pos)
+                .is_none_or(crate::worldgen::chunk_ticks::ChunkTicks::is_empty)
+    }
+
+    fn forget_empty(&mut self, pos: ChunkPos) {
+        debug_assert!(self.is_empty_at(pos));
+        self.parked.remove(&pos);
+        if self.queue.container(pos).is_some() {
+            self.queue.remove_container(pos);
+        }
+    }
+
     fn park(&mut self, pos: ChunkPos) -> bool {
         if self.parked.contains_key(&pos) {
             return false;
@@ -7068,6 +7090,33 @@ impl LoadedSession {
             || self.tick_chunks_needing_dirty.contains(&position)
             || self.chest_dirty_chunks.contains(&position)
             || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z))
+    }
+
+    fn empty_streamed_tick_containers(&self, position: ChunkPos) -> bool {
+        [&self.generated_block_order, &self.generated_fluid_order]
+            .into_iter()
+            .flatten()
+            .all(|order| order.is_empty_at(position))
+    }
+
+    /// Forget a clean unloaded chunk so a future disk read registers its own
+    /// ticks. Live or pending ticks must keep the chunk and its containers.
+    fn forget_clean_streamed_ticks(&mut self, position: ChunkPos) {
+        debug_assert!(!self.has_unsaved_chunk_changes(position));
+        debug_assert!(self.empty_streamed_tick_containers(position));
+        for order in [
+            &mut self.generated_block_order,
+            &mut self.generated_fluid_order,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            order.forget_empty(position);
+        }
+        self.fluid_chunks_seen.remove(&position);
+        let world = Arc::make_mut(&mut self.world);
+        world.saved_block_ticks.remove(&position);
+        world.saved_fluid_ticks.remove(&position);
     }
 
     fn generation_non_shape_pending(&self) -> BTreeSet<ChunkPos> {
@@ -13889,13 +13938,17 @@ impl LoadedSession {
                 let unsaved: BTreeSet<_> = outside
                     .iter()
                     .copied()
-                    .filter(|pos| self.has_unsaved_chunk_changes(*pos))
+                    .filter(|pos| {
+                        self.has_unsaved_chunk_changes(*pos)
+                            || !self.empty_streamed_tick_containers(*pos)
+                    })
                     .collect();
                 let retained_entities: BTreeSet<_> = outside
                     .iter()
                     .copied()
                     .filter(|pos| self.retain_entity_chunk(*pos))
                     .collect();
+                let mut forgotten_ticks = Vec::new();
                 let world = Arc::make_mut(&mut self.world);
                 for pos in outside {
                     let chunk = world
@@ -13912,6 +13965,7 @@ impl LoadedSession {
                         self.parked_chunks.insert(pos, chunk);
                         respawn_changed = true;
                     } else {
+                        forgotten_ticks.push(pos);
                         world.forget_saved_chunk_source(pos);
                         self.registered_sculk_chunks.remove(&pos);
                         let sensors: Vec<_> = self
@@ -13973,6 +14027,9 @@ impl LoadedSession {
                 world
                     .missing_chunks
                     .retain(|pos| within_window(*pos, window));
+                for pos in forgotten_ticks {
+                    self.forget_clean_streamed_ticks(pos);
+                }
                 for (pos, ticks, sand_ticks) in restored_ticks {
                     self.enqueue_streamed_ticks(pos, &ticks, &sand_ticks);
                     self.register_saved_sculk_chunk(pos);
@@ -13985,6 +14042,7 @@ impl LoadedSession {
             .copied()
             .filter(|pos| {
                 !self.has_unsaved_chunk_changes(*pos)
+                    && self.empty_streamed_tick_containers(*pos)
                     && !required_shapes.contains(pos)
                     && !required_sky.contains(pos)
                     && !required_simulation.contains(pos)
@@ -13998,6 +14056,7 @@ impl LoadedSession {
             .collect();
         for pos in unused {
             self.parked_chunks.remove(&pos);
+            self.forget_clean_streamed_ticks(pos);
             Arc::make_mut(&mut self.world).forget_saved_chunk_source(pos);
             self.registered_sculk_chunks.remove(&pos);
             let sensors: Vec<_> = self
@@ -14023,11 +14082,6 @@ impl LoadedSession {
             self.entity_collision_cache.remove(&pos);
             if self.spawn_heightmaps.contains_key(&pos) {
                 Arc::make_mut(&mut self.spawn_heightmaps).remove(&pos);
-            }
-            if !self.fluid_chunks_seen.contains(&pos) {
-                let world = Arc::make_mut(&mut self.world);
-                world.saved_fluid_ticks.remove(&pos);
-                world.saved_block_ticks.remove(&pos);
             }
             respawn_changed = true;
         }

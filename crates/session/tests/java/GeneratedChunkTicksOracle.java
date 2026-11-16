@@ -153,6 +153,20 @@ public class GeneratedChunkTicksOracle {
         replaced.tick(2, 100, (p, type) -> System.out.println("X1 " + type));
         replaced.schedule(tick("minecraft:new", new BlockPos(0, 1, 16), 3, TickPriority.NORMAL, 2));
         replaced.tick(3, 100, (p, type) -> System.out.println("X2 " + type));
+        var reloaded = new LevelTicks<String>(p -> true);
+        var reloadedPos = new ChunkPos(8, -1);
+        reloaded.addContainer(reloadedPos, new LevelChunkTicks<String>());
+        reloaded.removeContainer(reloadedPos);
+        var reloadedTicks = new LevelChunkTicks<String>(List.of(
+            new SavedTick<String>("minecraft:sand", new BlockPos(129, 4, -15), 5, TickPriority.NORMAL),
+            new SavedTick<String>("minecraft:water", new BlockPos(130, 4, -15), 2, TickPriority.HIGH),
+            new SavedTick<String>("minecraft:sand", new BlockPos(129, 4, -15), 7, TickPriority.NORMAL)));
+        reloaded.addContainer(reloadedPos, reloadedTicks);
+        reloadedTicks.unpack(117);
+        for (long time : new long[]{118, 119, 122, 124}) {
+            reloaded.tick(time, 100, (p, type) ->
+                System.out.println("C" + time + " " + type + " " + p.getX() + "," + p.getY() + "," + p.getZ()));
+        }
         var history = new LevelTicks<String>(p -> true);
         @SuppressWarnings("unchecked")
         LevelChunkTicks<String>[] historyChunks = new LevelChunkTicks[30];

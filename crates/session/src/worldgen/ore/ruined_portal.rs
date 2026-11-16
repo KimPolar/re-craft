@@ -746,9 +746,11 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
                 && self.inner.registry.has_block_entity(&state.name) == Some(false),
             "invalid portal template output"
         );
+        self.inner.region.portal_block_write = true;
         self.inner.region.magma_block_write = state.name == "minecraft:magma_block";
         let result = self.inner.region.set_proto_block(pos, state);
         self.inner.region.magma_block_write = false;
+        self.inner.region.portal_block_write = false;
         result?;
         if state.name == "minecraft:magma_block" {
             mark_magma(self.inner.region, pos)?;
@@ -805,9 +807,11 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
                 native_world::collision::jigsaw_state(&old),
                 "temporary jigsaw was replaced"
             );
+            self.inner.region.portal_block_write = true;
             self.inner.region.magma_block_write = state.name == "minecraft:magma_block";
             let result = self.inner.region.set_proto_block(pos, state);
             self.inner.region.magma_block_write = false;
+            self.inner.region.portal_block_write = false;
             result?;
             if let Some(order) = self.inner.region.entity_order.get_mut(&chunk(pos)) {
                 Arc::make_mut(order).remove(pos);
@@ -844,6 +848,22 @@ struct PortalRegion<'r, 'a, 'g> {
     region: &'r mut DecorationRegion<'a>,
     registry: &'g GeneratedBlockRegistry,
     protected: &'g BTreeSet<String>,
+}
+
+#[cfg(test)]
+pub(super) fn place_decoration_for_light_test(
+    region: &mut DecorationRegion<'_>,
+    registry: &GeneratedBlockRegistry,
+    pos: [i32; 3],
+    block: PortalBlock,
+) -> Result<()> {
+    let protected = BTreeSet::new();
+    let mut portal = PortalRegion {
+        region,
+        registry,
+        protected: &protected,
+    };
+    PortalDecorationWorld::set_block(&mut portal, pos, block)
 }
 
 fn mark_magma(region: &mut DecorationRegion<'_>, pos: [i32; 3]) -> Result<()> {
@@ -977,9 +997,11 @@ impl PortalDecorationWorld for PortalRegion<'_, '_, '_> {
                 && self.registry.has_block_entity(&state.name) == Some(false),
             "unverified portal output state"
         );
+        self.region.portal_block_write = true;
         self.region.magma_block_write = block == PortalBlock::Magma;
         let result = self.region.set_proto_block(pos, &state);
         self.region.magma_block_write = false;
+        self.region.portal_block_write = false;
         result?;
         if block == PortalBlock::Magma {
             mark_magma(self.region, pos)?;

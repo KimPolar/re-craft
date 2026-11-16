@@ -18,6 +18,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     final Map<BlockPos, BlockState> edits = new HashMap<>();
     boolean mixed;
     boolean magmaOnly;
+    boolean portalSources;
     boolean wide;
     boolean lateFar;
     boolean emptyEast;
@@ -46,7 +47,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(lateFar && p.getX()==31 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(magmaOnly && p.getX()==16 && p.getY()==8 && p.getZ()==8) return Blocks.WATER.defaultBlockState();
-        if(!blockCase && !magmaOnly && p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
+        if(!blockCase && !magmaOnly && !portalSources && p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(p.getY()>=0 && p.getY()<8 && Math.abs(Math.floorDiv(p.getX(),16))<=((mixed || wide)?2:1) && Math.abs(Math.floorDiv(p.getZ(),16))<=((mixed || wide)?2:1)) return Blocks.STONE.defaultBlockState();
         return Blocks.AIR.defaultBlockState();
     }
@@ -62,9 +63,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public int getHeight(){ return 16; }
         public ChunkSkyLightSources getSkyLightSources(){ return sources; }
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
-            if(x==1 && z==0 && magmaOnly) for(var entry:edits.entrySet())
+            if(x==1 && z==0 && (magmaOnly || portalSources)) for(var entry:edits.entrySet())
                 if(Math.floorDiv(entry.getKey().getX(),16)==1 && Math.floorDiv(entry.getKey().getZ(),16)==0 && entry.getValue().getLightEmission()>0) f.accept(entry.getKey(),entry.getValue());
-            if(x==1 && z==0 && !blockCase && !magmaOnly && !emptyEast) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !blockCase && !magmaOnly && !portalSources && !emptyEast) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
             if(x==0 && z==0 && blockCase && !stairSky){ f.accept(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState()); if(!stairCase)f.accept(new BlockPos(14,10,8),Blocks.TORCH.defaultBlockState()); }
             if(x==1 && z==0 && blockCase) for(var entry:edits.entrySet())
                 if(Math.floorDiv(entry.getKey().getX(),16)==1 && Math.floorDiv(entry.getKey().getZ(),16)==0 && entry.getValue().getLightEmission()>0) f.accept(entry.getKey(),entry.getValue());
@@ -238,6 +239,16 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.getFluidState().isEmpty() || !LightEngine.hasDifferentLightProperties(source,target.defaultBlockState()))
                     throw new AssertionError("unsupported patch vine source "+source+" -> "+target);
         boolean magmaActive=vineActive && args[1].endsWith("_magma_block");
+        boolean portalActive=vineActive && args[1].contains("_portal_");
+        String portalSource=null, portalTarget=null;
+        if(portalActive) {
+            var spec=args[1].substring(args[1].indexOf("_portal_")+8).replaceFirst("^template_","").split("_to_",2);
+            portalSource=spec[0].equals("magma") ? "magma_block" : spec[0];
+            portalTarget=spec[1];
+            var source=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+portalSource)).defaultBlockState();
+            var target=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+portalTarget)).defaultBlockState();
+            if(source.hasBlockEntity() || target.hasBlockEntity() || source.getLightDampening()!=15 || target.getLightDampening()!=15 || source.useShapeForLightOcclusion() || target.useShapeForLightOcclusion() || !LightEngine.hasDifferentLightProperties(source,target))throw new AssertionError("unsupported portal light change");
+        }
         if(magmaActive) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","raw_iron_block","raw_copper_block","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore","sulfur","cinnabar","deepslate","granite","diorite","andesite","tuff","calcite","gravel","sand","red_sand")) {
             var block=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
             for(var state:block.getStateDefinition().getPossibleStates())
@@ -295,6 +306,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
         boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing") || args[1].equals("vine_active_self_existing"));
         w.magmaOnly=magma || magmaActive;
+        w.portalSources=portalActive;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || (vine && !vineActive) || emptyPartialWide || (leafActive && !leafFull));
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         boolean late=args.length>1 && args[1].startsWith("late");
@@ -320,7 +332,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 fake.section.setBlockState(0,10,8,litter); w.edits.put(pos,litter);
             }
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
-            if(x==1 && z==0 && !blockCase && !magma && !magmaActive && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !blockCase && !magma && !magmaActive && !portalActive && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && lichenActive && !dryLichen) {
                 var water=Blocks.WATER.defaultBlockState();
                 fake.section.setBlockState(0,10,8,water); w.edits.put(new BlockPos(16,10,8),water);
@@ -453,6 +465,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     var source=(args[1].contains("_deepslate_redstone_ore_") ? Blocks.DEEPSLATE_REDSTONE_ORE : Blocks.REDSTONE_ORE).defaultBlockState().setValue(net.minecraft.world.level.block.RedStoneOreBlock.LIT,true);
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
                 }
+            }
+            if(x==1 && z==0 && portalActive) {
+                var source=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+portalSource)).defaultBlockState();
+                fake.section.setBlockState(0,10,8,source); w.edits.put(new BlockPos(16,10,8),source);
             }
             if(x==1 && z==0 && exposed) { fake.section.setBlockState(1,7,8,Blocks.AIR.defaultBlockState()); w.edits.put(new BlockPos(17,7,8),Blocks.AIR.defaultBlockState()); }
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
@@ -596,13 +612,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(roomActive)state=Blocks.CAVE_AIR.defaultBlockState();
                 if(mineshaftActive)state=Blocks.CAVE_AIR.defaultBlockState();
                 if(geodeActive)state=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+args[1].split("_to_",2)[1])).defaultBlockState();
+                if(portalActive)state=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+portalTarget)).defaultBlockState();
                 if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
                 boolean wasEmpty=eastSection.section.hasOnlyAir();
                 var old=eastSection.section.setBlockState(0,p[1],p[2],state); w.edits.put(pos,state);
                 if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
                 w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,p[1],p[2]);
                 boolean changed=LightEngine.hasDifferentLightProperties(old,state);
-                if(changed!=(!plantActive && !kelpColumn && (jigsawDecoratedPot || jigsawChain || jigsawSpeleothem ? jigsawWet : jigsawHopper ? false : jigsawPot ? jigsawWater : jigsawGrate ? jigsawWet : jigsawTripwire || jigsawTripwireHook ? jigsawStone : jigsawPressurePlate ? jigsawStone : jigsawButton ? jigsawStone : jigsawLadder ? (jigsawWet || jigsawStone) : jigsawCarpet ? (jigsawWater || jigsawStone) : jigsawCandle ? (jigsawWet || state.getLightEmission()!=0) : (jigsawGate || jigsawDoor || jigsawTrapdoor || jigsawBed || jigsawGlass) ? (jigsawWater || jigsawWet) : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || patchVine || (lakeActive && !lakeOre && !args[1].endsWith("_sulfur")) || lichenActive || (!lakeActive && berries)))))throw new AssertionError("unexpected active light check");
+                if(changed!=(!plantActive && !kelpColumn && (jigsawDecoratedPot || jigsawChain || jigsawSpeleothem ? jigsawWet : jigsawHopper ? false : jigsawPot ? jigsawWater : jigsawGrate ? jigsawWet : jigsawTripwire || jigsawTripwireHook ? jigsawStone : jigsawPressurePlate ? jigsawStone : jigsawButton ? jigsawStone : jigsawLadder ? (jigsawWet || jigsawStone) : jigsawCarpet ? (jigsawWater || jigsawStone) : jigsawCandle ? (jigsawWet || state.getLightEmission()!=0) : (jigsawGate || jigsawDoor || jigsawTrapdoor || jigsawBed || jigsawGlass) ? (jigsawWater || jigsawWet) : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || portalActive || patchActive || patchVine || (lakeActive && !lakeOre && !args[1].endsWith("_sulfur")) || lichenActive || (!lakeActive && berries)))))throw new AssertionError("unexpected active light check");
                 if(changed)engine.checkBlock(pos);
                 if(roomReadd){
                     var replacement=Blocks.CALCITE.defaultBlockState();

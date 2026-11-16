@@ -828,6 +828,7 @@ pub struct DecorationRegion<'a> {
     multiface_block_write: bool,
     lake_block_write: bool,
     magma_block_write: bool,
+    portal_block_write: bool,
     monster_room_block_write: bool,
     geode_block_write: bool,
     mineshaft_block_write: bool,
@@ -4020,6 +4021,7 @@ impl CarvedTerrainWorld {
             multiface_block_write: false,
             lake_block_write: false,
             magma_block_write: false,
+            portal_block_write: false,
             monster_room_block_write: false,
             geode_block_write: false,
             mineshaft_block_write: false,
@@ -8911,6 +8913,17 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || super::generated_potent_sulfur::is_valid_state(&old))
                         && state.name == "minecraft:magma_block"
                         && state.properties.is_empty();
+                    // Ruined portals may replace an existing light source
+                    // with another full block, or vice versa. Their write
+                    // path has already checked block-entity and state effects.
+                    let portal_light_update = guard.require_unchanged_light
+                        && self.portal_block_write
+                        && (ruined_portal::portal_full(&old)
+                            || disk_safe_solid(&old.name).is_some()
+                            || generated_ore_state(&old)?)
+                        && ruined_portal::portal_full(state)
+                        && native_world::sky_light::same_sky_behavior(&old, state) == Some(true)
+                        && native_world::block_light::same_light_behavior(&old, state) == Some(false);
                     if guard.require_unchanged_light {
                         ensure!(
                             tree_light_update
@@ -8923,6 +8936,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || geode_light_update
                                 || mineshaft_crystal_light_update
                                 || magma_light_update
+                                || portal_light_update
                                 || staged_patch_water
                                 || staged_patch_vines
                                 || native_world::block_light::same_light_behavior(&old, state)
@@ -8950,6 +8964,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || geode_light_update
                             || mineshaft_crystal_light_update
                             || magma_light_update
+                            || portal_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
                         "registered light chunk has changed at {p:?}: {old:?} -> {state:?}"
@@ -9026,6 +9041,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || geode_light_update
                         || mineshaft_crystal_light_update
                         || magma_light_update
+                        || portal_light_update
                         || section_changed
                     {
                         let guard = self.light_guard.as_mut().unwrap();
@@ -9039,6 +9055,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || geode_light_update
                             || mineshaft_crystal_light_update
                             || magma_light_update
+                            || portal_light_update
                             || staged_patch_water
                             || staged_patch_vines
                         {
@@ -9054,6 +9071,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || geode_light_update
                             || mineshaft_crystal_light_update
                             || magma_light_update
+                            || portal_light_update
                             || patch_check
                             || staged_patch_vines
                         {
@@ -14001,6 +14019,29 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_portal_full_block_emission_changes_match_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_portal_magma_to_netherrack",
+            "vine_active_self_portal_magma_to_netherrack",
+            "vine_active_self_portal_crying_obsidian_to_netherrack",
+            "vine_active_self_portal_template_magma_to_obsidian",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn queued_portal_full_block_emission_changes_match_java_light() {
+        check_generation_light_modes(
+            &[
+                "vine_active_portal_magma_to_netherrack",
+                "vine_active_self_portal_magma_to_netherrack",
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_magma_replaces_potent_sulfur_like_java_light() {
         check_staged_light_modes(&[
             "vine_active_potent_sulfur_magma_block",
@@ -14605,7 +14646,7 @@ mod tests {
                         .unwrap(),
                 );
                 section.blocks.as_mut().unwrap().fill(air);
-            } else if !mode.ends_with("_magma_block") {
+            } else if !mode.ends_with("_magma_block") && !mode.contains("_portal_") {
                 let torch = world.intern_state(state("torch"));
                 world.set_block_id(17, 10, 8, torch).unwrap();
             }
@@ -14703,6 +14744,17 @@ mod tests {
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();
                 }
+            }
+            if let Some(spec) = mode.split("_portal_").nth(1) {
+                let spec = spec.strip_prefix("template_").unwrap_or(spec);
+                let (source, _) = spec.split_once("_to_").unwrap();
+                let source = if source == "magma" {
+                    "magma_block"
+                } else {
+                    source
+                };
+                let id = world.intern_state(state(source));
+                world.set_block_id(16, 10, 8, id).unwrap();
             }
             if mode.ends_with("_existing") {
                 let mut plain = state("cave_vines_plant");
@@ -14974,6 +15026,38 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_portal_template_") {
+                    let all_ids = resources.vanilla_block_ids().unwrap();
+                    let wall_tags =
+                        ruined_portal::PortalUpdateTags::load(&mut resources, &all_ids).unwrap();
+                    let mut portal = ruined_portal::PortalTemplateRegion {
+                        inner: jigsaw::JigsawRegion {
+                            region: &mut draft,
+                            registry: &registry,
+                        },
+                        wall_tags: &wall_tags,
+                        temporary_jigsaws: BTreeSet::new(),
+                    };
+                    assert!(super::super::jigsaw::StructurePlacementWorld::place_structure_block(
+                        &mut portal,
+                        p,
+                        &state("obsidian"),
+                        None,
+                        &mut DecorationRandom::new(0),
+                    )
+                    .unwrap());
+                    continue;
+                }
+                if mode.contains("_portal_") {
+                    ruined_portal::place_decoration_for_light_test(
+                        &mut draft,
+                        &registry,
+                        p,
+                        native_resources::ruined_portal_decoration::PortalBlock::Netherrack,
+                    )
+                    .unwrap();
+                    continue;
+                }
                 if mode.contains("_mineshaft_") {
                     mineshaft::carve_test_block(&mut draft, p).unwrap();
                     continue;

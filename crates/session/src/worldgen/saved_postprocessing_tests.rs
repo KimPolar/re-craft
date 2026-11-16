@@ -1063,6 +1063,85 @@ fn live_no_effect_callback_activates_only_the_original_holder() -> Result<()> {
 
 #[test]
 #[cfg(target_os = "windows")]
+fn live_no_effect_callback_survives_tick_and_unrelated_queue_changes() -> Result<()> {
+    use crate::{GameSession, ticking_preparation::TickingFutureState};
+    use std::time::Duration;
+
+    for elapsed in [vec![150], vec![5, 10, 35, 100]] {
+        let (_root, area, ids, registration, mut session, terrain, ticks) =
+            live_callback_fixture(7)?;
+        let center = ChunkPos { x: 0, z: 0 };
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let mut original = ready_future(center, &registration)?;
+        let mut worker = original.fork_queued_callback()?;
+        let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+        assert!(batch.dispatch(&mut worker, 100)?);
+        let result = batch.finish()?;
+        for millis in elapsed {
+            session.update(Duration::from_millis(millis));
+        }
+        assert_eq!(session.snapshot().game_time, 103);
+        session.schedule_sand_for_postprocessing_test(
+            glam::IVec3::new(25, 8, 8),
+            crate::falling_block::FallingKind::RedSand,
+        );
+        session.schedule_sand_for_postprocessing_test(
+            glam::IVec3::new(9, 8, 8),
+            crate::falling_block::FallingKind::RedSand,
+        );
+        assert!(session.verify_saved_tick_queues(&ticks).is_err());
+        session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+        assert_eq!(original.state(), TickingFutureState::Available);
+        let current = session.capture_saved_tick_queues()?;
+        assert_eq!(current.game_time(), 103);
+        assert_eq!(current.next_sub_tick(), 2);
+        let region = current.isolated_region_ticks()?;
+        let center_ticks = region.chunk(center).unwrap().blocks.activated(103);
+        assert!(center_ticks.iter().any(|tick| {
+            tick.kind == "minecraft:sand"
+                && tick.position == [8, 8, 8]
+                && tick.trigger == 103
+                && tick.sub_tick == -1
+        }));
+        assert!(center_ticks.iter().any(|tick| {
+            tick.kind == "minecraft:red_sand"
+                && tick.position == [9, 8, 8]
+                && tick.trigger == 105
+                && tick.sub_tick == 1
+        }));
+        let neighbor_ticks = region.chunk(neighbor).unwrap().blocks.activated(103);
+        assert!(neighbor_ticks.iter().any(|tick| {
+            tick.kind == "minecraft:red_sand"
+                && tick.position == [25, 8, 8]
+                && tick.trigger == 105
+                && tick.sub_tick == 0
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_no_effect_callback_rejects_ticks_activated_while_working() -> Result<()> {
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    session.activate_saved_ticks_for_postprocessing_test(center)?;
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
 fn live_no_effect_callback_rejects_modified_result_and_changed_terrain() -> Result<()> {
     use super::super::chunk_ticks::ScheduledTick;
     use crate::ticking_preparation::TickingFutureState;
@@ -1177,6 +1256,73 @@ fn live_no_effect_callback_matches_java_saved_ticks() -> Result<()> {
     assert_eq!(actual, java);
     session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
     assert_eq!(original.state(), TickingFutureState::Available);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn delayed_live_no_effect_callback_matches_java_saved_ticks() -> Result<()> {
+    use crate::GameSession;
+    use std::time::Duration;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("chunk.nbt");
+    let output = directory.path().join("postprocessed.nbt");
+    std::fs::write(
+        &input,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    let java = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullPostprocessingOracle",
+        include_str!("../../tests/java/SavedFullPostprocessingOracle.java"),
+        &[
+            input.to_str().context("invalid NBT input path")?,
+            output.to_str().context("invalid NBT output path")?,
+            "unpack-with-live-tick",
+            "103",
+            "1",
+        ],
+    );
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    session.update(Duration::from_millis(150));
+    session.schedule_sand_for_postprocessing_test(
+        glam::IVec3::new(25, 8, 8),
+        crate::falling_block::FallingKind::RedSand,
+    );
+    session.schedule_sand_for_postprocessing_test(
+        glam::IVec3::new(9, 8, 8),
+        crate::falling_block::FallingKind::RedSand,
+    );
+    session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+    let current = session.capture_saved_tick_queues()?;
+    let region = current.isolated_region_ticks()?;
+    let mut actual = region
+        .chunk(center)
+        .unwrap()
+        .blocks
+        .pack(103)
+        .into_iter()
+        .map(|tick| {
+            format!(
+                "{} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.push(format!("counter {}", current.next_sub_tick()));
+    assert_eq!(actual, java);
     Ok(())
 }
 

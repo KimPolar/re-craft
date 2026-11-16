@@ -24,6 +24,7 @@ public class SavedFullPostprocessingOracle {
     static final Map<BlockPos, BlockState> blocks = new HashMap<>();
     static LevelTicks<Block> tickAccess;
     static long counter = 2;
+    static long gameTime = 100;
 
     static void set(Object object, String name, Object value) throws Exception {
         for (Class<?> type = object.getClass(); type != null; type = type.getSuperclass()) {
@@ -44,7 +45,7 @@ public class SavedFullPostprocessingOracle {
         }
         @Override public RandomSource getRandom() { return RandomSource.create(42); }
         @Override public LevelTicks<Block> getBlockTicks() { return tickAccess; }
-        @Override public long getGameTime() { return 100L; }
+        @Override public long getGameTime() { return gameTime; }
         @Override public long nextSubTickCount() { return counter++; }
     }
 
@@ -105,15 +106,23 @@ public class SavedFullPostprocessingOracle {
         tickAccess = new LevelTicks<Block>(pos -> true);
         tickAccess.addContainer(new ChunkPos(0, 0), ticks);
         boolean liveTick = args.length > 2 && args[2].equals("live-tick");
-        boolean unpackOnly = args.length > 2 && args[2].equals("unpack");
-        if (unpackOnly) counter = 0;
+        boolean unpackWithLiveTick = args.length > 2 && args[2].equals("unpack-with-live-tick");
+        boolean unpackOnly = args.length > 2 && (args[2].equals("unpack") || unpackWithLiveTick);
+        if (unpackOnly) {
+            gameTime = args.length > 3 ? Long.parseLong(args[3]) : 100L;
+            counter = args.length > 4 ? Long.parseLong(args[4]) : 0L;
+        }
+        if (unpackWithLiveTick) {
+            tickAccess.schedule(new ScheduledTick<>(Blocks.RED_SAND, new BlockPos(9, 8, 8),
+                    gameTime + 2L, TickPriority.NORMAL, counter++));
+        }
         if (liveTick) {
             counter = 1;
             tickAccess.schedule(new ScheduledTick<>(Blocks.RED_SAND, new BlockPos(8, 8, 8),
                     102L, TickPriority.NORMAL, 0L));
         }
         chunk.postProcessGeneration(level);
-        if (liveTick || unpackOnly) ticks.unpack(100L);
+        if (liveTick || unpackOnly) ticks.unpack(gameTime);
         if (args.length > 1) {
             var pack = SerializableChunkData.class.getDeclaredMethod("packOffsets",
                     it.unimi.dsi.fastutil.shorts.ShortList[].class);
@@ -122,7 +131,7 @@ public class SavedFullPostprocessingOracle {
             NbtIo.write(source, Path.of(args[1]));
         }
         out.println("BEGIN_RESULT");
-        for (var tick : ticks.pack(100L)) {
+        for (var tick : ticks.pack(gameTime)) {
             var pos = tick.pos();
             out.printf("%s %d,%d,%d %d %d%n", BuiltInRegistries.BLOCK.getKey(tick.type()),
                     pos.getX(), pos.getY(), pos.getZ(), tick.delay(), tick.priority().getValue());

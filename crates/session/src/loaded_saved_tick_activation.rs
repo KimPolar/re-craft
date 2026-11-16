@@ -84,8 +84,12 @@ impl LoadedSession {
     /// Apply a completed saved-chunk callback only when postprocessing made
     /// no block, lighting, entity, or new scheduling changes. The real holder
     /// future stays waiting while the worker runs and becomes available only
-    /// after both live tick queues have been activated. The completed marks
-    /// are still not saveable until the coordinated persistence path exists.
+    /// after both live tick queues have been activated. A no-effect result may
+    /// outlive its captured tick: saved delays are unpacked at the current
+    /// level time after rechecking the live queues. Completed marks are still
+    /// not saveable until the coordinated persistence path exists. The caller
+    /// must preserve the actual holder callback and simulation tick order;
+    /// surviving a later tick does not prove that dispatching later is correct.
     pub fn apply_no_effect_saved_ticking(
         &mut self,
         future: &mut crate::ticking_preparation::TickingPreparation,
@@ -101,8 +105,14 @@ impl LoadedSession {
                 source_conversion: self.lava_source_conversion,
             },
         )?;
+        let stamp = capture
+            .data_packs()
+            .context("captured data packs are unavailable")?
+            .stamp()
+            .clone();
+        let _read_lease = stamp.lock_current()?;
         self.verify_generation_terrain_stage(terrain)?;
-        self.verify_saved_tick_queues(capture)?;
+        self.verify_no_effect_tick_environment(capture)?;
         let center = future.center();
         let dependencies = crate::ticking_preparation::ticking_dependencies(center);
         ensure!(
@@ -124,6 +134,18 @@ impl LoadedSession {
                         .is_some_and(|captured| Arc::ptr_eq(captured, current)),
                 "FULL neighbor changed during saved ticking preparation"
             );
+            ensure!(
+                self.generated_block_order
+                    .as_ref()
+                    .and_then(|order| order.queue.container(position))
+                    .is_some()
+                    && self
+                        .generated_fluid_order
+                        .as_ref()
+                        .and_then(|order| order.queue.container(position))
+                        .is_some(),
+                "FULL neighbor tick containers are no longer registered"
+            );
         }
         ensure!(
             matches!(
@@ -143,7 +165,7 @@ impl LoadedSession {
         let (_, _, block_time, fluid_time) =
             self.plan_pending_saved_tick_activation(center, pending, self.scheduled_tick())?;
         ensure!(
-            block_time == Some(capture.game_time()) && fluid_time == Some(capture.game_time()),
+            block_time == Some(self.game_time) && fluid_time == Some(self.game_time),
             "saved ticking clock changed"
         );
         let dispatched = future.dispatch(
@@ -167,6 +189,48 @@ impl LoadedSession {
             |_| Ok(()),
         )?;
         ensure!(dispatched, "saved ticking callback was not queued");
+        Ok(())
+    }
+
+    /// A callback proven to have no scheduled or world effects does not read
+    /// the live queues. Other ticks may advance while it is prepared, but its
+    /// session, data packs and indexed clock must still match.
+    fn verify_no_effect_tick_environment(&self, captured: &SavedTickQueueCapture) -> Result<()> {
+        let current_packs = self
+            .world_data_packs
+            .as_ref()
+            .context("session data packs are not captured")?;
+        let captured_packs = captured
+            .packs
+            .as_ref()
+            .context("captured data packs are unavailable")?;
+        ensure!(
+            self.require_saved_chunk_sources
+                && self.initial_game_time_set
+                && !self.advancing_tick
+                && Arc::ptr_eq(&self.generation_identity, &captured.session)
+                && self.tick >= captured.tick
+                && Arc::ptr_eq(current_packs.packs(), captured_packs.packs())
+                && current_packs.selection() == captured_packs.selection()
+                && current_packs.stamp().is_current(),
+            "saved ticking session or data packs changed"
+        );
+        let blocks = self
+            .generated_block_order
+            .as_ref()
+            .context("live block tick index is unavailable")?;
+        let fluids = self
+            .generated_fluid_order
+            .as_ref()
+            .context("live fluid tick index is unavailable")?;
+        let time = i64::try_from(i128::from(captured.base_time) + self.scheduled_tick())
+            .context("live tick clock is outside the indexed range")?;
+        ensure!(
+            blocks.base_time == captured.base_time
+                && fluids.base_time == captured.base_time
+                && time == self.game_time,
+            "live tick indexes or clock changed"
+        );
         Ok(())
     }
 

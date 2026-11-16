@@ -75,6 +75,64 @@ fn captured_ticks(world: &World, pos: ChunkPos) -> SavedChunkActivation {
 }
 
 #[test]
+fn captured_tick_indexes_are_shared_and_detect_changes_without_clock_changes() {
+    use crate::worldgen::chunk_ticks::{ScheduleOutcome, ScheduledTick};
+    for fluid in [false, true] {
+        let mut session = super::tests::session();
+        let home = session.player_chunk().unwrap();
+        let world = Arc::make_mut(&mut session.world);
+        world.remember_saved_chunk_source_with_activation(
+            home,
+            [1; 32],
+            SavedChunkActivation::Empty,
+        );
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        session.set_initial_game_time(300).unwrap();
+        session.require_saved_chunk_sources().unwrap();
+        assert_eq!(
+            session.install_saved_tick_orders(&[home]).unwrap(),
+            (true, true)
+        );
+        let captured = session.capture_saved_tick_queues().unwrap();
+        session.verify_saved_tick_queues(&captured).unwrap();
+        let order = if fluid {
+            session.generated_fluid_order.as_mut().unwrap()
+        } else {
+            session.generated_block_order.as_mut().unwrap()
+        };
+        let tick = ScheduledTick {
+            kind: if fluid {
+                "minecraft:water"
+            } else {
+                "minecraft:sand"
+            }
+            .into(),
+            position: [home.x * 16 + 1, 1, home.z * 16 + 1],
+            trigger: 305,
+            priority: 0,
+            sub_tick: 0,
+        };
+        assert_eq!(
+            Arc::make_mut(&mut order.queue).schedule(tick).unwrap(),
+            ScheduleOutcome::Added
+        );
+        assert!(
+            session
+                .verify_saved_tick_queues(&captured)
+                .unwrap_err()
+                .to_string()
+                .contains("queues changed")
+        );
+        let unchanged = captured.isolated_region_ticks().unwrap();
+        let chunk = unchanged.chunk(home).unwrap();
+        assert!(chunk.blocks.pack(300).is_empty());
+        assert!(chunk.fluids.pack(300).is_empty());
+    }
+}
+
+#[test]
 fn streamed_pending_work_blocks_save_even_after_clean_chunk_is_evicted() {
     let mut session = super::tests::session();
     let home = session.player_chunk().unwrap();

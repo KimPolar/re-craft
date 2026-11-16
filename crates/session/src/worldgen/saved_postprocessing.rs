@@ -22,7 +22,7 @@ use native_world::{
 };
 
 use crate::{
-    loaded::{BuildBounds, GenerationTerrainStage},
+    loaded::{BuildBounds, GenerationTerrainStage, SavedTickQueueCapture},
     saved_chunk_activation::{SavedTickInputs, read_saved_work},
     ticking_preparation::{TickingFutureState, TickingPreparation, ticking_dependencies},
 };
@@ -194,6 +194,53 @@ impl SavedTickingBatch {
         })
     }
 
+    /// Run callbacks over captured live blocks and the actual registered tick
+    /// queues. The caller must pause simulation or reject stale terrain and
+    /// queue captures before using the result; holder, light and entity state
+    /// are not established by this operation.
+    pub fn begin_with_live_session(
+        provider: &mut impl ResourceProvider,
+        input: SavedPostprocessingInputs<'_>,
+        terrain: &GenerationTerrainStage,
+        ticks: &SavedTickQueueCapture,
+        validate_state: impl FnMut(&BlockState) -> Result<()>,
+        configure: impl FnOnce(&mut GeneratedPostprocessing) -> Result<()>,
+    ) -> Result<Self> {
+        ensure!(
+            ticks.belongs_to_terrain(terrain),
+            "tick and terrain captures belong to different sessions"
+        );
+        ensure!(
+            input.game_time == ticks.game_time()
+                && input.next_sub_tick == ticks.next_sub_tick()
+                && input.registration == ticks.registration_order(),
+            "saved postprocessing tick capture differs from its inputs"
+        );
+        let available = input
+            .area
+            .chunks
+            .keys()
+            .map(|pos| ChunkPos { x: pos.x, z: pos.z })
+            .collect();
+        let game_time = input.game_time;
+        let queues = ticks.isolated_region_ticks()?;
+        let mut stage = begin_saved_postprocessing_inner(
+            provider,
+            input,
+            Some(terrain),
+            Some(queues),
+            validate_state,
+        )?;
+        configure(&mut stage)?;
+        Ok(Self {
+            stage,
+            available,
+            game_time,
+            started: false,
+            failed: false,
+        })
+    }
+
     /// Dispatch one queued holder callback without interleaving another one.
     /// Pending saved ticks are unpacked after its postprocessing and become
     /// visible to later callbacks in this same captured level state.
@@ -345,7 +392,7 @@ pub fn begin_saved_postprocessing(
     input: SavedPostprocessingInputs<'_>,
     validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<GeneratedPostprocessing> {
-    begin_saved_postprocessing_inner(provider, input, None, validate_state)
+    begin_saved_postprocessing_inner(provider, input, None, None, validate_state)
 }
 
 /// Prepare an isolated pass using source-bound live block edits. This does not
@@ -357,13 +404,14 @@ pub fn begin_saved_postprocessing_with_live_terrain(
     terrain: &GenerationTerrainStage,
     validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<GeneratedPostprocessing> {
-    begin_saved_postprocessing_inner(provider, input, Some(terrain), validate_state)
+    begin_saved_postprocessing_inner(provider, input, Some(terrain), None, validate_state)
 }
 
 fn begin_saved_postprocessing_inner(
     provider: &mut impl ResourceProvider,
     input: SavedPostprocessingInputs<'_>,
     live_terrain: Option<&GenerationTerrainStage>,
+    live_ticks: Option<RegionTicks>,
     mut validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<GeneratedPostprocessing> {
     ensure!(
@@ -493,14 +541,30 @@ fn begin_saved_postprocessing_inner(
                 priority: tick.priority,
             })
             .collect();
+        let original = ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(pos, block_ticks)?,
+            fluids: ChunkTicks::from_saved(pos, fluid_ticks)?,
+        };
+        if let Some(live) = live_ticks.as_ref().and_then(|ticks| ticks.chunk(pos)) {
+            for (current, saved) in [
+                (&live.blocks, &original.blocks),
+                (&live.fluids, &original.fluids),
+            ] {
+                if let Some(pending) = current.pending_saved() {
+                    ensure!(
+                        Some(pending) == saved.pending_saved(),
+                        "live pending ticks differ from saved chunk {pos:?}"
+                    );
+                } else {
+                    ensure!(
+                        marks.sections().iter().all(Vec::is_empty),
+                        "saved postprocessing was not run before ticks activated at {pos:?}"
+                    );
+                }
+            }
+        }
         tasks.insert(pos, PostprocessingTask::new(Arc::new(marks), pos));
-        containers.insert(
-            pos,
-            ConvertedChunkTicks {
-                blocks: ChunkTicks::from_saved(pos, block_ticks)?,
-                fluids: ChunkTicks::from_saved(pos, fluid_ticks)?,
-            },
-        );
+        containers.insert(pos, original);
         let draft = if let Some(terrain) = live_terrain {
             terrain.saved_edited_chunk_draft(pos, source, |state| {
                 heightmap_block_flags(state, input.defaults, &tags.heightmaps, &mut validate_state)
@@ -513,12 +577,22 @@ fn begin_saved_postprocessing_inner(
             .map_or(source.document.as_ref(), |draft| draft.document());
         heightmaps.insert(pos, saved_heightmaps(document, input.bounds)?);
     }
-    let ticks = RegionTicks::new_ordered(
-        containers,
-        input.game_time,
-        input.next_sub_tick,
-        input.registration,
-    )?;
+    let ticks = if let Some(ticks) = live_ticks {
+        ensure!(
+            ticks.game_time() == input.game_time
+                && ticks.next_sub_tick() == input.next_sub_tick
+                && ticks.registration_order() == input.registration,
+            "live tick region differs from the captured session"
+        );
+        ticks
+    } else {
+        RegionTicks::new_ordered(
+            containers,
+            input.game_time,
+            input.next_sub_tick,
+            input.registration,
+        )?
+    };
     let mut stage = GeneratedPostprocessing::new(
         world,
         input.bounds.min_y,

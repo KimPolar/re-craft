@@ -43,6 +43,7 @@ mod simulation_tests;
 
 #[path = "loaded_saved_tick_activation.rs"]
 mod saved_tick_activation;
+pub use saved_tick_activation::SavedTickQueueCapture;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -2614,7 +2615,7 @@ struct ScheduledFluid {
 
 struct GeneratedTickOrder {
     base_time: i64,
-    queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+    queue: Arc<crate::worldgen::chunk_ticks::IndexedRegionQueue>,
     parked: BTreeMap<ChunkPos, crate::worldgen::chunk_ticks::ChunkTicks>,
     saved_registration: Option<Vec<ChunkPos>>,
 }
@@ -2650,7 +2651,7 @@ impl GeneratedTickOrder {
         debug_assert!(self.is_empty_at(pos));
         self.parked.remove(&pos);
         if self.queue.container(pos).is_some() {
-            self.queue.remove_container(pos);
+            Arc::make_mut(&mut self.queue).remove_container(pos);
         }
     }
 
@@ -2658,7 +2659,7 @@ impl GeneratedTickOrder {
         if self.parked.contains_key(&pos) {
             return false;
         }
-        let Some(container) = self.queue.remove_container(pos) else {
+        let Some(container) = Arc::make_mut(&mut self.queue).remove_container(pos) else {
             return false;
         };
         self.parked.insert(pos, container);
@@ -2672,7 +2673,10 @@ impl GeneratedTickOrder {
         let Some(container) = self.parked.remove(&pos) else {
             return false;
         };
-        matches!(self.queue.add_container(pos, container), Ok(None))
+        matches!(
+            Arc::make_mut(&mut self.queue).add_container(pos, container),
+            Ok(None)
+        )
     }
 
     fn register_saved(
@@ -2704,10 +2708,13 @@ impl GeneratedTickOrder {
             {
                 return false;
             }
-        } else if !matches!(self.queue.add_container(pos, container), Ok(None)) {
+        } else if !matches!(
+            Arc::make_mut(&mut self.queue).add_container(pos, container),
+            Ok(None)
+        ) {
             return false;
         }
-        pending || self.queue.unpack_container(pos, time).is_ok()
+        pending || Arc::make_mut(&mut self.queue).unpack_container(pos, time).is_ok()
     }
 }
 
@@ -8648,7 +8655,7 @@ impl LoadedSession {
         );
         let new_order = || GeneratedTickOrder {
             base_time: self.game_time,
-            queue: IndexedRegionQueue::default(),
+            queue: Arc::new(IndexedRegionQueue::default()),
             parked: BTreeMap::new(),
             saved_registration: None,
         };
@@ -8749,11 +8756,11 @@ impl LoadedSession {
             );
         }
         let blocks_installed = blocks.is_some_and(|order| {
-            self.install_block_tick_order(&snapshot, order.queue)
+            self.install_block_tick_order(&snapshot, Arc::unwrap_or_clone(order.queue))
                 .is_ok()
         });
         let fluids_installed = fluids.is_some_and(|order| {
-            self.install_fluid_tick_order(&snapshot, order.queue)
+            self.install_fluid_tick_order(&snapshot, Arc::unwrap_or_clone(order.queue))
                 .is_ok()
         });
         for order in [
@@ -9021,7 +9028,7 @@ impl LoadedSession {
         );
         self.generated_block_order = Some(GeneratedTickOrder {
             base_time: ticks.game_time,
-            queue,
+            queue: Arc::new(queue),
             parked: BTreeMap::new(),
             saved_registration: None,
         });
@@ -9092,7 +9099,7 @@ impl LoadedSession {
         );
         self.generated_fluid_order = Some(GeneratedTickOrder {
             base_time: ticks.game_time,
-            queue,
+            queue: Arc::new(queue),
             parked: BTreeMap::new(),
             saved_registration: None,
         });
@@ -19265,6 +19272,23 @@ impl LoadedSession {
         self.set_with_notify(position, id, false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn schedule_sand_for_postprocessing_test(
+        &mut self,
+        position: IVec3,
+        kind: FallingKind,
+    ) {
+        self.schedule_sand(position, kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_saved_ticks_for_postprocessing_test(
+        &mut self,
+        position: ChunkPos,
+    ) -> anyhow::Result<()> {
+        self.activate_pending_saved_ticks(position)
+    }
+
     fn set_with_notify(&mut self, relative: IVec3, id: BlockStateId, notify: bool) -> bool {
         self.set_with_banner_removal(relative, id, notify, false)
     }
@@ -19787,8 +19811,7 @@ impl LoadedSession {
                 (FluidKind::Lava, false) => "minecraft:flowing_lava",
             };
             let synchronized = trigger.ok().and_then(|trigger| {
-                indexed
-                    .queue
+                Arc::make_mut(&mut indexed.queue)
                     .schedule(ScheduledTick {
                         kind: kind.into(),
                         position: [key.x, key.y, key.z],
@@ -19827,8 +19850,7 @@ impl LoadedSession {
         if let Some(indexed) = &mut self.generated_block_order {
             let trigger = i64::try_from(i128::from(indexed.base_time) + now + i128::from(delay));
             let outcome = trigger.ok().and_then(|trigger| {
-                indexed
-                    .queue
+                Arc::make_mut(&mut indexed.queue)
                     .schedule(ScheduledTick {
                         kind: kind.into(),
                         position: absolute.to_array(),
@@ -20880,7 +20902,7 @@ impl LoadedSession {
             return Some(Vec::new());
         }
         let time = i64::try_from(i128::from(indexed.base_time) + self.scheduled_tick()).ok()?;
-        let selected = indexed.queue.collect_due(time, 65_536, |pos| {
+        let selected = Arc::make_mut(&mut indexed.queue).collect_due(time, 65_536, |pos| {
             self.simulation_allows_block_ticks(pos)
                 && self
                     .world
@@ -24624,7 +24646,7 @@ impl LoadedSession {
             return Some(Vec::new());
         }
         let time = i64::try_from(i128::from(indexed.base_time) + self.scheduled_tick()).ok()?;
-        let selected = indexed.queue.collect_due(time, 65_536, |pos| {
+        let selected = Arc::make_mut(&mut indexed.queue).collect_due(time, 65_536, |pos| {
             self.simulation_allows_block_ticks(pos)
                 && self
                     .world

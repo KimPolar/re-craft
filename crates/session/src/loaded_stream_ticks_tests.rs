@@ -664,11 +664,7 @@ fn nonempty_index_container_is_not_forgotten_if_dirty_tracking_is_missing() {
     session.apply_streaming();
     let position = [neighbor.x * 16 + 1, 2, neighbor.z * 16 + 1];
     assert_eq!(
-        session
-            .generated_block_order
-            .as_mut()
-            .unwrap()
-            .queue
+        Arc::make_mut(&mut session.generated_block_order.as_mut().unwrap().queue)
             .schedule(ScheduledTick {
                 kind: "minecraft:sand".into(),
                 position,

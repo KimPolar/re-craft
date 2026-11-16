@@ -796,6 +796,174 @@ fn begin_live_fixture(
     )
 }
 
+fn live_session_tick_fixture() -> Result<(
+    ChunkArea,
+    BTreeSet<String>,
+    Vec<ChunkPos>,
+    crate::loaded::LoadedSession,
+    GenerationTerrainStage,
+    SavedTickQueueCapture,
+)> {
+    let (area, ids, registration, mut session, _, terrain) = live_ticking_fixture()?;
+    session
+        .set_initial_game_time(100)
+        .map_err(anyhow::Error::msg)?;
+    session.require_saved_chunk_sources()?;
+    ensure!(
+        session.install_saved_tick_orders(&registration)? == (true, true),
+        "fixture tick indexes were not installed"
+    );
+    session.schedule_sand_for_postprocessing_test(
+        glam::IVec3::new(8, 8, 8),
+        crate::falling_block::FallingKind::RedSand,
+    );
+    let ticks = session.capture_saved_tick_queues()?;
+    Ok((area, ids, registration, session, terrain, ticks))
+}
+
+fn begin_live_session_fixture(
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    terrain: &GenerationTerrainStage,
+    ticks: &SavedTickQueueCapture,
+) -> Result<SavedTickingBatch> {
+    SavedTickingBatch::begin_with_live_session(
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area,
+            dimension: &DimensionId::parse("overworld")?,
+            defaults: &BTreeMap::new(),
+            block_ids: ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration: ticks.registration_order(),
+            game_time: ticks.game_time(),
+            next_sub_tick: ticks.next_sub_tick(),
+            light: None,
+        },
+        terrain,
+        ticks,
+        |state| {
+            ensure!(
+                ids.contains(&state.name) && state.properties.is_empty(),
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+}
+
+#[test]
+fn saved_ticking_preserves_live_schedules_and_detects_stale_queue_capture() -> Result<()> {
+    let (area, ids, registration, mut session, terrain, capture) = live_session_tick_fixture()?;
+    session.verify_saved_tick_queues(&capture)?;
+    session.verify_generation_terrain_stage(&terrain)?;
+    assert_eq!(capture.registration_order(), registration);
+    assert_eq!(capture.next_sub_tick(), 1);
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut batch = begin_live_session_fixture(&area, &ids, &terrain, &capture)?;
+    assert!(batch.dispatch(&mut ready_future(center, &registration)?, 100)?);
+    let result = batch.finish()?;
+    let center_ticks = result.block_ticks.container(center).unwrap();
+    let reds: Vec<_> = center_ticks
+        .activated(100)
+        .into_iter()
+        .filter(|tick| tick.kind == "minecraft:red_sand" && tick.position == [8, 8, 8])
+        .collect();
+    assert_eq!(reds.len(), 1);
+    assert_eq!((reds[0].trigger, reds[0].sub_tick), (102, 0));
+    let neighbor = result.block_ticks.container(registration[0]).unwrap();
+    assert_eq!(neighbor.pack(100)[0].delay, 7);
+    assert_eq!(neighbor.pack(200)[0].delay, -93);
+    session.verify_saved_tick_queues(&capture)?;
+
+    // A duplicate scheduling request still consumes a sub-tick counter and
+    // invalidates the capture, while the isolated result keeps the old queue.
+    session.schedule_sand_for_postprocessing_test(
+        glam::IVec3::new(8, 8, 8),
+        crate::falling_block::FallingKind::RedSand,
+    );
+    assert!(session.verify_saved_tick_queues(&capture).is_err());
+    assert_eq!(
+        center_ticks
+            .activated(100)
+            .into_iter()
+            .filter(|tick| { tick.kind == "minecraft:red_sand" && tick.position == [8, 8, 8] })
+            .count(),
+        1
+    );
+
+    let (_, _, _, _, other_terrain, other_capture) = live_session_tick_fixture()?;
+    assert!(begin_live_session_fixture(&area, &ids, &other_terrain, &capture).is_err());
+    assert!(session.verify_saved_tick_queues(&other_capture).is_err());
+    Ok(())
+}
+
+#[test]
+fn saved_ticking_rejects_marks_after_saved_ticks_activate() -> Result<()> {
+    let (area, ids, _, mut session, terrain, _) = live_session_tick_fixture()?;
+    session.activate_saved_ticks_for_postprocessing_test(ChunkPos { x: 0, z: 0 })?;
+    let capture = session.capture_saved_tick_queues()?;
+    let error = begin_live_session_fixture(&area, &ids, &terrain, &capture)
+        .err()
+        .context("activated ticks with unfinished postprocessing were accepted")?;
+    assert!(error.to_string().contains("not run before ticks activated"));
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn saved_ticking_with_live_schedules_matches_java() -> Result<()> {
+    let (area, ids, registration, session, terrain, capture) = live_session_tick_fixture()?;
+    session.verify_saved_tick_queues(&capture)?;
+    session.verify_generation_terrain_stage(&terrain)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let draft = terrain
+        .saved_edited_chunk_draft(center, &area.chunks[&area.center], classify_live_fixture)?
+        .context("live edit draft is missing")?;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("live.nbt");
+    let output = directory.path().join("postprocessed.nbt");
+    std::fs::write(&input, native_persistence::nbt::write(draft.document())?)?;
+    let expected = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullPostprocessingOracle",
+        include_str!("../../tests/java/SavedFullPostprocessingOracle.java"),
+        &[
+            input.to_str().context("invalid NBT input path")?,
+            output.to_str().context("invalid NBT output path")?,
+            "live-tick",
+        ],
+    );
+    let mut batch = begin_live_session_fixture(&area, &ids, &terrain, &capture)?;
+    assert!(batch.dispatch(&mut ready_future(center, &registration)?, 100)?);
+    let result = batch.finish()?;
+    let mut actual = result
+        .block_ticks
+        .container(center)
+        .unwrap()
+        .pack(100)
+        .into_iter()
+        .map(|tick| {
+            format!(
+                "{} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.push(format!("counter {}", result.region.ticks().next_sub_tick()));
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[test]
 fn saved_ticking_uses_live_blocks_and_rejects_stale_terrain() -> Result<()> {
     use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};

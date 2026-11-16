@@ -5,6 +5,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
 };
 
 use anyhow::{Result, ensure};
@@ -259,14 +260,17 @@ pub struct ActivatedRegionTicks {
 /// Detached, activated containers for one registry. The caller supplies the
 /// level scheduler's container traversal order on every collection; that order
 /// matters when two container heads compare equal.
+#[derive(Clone)]
 pub struct ActiveRegionQueue {
-    chunks: BTreeMap<ChunkPos, ChunkTicks>,
+    chunks: BTreeMap<ChunkPos, Arc<ChunkTicks>>,
 }
 
 /// Activated containers and the stateful Java-order index of their next ticks.
+#[derive(Clone)]
 pub struct IndexedRegionQueue {
     queue: ActiveRegionQueue,
     index: super::tick_index::LevelTickIndex,
+    registration: Vec<ChunkPos>,
 }
 
 impl Default for IndexedRegionQueue {
@@ -276,6 +280,7 @@ impl Default for IndexedRegionQueue {
                 chunks: BTreeMap::new(),
             },
             index: super::tick_index::LevelTickIndex::default(),
+            registration: Vec::new(),
         }
     }
 }
@@ -370,7 +375,11 @@ impl ActiveRegionQueue {
             let Some(pos) = self.pop_container(&mut heap) else {
                 break;
             };
-            collected.push(self.chunks.get_mut(&pos).unwrap().poll().unwrap());
+            collected.push(
+                Arc::make_mut(self.chunks.get_mut(&pos).unwrap())
+                    .poll()
+                    .unwrap(),
+            );
             while collected.len() < limit {
                 let Some(next) = self.chunks[&pos].peek() else {
                     break;
@@ -384,7 +393,11 @@ impl ActiveRegionQueue {
                         break;
                     }
                 }
-                collected.push(self.chunks.get_mut(&pos).unwrap().poll().unwrap());
+                collected.push(
+                    Arc::make_mut(self.chunks.get_mut(&pos).unwrap())
+                        .poll()
+                        .unwrap(),
+                );
             }
             if let Some(next) = self.chunks[&pos].peek() {
                 if collected.len() < limit && next.trigger <= time {
@@ -411,7 +424,7 @@ impl ActiveRegionQueue {
         let Some(chunk) = self.chunks.get_mut(&pos) else {
             return Ok(ScheduleOutcome::MissingChunk);
         };
-        Ok(if chunk.schedule(tick)? {
+        Ok(if Arc::make_mut(chunk).schedule(tick)? {
             ScheduleOutcome::Added
         } else {
             ScheduleOutcome::Duplicate
@@ -434,7 +447,11 @@ impl IndexedRegionQueue {
         if let Some(head) = ticks.peek() {
             self.index.insert(pos, head.trigger);
         }
-        Ok(self.queue.chunks.insert(pos, ticks))
+        let previous = self.queue.chunks.insert(pos, Arc::new(ticks));
+        if previous.is_none() {
+            self.registration.push(pos);
+        }
+        Ok(previous.map(Arc::unwrap_or_clone))
     }
 
     /// Unpack the registered container's pending ticks at level time.
@@ -444,6 +461,7 @@ impl IndexedRegionQueue {
             .chunks
             .get_mut(&pos)
             .ok_or_else(|| anyhow::anyhow!("tick container is not registered"))?;
+        let ticks = Arc::make_mut(ticks);
         let before = ticks.peek().map(tick_order);
         ticks.unpack(time);
         let after = ticks.peek().map(tick_order);
@@ -458,11 +476,20 @@ impl IndexedRegionQueue {
     /// Detach a container and its index entry when a chunk leaves the level.
     pub fn remove_container(&mut self, pos: ChunkPos) -> Option<ChunkTicks> {
         self.index.remove(pos);
-        self.queue.chunks.remove(&pos)
+        let removed = self.queue.chunks.remove(&pos);
+        if removed.is_some() {
+            self.registration.retain(|&position| position != pos);
+        }
+        removed.map(Arc::unwrap_or_clone)
     }
 
     pub fn container(&self, pos: ChunkPos) -> Option<&ChunkTicks> {
-        self.queue.chunks.get(&pos)
+        self.queue.chunks.get(&pos).map(Arc::as_ref)
+    }
+
+    /// Order in which currently registered containers were attached.
+    pub fn registration_order(&self) -> &[ChunkPos] {
+        &self.registration
     }
 
     /// Collect due ticks in Java's container-map and intra-tick order.
@@ -475,7 +502,7 @@ impl IndexedRegionQueue {
         use super::tick_index::DueEntryAction;
         let queue = &self.queue;
         let traversal = self.index.inspect_due(time, |pos| {
-            let Some(head) = queue.chunks.get(&pos).and_then(ChunkTicks::peek) else {
+            let Some(head) = queue.chunks.get(&pos).and_then(|ticks| ticks.peek()) else {
                 return DueEntryAction::Remove;
             };
             if head.trigger > time {
@@ -503,7 +530,7 @@ impl IndexedRegionQueue {
             .queue
             .chunks
             .get(&pos)
-            .and_then(ChunkTicks::peek)
+            .and_then(|ticks| ticks.peek())
             .map(tick_order);
         let outcome = self.queue.schedule(tick)?;
         if outcome == ScheduleOutcome::Added {
@@ -567,6 +594,62 @@ impl RegionTicks {
             next_sub_tick,
             registration: registration.to_vec(),
             indexes: Some(indexes),
+        })
+    }
+
+    /// Fork the actual level queues without rebuilding their hash-index
+    /// histories or prematurely unpacking any saved chunk ticks. This should
+    /// run on a worker thread; the caller must recheck its live capture.
+    pub(crate) fn from_indexed_queues(
+        blocks: &IndexedRegionQueue,
+        fluids: &IndexedRegionQueue,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> Result<Self> {
+        ensure!(
+            blocks.registration == fluids.registration,
+            "block and fluid tick registration orders differ"
+        );
+        let registration = &blocks.registration;
+        ensure!(
+            registration.len() == blocks.queue.chunks.len()
+                && registration.len() == fluids.queue.chunks.len(),
+            "tick registration and containers differ"
+        );
+        let mut chunks = BTreeMap::new();
+        for &pos in registration {
+            let block = blocks
+                .container(pos)
+                .ok_or_else(|| anyhow::anyhow!("block tick container is missing"))?;
+            let fluid = fluids
+                .container(pos)
+                .ok_or_else(|| anyhow::anyhow!("fluid tick container is missing"))?;
+            ensure!(
+                block.chunk == pos && fluid.chunk == pos,
+                "tick container belongs to another chunk"
+            );
+            ensure!(
+                chunks
+                    .insert(
+                        pos,
+                        ConvertedChunkTicks {
+                            blocks: block.clone(),
+                            fluids: fluid.clone(),
+                        },
+                    )
+                    .is_none(),
+                "duplicate tick container registration"
+            );
+        }
+        Ok(Self {
+            chunks,
+            game_time,
+            next_sub_tick,
+            registration: registration.clone(),
+            indexes: Some(RegionTickIndexes {
+                blocks: blocks.index.clone(),
+                fluids: fluids.index.clone(),
+            }),
         })
     }
 
@@ -690,7 +773,7 @@ impl RegionTicks {
                         TickRegistry::Fluid => ticks.fluids.clone(),
                     };
                     ticks.unpack(self.game_time);
-                    (pos, ticks)
+                    (pos, Arc::new(ticks))
                 })
                 .collect(),
         }
@@ -721,7 +804,11 @@ impl RegionTicks {
             seen.len() == queue.chunks.len(),
             "missing tick container registration"
         );
-        Ok(IndexedRegionQueue { queue, index })
+        Ok(IndexedRegionQueue {
+            queue,
+            index,
+            registration: registration.to_vec(),
+        })
     }
 
     /// Activate a clone while retaining the actual recorded index mutations.
@@ -763,10 +850,10 @@ impl RegionTicks {
             .map(|(&pos, ticks)| {
                 (
                     pos,
-                    match registry {
+                    Arc::new(match registry {
                         TickRegistry::Block => ticks.blocks.clone(),
                         TickRegistry::Fluid => ticks.fluids.clone(),
-                    },
+                    }),
                 )
             })
             .collect();
@@ -777,6 +864,7 @@ impl RegionTicks {
         let mut queue = IndexedRegionQueue {
             queue: ActiveRegionQueue { chunks },
             index,
+            registration: self.registration.clone(),
         };
         for &pos in activation {
             queue.unpack_container(pos, self.game_time)?;
@@ -834,5 +922,74 @@ impl RegionTicks {
         } else {
             ScheduleOutcome::Duplicate
         })
+    }
+}
+
+#[cfg(test)]
+mod live_capture_tests {
+    use super::*;
+
+    #[test]
+    fn captured_indexes_keep_registration_and_copy_only_changed_containers() -> Result<()> {
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos { x: 1, z: 0 };
+        let mut blocks = IndexedRegionQueue::default();
+        let mut fluids = IndexedRegionQueue::default();
+        for queue in [&mut blocks, &mut fluids] {
+            queue.add_container(first, ChunkTicks::from_saved(first, vec![])?)?;
+            queue.add_container(second, ChunkTicks::from_saved(second, vec![])?)?;
+        }
+        blocks.schedule(ScheduledTick {
+            kind: "minecraft:sand".into(),
+            position: [1, 4, 1],
+            trigger: 107,
+            priority: 0,
+            sub_tick: 2,
+        })?;
+        let original = blocks.clone();
+        assert!(Arc::ptr_eq(
+            &original.queue.chunks[&first],
+            &blocks.queue.chunks[&first]
+        ));
+        assert!(Arc::ptr_eq(
+            &original.queue.chunks[&second],
+            &blocks.queue.chunks[&second]
+        ));
+        blocks.schedule(ScheduledTick {
+            kind: "minecraft:gravel".into(),
+            position: [2, 4, 1],
+            trigger: 105,
+            priority: 0,
+            sub_tick: 3,
+        })?;
+        assert!(!Arc::ptr_eq(
+            &original.queue.chunks[&first],
+            &blocks.queue.chunks[&first]
+        ));
+        assert!(Arc::ptr_eq(
+            &original.queue.chunks[&second],
+            &blocks.queue.chunks[&second]
+        ));
+        assert_eq!(original.container(first).unwrap().pack(100).len(), 1);
+        assert_eq!(blocks.container(first).unwrap().pack(100).len(), 2);
+
+        let region = RegionTicks::from_indexed_queues(&blocks, &fluids, 100, 4)?;
+        assert_eq!(region.registration_order(), &[first, second]);
+        let mut actual = region.captured_indexed_queue_for(TickRegistry::Block, &[])?;
+        let mut expected = blocks.clone();
+        assert_eq!(
+            actual.collect_due(110, 10, |_| true),
+            expected.collect_due(110, 10, |_| true)
+        );
+        assert_eq!(blocks.registration_order(), &[first, second]);
+
+        let replaced = blocks.add_container(first, ChunkTicks::from_saved(first, vec![])?)?;
+        assert!(replaced.is_some());
+        assert_eq!(blocks.registration_order(), &[first, second]);
+        blocks.remove_container(first).unwrap();
+        blocks.add_container(first, ChunkTicks::from_saved(first, vec![])?)?;
+        assert_eq!(blocks.registration_order(), &[second, first]);
+        assert!(RegionTicks::from_indexed_queues(&blocks, &fluids, 100, 4).is_err());
+        Ok(())
     }
 }

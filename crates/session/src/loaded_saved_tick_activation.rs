@@ -3,16 +3,136 @@
 //! This does not establish the Java holder's ticking readiness or authorize a
 //! save. New schedules remain separate from the original pending entries.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    CollectedBlockTick, GeneratedTickOrder, LoadedSession, PendingSavedTickActivation,
-    ScheduledFluid, generated_block_key, generated_fluid_key,
+    CollectedBlockTick, GeneratedTickOrder, GenerationTerrainStage, LoadedSession,
+    PendingSavedTickActivation, ScheduledFluid, generated_block_key, generated_fluid_key,
 };
-use crate::worldgen::chunk_ticks::{ChunkTicks, SavedTick, ScheduledTick};
+use crate::worldgen::chunk_ticks::{
+    ChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, ScheduledTick,
+};
 use native_world::loaded::ChunkPos;
 
 type Order = (i128, i32, i64, u64);
+
+/// Immutable live LevelTicks indexes captured at one simulation boundary.
+/// Holder readiness, terrain, lighting, entities, POIs and disk state require
+/// their own checks before a postprocessing result can be published.
+pub struct SavedTickQueueCapture {
+    session: Arc<()>,
+    blocks: Arc<IndexedRegionQueue>,
+    fluids: Arc<IndexedRegionQueue>,
+    base_time: i64,
+    game_time: i64,
+    next_sub_tick: i64,
+    tick: u64,
+}
+
+impl SavedTickQueueCapture {
+    pub fn game_time(&self) -> i64 {
+        self.game_time
+    }
+
+    pub fn next_sub_tick(&self) -> i64 {
+        self.next_sub_tick
+    }
+
+    /// Actual attachment order of the registered tick containers.
+    pub fn registration_order(&self) -> &[ChunkPos] {
+        self.blocks.registration_order()
+    }
+
+    pub(crate) fn belongs_to_terrain(&self, terrain: &GenerationTerrainStage) -> bool {
+        Arc::ptr_eq(&self.session, &terrain.session)
+    }
+
+    /// Deep-copy only on the worker thread, preserving the original index and
+    /// heap layouts, pending entries, and the shared sub-tick counter.
+    pub(crate) fn isolated_region_ticks(&self) -> Result<RegionTicks> {
+        RegionTicks::from_indexed_queues(
+            &self.blocks,
+            &self.fluids,
+            self.game_time,
+            self.next_sub_tick,
+        )
+    }
+}
+
+impl LoadedSession {
+    /// Capture the current registered queues without cloning every tick on the
+    /// simulation thread. Later mutations use copy-on-write per container.
+    pub fn capture_saved_tick_queues(&self) -> Result<SavedTickQueueCapture> {
+        ensure!(
+            self.require_saved_chunk_sources && self.initial_game_time_set && !self.advancing_tick,
+            "saved tick queues can only be captured at a session tick boundary"
+        );
+        let blocks = self
+            .generated_block_order
+            .as_ref()
+            .context("live block tick index is unavailable")?;
+        let fluids = self
+            .generated_fluid_order
+            .as_ref()
+            .context("live fluid tick index is unavailable")?;
+        ensure!(
+            blocks.base_time == fluids.base_time,
+            "live tick indexes use different clocks"
+        );
+        let time = i64::try_from(i128::from(blocks.base_time) + self.scheduled_tick())
+            .context("live tick clock is outside the indexed range")?;
+        ensure!(
+            time == self.game_time,
+            "live tick clock differs from level time"
+        );
+        ensure!(
+            blocks.queue.registration_order() == fluids.queue.registration_order(),
+            "live block and fluid registrations differ"
+        );
+        Ok(SavedTickQueueCapture {
+            session: Arc::clone(&self.generation_identity),
+            blocks: Arc::clone(&blocks.queue),
+            fluids: Arc::clone(&fluids.queue),
+            base_time: blocks.base_time,
+            game_time: self.game_time,
+            next_sub_tick: self.next_sub_tick,
+            tick: self.tick,
+        })
+    }
+
+    /// A completed worker result may only use this snapshot if neither the
+    /// level clock nor either registered queue changed since capture.
+    pub fn verify_saved_tick_queues(&self, captured: &SavedTickQueueCapture) -> Result<()> {
+        ensure!(
+            self.require_saved_chunk_sources
+                && self.initial_game_time_set
+                && !self.advancing_tick
+                && Arc::ptr_eq(&self.generation_identity, &captured.session)
+                && self.tick == captured.tick
+                && self.game_time == captured.game_time
+                && self.next_sub_tick == captured.next_sub_tick,
+            "saved tick session or clock changed"
+        );
+        let blocks = self
+            .generated_block_order
+            .as_ref()
+            .context("live block tick index is unavailable")?;
+        let fluids = self
+            .generated_fluid_order
+            .as_ref()
+            .context("live fluid tick index is unavailable")?;
+        ensure!(
+            blocks.base_time == captured.base_time
+                && fluids.base_time == captured.base_time
+                && Arc::ptr_eq(&blocks.queue, &captured.blocks)
+                && Arc::ptr_eq(&fluids.queue, &captured.fluids),
+            "saved tick queues changed"
+        );
+        Ok(())
+    }
+}
 
 struct BlockMove {
     old: Order,
@@ -270,20 +390,26 @@ impl LoadedSession {
             debug_assert!(previous.is_none());
         }
         if let Some(time) = block_time {
-            self.generated_block_order
-                .as_mut()
-                .expect("validated saved block index")
-                .queue
-                .unpack_container(pos, time)
-                .expect("validated saved block container");
+            Arc::make_mut(
+                &mut self
+                    .generated_block_order
+                    .as_mut()
+                    .expect("validated saved block index")
+                    .queue,
+            )
+            .unpack_container(pos, time)
+            .expect("validated saved block container");
         }
         if let Some(time) = fluid_time {
-            self.generated_fluid_order
-                .as_mut()
-                .expect("validated saved fluid index")
-                .queue
-                .unpack_container(pos, time)
-                .expect("validated saved fluid container");
+            Arc::make_mut(
+                &mut self
+                    .generated_fluid_order
+                    .as_mut()
+                    .expect("validated saved fluid index")
+                    .queue,
+            )
+            .unpack_container(pos, time)
+            .expect("validated saved fluid container");
         }
         self.pending_saved_tick_activation.remove(&pos);
         Ok(())

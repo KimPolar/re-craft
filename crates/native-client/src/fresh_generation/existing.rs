@@ -2074,6 +2074,108 @@ impl StagedLiveTerrainBatch {
         self.batch.schedule.completed(pos)
     }
 
+    /// Record INITIALIZE_LIGHT only for saved FULL chunks or completed feature
+    /// passes whose sections are registered in the same observed engine. This
+    /// does not prove ticking readiness, entity completeness, or safe saving.
+    pub fn restore_observed_queued_light_stages(
+        &mut self,
+        light: &CapturedQueuedLight,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+
+        ensure!(
+            light.matches_batch(&self.batch),
+            "light belongs to another terrain revision"
+        );
+        light.engine.verify_terrain(&self.batch.terrain)?;
+        let world = self.batch.terrain.snapshot();
+        let mut seen = BTreeSet::new();
+        let mut imported = Vec::new();
+        for pos in positions {
+            ensure!(seen.insert(pos), "duplicate observed light chunk");
+            let source = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let chunk = world
+                .chunks
+                .get(&pos)
+                .context("observed light chunk is missing")?;
+            ensure!(
+                chunk.position == pos,
+                "observed light chunk position differs"
+            );
+            let completed = self
+                .batch
+                .schedule
+                .completed(pos)
+                .context("observed light chunk is not requested")?;
+            if self.batch.saved_stage(pos) == Some(GenerationStage::Full) {
+                ensure!(
+                    matches!(self.batch.sources.get(&source), Some(Some(_)))
+                        && chunk.status.as_deref() == Some("minecraft:full")
+                        && completed >= GenerationStage::Terrain,
+                    "saved light terrain is not restored from a FULL source"
+                );
+            } else {
+                ensure!(
+                    self.batch.sources.contains_key(&source)
+                        && self.batch.feature_entity_sources.completed.contains(&pos)
+                        && completed >= GenerationStage::Features,
+                    "generated light chunk has no completed feature pass"
+                );
+            }
+            ensure!(
+                light.engine.is_registered(pos),
+                "observed light chunk is not registered"
+            );
+            let required = self
+                .batch
+                .schedule
+                .required(pos)
+                .context("observed light chunk is not requested")?;
+            if required >= GenerationStage::InitializeLight
+                && completed < GenerationStage::InitializeLight
+            {
+                imported.push((pos, GenerationStage::InitializeLight));
+            }
+        }
+        self.batch.schedule.restore_imported(imported)
+    }
+
+    /// Registrations with restored saved terrain or completed feature work.
+    /// Their actual light state is still checked separately.
+    pub fn observed_light_candidates(
+        &self,
+        positions: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+    ) -> Result<Vec<native_world::loaded::ChunkPos>> {
+        use native_session::worldgen::schedule::GenerationStage;
+        let mut result = Vec::new();
+        for pos in positions {
+            if self
+                .batch
+                .schedule
+                .required(pos)
+                .is_none_or(|stage| stage < GenerationStage::InitializeLight)
+            {
+                continue;
+            }
+            ensure!(
+                self.batch.saved_stage(pos) == Some(GenerationStage::Full)
+                    || self.batch.feature_entity_sources.completed.contains(&pos),
+                "registered light chunk lacks completed features"
+            );
+            result.push(pos);
+        }
+        Ok(result)
+    }
+
+    pub fn ready_queued_light(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+        stage: native_session::worldgen::schedule::GenerationStage,
+    ) -> bool {
+        self.batch.schedule.ready(pos, stage)
+    }
+
     pub fn require_ready_features(&self, pos: native_world::loaded::ChunkPos) -> Result<()> {
         use native_session::worldgen::schedule::GenerationStage;
         self.batch.require_unfinished_features(pos)?;
@@ -7199,6 +7301,26 @@ impl PreparedExistingGenerator {
             .run_queued_light(&batch.terrain, position, &mut light.engine)
     }
 
+    /// Continue a staged live batch using its observed queued light engine.
+    pub fn initialize_staged_live_queued_light(
+        &self,
+        batch: &mut StagedLiveTerrainBatch,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        self.initialize_captured_queued_light(&mut batch.batch, light, position)
+    }
+
+    /// Propagation remains private until the remaining live state is verified.
+    pub fn propagate_staged_live_queued_light(
+        &self,
+        batch: &mut StagedLiveTerrainBatch,
+        light: &mut CapturedQueuedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        self.propagate_captured_queued_light(&mut batch.batch, light, position)
+    }
+
     /// Run FEATURES for a mixed captured batch, including supported saved
     /// buried-treasure references. Generated starts remain unsupported.
     /// A light-dependent feature fails until an appropriate light view exists.
@@ -10684,6 +10806,181 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn saved_light_registration_unblocks_mixed_chunk_schedule_atomically() -> Result<()> {
+        use native_persistence::heightmap::{HeightBounds, SavedGenerationHeightmaps};
+        use native_resources::surface_pass::SurfaceStageChunk;
+        use native_session::worldgen::{
+            BiomeNeighborhood, CarvedTerrainWorld, QuartBiomeChunk, QueuedGenerationLightEngine,
+            materialize_carved_terrain, schedule::GenerationStage,
+        };
+        use native_world::{generation_light::QueuedSectionLightTracker, loaded::ChunkPos};
+
+        let make = |pos: ChunkPos| -> Result<_> {
+            let biome = QuartBiomeChunk::from_values(
+                [pos.x, pos.z],
+                0,
+                0,
+                16,
+                vec![ResourceId::parse("minecraft:plains")?; 64],
+            )?;
+            let chunk = SurfaceStageChunk {
+                chunk_position: [pos.x, pos.z],
+                min_y: 0,
+                height: 16,
+                states: vec![Arc::new(json!("minecraft:air")); 4096],
+                fluid_updates: vec![false; 4096],
+                noise_postprocessing: None,
+                surface_postprocessing: None,
+                carver_postprocessing: None,
+            };
+            materialize_carved_terrain(chunk, &biome, "minecraft:overworld", |_| {
+                Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: BTreeMap::new(),
+                })
+            })
+        };
+        let center = ChunkPos { x: 0, z: 0 };
+        let neighbors: Vec<_> = (-1..=1)
+            .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+            .filter(|pos| *pos != center)
+            .collect();
+        let mut terrain = CarvedTerrainWorld::new(make(center)?);
+        let mut sources =
+            BTreeMap::from([(native_persistence::world::ChunkPos { x: 0, z: 0 }, None)]);
+        let mut saved_stages = BTreeMap::new();
+        for &pos in &neighbors {
+            let (mut world, _, _, _, _) = make(pos)?.into_parts();
+            let chunk = Arc::make_mut(world.chunks.get_mut(&pos).context("saved chunk missing")?);
+            chunk.status = Some("minecraft:full".into());
+            chunk.block_light_correct = true;
+            let document = Arc::new(NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            });
+            let maps = SavedGenerationHeightmaps::read(
+                &document,
+                HeightBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+            )?;
+            terrain.insert_saved_chunk(&world, pos, &maps, None)?;
+            sources.insert(
+                native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+                Some(document),
+            );
+            saved_stages.insert(pos, GenerationStage::Full);
+        }
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(center, GenerationStage::Light)?;
+        schedule.restore_imported(
+            neighbors
+                .iter()
+                .copied()
+                .map(|pos| (pos, GenerationStage::Terrain))
+                .chain([(center, GenerationStage::Features)]),
+        )?;
+        let batch = CapturedTerrainBatch {
+            identity: Arc::new(()),
+            schedule,
+            biomes: BiomeNeighborhood::new(0, 0, 16)?,
+            terrain,
+            sources,
+            saved_stages,
+            generated_references: BTreeMap::new(),
+            generated_starts: BTreeMap::new(),
+            treasure_starts: BTreeMap::new(),
+            feature_entity_sources: ResumedFeatureEntitySources::default(),
+            revision: Arc::new(()),
+        };
+        let mut staged = StagedLiveTerrainBatch {
+            batch,
+            feature_order: Vec::new(),
+            mineshaft_starts: BTreeMap::new(),
+        };
+        let all: Vec<_> = neighbors.iter().copied().chain([center]).collect();
+        let make_light = |registered: &[ChunkPos]| -> Result<CapturedQueuedLight> {
+            let tracker = QueuedSectionLightTracker::fresh(true, false, all.iter().copied())
+                .context("test tracker unavailable")?;
+            let engine = QueuedGenerationLightEngine::new(
+                &staged.batch.terrain,
+                tracker,
+                registered.iter().copied(),
+                BTreeMap::new(),
+                false,
+                |state| Some(state.name == "minecraft:air"),
+            )?;
+            Ok(CapturedQueuedLight {
+                identity: Arc::clone(&staged.batch.identity),
+                revision: Arc::clone(&staged.batch.revision),
+                engine,
+            })
+        };
+        let partial = make_light(&all[1..])?;
+        let mut full = make_light(&all)?;
+        assert!(!staged.ready_queued_light(center, GenerationStage::Light));
+        let before = staged.snapshot();
+        assert!(
+            staged
+                .restore_observed_queued_light_stages(
+                    &partial,
+                    neighbors[1..].iter().copied().chain([neighbors[0]]),
+                )
+                .is_err()
+        );
+        assert!(
+            neighbors
+                .iter()
+                .all(|&pos| staged.completed_stage(pos) == Some(GenerationStage::Terrain))
+        );
+        let stale = CapturedQueuedLight {
+            identity: Arc::clone(&staged.batch.identity),
+            revision: Arc::new(()),
+            engine: full.engine.clone(),
+        };
+        assert!(
+            staged
+                .restore_observed_queued_light_stages(&stale, neighbors.iter().copied())
+                .is_err()
+        );
+        assert!(
+            staged
+                .restore_observed_queued_light_stages(&full, [neighbors[0], neighbors[0]])
+                .is_err()
+        );
+        assert!(
+            staged
+                .restore_observed_queued_light_stages(&full, [center])
+                .is_err()
+        );
+        assert!(
+            staged
+                .observed_light_candidates(all.iter().copied())
+                .is_err()
+        );
+        staged.batch.feature_entity_sources.complete(center, false);
+        assert_eq!(staged.observed_light_candidates(all.iter().copied())?, all);
+        staged.restore_observed_queued_light_stages(&full, all.iter().copied())?;
+        assert!(
+            neighbors
+                .iter()
+                .all(|&pos| staged.completed_stage(pos) == Some(GenerationStage::InitializeLight))
+        );
+        assert!(staged.ready_queued_light(center, GenerationStage::Light));
+        let visible = staged.batch.schedule.run_queued_light(
+            &staged.batch.terrain,
+            center,
+            &mut full.engine,
+        )?;
+        assert!(visible.complete_column(center).is_some());
+        assert_eq!(staged.completed_stage(center), Some(GenerationStage::Light));
+        assert!(Arc::ptr_eq(&before, &staged.snapshot()));
+        assert!(staged.feature_order().is_empty());
+        Ok(())
+    }
 
     #[test]
     fn saved_mineshaft_filter_uses_inclusive_chunk_bounds() -> Result<()> {

@@ -1013,6 +1013,10 @@ impl StagedMissingTerrain {
         self.batch.feature_order()
     }
 
+    pub fn ready_queued_light(&self, position: ChunkPos, operation: StagedLightOperation) -> bool {
+        self.queued_light.is_some() && self.batch.ready_queued_light(position, operation.stage())
+    }
+
     /// The caller must supply a continuously observed light-engine revision.
     /// The live terrain guard still has to match before and after feature work.
     pub fn bind_observed_light(
@@ -1031,12 +1035,16 @@ impl StagedMissingTerrain {
             self.queued_light.is_none(),
             "observed light is already bound"
         );
+        let registered: Vec<_> = registered.into_iter().collect();
         let light = self.generator.bind_staged_live_queued_light(
             &self.batch,
             tracker,
-            registered,
+            registered.iter().copied(),
             sky_sources,
         )?;
+        let candidates = self.batch.observed_light_candidates(registered)?;
+        self.batch
+            .restore_observed_queued_light_stages(&light, candidates)?;
         self.queued_light = Some(light);
         Ok(())
     }
@@ -1319,6 +1327,193 @@ impl MissingGenerationStagedFeatureWorker {
 }
 
 impl Drop for MissingGenerationStagedFeatureWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StagedLightOperation {
+    Initialize,
+    Propagate,
+}
+
+impl StagedLightOperation {
+    fn stage(self) -> native_session::worldgen::schedule::GenerationStage {
+        use native_session::worldgen::schedule::GenerationStage;
+        match self {
+            Self::Initialize => GenerationStage::InitializeLight,
+            Self::Propagate => GenerationStage::Light,
+        }
+    }
+}
+
+pub(crate) struct MissingGenerationStagedLightStartError {
+    pub terrain: StagedMissingTerrain,
+    pub error: anyhow::Error,
+}
+
+/// A light operation and its still-private terrain. The caller must keep the
+/// observed engine and remaining live and save checks with this result.
+pub(crate) enum StagedMissingLightResult {
+    Completed {
+        terrain: StagedMissingTerrain,
+        position: ChunkPos,
+        operation: StagedLightOperation,
+        visible: Option<native_world::generation_light::VisibleLightSnapshot>,
+    },
+    Failed {
+        terrain: StagedMissingTerrain,
+        error: anyhow::Error,
+    },
+}
+
+pub(crate) struct MissingGenerationStagedLightWorker {
+    observed: MissingGenerationTargets,
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<StagedMissingLightResult>,
+    finished: bool,
+}
+
+impl MissingGenerationStagedLightWorker {
+    /// Run one caller-ordered light operation off the simulation thread.
+    /// A failure returns the private terrain and observed engine for retry.
+    pub fn start(
+        terrain: StagedMissingTerrain,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+        position: ChunkPos,
+        operation: StagedLightOperation,
+    ) -> std::result::Result<Self, MissingGenerationStagedLightStartError> {
+        let error = if !terrain.is_current(streamer, session) {
+            Some("staged terrain is stale")
+        } else if terrain.queued_light.is_none() {
+            Some("observed light is not bound")
+        } else if !terrain.ready_queued_light(position, operation) {
+            Some("queued light dependencies are incomplete")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(MissingGenerationStagedLightStartError {
+                terrain,
+                error: anyhow::anyhow!(error),
+            });
+        }
+        let observed = terrain.observed.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, result) = mpsc::channel();
+        crate::generation_staging::spawn_with_payload(
+            terrain,
+            move |mut terrain| {
+                let work =
+                    (|| -> Result<Option<native_world::generation_light::VisibleLightSnapshot>> {
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire),
+                            "staged light operation cancelled"
+                        );
+                        anyhow::ensure!(
+                            terrain.observed.stamp.is_current(),
+                            "staged terrain is stale"
+                        );
+                        let light = terrain
+                            .queued_light
+                            .as_mut()
+                            .context("observed light is not bound")?;
+                        let visible = match operation {
+                            StagedLightOperation::Initialize => {
+                                terrain.generator.initialize_staged_live_queued_light(
+                                    &mut terrain.batch,
+                                    light,
+                                    position,
+                                )?;
+                                None
+                            }
+                            StagedLightOperation::Propagate => {
+                                Some(terrain.generator.propagate_staged_live_queued_light(
+                                    &mut terrain.batch,
+                                    light,
+                                    position,
+                                )?)
+                            }
+                        };
+                        anyhow::ensure!(
+                            !worker_cancelled.load(Ordering::Acquire)
+                                && terrain.observed.stamp.is_current(),
+                            "staged light operation was cancelled or became stale"
+                        );
+                        Ok(visible)
+                    })();
+                let outcome = match work {
+                    Ok(visible) => StagedMissingLightResult::Completed {
+                        terrain,
+                        position,
+                        operation,
+                        visible,
+                    },
+                    Err(error) => StagedMissingLightResult::Failed { terrain, error },
+                };
+                let _ = sender.send(outcome);
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("missing-generation-staged-light".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(terrain, error)| MissingGenerationStagedLightStartError {
+            terrain,
+            error: anyhow::Error::new(error).context("cannot start staged light operation"),
+        })?;
+        Ok(Self {
+            observed,
+            cancelled,
+            result,
+            finished: false,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn try_result(
+        &mut self,
+        streamer: &ChunkStreamer,
+        session: &LoadedSession,
+    ) -> Result<Option<StagedMissingLightResult>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                anyhow::bail!("staged light operation stopped unexpectedly");
+            }
+        };
+        self.finished = true;
+        if self.cancelled.load(Ordering::Acquire) || !self.observed.is_current(streamer, session) {
+            crate::generation_staging::discard_async(result);
+            anyhow::bail!("staged light operation was cancelled or became stale");
+        }
+        let terrain = match &result {
+            StagedMissingLightResult::Completed { terrain, .. }
+            | StagedMissingLightResult::Failed { terrain, .. } => terrain,
+        };
+        if !terrain.is_current(streamer, session) {
+            crate::generation_staging::discard_async(result);
+            anyhow::bail!("live generation inputs changed during staged light operation");
+        }
+        Ok(Some(result))
+    }
+}
+
+impl Drop for MissingGenerationStagedLightWorker {
     fn drop(&mut self) {
         self.cancel();
         crate::generation_staging::discard_receiver(&mut self.result);

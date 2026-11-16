@@ -71,7 +71,8 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
         MissingGenerationAssemblyWorker, MissingGenerationBiomeWorker,
         MissingGenerationCaptureWorker, MissingGenerationPrepareWorker,
         MissingGenerationStagedAssemblyWorker, MissingGenerationStagedFeatureWorker,
-        MissingGenerationTerrainWorker, StagedMissingFeatureResult,
+        MissingGenerationStagedLightWorker, MissingGenerationTerrainWorker, StagedLightOperation,
+        StagedMissingFeatureResult, StagedMissingLightResult,
     };
 
     let path = private_play_save_world()?;
@@ -325,6 +326,91 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
         completed.len(),
         cart_ids.len()
     );
+    // A synthetic empty engine exercises worker ownership and scheduling only;
+    // it is not an observed live engine or a Java light comparison.
+    let failure = match MissingGenerationStagedLightWorker::start(
+        staged,
+        &streamer,
+        &session,
+        target,
+        StagedLightOperation::Initialize,
+    ) {
+        Ok(_) => anyhow::bail!("light initialization accepted an unbound engine"),
+        Err(failure) => failure,
+    };
+    ensure!(
+        failure.error.to_string().contains("not bound"),
+        "unexpected light error"
+    );
+    let mut staged = failure.terrain;
+    let tracker = native_world::generation_light::QueuedSectionLightTracker::fresh(true, true, [])
+        .context("synthetic light tracker is unavailable")?;
+    staged.bind_observed_light(&streamer, &session, tracker, [], Default::default())?;
+    let failure = match MissingGenerationStagedLightWorker::start(
+        staged,
+        &streamer,
+        &session,
+        target,
+        StagedLightOperation::Propagate,
+    ) {
+        Ok(_) => anyhow::bail!("uninitialized light propagation was accepted"),
+        Err(failure) => failure,
+    };
+    ensure!(
+        failure.error.to_string().contains("incomplete"),
+        "unexpected light dependency error"
+    );
+    let mut worker = MissingGenerationStagedLightWorker::start(
+        failure.terrain,
+        &streamer,
+        &session,
+        target,
+        StagedLightOperation::Initialize,
+    )
+    .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let staged = loop {
+        if let Some(result) = worker.try_result(&streamer, &session)? {
+            match result {
+                StagedMissingLightResult::Completed {
+                    terrain,
+                    position,
+                    operation,
+                    visible,
+                } => {
+                    assert_eq!(position, target);
+                    assert_eq!(operation, StagedLightOperation::Initialize);
+                    assert!(visible.is_none());
+                    break terrain;
+                }
+                StagedMissingLightResult::Failed { error, .. } => return Err(error),
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "staged light initialization timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(
+        staged.completed_stage(target),
+        Some(native_session::worldgen::schedule::GenerationStage::InitializeLight)
+    );
+    let failure = match MissingGenerationStagedLightWorker::start(
+        staged,
+        &streamer,
+        &session,
+        target,
+        StagedLightOperation::Propagate,
+    ) {
+        Ok(_) => anyhow::bail!("light propagation accepted uninitialized neighbors"),
+        Err(failure) => failure,
+    };
+    ensure!(
+        failure.error.to_string().contains("incomplete"),
+        "unexpected neighbor light error"
+    );
+    let staged = failure.terrain;
     let snapshot = session.snapshot();
     let world = std::sync::Arc::clone(snapshot.world.loaded().context("world missing")?);
     assert!(std::sync::Arc::ptr_eq(&live_world, &world));
@@ -333,6 +419,39 @@ fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<
             .capture_generation_terrain(&world, [target])
             .is_err()
     );
+    if let Some(next) = completed.into_iter().find(|&position| {
+        position != target && staged.ready_queued_light(position, StagedLightOperation::Initialize)
+    }) {
+        let mut cancelled = MissingGenerationStagedLightWorker::start(
+            staged,
+            &streamer,
+            &session,
+            next,
+            StagedLightOperation::Initialize,
+        )
+        .map_err(|failure| failure.error)?;
+        cancelled.cancel();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match cancelled.try_result(&streamer, &session) {
+                Err(error) => {
+                    ensure!(
+                        error.to_string().contains("cancelled"),
+                        "unexpected cancellation error"
+                    );
+                    eprintln!("cancelled staged light initialization for {next:?}");
+                    break;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => anyhow::bail!("cancelled light work returned a result"),
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "cancelled light work did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
     Ok(())
 }
 

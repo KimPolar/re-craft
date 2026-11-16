@@ -969,6 +969,16 @@ impl QueuedGenerationLightEngine {
         &self.tracker
     }
 
+    /// Whether the observed engine still owns this chunk's registration.
+    pub fn is_registered(&self, position: native_world::loaded::ChunkPos) -> bool {
+        self.registered.contains_key(&position)
+    }
+
+    /// Check that the terrain still matches every registered light input.
+    pub fn verify_terrain(&self, terrain: &CarvedTerrainWorld) -> Result<()> {
+        self.validate_terrain(terrain)
+    }
+
     fn validate_terrain(&self, terrain: &CarvedTerrainWorld) -> Result<()> {
         self.validate_terrain_with_arrival(terrain, None)
     }

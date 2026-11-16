@@ -130,9 +130,9 @@ pub fn dispatch_saved_ticking(
 
 /// Restore an isolated postprocessing stage from original FULL chunk data.
 /// Saved tick entries remain pending during callbacks. Reproducible default
-/// chests, chests with deferred loot, and default potent sulfur entities are
-/// admitted. Active upgrade data and other entity contents are rejected. This
-/// does not authorize a live commit or save.
+/// chests, chests and brushable blocks with deferred loot, and default potent
+/// sulfur entities are admitted. Active upgrade data and other contents are
+/// rejected. This does not authorize a live commit or save.
 pub fn begin_saved_postprocessing(
     provider: &mut impl ResourceProvider,
     input: SavedPostprocessingInputs<'_>,

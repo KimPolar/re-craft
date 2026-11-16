@@ -19,12 +19,15 @@ public class BrushableBlockEntityOracle {
         var tests = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         for (var entry : tests) {
             var test = entry.getAsJsonObject();
-            var state = (test.get("sand").getAsBoolean() ? Blocks.SUSPICIOUS_SAND : Blocks.SUSPICIOUS_GRAVEL).defaultBlockState();
+            var state = (test.get("sand").getAsBoolean() ? Blocks.SUSPICIOUS_SAND : Blocks.SUSPICIOUS_GRAVEL).defaultBlockState()
+                .setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DUSTED, test.has("dusted") ? test.get("dusted").getAsInt() : 0);
             var block = new BrushableBlockEntity(new BlockPos(test.get("x").getAsInt(), test.get("y").getAsInt(), test.get("z").getAsInt()), state);
             var data = new CompoundTag();
-            data.putString("LootTable", test.get("table").getAsString());
-            data.putLong("LootTableSeed", test.get("seed").getAsLong());
-            block.loadWithComponents(TagValueInput.create(ProblemReporter.DISCARDING, lookup, data));
+            if (test.has("table")) {
+                data.putString("LootTable", test.get("table").getAsString());
+                data.putLong("LootTableSeed", test.get("seed").getAsLong());
+                block.loadWithComponents(TagValueInput.create(ProblemReporter.DISCARDING, lookup, data));
+            }
             var actual = block.saveWithFullMetadata(lookup);
             var expected = NbtIo.read(Path.of(test.get("path").getAsString()));
             if (!actual.equals(expected)) throw new AssertionError("case=" + test + " java=" + actual + " rust=" + expected);

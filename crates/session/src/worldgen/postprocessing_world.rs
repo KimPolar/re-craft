@@ -57,7 +57,13 @@ fn materialize_pending_block_entity(
         "minecraft:potent_sulfur" => {
             Ok(super::GeneratedPotentSulfur::new(pos, state)?.block_entity())
         }
-        _ => bail!("unsupported pending generated block entity"),
+        "minecraft:suspicious_sand" | "minecraft:suspicious_gravel" => {
+            super::GeneratedBrushable::empty_block_entity(pos, &state)
+        }
+        _ => bail!(
+            "unsupported pending generated block entity {} at {pos:?}",
+            state.name
+        ),
     }
 }
 
@@ -69,6 +75,23 @@ fn materialize_saved_block_entity(
     original: &native_persistence::nbt::Tag,
 ) -> Result<native_persistence::nbt::Tag> {
     use native_persistence::nbt::Tag;
+    if matches!(
+        state.name.as_str(),
+        "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
+    ) && original.get("LootTable").is_some()
+    {
+        let Some(Tag::String(table)) = original.get("LootTable") else {
+            bail!("invalid saved brushable loot table")
+        };
+        let table = String::from_utf16(&table.0).context("invalid saved brushable loot table")?;
+        let seed = match original.get("LootTableSeed") {
+            None => 0,
+            Some(Tag::Long(seed)) => *seed,
+            _ => bail!("invalid saved brushable loot seed"),
+        };
+        return Ok(super::GeneratedBrushable::from_saved_loot(pos, state, &table, seed)?
+            .block_entity());
+    }
     if state.name == "minecraft:chest" && original.get("LootTable").is_some() {
         let Some(Tag::String(table)) = original.get("LootTable") else {
             bail!("invalid saved chest loot table")

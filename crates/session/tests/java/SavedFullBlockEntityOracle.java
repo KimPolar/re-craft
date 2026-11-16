@@ -75,7 +75,8 @@ public class SavedFullBlockEntityOracle {
                 biomeStrategy, plains, PalettedContainer.codecRO(biomeCodec, biomeStrategy, plains));
         var parsed = SerializableChunkData.parse(LevelHeightAccessor.create(0, 16), factory,
                 NbtIo.read(Path.of(args[0])));
-        if (parsed == null || parsed.chunkStatus() != ChunkStatus.FULL || parsed.blockEntities().size() != 27)
+        int expectedCount = args.length > 2 ? Integer.parseInt(args[2]) : 27;
+        if (parsed == null || parsed.chunkStatus() != ChunkStatus.FULL || parsed.blockEntities().size() != expectedCount)
             throw new AssertionError("invalid saved FULL fixture");
         var section = parsed.sectionData().stream().filter(value -> value.y() == 0)
                 .findFirst().orElseThrow().chunkSection();

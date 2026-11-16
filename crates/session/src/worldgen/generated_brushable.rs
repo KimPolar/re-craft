@@ -17,6 +17,39 @@ pub struct GeneratedBrushable {
 }
 
 impl GeneratedBrushable {
+    pub(super) fn from_saved_loot(
+        position: [i32; 3],
+        state: BlockState,
+        table: &str,
+        seed: i64,
+    ) -> Result<Self> {
+        ensure!(
+            native_world::collision::brushable_state(&state),
+            "invalid saved brushable state"
+        );
+        Ok(Self {
+            position,
+            state,
+            loot_table: ResourceId::parse(table)?,
+            loot_seed: seed,
+        })
+    }
+
+    pub(super) fn empty_block_entity(position: [i32; 3], state: &BlockState) -> Result<Tag> {
+        ensure!(
+            native_world::collision::brushable_state(state),
+            "invalid empty brushable state"
+        );
+        let [x, y, z] = position;
+        Ok(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:brushable_block".into())),
+            ("x".into(), Tag::Int(x)),
+            ("y".into(), Tag::Int(y)),
+            ("z".into(), Tag::Int(z)),
+            ("components".into(), Tag::Compound(vec![])),
+        ]))
+    }
+
     pub fn from_replacement(
         position: [i32; 3],
         replacement: &ArchaeologyReplacement,
@@ -131,6 +164,32 @@ mod tests {
     }
 
     #[test]
+    fn restored_brushable_entities_validate_state_and_loot() {
+        let mut block = replacement(true, 0).state;
+        for dusted in ["0", "1", "2", "3"] {
+            block.properties.insert("dusted".into(), dusted.into());
+            let empty = GeneratedBrushable::empty_block_entity([1, 2, 3], &block).unwrap();
+            assert!(
+                matches!(empty.get("id"), Some(Tag::String(id)) if id.matches("minecraft:brushable_block"))
+            );
+            assert!(empty.get("LootTable").is_none());
+            let loot = GeneratedBrushable::from_saved_loot(
+                [1, 2, 3],
+                block.clone(),
+                "minecraft:archaeology/ocean_ruin_cold",
+                -7,
+            )
+            .unwrap()
+            .block_entity();
+            assert_eq!(loot.get("LootTableSeed"), Some(&Tag::Long(-7)));
+        }
+        block.properties.insert("dusted".into(), "4".into());
+        assert!(GeneratedBrushable::empty_block_entity([1, 2, 3], &block).is_err());
+        block.properties.insert("dusted".into(), "0".into());
+        assert!(GeneratedBrushable::from_saved_loot([1, 2, 3], block, "invalid id", 0).is_err());
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn brushable_block_entity_matches_java() -> Result<()> {
         use native_persistence::nbt::{self, NamedTag};
@@ -189,6 +248,38 @@ mod tests {
                     })?,
                 )?;
                 cases.push(serde_json::json!({"x":position[0],"y":position[1],"z":position[2],"sand":sand,"table":"minecraft:archaeology/ocean_ruin_warm","seed":seed,"path":path}));
+            }
+        }
+        for dusted in 0..4 {
+            for sand in [false, true] {
+                for with_loot in [false, true] {
+                    let position = [dusted - 5, -32 + dusted, 8];
+                    let mut state = replacement(sand, 0).state;
+                    state.properties.insert("dusted".into(), dusted.to_string());
+                    let table = "minecraft:archaeology/ocean_ruin_cold";
+                    let value = if with_loot {
+                        GeneratedBrushable::from_saved_loot(position, state, table, -37)?
+                            .block_entity()
+                    } else {
+                        GeneratedBrushable::empty_block_entity(position, &state)?
+                    };
+                    let path = temp
+                        .path()
+                        .join(format!("saved-{dusted}-{sand}-{with_loot}.nbt"));
+                    std::fs::write(
+                        &path,
+                        nbt::write(&NamedTag {
+                            name: "".into(),
+                            value,
+                        })?,
+                    )?;
+                    let mut case = serde_json::json!({"x":position[0],"y":position[1],"z":position[2],"sand":sand,"dusted":dusted,"path":path});
+                    if with_loot {
+                        case["table"] = table.into();
+                        case["seed"] = (-37).into();
+                    }
+                    cases.push(case);
+                }
             }
         }
         let input = temp.path().join("cases.json");

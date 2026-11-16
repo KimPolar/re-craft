@@ -431,6 +431,29 @@ pub struct GenerationContextSnapshot {
     selection: DataPackSettings,
 }
 
+/// Selected data packs captured together from one locked world. Later writes
+/// and external changes require separate validation before saving.
+#[derive(Clone)]
+pub struct WorldDataPackSnapshot {
+    packs: Arc<native_resources::datapack_snapshot::DataPackSnapshot>,
+    selection: DataPackSettings,
+    stamp: crate::save::WorldReadStamp,
+}
+
+impl WorldDataPackSnapshot {
+    pub fn packs(&self) -> &Arc<native_resources::datapack_snapshot::DataPackSnapshot> {
+        &self.packs
+    }
+
+    pub fn selection(&self) -> &DataPackSettings {
+        &self.selection
+    }
+
+    pub fn stamp(&self) -> &crate::save::WorldReadStamp {
+        &self.stamp
+    }
+}
+
 impl GenerationContextSnapshot {
     pub fn inputs(&self) -> &GenerationInputSnapshot {
         &self.inputs
@@ -1457,6 +1480,36 @@ impl WorldReader {
             inputs,
             packs,
             selection,
+        })
+    }
+
+    /// Capture the selected packs without requiring world-generation settings
+    /// or reading any chunks. The caller may use the snapshot off-thread.
+    pub fn capture_world_data_packs(&self) -> Result<WorldDataPackSnapshot> {
+        let session = self
+            .session_guard
+            .clone()
+            .context("data pack capture requires a locked world session")?;
+        let stamp = session.read_stamp()?;
+        let lease = session.acquire_capture()?;
+        let selection = lease.data_pack_settings()?;
+        ensure!(
+            selection == self.data_pack_settings()?,
+            "world data pack selection differs from the loaded level"
+        );
+        let packs = lease.data_pack_snapshot()?;
+        packs.verify()?;
+        lease.verify_data_pack_source(&packs)?;
+        ensure!(
+            lease.data_pack_settings()? == selection,
+            "world data pack selection changed during capture"
+        );
+        drop(lease);
+        ensure!(stamp.is_current(), "world data pack capture became stale");
+        Ok(WorldDataPackSnapshot {
+            packs,
+            selection,
+            stamp,
         })
     }
 
@@ -2988,6 +3041,52 @@ mod tests {
                 ]),
             )]),
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn world_pack_capture_is_bound_to_the_loaded_level_and_lock() {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("world-packs-")
+            .tempdir_in(parent)
+            .unwrap();
+        write_gzip(&root.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let pack = root.path().join("datapacks/example.zip");
+        std::fs::create_dir_all(pack.parent().unwrap()).unwrap();
+        std::fs::write(&pack, b"original").unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let unlocked = WorldReader::open(root.path(), dimension.clone()).unwrap();
+        assert!(unlocked.capture_world_data_packs().is_err());
+        drop(unlocked);
+        let reader = WorldReader::open_for_session(root.path(), dimension).unwrap();
+        let captured = reader.capture_world_data_packs().unwrap();
+        assert!(
+            captured
+                .stamp()
+                .belongs_to_session(&reader.session_guard().unwrap())
+        );
+        assert_eq!(captured.selection(), &reader.data_pack_settings().unwrap());
+        std::fs::write(&pack, b"changed").unwrap();
+        captured.packs().verify().unwrap();
+        assert!(captured.packs().verify_source(root.path()).is_err());
+        let mut changed = level(TARGET_DATA_VERSION);
+        let Tag::Compound(root_fields) = &mut changed.value else {
+            unreachable!()
+        };
+        let Tag::Compound(data) = &mut root_fields[0].1 else {
+            unreachable!()
+        };
+        data.push((
+            "enabled_features".into(),
+            Tag::List {
+                element_type: TagType::String,
+                values: vec![Tag::String("minecraft:trade_rebalance".into())],
+            },
+        ));
+        write_gzip(&root.path().join("level.dat"), &changed);
+        assert!(reader.capture_world_data_packs().is_err());
     }
 
     #[test]

@@ -232,6 +232,7 @@ struct StagedTerrainChunk {
 /// save; ticks, block entities, POIs, entities and lighting need other proofs.
 pub struct GenerationTerrainStage {
     session: Arc<()>,
+    identity: Arc<()>,
     bounds: BuildBounds,
     live_world: Arc<World>,
     saved_world: Arc<World>,
@@ -325,6 +326,10 @@ impl GenerationTerrainStageDraft {
 }
 
 impl GenerationTerrainStage {
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
     fn chunk_at(&self, x: i32, z: i32) -> Option<(&World, &native_world::loaded::Chunk)> {
         let pos = ChunkPos {
             x: x.div_euclid(16),
@@ -1810,6 +1815,7 @@ pub struct LoadedSession {
     unsupported_states: usize,
     require_saved_chunk_sources: bool,
     saved_world_session: Option<native_persistence::save::WorldSessionGuard>,
+    world_data_packs: Option<native_persistence::world::WorldDataPackSnapshot>,
     checked_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
     rejected_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
     unresolved_chunk_preparation: Option<String>,
@@ -5579,6 +5585,9 @@ impl LoadedSession {
             )?,
         };
         plan.add_generation_sources(sources.chunks())?;
+        if let Some(packs) = &self.world_data_packs {
+            plan.require_world_data_packs(packs)?;
+        }
         ensure!(sources.stamp().is_current(), "save sources became stale");
         Ok(plan)
     }
@@ -7347,6 +7356,28 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Bind the data-pack files and selection used to initialize this session.
+    /// Later workers must use the same immutable snapshot.
+    pub fn bind_world_data_packs(
+        &mut self,
+        packs: native_persistence::world::WorldDataPackSnapshot,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .saved_world_session
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("loaded session has no bound world lock"))?;
+        anyhow::ensure!(
+            self.tick == 0
+                && self.accumulated == Duration::ZERO
+                && self.world_data_packs.is_none()
+                && packs.stamp().belongs_to_session(session)
+                && packs.stamp().is_current(),
+            "world data packs do not belong to the initial session"
+        );
+        self.world_data_packs = Some(packs);
+        Ok(())
+    }
+
     fn mark_tick_chunk_dirty(&mut self, x: i32, z: i32) {
         self.tick_dirty_chunks.insert(ChunkPos {
             x: x.div_euclid(16),
@@ -7729,6 +7760,7 @@ impl LoadedSession {
         Ok(GenerationTerrainStageDraft {
             stage: GenerationTerrainStage {
                 session: Arc::clone(&self.generation_identity),
+                identity: Arc::new(()),
                 bounds: self.bounds,
                 live_world: Arc::clone(&self.world),
                 saved_world: source,
@@ -9668,6 +9700,7 @@ impl LoadedSession {
             unsupported_states,
             require_saved_chunk_sources: false,
             saved_world_session: None,
+            world_data_packs: None,
             checked_chunk_preparation: BTreeMap::new(),
             rejected_chunk_preparation: BTreeMap::new(),
             unresolved_chunk_preparation: None,
@@ -64684,6 +64717,9 @@ pub(crate) mod tests {
         let world_lock = capture_reader.session_guard().unwrap();
         session
             .bind_saved_world_session(world_lock.clone())
+            .unwrap();
+        session
+            .bind_world_data_packs(capture_reader.capture_world_data_packs().unwrap())
             .unwrap();
         session.set_new_player_last_death().unwrap();
         let uuid = session.initialize_new_player().unwrap();

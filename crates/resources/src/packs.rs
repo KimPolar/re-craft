@@ -136,6 +136,7 @@ pub struct ResourceStack {
     packs: Vec<Pack>,
     world_data: Option<crate::datapacks::DataPackStack>,
     world_snapshot: Option<Arc<crate::datapack_snapshot::DataPackSnapshot>>,
+    world_snapshot_selection: Option<crate::datapacks::DataPackSettings>,
 }
 
 impl ResourceStack {
@@ -145,6 +146,7 @@ impl ResourceStack {
             packs: Vec::new(),
             world_data: None,
             world_snapshot: None,
+            world_snapshot_selection: None,
         })
     }
 
@@ -275,6 +277,7 @@ impl ResourceStack {
             crate::datapacks::DataPackStack::open(world_dir, settings, &mut self.base)?;
         self.world_data = Some(stack);
         self.world_snapshot = None;
+        self.world_snapshot_selection = None;
         Ok(warnings)
     }
 
@@ -289,11 +292,16 @@ impl ResourceStack {
             crate::datapacks::DataPackStack::open(snapshot.world_path(), settings, &mut self.base)?;
         self.world_data = Some(stack);
         self.world_snapshot = Some(snapshot);
+        self.world_snapshot_selection = Some(settings.clone());
         Ok(warnings)
     }
 
     pub fn data_pack_snapshot(&self) -> Option<Arc<crate::datapack_snapshot::DataPackSnapshot>> {
         self.world_snapshot.clone()
+    }
+
+    pub fn data_pack_snapshot_selection(&self) -> Option<&crate::datapacks::DataPackSettings> {
+        self.world_snapshot_selection.as_ref()
     }
 
     pub fn selected_data_pack_ids(&self) -> Option<Vec<&str>> {

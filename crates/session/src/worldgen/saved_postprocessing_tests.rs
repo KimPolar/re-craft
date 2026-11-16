@@ -914,6 +914,353 @@ fn saved_ticking_rejects_marks_after_saved_ticks_activate() -> Result<()> {
     Ok(())
 }
 
+fn live_callback_fixture(
+    mark_x: i32,
+) -> Result<(
+    tempfile::TempDir,
+    ChunkArea,
+    BTreeSet<String>,
+    Vec<ChunkPos>,
+    crate::loaded::LoadedSession,
+    GenerationTerrainStage,
+    SavedTickQueueCapture,
+)> {
+    use flate2::{Compression, write::GzEncoder};
+    use glam::{IVec3, Vec3};
+    use std::io::Write;
+
+    let (mut area, mut ids, registration) = ticking_fixture()?;
+    ids.insert("minecraft:air".into());
+    let chunk = Arc::make_mut(area.chunks.get_mut(&area.center).unwrap());
+    let Tag::Compound(fields) = &mut Arc::make_mut(&mut chunk.document).value else {
+        unreachable!()
+    };
+    let mut marks = PostProcessing::new(0, 16).unwrap();
+    assert!(marks.mark(mark_x, 8, 8));
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("PostProcessing"))
+        .unwrap()
+        .1 = native_persistence::postprocessing::encode(&marks);
+    let dimension = DimensionId::parse("overworld")?;
+    let source = Arc::new(area.materialize(&dimension)?);
+    let mut session = crate::loaded::LoadedSession::new(
+        source.as_ref().clone(),
+        IVec3::ZERO,
+        BuildBounds {
+            min_y: 0,
+            max_y: 16,
+        },
+        crate::PlayerState {
+            position: Vec3::new(8.5, 10.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: crate::PlayerPose::Standing,
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    let root = tempfile::tempdir()?;
+    let level = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![(
+            "Data".into(),
+            Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Time".into(), Tag::Long(100)),
+            ]),
+        )]),
+    };
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(&native_persistence::nbt::write(&level)?)?;
+    std::fs::write(root.path().join("level.dat"), gzip.finish()?)?;
+    let reader = native_persistence::world::WorldReader::open_for_session(root.path(), dimension)?;
+    let packs = reader.capture_world_data_packs()?;
+    session.bind_saved_world_session(reader.session_guard().context("missing session lock")?)?;
+    session.bind_world_data_packs(packs)?;
+    session
+        .set_initial_game_time(100)
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        session.install_saved_tick_orders(&registration)? == (true, true),
+        "tick indexes not installed"
+    );
+    let terrain = session.capture_generation_terrain_stage(source, registration.iter().copied())?;
+    let ticks = session.capture_saved_tick_queues()?;
+    Ok((root, area, ids, registration, session, terrain, ticks))
+}
+
+fn begin_no_effect_fixture(
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    terrain: &GenerationTerrainStage,
+    ticks: &SavedTickQueueCapture,
+) -> Result<SavedTickingBatch> {
+    let mut batch = begin_live_session_fixture(area, ids, terrain, ticks)?;
+    batch.stage.set_water_source_conversion(true)?;
+    batch
+        .stage
+        .set_lava_rules(super::super::postprocessing_world::GeneratedLavaRules {
+            fast_lava: false,
+            source_conversion: false,
+        })?;
+    // This synthetic provider has no ResourceStack; production can only bind
+    // the proof through begin_with_bound_live_session.
+    ensure!(ticks.data_packs().is_some(), "fixture packs are missing");
+    batch.live.as_mut().unwrap().packs_bound = true;
+    Ok(batch)
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_no_effect_callback_activates_only_the_original_holder() -> Result<()> {
+    use crate::ticking_preparation::TickingFutureState;
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    let mut unrelated = ready_future(center, &registration)?;
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut unrelated, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    assert!(session.verify_saved_tick_queues(&ticks).is_err());
+    let after = session
+        .capture_saved_tick_queues()?
+        .isolated_region_ticks()?;
+    assert!(
+        after
+            .chunk(center)
+            .unwrap()
+            .blocks
+            .pending_saved()
+            .is_none()
+    );
+    assert!(session.dirty_chunk_positions().contains(&center));
+    assert!(
+        session
+            .draft_block_ticks(center)
+            .unwrap_err()
+            .to_string()
+            .contains("postprocessing")
+    );
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_no_effect_callback_rejects_modified_result_and_changed_terrain() -> Result<()> {
+    use super::super::chunk_ticks::ScheduledTick;
+    use crate::ticking_preparation::TickingFutureState;
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let mut result = batch.finish()?;
+    Arc::make_mut(&mut result.block_ticks).schedule(ScheduledTick {
+        kind: "minecraft:gravel".into(),
+        position: [1, 8, 1],
+        trigger: 102,
+        priority: 0,
+        sub_tick: 0,
+    })?;
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.verify_saved_tick_queues(&ticks)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    assert!(session.set_block_for_postprocessing_test(
+        glam::IVec3::new(7, 8, 8),
+        BlockState {
+            name: "minecraft:red_sand".into(),
+            properties: BTreeMap::new(),
+        }
+    ));
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_callback_rejects_new_scheduling_until_it_is_reconciled() -> Result<()> {
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(8)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    assert!(result.region.ticks().next_sub_tick() > ticks.next_sub_tick());
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.verify_saved_tick_queues(&ticks)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn live_no_effect_callback_matches_java_saved_ticks() -> Result<()> {
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("chunk.nbt");
+    let output = directory.path().join("postprocessed.nbt");
+    std::fs::write(
+        &input,
+        native_persistence::nbt::write(&area.chunks[&area.center].document)?,
+    )?;
+    let java = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullPostprocessingOracle",
+        include_str!("../../tests/java/SavedFullPostprocessingOracle.java"),
+        &[
+            input.to_str().context("invalid NBT input path")?,
+            output.to_str().context("invalid NBT output path")?,
+            "unpack",
+        ],
+    );
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    let mut actual = result
+        .block_ticks
+        .container(center)
+        .unwrap()
+        .pack(100)
+        .into_iter()
+        .map(|tick| {
+            format!(
+                "{} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.push(format!("counter {}", result.region.ticks().next_sub_tick()));
+    assert_eq!(actual, java);
+    session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3"]
+fn live_callback_binds_the_actual_session_data_packs() -> Result<()> {
+    let (root, area, _, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let game =
+        native_resources::default_minecraft_dir().context("Minecraft directory unavailable")?;
+    let packs = ticks.data_packs().context("fixture packs missing")?;
+    let selection = packs.selection();
+    let settings = native_resources::datapacks::DataPackSettings {
+        enabled: selection.enabled.clone(),
+        disabled: selection.disabled.clone(),
+        enabled_features: selection.enabled_features.clone(),
+    };
+    let mut provider = native_resources::packs::ResourceStack::open(&game)?;
+    let ids = provider.vanilla_block_ids()?;
+    let registry = provider.vanilla_generated_block_registry()?;
+    let defaults = registry.default_states();
+    let begin = |provider: &mut native_resources::packs::ResourceStack| {
+        SavedTickingBatch::begin_with_bound_live_session(
+            provider,
+            SavedPostprocessingInputs {
+                area: &area,
+                dimension: &DimensionId::parse("overworld")?,
+                defaults: &defaults,
+                block_ids: &ids,
+                bounds: BuildBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                registration: ticks.registration_order(),
+                game_time: ticks.game_time(),
+                next_sub_tick: ticks.next_sub_tick(),
+                light: None,
+            },
+            &terrain,
+            &ticks,
+            |state| {
+                ensure!(
+                    registry.is_canonical_state(&state.name, &state.properties),
+                    "unknown block state"
+                );
+                Ok(())
+            },
+            true,
+            super::super::postprocessing_world::GeneratedLavaRules {
+                fast_lava: false,
+                source_conversion: false,
+            },
+        )
+    };
+    let other =
+        Arc::new(native_resources::datapack_snapshot::DataPackSnapshot::capture(root.path())?);
+    assert!(
+        provider
+            .configure_snapshot_data(other, &settings)?
+            .is_empty()
+    );
+    assert!(begin(&mut provider).is_err());
+    let mut different_selection = settings.clone();
+    different_selection
+        .disabled
+        .push("file/disabled.zip".into());
+    provider.configure_snapshot_data(Arc::clone(packs.packs()), &different_selection)?;
+    assert!(begin(&mut provider).is_err());
+    assert!(
+        provider
+            .configure_snapshot_data(Arc::clone(packs.packs()), &settings)?
+            .is_empty()
+    );
+    let mut batch = begin(&mut provider)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    assert!(batch.dispatch(&mut worker, 100)?);
+    let result = batch.finish()?;
+    session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+    Ok(())
+}
+
 #[test]
 #[cfg(target_os = "windows")]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
@@ -1634,7 +1981,7 @@ fn overlapping_saved_ticking_callbacks_match_java() -> Result<()> {
         neighbor.pack(1_000)[0].delay
     ));
     actual.push(format!("counter {}", result.region.ticks().next_sub_tick()));
-    for tick in result.block_ticks.collect_due(502, 65_536, |_| true) {
+    for tick in Arc::make_mut(&mut result.block_ticks).collect_due(502, 65_536, |_| true) {
         actual.push(format!(
             "run {} {},{},{}",
             tick.kind, tick.position[0], tick.position[1], tick.position[2]

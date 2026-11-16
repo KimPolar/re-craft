@@ -953,14 +953,27 @@ fn prepare_world_with_session(
         resources.push_pack(pack)?;
     }
     let saved_packs = reader.data_pack_settings()?;
-    let pack_warnings = resources.configure_world_data(
-        world_dir,
-        &native_resources::datapacks::DataPackSettings {
-            enabled: saved_packs.enabled,
-            disabled: saved_packs.disabled,
-            enabled_features: saved_packs.enabled_features,
-        },
-    )?;
+    let pack_settings = native_resources::datapacks::DataPackSettings {
+        enabled: saved_packs.enabled,
+        disabled: saved_packs.disabled,
+        enabled_features: saved_packs.enabled_features,
+    };
+    let (world_packs, pack_warnings) = match reader.capture_world_data_packs() {
+        Ok(packs) => {
+            let warnings =
+                resources.configure_snapshot_data(Arc::clone(packs.packs()), &pack_settings)?;
+            (Some(packs), warnings)
+        }
+        Err(error) => {
+            // Preserve experimental read-only access when a pack cannot be
+            // snapshotted. Live postprocessing remains disabled in that case.
+            eprintln!("Cannot capture world data packs: {error:#}");
+            (
+                None,
+                resources.configure_world_data(world_dir, &pack_settings)?,
+            )
+        }
+    };
     let saved_dimensions = reader
         .saved_dimension_types()
         .context("cannot read saved dimension mappings")?;
@@ -1215,6 +1228,9 @@ fn prepare_world_with_session(
                 .session_guard()
                 .context("playable world requires a session lock")?,
         )?;
+        if let Some(world_packs) = world_packs {
+            session.bind_world_data_packs(world_packs)?;
+        }
         let mut new_player_uuid = None;
         if let Some(seed) = world_seed {
             match reader.random_sequences() {

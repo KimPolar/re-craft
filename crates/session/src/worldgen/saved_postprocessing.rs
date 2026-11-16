@@ -56,11 +56,89 @@ pub struct SavedPostprocessingInputs<'a> {
 /// only the center. Other converted chunks retain their pending saved ticks.
 pub struct SavedTickingResult {
     pub region: PostprocessedGeneratedRegion,
-    pub block_ticks: IndexedRegionQueue,
-    pub fluid_ticks: IndexedRegionQueue,
+    pub block_ticks: Arc<IndexedRegionQueue>,
+    pub fluid_ticks: Arc<IndexedRegionQueue>,
+    live: Option<LiveTickingProvenance>,
+}
+
+struct LiveTickingProvenance {
+    terrain: Arc<()>,
+    ticks: SavedTickQueueCapture,
+    callbacks: Vec<(ChunkPos, Arc<()>)>,
+    packs_bound: bool,
+    sealed_queues: Option<(Arc<IndexedRegionQueue>, Arc<IndexedRegionQueue>)>,
 }
 
 impl SavedTickingResult {
+    pub(crate) fn verify_no_effect_live_callback(
+        &self,
+        terrain: &GenerationTerrainStage,
+        future: &TickingPreparation,
+        water_source_conversion: bool,
+        lava_rules: super::postprocessing_world::GeneratedLavaRules,
+    ) -> Result<&SavedTickQueueCapture> {
+        let live = self
+            .live
+            .as_ref()
+            .context("saved ticking result is not bound to a live session")?;
+        ensure!(
+            live.packs_bound,
+            "saved ticking result has no bound data-pack snapshot"
+        );
+        ensure!(
+            live.sealed_queues.as_ref().is_some_and(|(blocks, fluids)| {
+                Arc::ptr_eq(blocks, &self.block_ticks) && Arc::ptr_eq(fluids, &self.fluid_ticks)
+            }),
+            "postprocessing tick queues need live reconciliation"
+        );
+        ensure!(
+            Arc::ptr_eq(&live.terrain, terrain.identity())
+                && live.callbacks.len() == 1
+                && live.callbacks[0].0 == future.center()
+                && Arc::ptr_eq(&live.callbacks[0].1, future.callback_identity())
+                && future.has_ready_callback(),
+            "saved ticking callback or terrain capture changed"
+        );
+        let region = &self.region;
+        let dependencies: BTreeSet<_> =
+            crate::ticking_preparation::ticking_dependencies(future.center())
+                .into_iter()
+                .collect();
+        ensure!(
+            Arc::ptr_eq(&region.world, &region.sealed_world)
+                && region.edits == region.sealed_edits
+                && region.edits.len() == region.edit_states.len()
+                && region.read_chunks == region.sealed_read_chunks
+                && region.light_reads == region.sealed_light_reads
+                && region.light_checks == region.sealed_checks
+                && region.chunks == region.sealed_chunks,
+            "saved postprocessing result was modified"
+        );
+        ensure!(
+            region.chunks == BTreeSet::from([future.center()])
+                && region.edits.is_empty()
+                && region.read_chunks.is_subset(&dependencies)
+                && region.light_checks.is_empty()
+                && region.light_reads.is_empty()
+                && region.lava_fizz_events().is_empty()
+                && region
+                    .block_drops()
+                    .is_none_or(|drops| drops.operations() == 0)
+                && region.ticks().next_sub_tick() == live.ticks.next_sub_tick(),
+            "saved postprocessing has effects that need live reconciliation"
+        );
+        ensure!(
+            region.water_source_conversion() == Some(water_source_conversion)
+                && region.lava_rules() == Some(lava_rules),
+            "saved postprocessing game rules changed"
+        );
+        ensure!(
+            matches!(region.block_entity_data(future.center())?, Tag::List { values, .. } if values.is_empty()),
+            "saved postprocessing has block entities to reconcile"
+        );
+        Ok(&live.ticks)
+    }
+
     /// Create marks-only drafts for completed callbacks, using the same saved
     /// inputs as the isolated pass. The drafts cannot be saved: block edits,
     /// ticks, lighting, entities, POIs and live state still need reconciliation.
@@ -136,6 +214,7 @@ pub struct SavedTickingBatch {
     game_time: i64,
     started: bool,
     failed: bool,
+    live: Option<LiveTickingProvenance>,
 }
 
 impl SavedTickingBatch {
@@ -162,6 +241,7 @@ impl SavedTickingBatch {
             game_time,
             started: false,
             failed: false,
+            live: None,
         })
     }
 
@@ -191,6 +271,7 @@ impl SavedTickingBatch {
             game_time,
             started: false,
             failed: false,
+            live: None,
         })
     }
 
@@ -238,7 +319,71 @@ impl SavedTickingBatch {
             game_time,
             started: false,
             failed: false,
+            live: Some(LiveTickingProvenance {
+                terrain: Arc::clone(terrain.identity()),
+                ticks: ticks.clone(),
+                callbacks: Vec::new(),
+                packs_bound: false,
+                sealed_queues: None,
+            }),
         })
+    }
+
+    /// Prepare a live callback from the same data-pack snapshot and selection
+    /// used by the session. All other live dependencies still need checks.
+    pub fn begin_with_bound_live_session(
+        provider: &mut native_resources::packs::ResourceStack,
+        input: SavedPostprocessingInputs<'_>,
+        terrain: &GenerationTerrainStage,
+        ticks: &SavedTickQueueCapture,
+        mut validate_state: impl FnMut(&BlockState) -> Result<()>,
+        water_source_conversion: bool,
+        lava_rules: super::postprocessing_world::GeneratedLavaRules,
+    ) -> Result<Self> {
+        let packs = ticks
+            .data_packs()
+            .context("session data packs are not captured")?;
+        let selected = packs.selection();
+        ensure!(
+            provider
+                .data_pack_snapshot()
+                .as_ref()
+                .is_some_and(|snapshot| Arc::ptr_eq(snapshot, packs.packs()))
+                && provider.data_pack_snapshot_selection()
+                    == Some(&native_resources::datapacks::DataPackSettings {
+                        enabled: selected.enabled.clone(),
+                        disabled: selected.disabled.clone(),
+                        enabled_features: selected.enabled_features.clone(),
+                    }),
+            "postprocessing resources differ from the session data packs"
+        );
+        packs.packs().verify()?;
+        let block_ids = provider.vanilla_block_ids()?;
+        let registry = provider.vanilla_generated_block_registry()?;
+        ensure!(
+            input.block_ids == &block_ids && input.defaults == &registry.default_states(),
+            "postprocessing block registry differs from the session resources"
+        );
+        let mut batch = Self::begin_with_live_session(
+            provider,
+            input,
+            terrain,
+            ticks,
+            |state| {
+                ensure!(
+                    registry.is_canonical_state(&state.name, &state.properties),
+                    "unknown saved postprocessing block state"
+                );
+                validate_state(state)
+            },
+            |stage| {
+                stage.set_water_source_conversion(water_source_conversion)?;
+                stage.set_lava_rules(lava_rules)?;
+                Ok(())
+            },
+        )?;
+        batch.live.as_mut().expect("live provenance").packs_bound = true;
+        Ok(batch)
     }
 
     /// Dispatch one queued holder callback without interleaving another one.
@@ -280,6 +425,11 @@ impl SavedTickingBatch {
         self.started = started.get();
         if result.is_err() {
             self.failed = true;
+        } else if matches!(result, Ok(true)) && future.state() == TickingFutureState::Available {
+            if let Some(live) = &mut self.live {
+                live.callbacks
+                    .push((future.center(), Arc::clone(future.callback_identity())));
+            }
         }
         result
     }
@@ -291,16 +441,42 @@ impl SavedTickingBatch {
             "no completed saved ticking callbacks"
         );
         let region = self.stage.finish()?;
-        let block_ticks = region
-            .ticks()
-            .captured_indexed_queue_for(TickRegistry::Block, &[])?;
-        let fluid_ticks = region
-            .ticks()
-            .captured_indexed_queue_for(TickRegistry::Fluid, &[])?;
+        let block_ticks = Arc::new(
+            region
+                .ticks()
+                .captured_indexed_queue_for(TickRegistry::Block, &[])?,
+        );
+        let fluid_ticks = Arc::new(
+            region
+                .ticks()
+                .captured_indexed_queue_for(TickRegistry::Fluid, &[])?,
+        );
+        let mut live = self.live;
+        if let Some(proof) = &mut live {
+            if proof.packs_bound {
+                proof
+                    .ticks
+                    .data_packs()
+                    .context("session data packs are not captured")?
+                    .packs()
+                    .verify()?;
+            }
+            if proof.packs_bound && proof.callbacks.len() == 1 {
+                if let Ok((blocks, fluids)) =
+                    proof.ticks.expected_after_unpack(proof.callbacks[0].0)
+                {
+                    if blocks == *block_ticks && fluids == *fluid_ticks {
+                        proof.sealed_queues =
+                            Some((Arc::clone(&block_ticks), Arc::clone(&fluid_ticks)));
+                    }
+                }
+            }
+        }
         Ok(SavedTickingResult {
             region,
             block_ticks,
             fluid_ticks,
+            live,
         })
     }
 }
@@ -366,8 +542,9 @@ pub fn dispatch_saved_ticking(
                 .captured_indexed_queue_for(TickRegistry::Fluid, &[])?;
             *result.borrow_mut() = Some(SavedTickingResult {
                 region,
-                block_ticks: blocks,
-                fluid_ticks: fluids,
+                block_ticks: Arc::new(blocks),
+                fluid_ticks: Arc::new(fluids),
+                live: None,
             });
             Ok(())
         },

@@ -25,7 +25,7 @@ const FEATURES: &[&str] = &[
     "minecraft:minecart_improvements",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataPackSettings {
     pub enabled: Vec<String>,
     pub disabled: Vec<String>,

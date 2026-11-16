@@ -66,6 +66,52 @@ fn private_play_save_world() -> Result<PathBuf> {
 
 #[test]
 #[ignore = "requires a private generated 26.3 test world"]
+fn existing_generated_world_uses_captured_data_packs() -> Result<()> {
+    let path = private_play_save_world()?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let reader = WorldReader::open_for_session(&path, DimensionId::parse("overworld")?)?;
+    let selection = reader.data_pack_settings()?;
+    let lock = reader
+        .session_guard()
+        .context("test world session lock is missing")?;
+    drop(reader);
+    let options = crate::ViewOptions {
+        dimension: None,
+        chunk: None,
+        radius: 1,
+        smoke_test: false,
+        block_report: None,
+        play: true,
+        video: crate::menu_settings::VideoSettings::default(),
+    };
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock))?
+    else {
+        anyhow::bail!("generated world did not open for play")
+    };
+    let snapshot = prepared
+        .resources
+        .data_pack_snapshot()
+        .context("session pack snapshot missing")?;
+    snapshot.verify()?;
+    snapshot.verify_source(&path)?;
+    let actual = prepared
+        .resources
+        .data_pack_snapshot_selection()
+        .context("session pack selection missing")?;
+    ensure!(
+        actual.enabled == selection.enabled
+            && actual.disabled == selection.disabled
+            && actual.enabled_features == selection.enabled_features,
+        "session pack selection changed"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a private generated 26.3 test world"]
 fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<()> {
     use crate::chunk_stream::{
         MissingGenerationAssemblyWorker, MissingGenerationBiomeWorker,

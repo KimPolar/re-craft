@@ -4,7 +4,10 @@
 //! thread callback runs. A loaded chunk or a simulation ticket alone is not a
 //! completed holder future, and this module does not publish world changes.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use anyhow::{Result, ensure};
 use native_world::loaded::ChunkPos;
@@ -52,6 +55,7 @@ enum Queued {
 /// futures; the caller must deliver completion to each dependent request in the
 /// order those notifications actually arrive.
 pub struct TickingPreparation {
+    identity: Arc<()>,
     center: ChunkPos,
     dependencies: Vec<Dependency>,
     queued: Option<Queued>,
@@ -76,6 +80,7 @@ impl TickingPreparation {
         mut request: impl FnMut(ChunkPos) -> Option<FullFuture>,
     ) -> Result<Self> {
         let mut preparation = Self {
+            identity: Arc::new(()),
             center,
             dependencies: Vec::with_capacity(9),
             queued: None,
@@ -123,6 +128,31 @@ impl TickingPreparation {
 
     pub fn center(&self) -> ChunkPos {
         self.center
+    }
+
+    /// Fork a queued callback for off-thread preparation. The original future
+    /// remains waiting until its owner applies the result on the tick thread.
+    pub fn fork_queued_callback(&self) -> Result<Self> {
+        ensure!(
+            self.state == TickingFutureState::Waiting
+                && matches!(self.queued, Some(Queued::Prepare)),
+            "ticking callback is not ready for background preparation"
+        );
+        Ok(Self {
+            identity: Arc::clone(&self.identity),
+            center: self.center,
+            dependencies: self.dependencies.clone(),
+            queued: self.queued,
+            state: self.state,
+        })
+    }
+
+    pub(crate) fn callback_identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
+    pub(crate) fn has_ready_callback(&self) -> bool {
+        self.state == TickingFutureState::Waiting && matches!(self.queued, Some(Queued::Prepare))
     }
 
     /// The executor may still contain a callback after the future is cancelled.

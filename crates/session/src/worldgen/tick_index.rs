@@ -24,7 +24,7 @@ fn mix(key: u64) -> u64 {
 }
 
 /// The next scheduled time for each chunk, in Java fastutil map order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LevelTickIndex {
     slots: Vec<Option<(u64, i64)>>,
     zero: Option<i64>,

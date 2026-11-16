@@ -1640,14 +1640,52 @@ impl WorldSavePlan {
         &mut self,
         context: &crate::world::GenerationContextSnapshot,
     ) -> Result<()> {
+        if let Some(existing) = &self.generation_packs {
+            ensure!(
+                existing.selection == *context.selection(),
+                "generation data pack selection differs from the session"
+            );
+            if !Arc::ptr_eq(&existing.snapshot, context.packs()) {
+                existing.snapshot.verify()?;
+                context.packs().verify()?;
+                ensure!(
+                    existing.snapshot.fingerprint()? == context.packs().fingerprint()?,
+                    "generation data packs differ from the session"
+                );
+            }
+        }
+        self.add_generation_inputs(context.inputs())?;
+        if self.generation_packs.is_none() {
+            self.generation_packs = Some(PlannedGenerationPacks {
+                snapshot: Arc::clone(context.packs()),
+                selection: context.selection().clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Require the selected world data packs used by a live session to stay
+    /// unchanged through the same recoverable save transaction.
+    pub fn require_world_data_packs(
+        &mut self,
+        packs: &crate::world::WorldDataPackSnapshot,
+    ) -> Result<()> {
         ensure!(
             self.generation_packs.is_none(),
-            "generation packs already bound"
+            "world data packs already bound"
         );
-        self.add_generation_inputs(context.inputs())?;
+        let stamp = packs.stamp();
+        ensure!(stamp.is_current(), "world data pack capture is stale");
+        if let Some(session) = &self.generation_source_session {
+            ensure!(
+                stamp.belongs_to_session(session),
+                "data packs belong to another world session"
+            );
+        }
+        self.generation_source_session = Some(stamp.session.clone());
         self.generation_packs = Some(PlannedGenerationPacks {
-            snapshot: Arc::clone(context.packs()),
-            selection: context.selection().clone(),
+            snapshot: Arc::clone(packs.packs()),
+            selection: packs.selection().clone(),
         });
         Ok(())
     }
@@ -11382,6 +11420,111 @@ mod tests {
                     crate::world::WorldReader::validate_level_game_time(&saved).unwrap(),
                     57
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn session_pack_capture_guards_the_save_transaction() {
+        for changed in [false, true] {
+            let world = test_world();
+            fixture(world.path());
+            let pack = world.path().join("datapacks/example.zip");
+            fs::create_dir_all(pack.parent().unwrap()).unwrap();
+            fs::write(&pack, b"before").unwrap();
+            let dimension = DimensionId::parse("overworld").unwrap();
+            let reader =
+                crate::world::WorldReader::open_for_session(world.path(), dimension).unwrap();
+            let session = reader.session_guard().unwrap();
+            let packs = reader.capture_world_data_packs().unwrap();
+            if !changed {
+                let other = test_world();
+                fixture(other.path());
+                let mut other_reader = crate::world::WorldReader::open_for_session(
+                    other.path(),
+                    DimensionId::parse("overworld").unwrap(),
+                )
+                .unwrap();
+                let sources = other_reader
+                    .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+                    .unwrap();
+                let mut conflict = WorldSavePlan::new();
+                conflict.add_generation_sources(&sources).unwrap();
+                assert!(conflict.require_world_data_packs(&packs).is_err());
+                assert!(conflict.generation_packs.is_none());
+            }
+            let level_path = world.path().join("level.dat");
+            let original = fs::read(&level_path).unwrap();
+            let mut plan = WorldSavePlan::new();
+            plan.require_world_data_packs(&packs).unwrap();
+            assert!(plan.require_world_data_packs(&packs).is_err());
+            plan.add_level_time(&reader.level, 42).unwrap();
+            if changed {
+                fs::write(&pack, b"after").unwrap();
+            }
+            let mut writer = session.acquire_write().unwrap();
+            let result = writer.write_plan(plan, |_, _| Ok(()));
+            if changed {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&level_path).unwrap(), original);
+            } else {
+                result.unwrap();
+                let saved = nbt::read_gzip(File::open(&level_path).unwrap()).unwrap();
+                assert_eq!(
+                    crate::world::WorldReader::validate_level_game_time(&saved).unwrap(),
+                    42
+                );
+            }
+            drop(writer);
+            let mut stale = WorldSavePlan::new();
+            assert!(stale.require_world_data_packs(&packs).is_err());
+        }
+    }
+
+    #[test]
+    fn session_pack_capture_composes_with_matching_generation_context() {
+        for changed in [false, true] {
+            let world = test_world();
+            fixture(world.path());
+            let data = world.path().join("data/minecraft");
+            fs::create_dir_all(&data).unwrap();
+            let settings = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    (
+                        "data".into(),
+                        Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                    ),
+                ]),
+            };
+            fs::write(
+                data.join("world_gen_settings.dat"),
+                nbt::write(&settings).unwrap(),
+            )
+            .unwrap();
+            let pack = world.path().join("datapacks/example.zip");
+            fs::create_dir_all(pack.parent().unwrap()).unwrap();
+            fs::write(&pack, b"before").unwrap();
+            let mut reader = crate::world::WorldReader::open_for_session(
+                world.path(),
+                DimensionId::parse("overworld").unwrap(),
+            )
+            .unwrap();
+            let packs = reader.capture_world_data_packs().unwrap();
+            if changed {
+                fs::write(&pack, b"after").unwrap();
+            }
+            let context = reader
+                .capture_generation_context([ChunkPos { x: 1, z: 0 }])
+                .unwrap();
+            let mut plan = WorldSavePlan::new();
+            plan.require_world_data_packs(&packs).unwrap();
+            let result = plan.add_generation_context(&context);
+            assert_eq!(result.is_ok(), !changed);
+            if changed {
+                assert!(plan.generation_settings.is_none());
+                assert!(plan.generation_dependencies.is_empty());
             }
         }
     }

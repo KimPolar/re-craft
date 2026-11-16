@@ -45,7 +45,7 @@ fn canonical(kind: &str) -> Result<String> {
 /// Models Java's pending list, uniqueness set and PriorityQueue. Construct
 /// one separately for blocks and fluids; type IDs must be from the active
 /// registry. This alone does not make a generated chunk playable or saveable.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ChunkTicks {
     chunk: ChunkPos,
     pending: Option<Vec<SavedTick>>,
@@ -260,13 +260,13 @@ pub struct ActivatedRegionTicks {
 /// Detached, activated containers for one registry. The caller supplies the
 /// level scheduler's container traversal order on every collection; that order
 /// matters when two container heads compare equal.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ActiveRegionQueue {
     chunks: BTreeMap<ChunkPos, Arc<ChunkTicks>>,
 }
 
 /// Activated containers and the stateful Java-order index of their next ticks.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct IndexedRegionQueue {
     queue: ActiveRegionQueue,
     index: super::tick_index::LevelTickIndex,

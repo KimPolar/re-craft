@@ -21,6 +21,7 @@ type Order = (i128, i32, i64, u64);
 /// Immutable live LevelTicks indexes captured at one simulation boundary.
 /// Holder readiness, terrain, lighting, entities, POIs and disk state require
 /// their own checks before a postprocessing result can be published.
+#[derive(Clone)]
 pub struct SavedTickQueueCapture {
     session: Arc<()>,
     blocks: Arc<IndexedRegionQueue>,
@@ -29,6 +30,7 @@ pub struct SavedTickQueueCapture {
     game_time: i64,
     next_sub_tick: i64,
     tick: u64,
+    packs: Option<native_persistence::world::WorldDataPackSnapshot>,
 }
 
 impl SavedTickQueueCapture {
@@ -49,6 +51,10 @@ impl SavedTickQueueCapture {
         Arc::ptr_eq(&self.session, &terrain.session)
     }
 
+    pub(crate) fn data_packs(&self) -> Option<&native_persistence::world::WorldDataPackSnapshot> {
+        self.packs.as_ref()
+    }
+
     /// Deep-copy only on the worker thread, preserving the original index and
     /// heap layouts, pending entries, and the shared sub-tick counter.
     pub(crate) fn isolated_region_ticks(&self) -> Result<RegionTicks> {
@@ -59,9 +65,111 @@ impl SavedTickQueueCapture {
             self.next_sub_tick,
         )
     }
+
+    /// Compute the only queue change permitted by a no-effect callback. Run
+    /// on the worker, since the captured index can cover many loaded chunks.
+    pub(crate) fn expected_after_unpack(
+        &self,
+        center: ChunkPos,
+    ) -> Result<(IndexedRegionQueue, IndexedRegionQueue)> {
+        let mut blocks = self.blocks.as_ref().clone();
+        let mut fluids = self.fluids.as_ref().clone();
+        blocks.unpack_container(center, self.game_time)?;
+        fluids.unpack_container(center, self.game_time)?;
+        Ok((blocks, fluids))
+    }
 }
 
 impl LoadedSession {
+    /// Apply a completed saved-chunk callback only when postprocessing made
+    /// no block, lighting, entity, or new scheduling changes. The real holder
+    /// future stays waiting while the worker runs and becomes available only
+    /// after both live tick queues have been activated. The completed marks
+    /// are still not saveable until the coordinated persistence path exists.
+    pub fn apply_no_effect_saved_ticking(
+        &mut self,
+        future: &mut crate::ticking_preparation::TickingPreparation,
+        terrain: &GenerationTerrainStage,
+        result: &crate::worldgen::saved_postprocessing::SavedTickingResult,
+    ) -> Result<()> {
+        let capture = result.verify_no_effect_live_callback(
+            terrain,
+            future,
+            self.water_source_conversion,
+            crate::worldgen::GeneratedLavaRules {
+                fast_lava: self.fast_lava,
+                source_conversion: self.lava_source_conversion,
+            },
+        )?;
+        self.verify_generation_terrain_stage(terrain)?;
+        self.verify_saved_tick_queues(capture)?;
+        let center = future.center();
+        let dependencies = crate::ticking_preparation::ticking_dependencies(center);
+        ensure!(
+            future.dependencies().map(|(pos, _)| pos).eq(dependencies),
+            "saved ticking holder dependencies changed"
+        );
+        for position in dependencies {
+            let current = self
+                .world
+                .chunks
+                .get(&position)
+                .context("FULL neighbor is not resident")?;
+            ensure!(
+                current.status.as_deref() == Some("minecraft:full")
+                    && terrain
+                        .chunks
+                        .get(&position)
+                        .and_then(|chunk| chunk.live.as_ref())
+                        .is_some_and(|captured| Arc::ptr_eq(captured, current)),
+                "FULL neighbor changed during saved ticking preparation"
+            );
+        }
+        ensure!(
+            matches!(
+                self.world.saved_block_entities.get(&center),
+                Some(native_world::loaded::SavedBlockEntities::Empty)
+            ) && !self.world.live_block_entities.contains_key(&center),
+            "saved block entities need live reconciliation"
+        );
+        let source = self
+            .world
+            .saved_chunk_source(center)
+            .context("saved chunk source is missing")?;
+        let pending = self
+            .pending_saved_tick_activation
+            .get(&center)
+            .context("saved chunk ticks are not pending")?;
+        let (_, _, block_time, fluid_time) =
+            self.plan_pending_saved_tick_activation(center, pending, self.scheduled_tick())?;
+        ensure!(
+            block_time == Some(capture.game_time()) && fluid_time == Some(capture.game_time()),
+            "saved ticking clock changed"
+        );
+        let dispatched = future.dispatch(
+            |position| {
+                self.activate_pending_saved_ticks(position)?;
+                self.checked_chunk_preparation.insert(position, source);
+                self.rejected_chunk_preparation.remove(&position);
+                // The completed marks must eventually be saved, even when no
+                // block or scheduled tick changed during postprocessing.
+                self.tick_dirty_chunks.insert(position);
+                if self.unresolved_chunk_preparation.is_none() {
+                    self.unresolved_chunk_preparation = Some(format!(
+                        "chunk {}, {}: completed postprocessing is not yet coordinated for saving",
+                        position.x, position.z
+                    ));
+                }
+                self.random_tick_revision = None;
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )?;
+        ensure!(dispatched, "saved ticking callback was not queued");
+        Ok(())
+    }
+
     /// Capture the current registered queues without cloning every tick on the
     /// simulation thread. Later mutations use copy-on-write per container.
     pub fn capture_saved_tick_queues(&self) -> Result<SavedTickQueueCapture> {
@@ -99,6 +207,7 @@ impl LoadedSession {
             game_time: self.game_time,
             next_sub_tick: self.next_sub_tick,
             tick: self.tick,
+            packs: self.world_data_packs.clone(),
         })
     }
 
@@ -112,7 +221,16 @@ impl LoadedSession {
                 && Arc::ptr_eq(&self.generation_identity, &captured.session)
                 && self.tick == captured.tick
                 && self.game_time == captured.game_time
-                && self.next_sub_tick == captured.next_sub_tick,
+                && self.next_sub_tick == captured.next_sub_tick
+                && match (&self.world_data_packs, &captured.packs) {
+                    (Some(current), Some(previous)) => {
+                        Arc::ptr_eq(current.packs(), previous.packs())
+                            && current.selection() == previous.selection()
+                            && current.stamp().is_current()
+                    }
+                    (None, None) => true,
+                    _ => false,
+                },
             "saved tick session or clock changed"
         );
         let blocks = self

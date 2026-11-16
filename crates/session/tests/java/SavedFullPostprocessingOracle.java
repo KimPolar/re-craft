@@ -105,13 +105,15 @@ public class SavedFullPostprocessingOracle {
         tickAccess = new LevelTicks<Block>(pos -> true);
         tickAccess.addContainer(new ChunkPos(0, 0), ticks);
         boolean liveTick = args.length > 2 && args[2].equals("live-tick");
+        boolean unpackOnly = args.length > 2 && args[2].equals("unpack");
+        if (unpackOnly) counter = 0;
         if (liveTick) {
             counter = 1;
             tickAccess.schedule(new ScheduledTick<>(Blocks.RED_SAND, new BlockPos(8, 8, 8),
                     102L, TickPriority.NORMAL, 0L));
         }
         chunk.postProcessGeneration(level);
-        if (liveTick) ticks.unpack(100L);
+        if (liveTick || unpackOnly) ticks.unpack(100L);
         if (args.length > 1) {
             var pack = SerializableChunkData.class.getDeclaredMethod("packOffsets",
                     it.unimi.dsi.fastutil.shorts.ShortList[].class);

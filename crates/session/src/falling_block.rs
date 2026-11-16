@@ -100,6 +100,8 @@ pub enum FallingKind {
     Sand,
     RedSand,
     Gravel,
+    SuspiciousSand,
+    SuspiciousGravel,
     PointedDripstone,
     SulfurSpike,
 }
@@ -232,11 +234,17 @@ impl FallingStalactite {
 }
 
 impl FallingKind {
+    pub fn is_brushable(self) -> bool {
+        matches!(self, Self::SuspiciousSand | Self::SuspiciousGravel)
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Sand => "minecraft:sand",
             Self::RedSand => "minecraft:red_sand",
             Self::Gravel => "minecraft:gravel",
+            Self::SuspiciousSand => "minecraft:suspicious_sand",
+            Self::SuspiciousGravel => "minecraft:suspicious_gravel",
             Self::PointedDripstone => "minecraft:pointed_dripstone",
             Self::SulfurSpike => "minecraft:sulfur_spike",
         }
@@ -247,6 +255,8 @@ impl FallingKind {
             "sand" => Some(Self::Sand),
             "red_sand" => Some(Self::RedSand),
             "gravel" => Some(Self::Gravel),
+            "suspicious_sand" => Some(Self::SuspiciousSand),
+            "suspicious_gravel" => Some(Self::SuspiciousGravel),
             _ => None,
         }
     }
@@ -383,6 +393,85 @@ mod tests {
     use super::*;
     use glam::{IVec3, Vec3};
     use native_world::collision::Aabb;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn freshly_loaded_supported_brushable_tick_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(metadata["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")
+            })
+            .join("bin");
+        let source = temp.path().join("BrushableTickOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BrushableTickOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("BrushableTickOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        let actual: Vec<_> = output
+            .lines()
+            .skip_while(|line| line.trim() != "BEGIN_RESULT")
+            .skip(1)
+            .take_while(|line| line.trim() != "END_RESULT")
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect();
+        let mut expected = Vec::new();
+        for name in ["sand", "gravel"] {
+            for dusted in 0..4 {
+                for has_entity in [false, true] {
+                    let next = native_core::random::LegacyRandom::new(42).next_long();
+                    expected.push(format!("{name} {dusted} {has_entity} 1 {next}"));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn stalactite_damage_uses_height_threshold_rounding_and_cap() {

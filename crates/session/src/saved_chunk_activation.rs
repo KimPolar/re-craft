@@ -18,6 +18,62 @@ pub(crate) struct SavedTickInputs<'a> {
     pub supports_block: fn(&str) -> bool,
 }
 
+/// Brush counts are not saved by Java and start at zero after loading. A saved
+/// hit direction is cleared by the first tick, so leave it unhandled until
+/// the live block-entity state can be updated together with the chunk.
+pub(crate) fn brushable_reset_is_inert(entities: &SavedBlockEntities, position: [i32; 3]) -> bool {
+    let bytes = match entities {
+        SavedBlockEntities::Empty => return true,
+        SavedBlockEntities::Unavailable => return false,
+        SavedBlockEntities::Encoded(bytes) => bytes,
+    };
+    let Ok(document) = nbt::read(bytes) else {
+        return false;
+    };
+    let Tag::List {
+        element_type,
+        values,
+    } = document.value
+    else {
+        return false;
+    };
+    if values.is_empty() {
+        return matches!(element_type, TagType::End | TagType::Compound);
+    }
+    if element_type != TagType::Compound {
+        return false;
+    }
+    let mut found = false;
+    for entity in values {
+        let Tag::Compound(fields) = &entity else {
+            return false;
+        };
+        let mut names = BTreeSet::new();
+        if fields.iter().any(|(name, _)| !names.insert(name.0.clone())) {
+            return false;
+        }
+        let [Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))] =
+            [entity.get("x"), entity.get("y"), entity.get("z")]
+        else {
+            return false;
+        };
+        if [*x, *y, *z] != position {
+            continue;
+        }
+        if found {
+            return false;
+        }
+        found = true;
+        if !matches!(entity.get("id"), Some(Tag::String(id)) if id.matches("minecraft:brushable_block") || id.matches("brushable_block"))
+            || entity.get("hit_direction").is_some()
+            || !matches!(entity.get("keepPacked"), None | Some(Tag::Byte(0)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn check_saved_work(
     saved: &SavedChunkActivation,
     entities: &SavedBlockEntities,
@@ -301,6 +357,61 @@ mod tests {
             fluids: &[],
             supports_block: |_| false,
         }
+    }
+
+    #[test]
+    fn unbrushed_reset_requires_resolved_matching_entity_data() {
+        let position = [1, 2, 3];
+        let base = vec![
+            ("id".into(), Tag::String("minecraft:brushable_block".into())),
+            ("x".into(), Tag::Int(1)),
+            ("y".into(), Tag::Int(2)),
+            ("z".into(), Tag::Int(3)),
+            (
+                "LootTable".into(),
+                Tag::String("minecraft:archaeology/ocean_ruin_cold".into()),
+            ),
+        ];
+        let payload = |values| {
+            SavedBlockEntities::Encoded(encode(Tag::List {
+                element_type: TagType::Compound,
+                values,
+            }))
+        };
+        assert!(brushable_reset_is_inert(
+            &SavedBlockEntities::Empty,
+            position
+        ));
+        assert!(!brushable_reset_is_inert(
+            &SavedBlockEntities::Unavailable,
+            position
+        ));
+        assert!(brushable_reset_is_inert(
+            &payload(vec![Tag::Compound(base.clone())]),
+            position
+        ));
+        let mut hit = base.clone();
+        hit.push(("hit_direction".into(), Tag::Int(2)));
+        assert!(!brushable_reset_is_inert(
+            &payload(vec![Tag::Compound(hit)]),
+            position
+        ));
+        let mut packed = base.clone();
+        packed.push(("keepPacked".into(), Tag::Byte(1)));
+        assert!(!brushable_reset_is_inert(
+            &payload(vec![Tag::Compound(packed)]),
+            position
+        ));
+        let mut duplicate_field = base.clone();
+        duplicate_field.push(("x".into(), Tag::Int(1)));
+        assert!(!brushable_reset_is_inert(
+            &payload(vec![Tag::Compound(duplicate_field)]),
+            position
+        ));
+        assert!(!brushable_reset_is_inert(
+            &payload(vec![Tag::Compound(base.clone()), Tag::Compound(base)]),
+            position,
+        ));
     }
 
     #[test]

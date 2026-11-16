@@ -1752,6 +1752,7 @@ pub struct LoadedSession {
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
     sand_ticks: BTreeMap<(i128, i32, i64, u64), SandTickKey>,
+    unresolved_brushable_lifecycle: bool,
     sand_deferred: BTreeMap<(i128, i32, i64, u64), SandTickKey>,
     sand_deferred_revision: Option<u64>,
     sand_pending: BTreeSet<SandTickKey>,
@@ -7009,6 +7010,10 @@ impl LoadedSession {
         if let Some(error) = &self.unresolved_chunk_preparation {
             anyhow::bail!("saved chunk preparation could not be preserved: {error}");
         }
+        anyhow::ensure!(
+            !self.unresolved_brushable_lifecycle,
+            "a brushable block or falling entity could not be preserved"
+        );
         Ok(())
     }
 
@@ -9292,6 +9297,7 @@ impl LoadedSession {
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
+            unresolved_brushable_lifecycle: false,
             sand_deferred: BTreeMap::new(),
             sand_deferred_revision: None,
             sand_pending: BTreeSet::new(),
@@ -14454,6 +14460,16 @@ impl LoadedSession {
                     // Unsupported saved cases must also prevent a world write:
                     // their possible movement and effects have not been tracked.
                     self.unresolved_stalactite_lifecycle = true;
+                }
+                if FallingKind::from_id(&saved.block.name).is_some_and(FallingKind::is_brushable) {
+                    // Its carried state and block-entity lifecycle are not yet
+                    // simulated; accepting it as ordinary sand loses data.
+                    self.unresolved_brushable_lifecycle = true;
+                    self.stream_errors.push(format!(
+                        "unsupported saved brushable falling block in chunk {}, {}",
+                        pos.x, pos.z
+                    ));
+                    continue;
                 }
                 if entity.get("TileEntityData").is_some() || entity.get("Passengers").is_some() {
                     self.stream_errors.push(format!(
@@ -20753,6 +20769,7 @@ impl LoadedSession {
         for (order, entry) in collected {
             if let CollectedBlockTick::Sand(key) = entry {
                 let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    self.unresolved_brushable_lifecycle |= key.kind.is_brushable();
                     self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
@@ -20764,6 +20781,7 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.unresolved_brushable_lifecycle |= key.kind.is_brushable();
                     self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
@@ -20776,17 +20794,60 @@ impl LoadedSession {
                 {
                     continue;
                 }
+                if key.kind.is_brushable()
+                    && self
+                        .world
+                        .state(id)
+                        .is_none_or(|state| !native_world::collision::brushable_state(state))
+                {
+                    self.unresolved_brushable_lifecycle = true;
+                    self.sand_pending.insert(key);
+                    deferred_sand.push((order, key));
+                    continue;
+                }
+                if key.kind.is_brushable() {
+                    let chunk = ChunkPos {
+                        x: key.x.div_euclid(16),
+                        z: key.z.div_euclid(16),
+                    };
+                    let inert = !self.world.live_block_entities.contains_key(&chunk)
+                        && self
+                            .world
+                            .visible_block_entities(&chunk)
+                            .is_some_and(|entities| {
+                                crate::saved_chunk_activation::brushable_reset_is_inert(
+                                    entities,
+                                    [key.x, key.y, key.z],
+                                )
+                            });
+                    if !inert {
+                        self.unresolved_brushable_lifecycle = true;
+                        self.sand_pending.insert(key);
+                        deferred_sand.push((order, key));
+                        continue;
+                    }
+                }
                 let Some(below) = add(relative, IVec3::NEG_Y) else {
+                    self.unresolved_brushable_lifecycle |= key.kind.is_brushable();
                     self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
                 };
                 let Some(free) = self.falling_support_is_free(below) else {
+                    self.unresolved_brushable_lifecycle |= key.kind.is_brushable();
                     self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
                 };
                 if free && key.y >= self.bounds.min_y {
+                    if key.kind.is_brushable() {
+                        // Brushable falling entities and block-entity removal
+                        // must be coordinated before this tick can execute.
+                        self.unresolved_brushable_lifecycle = true;
+                        self.sand_pending.insert(key);
+                        deferred_sand.push((order, key));
+                        continue;
+                    }
                     // The removed sand may support a banner in a chunk that
                     // has not streamed in yet. Keep the original scheduled
                     // tick until all neighboring state can be checked.
@@ -35761,6 +35822,98 @@ pub(crate) mod tests {
             z: -1_000_000
         }));
         assert!(session.install_generated_ticks(&ticks).is_err());
+    }
+
+    #[test]
+    fn generated_brushable_ticks_preserve_order_and_defer_unhandled_falls() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        for kind in [FallingKind::SuspiciousSand, FallingKind::SuspiciousGravel] {
+            for dusted in ["0", "1", "2", "3"] {
+                for falling in [false, true] {
+                    for indexed in [false, true] {
+                        let mut session = session();
+                        let home = *session.world.chunks.keys().next().unwrap();
+                        let relative = IVec3::new(10, 5, 8);
+                        let absolute = session.origin + relative;
+                        let brushable =
+                            session.intern_block(state(kind.id(), &[("dusted", dusted)]));
+                        let below = if falling {
+                            session.states[0]
+                        } else {
+                            session.intern_block(state("minecraft:stone", &[]))
+                        };
+                        let world = Arc::make_mut(&mut session.world);
+                        world
+                            .set_block_id(absolute.x, absolute.y, absolute.z, brushable)
+                            .unwrap();
+                        world
+                            .set_block_id(absolute.x, absolute.y - 1, absolute.z, below)
+                            .unwrap();
+                        world
+                            .saved_block_entities
+                            .insert(home, native_world::loaded::SavedBlockEntities::Empty);
+                        let saved = SavedTick {
+                            kind: kind.id().into(),
+                            position: absolute.to_array(),
+                            delay: 2,
+                            priority: -1,
+                        };
+                        let region = RegionTicks::new(
+                            BTreeMap::from([(
+                                home,
+                                ConvertedChunkTicks {
+                                    blocks: ChunkTicks::from_saved(home, vec![saved]).unwrap(),
+                                    fluids: ChunkTicks::from_saved(home, vec![]).unwrap(),
+                                },
+                            )]),
+                            42,
+                            0,
+                        )
+                        .unwrap();
+                        let snapshot = region.activated_snapshot();
+                        session.install_generated_ticks(&snapshot).unwrap();
+                        if indexed {
+                            session
+                                .install_generated_block_order(
+                                    &snapshot,
+                                    region
+                                        .captured_indexed_queue(TickRegistry::Block, &[home])
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                        }
+                        let pending = session.draft_block_ticks(home).unwrap();
+                        assert_eq!(pending.len(), 1);
+                        assert_eq!(pending[0].block, kind.id());
+                        assert_eq!(pending[0].delay, 2);
+                        assert_eq!(pending[0].priority, -1);
+                        session.tick = 2;
+                        session.advance_block_ticks();
+                        assert_eq!(
+                            session
+                                .world
+                                .block(absolute.x, absolute.y, absolute.z)
+                                .unwrap()
+                                .name,
+                            kind.id()
+                        );
+                        assert!(session.falling_sand.is_empty());
+                        assert_eq!(session.unresolved_brushable_lifecycle, falling);
+                        if falling {
+                            assert_eq!(session.sand_deferred.len(), 1);
+                            assert!(session.draft_block_ticks(home).is_err());
+                            assert!(session.validate_generation_block_readiness().is_err());
+                        } else {
+                            assert!(session.sand_ticks.is_empty());
+                            assert!(session.sand_deferred.is_empty());
+                            assert!(session.draft_block_ticks(home).unwrap().is_empty());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -86027,6 +86180,48 @@ pub(crate) mod tests {
             )
             .unwrap();
         session.activate_saved_falling_sand();
+    }
+
+    #[test]
+    fn saved_brushable_falling_entity_blocks_unverified_saves() {
+        use native_persistence::nbt::Tag;
+        for name in ["minecraft:suspicious_sand", "minecraft:suspicious_gravel"] {
+            let mut session = session();
+            let draft = crate::saved_falling_block::draft_created(
+                [1, 2, 3, 4],
+                "minecraft:sand",
+                crate::saved_falling_block::FallingSaveState {
+                    position: session.origin.as_dvec3() + DVec3::new(8.5, 5.0, 8.5),
+                    velocity: DVec3::ZERO,
+                    fall_distance: 0.0,
+                    on_ground: false,
+                    no_gravity: false,
+                    time: 0,
+                    drop_item: true,
+                    cancel_drop: true,
+                },
+            )
+            .unwrap();
+            let mut entity = draft.document().value.clone();
+            let Tag::Compound(fields) = &mut entity else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("BlockState"))
+                .unwrap()
+                .1 = Tag::String(name.into());
+            activate_test_falling_entity(&mut session, entity);
+            assert!(session.falling_sand.is_empty());
+            assert!(session.unresolved_brushable_lifecycle);
+            assert!(session.validate_saved_chunk_preparation().is_err());
+            assert!(
+                session
+                    .stream_errors
+                    .iter()
+                    .any(|error| error.contains("unsupported saved brushable falling block"))
+            );
+        }
     }
 
     #[test]

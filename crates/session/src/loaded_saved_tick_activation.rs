@@ -132,11 +132,12 @@ impl SavedTickQueueCapture {
 impl LoadedSession {
     /// Apply a completed saved-chunk callback only when postprocessing made
     /// no block, lighting, entity, or new scheduling changes. The real holder
-    /// future stays waiting while the worker runs and becomes available only
-    /// after both live tick queues have been activated. A no-effect result may
-    /// outlive its captured tick: saved delays are unpacked at the current
-    /// level time after rechecking the live queues. Completed marks are still
-    /// not saveable until the coordinated persistence path exists. The caller
+    /// future stays pending unless completed externally and otherwise becomes
+    /// available only after both live tick queues have been activated. A
+    /// no-effect result may outlive its captured tick: saved delays are
+    /// unpacked at the current level time after rechecking the live queues.
+    /// Completed marks are not saveable until the coordinated persistence
+    /// path exists. The caller
     /// must preserve the actual holder callback and simulation tick order;
     /// surviving a later tick does not prove that dispatching later is correct.
     pub fn apply_no_effect_saved_ticking(
@@ -163,7 +164,7 @@ impl LoadedSession {
         self.verify_generation_terrain_stage(terrain)?;
         self.verify_no_effect_tick_environment(capture)?;
         let source = self.verify_ready_saved_ticking_input(future, terrain)?;
-        let dispatched = future.dispatch(
+        let dispatched = future.dispatch_prepared(
             |position| {
                 self.activate_pending_saved_ticks(position)?;
                 self.mark_saved_ticking_completed(position, source);
@@ -229,7 +230,7 @@ impl LoadedSession {
                     .all(|(order, _)| !moved_fluids.contains(order)),
             "postprocessing schedule collides with a saved tick activation"
         );
-        let dispatched = future.dispatch(
+        let dispatched = future.dispatch_prepared(
             |position| {
                 // The background replay already computed the exact indexes.
                 // Move the typed pending entries before installing new ones,

@@ -59,6 +59,8 @@ pub struct TickingPreparation {
     center: ChunkPos,
     dependencies: Vec<Dependency>,
     queued: Option<Queued>,
+    running: bool,
+    holder: bool,
     state: TickingFutureState,
 }
 
@@ -84,6 +86,8 @@ impl TickingPreparation {
             center,
             dependencies: Vec::with_capacity(9),
             queued: None,
+            running: false,
+            holder: true,
             state: TickingFutureState::Waiting,
         };
         for position in ticking_dependencies(center) {
@@ -130,12 +134,13 @@ impl TickingPreparation {
         self.center
     }
 
-    /// Fork a queued callback for off-thread preparation. The original future
-    /// remains waiting until its owner applies the result on the tick thread.
+    /// Fork a queued callback for off-thread preparation. Its holder remains
+    /// pending unless externally completed, and only the holder may publish.
     pub fn fork_queued_callback(&self) -> Result<Self> {
         ensure!(
             self.state == TickingFutureState::Waiting
-                && matches!(self.queued, Some(Queued::Prepare)),
+                && matches!(self.queued, Some(Queued::Prepare))
+                && !self.running,
             "ticking callback is not ready for background preparation"
         );
         Ok(Self {
@@ -143,8 +148,34 @@ impl TickingPreparation {
             center: self.center,
             dependencies: self.dependencies.clone(),
             queued: self.queued,
+            running: false,
+            holder: false,
             state: self.state,
         })
+    }
+
+    /// Reserve the queued callback at its executor position and return a
+    /// private worker copy. Once started, external completion of the holder
+    /// future does not stop the callback's postprocess or unpack side effects.
+    pub fn begin_background_callback(&mut self) -> Result<Self> {
+        ensure!(self.holder, "a worker copy cannot own the ticking callback");
+        let worker = self.fork_queued_callback()?;
+        self.reserve_background_callback()?;
+        Ok(worker)
+    }
+
+    fn reserve_background_callback(&mut self) -> Result<()> {
+        ensure!(
+            self.holder && self.has_ready_callback(),
+            "ticking callback is not ready to start"
+        );
+        self.queued = None;
+        self.running = true;
+        Ok(())
+    }
+
+    pub fn is_running_callback(&self) -> bool {
+        self.running
     }
 
     pub(crate) fn callback_identity(&self) -> &Arc<()> {
@@ -152,7 +183,13 @@ impl TickingPreparation {
     }
 
     pub(crate) fn has_ready_callback(&self) -> bool {
-        self.state == TickingFutureState::Waiting && matches!(self.queued, Some(Queued::Prepare))
+        !self.running
+            && self.state == TickingFutureState::Waiting
+            && matches!(self.queued, Some(Queued::Prepare))
+    }
+
+    pub(crate) fn accepts_prepared_callback(&self) -> bool {
+        self.holder && (self.running || self.has_ready_callback())
     }
 
     /// The executor may still contain a callback after the future is cancelled.
@@ -221,6 +258,54 @@ impl TickingPreparation {
         true
     }
 
+    /// Complete the holder future exceptionally without suppressing a
+    /// callback that has already begun executing.
+    pub fn complete_exceptionally(&mut self) -> bool {
+        if self.state != TickingFutureState::Waiting {
+            return false;
+        }
+        self.state = TickingFutureState::Exceptional;
+        true
+    }
+
+    /// Finish an already-started callback. If the holder future was completed
+    /// while work was running, preserve that outcome but still run the side
+    /// effects, just like CompletableFuture's already-executing task.
+    pub fn finish_background_callback(
+        &mut self,
+        mut postprocess: impl FnMut(ChunkPos) -> Result<()>,
+        mut unpack: impl FnMut(ChunkPos) -> Result<()>,
+        mut after_start: impl FnMut(ChunkPos) -> Result<()>,
+    ) -> Result<bool> {
+        ensure!(self.running, "ticking callback is not running");
+        self.running = false;
+        let waiting = self.state == TickingFutureState::Waiting;
+        if waiting {
+            // A failed callback completes a still-pending future exceptionally.
+            self.state = TickingFutureState::Exceptional;
+        }
+        postprocess(self.center)?;
+        unpack(self.center)?;
+        after_start(self.center)?;
+        if waiting {
+            self.state = TickingFutureState::Available;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn dispatch_prepared(
+        &mut self,
+        postprocess: impl FnMut(ChunkPos) -> Result<()>,
+        unpack: impl FnMut(ChunkPos) -> Result<()>,
+        after_start: impl FnMut(ChunkPos) -> Result<()>,
+    ) -> Result<bool> {
+        if self.running {
+            self.finish_background_callback(postprocess, unpack, after_start)
+        } else {
+            self.dispatch(postprocess, unpack, after_start)
+        }
+    }
+
     /// Execute the queued main-thread callback. Java postprocesses the center,
     /// unpacks saved ticks, then checks the chunk's send-sync future before
     /// completing. `after_start` must perform that check and any synchronous
@@ -232,6 +317,7 @@ impl TickingPreparation {
         mut unpack: impl FnMut(ChunkPos) -> Result<()>,
         mut after_start: impl FnMut(ChunkPos) -> Result<()>,
     ) -> Result<bool> {
+        ensure!(!self.running, "ticking callback is already running");
         let Some(queued) = self.queued.take() else {
             return Ok(false);
         };
@@ -266,6 +352,7 @@ pub struct TickingPreparations {
     subscribers: BTreeMap<FullFutureId, Vec<TickingRequestId>>,
     requests: BTreeMap<TickingRequestId, TickingPreparation>,
     queued: VecDeque<TickingRequestId>,
+    running: Option<TickingRequestId>,
 }
 
 impl TickingPreparations {
@@ -356,8 +443,78 @@ impl TickingPreparations {
         self.requests.get_mut(&id).map(TickingPreparation::cancel)
     }
 
+    pub fn complete_exceptionally(&mut self, id: TickingRequestId) -> Option<bool> {
+        self.requests
+            .get_mut(&id)
+            .map(TickingPreparation::complete_exceptionally)
+    }
+
     pub fn queued_len(&self) -> usize {
         self.queued.len()
+    }
+
+    /// The running callback has left the queue but still occupies the
+    /// executor. Later callbacks and the next simulation tick must wait.
+    pub fn running_id(&self) -> Option<TickingRequestId> {
+        self.running
+    }
+
+    /// Fork the head before starting a background worker. If starting the
+    /// worker fails, the holder and executor queue remain untouched.
+    pub fn fork_next_background(&self) -> Result<Option<(TickingRequestId, TickingPreparation)>> {
+        ensure!(
+            self.running.is_none(),
+            "a ticking callback is already running"
+        );
+        let Some(&id) = self.queued.front() else {
+            return Ok(None);
+        };
+        let preparation = self.requests.get(&id).expect("queued ticking request");
+        Ok(Some((id, preparation.fork_queued_callback()?)))
+    }
+
+    /// Reserve the same queue head from which the submitted worker was forked.
+    /// A cancelled or unavailable callback must be dispatched normally; a
+    /// stale or different fork cannot consume another holder's position.
+    pub fn begin_next_background(
+        &mut self,
+        fork: &TickingPreparation,
+    ) -> Result<Option<TickingRequestId>> {
+        ensure!(
+            self.running.is_none(),
+            "a ticking callback is already running"
+        );
+        let Some(&id) = self.queued.front() else {
+            return Ok(None);
+        };
+        let preparation = self.requests.get_mut(&id).expect("queued ticking request");
+        ensure!(
+            !fork.holder
+                && fork.has_ready_callback()
+                && Arc::ptr_eq(&preparation.identity, &fork.identity),
+            "background worker belongs to another ticking callback"
+        );
+        preparation.reserve_background_callback()?;
+        self.queued.pop_front();
+        self.running = Some(id);
+        Ok(Some(id))
+    }
+
+    /// Attempt to finish the current callback in its original executor slot.
+    /// If the caller cannot apply its result yet, the slot remains occupied.
+    pub fn finish_background<T>(
+        &mut self,
+        finish: impl FnOnce(&mut TickingPreparation) -> Result<T>,
+    ) -> Result<Option<(TickingRequestId, T)>> {
+        let Some(id) = self.running else {
+            return Ok(None);
+        };
+        let preparation = self.requests.get_mut(&id).expect("running ticking request");
+        let result = finish(preparation);
+        if !preparation.is_running_callback() {
+            self.running = None;
+        }
+        result.map(|value| Some((id, value)))
     }
 
     /// Run one executor callback. If the caller does not consume it, the same
@@ -366,6 +523,10 @@ impl TickingPreparations {
         &mut self,
         dispatch: impl FnOnce(&mut TickingPreparation) -> Result<T>,
     ) -> Result<Option<(TickingRequestId, T)>> {
+        ensure!(
+            self.running.is_none(),
+            "a ticking callback is already running"
+        );
         let Some(id) = self.queued.pop_front() else {
             return Ok(None);
         };
@@ -384,7 +545,8 @@ impl TickingPreparations {
         };
         ensure!(
             preparation.state() != TickingFutureState::Waiting
-                && !preparation.has_queued_callback(),
+                && !preparation.has_queued_callback()
+                && !preparation.is_running_callback(),
             "ticking request still has work"
         );
         let future_ids: Vec<_> = preparation

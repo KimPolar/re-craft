@@ -1085,6 +1085,14 @@ fn live_no_effect_callback_activates_only_the_original_holder() -> Result<()> {
             .apply_no_effect_saved_ticking(&mut unrelated, &terrain, &result)
             .is_err()
     );
+    let mut worker_copy = original.fork_queued_callback()?;
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut worker_copy, &terrain, &result)
+            .is_err()
+    );
+    assert!(worker_copy.begin_background_callback().is_err());
+    session.verify_saved_tick_queues(&ticks)?;
     assert_eq!(original.state(), TickingFutureState::Waiting);
     session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
     assert_eq!(original.state(), TickingFutureState::Available);
@@ -1447,6 +1455,53 @@ fn live_scheduled_callback_consumes_duplicate_attempt_without_adding_a_tick() ->
     let actual = region.chunk(center).unwrap().blocks.pack(100);
     assert_eq!(actual.len(), 1);
     assert_eq!(actual[0].kind, "minecraft:sand");
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn live_background_callback_applies_after_running_holder_is_completed() -> Result<()> {
+    use crate::ticking_preparation::TickingFutureState;
+
+    for (marked_x, exceptional) in [(7, false), (7, true), (9, false), (9, true)] {
+        let (_root, area, ids, registration, mut session, terrain, ticks) =
+            live_callback_fixture(marked_x)?;
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut original = ready_future(center, &registration)?;
+        let mut worker = original.begin_background_callback()?;
+        let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+        assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+        let result = batch.finish()?;
+        let expected = if exceptional {
+            assert!(original.complete_exceptionally());
+            TickingFutureState::Exceptional
+        } else {
+            assert!(original.cancel());
+            TickingFutureState::Unavailable
+        };
+        if marked_x == 7 {
+            session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+        } else {
+            session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+        }
+        assert_eq!(original.state(), expected);
+        assert!(!original.is_running_callback());
+        let after = session.capture_saved_tick_queues()?;
+        assert_eq!(after.next_sub_tick(), result.region.ticks().next_sub_tick());
+        if marked_x == 9 {
+            let entries = after
+                .isolated_region_ticks()?
+                .chunk(center)
+                .unwrap()
+                .blocks
+                .activated(100);
+            assert!(
+                entries
+                    .iter()
+                    .any(|tick| tick.kind == "minecraft:red_sand" && tick.position == [9, 8, 8])
+            );
+        }
+    }
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use std::cell::RefCell;
 
 fn trace(name: &str) -> Result<String> {
@@ -637,6 +638,268 @@ fn overlapping_requests_reject_inconsistent_futures_and_retire_cleanly() -> Resu
         assert!(requests.forget_full_future(FullFutureId(index))?);
     }
     assert!(!requests.forget_full_future(FullFutureId(0))?);
+    Ok(())
+}
+
+fn running_callback_trace(name: &str) -> Result<String> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let positions = ticking_dependencies(center);
+    let mut preparation = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(positions.iter().position(|&pos| pos == position)? as u64),
+            result: Some(FullFutureResult::Full),
+        })
+    })?;
+    let worker = preparation.begin_background_callback()?;
+    assert!(worker.has_queued_callback());
+    assert!(preparation.is_running_callback());
+    let mut events = vec!["post"];
+    let completed = match name {
+        "normal" | "normal-throw" => false,
+        "cancel" | "cancel-throw" => preparation.cancel(),
+        "exception" => preparation.complete_exceptionally(),
+        _ => anyhow::bail!("unknown running callback case"),
+    };
+    let snapshot = |state, queued, events: &[&str]| {
+        let status = match state {
+            TickingFutureState::Waiting => "waiting",
+            TickingFutureState::Available => "success",
+            TickingFutureState::Unavailable => "error",
+            TickingFutureState::Exceptional => "exception",
+        };
+        format!(
+            "{status}/{}/{events}",
+            usize::from(queued),
+            events = events.join(",")
+        )
+    };
+    let during = snapshot(
+        preparation.state(),
+        preparation.has_queued_callback(),
+        &events,
+    );
+    let outcome = preparation.finish_background_callback(
+        |_| {
+            if name.ends_with("-throw") {
+                anyhow::bail!("post failed");
+            }
+            Ok(())
+        },
+        |_| {
+            events.push("unpack");
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(outcome.is_err(), name.ends_with("-throw"));
+    assert!(!preparation.is_running_callback());
+    Ok(format!(
+        "running:{name}|{completed}|{during}|{}",
+        snapshot(
+            preparation.state(),
+            preparation.has_queued_callback(),
+            &events
+        )
+    ))
+}
+
+#[test]
+fn running_callback_keeps_its_side_effects_after_external_completion() -> Result<()> {
+    assert_eq!(
+        running_callback_trace("normal")?,
+        "running:normal|false|waiting/0/post|success/0/post,unpack"
+    );
+    assert_eq!(
+        running_callback_trace("cancel")?,
+        "running:cancel|true|error/0/post|error/0/post,unpack"
+    );
+    assert_eq!(
+        running_callback_trace("exception")?,
+        "running:exception|true|exception/0/post|exception/0/post,unpack"
+    );
+    assert_eq!(
+        running_callback_trace("cancel-throw")?,
+        "running:cancel-throw|true|error/0/post|error/0/post"
+    );
+    assert_eq!(
+        running_callback_trace("normal-throw")?,
+        "running:normal-throw|false|waiting/0/post|exception/0/post"
+    );
+    Ok(())
+}
+
+#[test]
+fn background_callback_blocks_later_callbacks_until_its_effects_finish() -> Result<()> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let positions = ticking_dependencies(center);
+    let mut queue = TickingPreparations::default();
+    let first = TickingRequestId(1);
+    let second = TickingRequestId(2);
+    for id in [first, second] {
+        queue.start(id, center, |position| {
+            Some(FullFuture {
+                id: FullFutureId(positions.iter().position(|&pos| pos == position)? as u64),
+                result: Some(FullFutureResult::Full),
+            })
+        })?;
+    }
+    let (candidate, mut preview) = queue
+        .fork_next_background()?
+        .context("missing first callback")?;
+    assert_eq!(candidate, first);
+    assert!(preview.begin_background_callback().is_err());
+    assert_eq!(queue.queued_len(), 2);
+    assert_eq!(queue.running_id(), None);
+    let id = queue
+        .begin_next_background(&preview)?
+        .context("missing first callback")?;
+    assert_eq!(id, first);
+    assert!(preview.has_queued_callback());
+    assert_eq!(queue.running_id(), Some(first));
+    assert_eq!(queue.queued_len(), 1);
+    assert!(queue.dispatch_next(|_| Ok(())).is_err());
+    assert_eq!(queue.cancel(first), Some(true));
+    assert!(queue.retire(first).is_err());
+    assert!(queue.finish_background(|_| Ok(()))?.is_some());
+    assert_eq!(queue.running_id(), Some(first));
+    assert!(
+        queue
+            .finish_background::<()>(|_| anyhow::bail!("result is not ready"))
+            .is_err()
+    );
+    assert_eq!(queue.running_id(), Some(first));
+    let events = RefCell::new(Vec::new());
+    queue.finish_background(|callback| {
+        callback.finish_background_callback(
+            |_| {
+                events.borrow_mut().push("first:post");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("first:unpack");
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+    })?;
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    assert_eq!(queue.running_id(), None);
+    queue.dispatch_next(|callback| {
+        callback.dispatch(
+            |_| {
+                events.borrow_mut().push("second:post");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("second:unpack");
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+    })?;
+    assert_eq!(queue.state(second), Some(TickingFutureState::Available));
+    assert_eq!(
+        *events.borrow(),
+        ["first:post", "first:unpack", "second:post", "second:unpack"]
+    );
+    assert!(queue.retire(first)?);
+    assert!(queue.retire(second)?);
+    Ok(())
+}
+
+#[test]
+fn failed_background_callback_releases_the_executor_without_replacing_a_cancelled_future()
+-> Result<()> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let positions = ticking_dependencies(center);
+    let mut queue = TickingPreparations::default();
+    let first = TickingRequestId(1);
+    let second = TickingRequestId(2);
+    for id in [first, second] {
+        queue.start(id, center, |position| {
+            Some(FullFuture {
+                id: FullFutureId(positions.iter().position(|&pos| pos == position)? as u64),
+                result: Some(FullFutureResult::Full),
+            })
+        })?;
+    }
+    let (_, fork) = queue.fork_next_background()?.context("missing callback")?;
+    queue
+        .begin_next_background(&fork)?
+        .context("missing callback")?;
+    assert_eq!(queue.cancel(first), Some(true));
+    assert!(
+        queue
+            .finish_background(|callback| callback.finish_background_callback(
+                |_| anyhow::bail!("postprocessing failed"),
+                |_| anyhow::bail!("failed callback unpacked"),
+                |_| anyhow::bail!("failed callback notified"),
+            ))
+            .is_err()
+    );
+    assert_eq!(queue.running_id(), None);
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    queue.dispatch_next(|callback| callback.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(())))?;
+    assert_eq!(queue.state(second), Some(TickingFutureState::Available));
+    Ok(())
+}
+
+#[test]
+fn stale_background_fork_cannot_reserve_a_different_holder() -> Result<()> {
+    let center = ChunkPos { x: 0, z: 0 };
+    let positions = ticking_dependencies(center);
+    let mut queue = TickingPreparations::default();
+    let first = TickingRequestId(1);
+    let second = TickingRequestId(2);
+    for id in [first, second] {
+        queue.start(id, center, |position| {
+            Some(FullFuture {
+                id: FullFutureId(positions.iter().position(|&pos| pos == position)? as u64),
+                result: Some(FullFutureResult::Full),
+            })
+        })?;
+    }
+    let (_, stale) = queue
+        .fork_next_background()?
+        .context("missing first callback")?;
+    assert_eq!(queue.cancel(first), Some(true));
+    queue.dispatch_next(|callback| callback.dispatch(|_| Ok(()), |_| Ok(()), |_| Ok(())))?;
+    assert!(queue.begin_next_background(&stale).is_err());
+    assert_eq!(queue.running_id(), None);
+    assert_eq!(queue.queued_len(), 1);
+    assert_eq!(queue.state(second), Some(TickingFutureState::Waiting));
+    let (id, current) = queue
+        .fork_next_background()?
+        .context("missing second callback")?;
+    assert_eq!(id, second);
+    assert_eq!(queue.begin_next_background(&current)?, Some(second));
+    queue.finish_background(|callback| {
+        callback.finish_background_callback(|_| Ok(()), |_| Ok(()), |_| Ok(()))
+    })?;
+    assert_eq!(queue.state(second), Some(TickingFutureState::Available));
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn java_ticking_callback_cancellation_while_postprocessing() -> Result<()> {
+    let java = crate::worldgen::postprocessing_java_results(
+        "TickingChunkFutureOracle",
+        include_str!("../tests/java/TickingChunkFutureOracle.java"),
+        &["running-cancel"],
+    );
+    let actual = [
+        "normal",
+        "cancel",
+        "exception",
+        "cancel-throw",
+        "normal-throw",
+    ]
+    .into_iter()
+    .map(running_callback_trace)
+    .collect::<Result<Vec<_>>>()?;
+    assert_eq!(actual, java);
     Ok(())
 }
 

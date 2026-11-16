@@ -1,8 +1,8 @@
 //! Prepare a saved chunk's ticking callback away from the event loop.
 //!
-//! The caller must supply the actual queued holder callback and keep its
-//! position in the tick executor. This worker does not infer holder readiness,
-//! publish generated chunks, or authorize a world save.
+//! The caller must supply the actual queued holder callback or its private
+//! fork, then retain that holder's position in the tick executor. This worker
+//! does not infer holder readiness, publish chunks, or authorize a world save.
 
 use std::{
     path::PathBuf,
@@ -118,8 +118,9 @@ pub(crate) struct SavedTickingWorker {
 
 impl SavedTickingWorker {
     /// Capture cheap shared session state now and validate it on the worker.
-    /// The requested FULL neighbors and registration order still come from the
-    /// holder; resident terrain by itself does not establish readiness.
+    /// The caller can fork the executor head first, start the worker, then
+    /// reserve that same callback; a failed spawn leaves the queue untouched.
+    /// FULL neighbors and registration still come from the real holder.
     pub fn start(
         original: &TickingPreparation,
         session: &LoadedSession,

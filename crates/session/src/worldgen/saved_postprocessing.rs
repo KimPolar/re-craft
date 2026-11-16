@@ -156,7 +156,7 @@ impl SavedTickingResult {
                 && live.callbacks.len() == 1
                 && live.callbacks[0].0 == future.center()
                 && Arc::ptr_eq(&live.callbacks[0].1, future.callback_identity())
-                && future.has_ready_callback(),
+                && future.accepts_prepared_callback(),
             "saved ticking callback or terrain capture changed"
         );
         let region = &self.region;

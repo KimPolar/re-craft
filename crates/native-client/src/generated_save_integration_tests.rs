@@ -118,7 +118,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         loaded::BuildBounds,
         ticking_preparation::{
             FullFuture, FullFutureId, FullFutureResult, TickingFutureState, TickingPreparation,
-            ticking_dependencies,
+            TickingPreparations, TickingRequestId, ticking_dependencies,
         },
         worldgen::GeneratedLavaRules,
     };
@@ -206,7 +206,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         })
     };
     let dependencies = ticking_dependencies(center);
-    let mut original = TickingPreparation::start(center, |position| {
+    let original = TickingPreparation::start(center, |position| {
         Some(FullFuture {
             id: FullFutureId(dependencies.iter().position(|&entry| entry == position)? as u64),
             result: Some(FullFutureResult::Full),
@@ -244,7 +244,31 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     assert_eq!(original.state(), TickingFutureState::Waiting);
     assert!(original.has_queued_callback());
 
-    let mut worker = SavedTickingWorker::start(&original, &session, make_request(&mut reader)?)?;
+    let first = TickingRequestId(1);
+    let second = TickingRequestId(2);
+    let mut queue = TickingPreparations::default();
+    for id in [first, second] {
+        queue.start(id, center, |position| {
+            Some(FullFuture {
+                id: FullFutureId(dependencies.iter().position(|&entry| entry == position)? as u64),
+                result: Some(FullFutureResult::Full),
+            })
+        })?;
+    }
+    let (expected, fork) = queue
+        .fork_next_background()?
+        .context("callback not queued")?;
+    assert_eq!(expected, first);
+    let mut worker = SavedTickingWorker::start(&fork, &session, make_request(&mut reader)?)?;
+    let running = queue
+        .begin_next_background(&fork)?
+        .context("callback not queued")?;
+    assert_eq!(running, first);
+    assert_eq!(queue.cancel(first), Some(true));
+    assert_eq!(queue.cancel(second), Some(true));
+    assert!(queue.dispatch_next(|_| Ok(())).is_err());
+    assert_eq!(queue.running_id(), Some(first));
+    assert_eq!(queue.queued_len(), 1);
     let deadline = Instant::now() + Duration::from_secs(120);
     let completed = loop {
         if let Some(result) = worker.try_result()? {
@@ -267,39 +291,57 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         session.snapshot().world.loaded().unwrap(),
         &before_world
     ));
-    assert_eq!(original.state(), TickingFutureState::Waiting);
-    let failure = match completed.apply_no_effect(&mut session, &mut original) {
-        Ok(()) => anyhow::bail!("scheduled callback was accepted as a no-effect callback"),
-        Err(failure) => failure,
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    let failure = match queue
+        .finish_background(|callback| Ok(completed.apply_no_effect(&mut session, callback)))?
+    {
+        Some((id, Err(failure))) if id == first => failure,
+        _ => anyhow::bail!("scheduled callback was accepted as a no-effect callback"),
     };
     let message = format!("{:#}", failure.error);
     ensure!(
         message.contains("postprocessing tick queues need live reconciliation"),
         "unexpected rejection: {message}"
     );
-    assert_eq!(original.state(), TickingFutureState::Waiting);
-    assert!(original.has_queued_callback());
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    assert_eq!(queue.running_id(), Some(first));
     assert!(Arc::ptr_eq(
         session.snapshot().world.loaded().unwrap(),
         &before_world
     ));
-    let retry = match failure
-        .prepared
-        .apply_no_effect(&mut session, &mut original)
-    {
-        Ok(()) => anyhow::bail!("unchanged callback unexpectedly succeeded on retry"),
-        Err(retry) => retry,
+    let retry = match queue.finish_background(|callback| {
+        Ok(failure.prepared.apply_no_effect(&mut session, callback))
+    })? {
+        Some((id, Err(retry))) if id == first => retry,
+        _ => anyhow::bail!("unchanged callback unexpectedly succeeded on retry"),
     };
     assert_eq!(format!("{:#}", retry.error), message);
-    assert_eq!(original.state(), TickingFutureState::Waiting);
-    assert!(original.has_queued_callback());
-    if let Err(failure) = retry.prepared.apply_scheduled(&mut session, &mut original) {
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    assert_eq!(queue.running_id(), Some(first));
+    let applied = queue
+        .finish_background(|callback| Ok(retry.prepared.apply_scheduled(&mut session, callback)))?
+        .context("running callback missing")?;
+    assert_eq!(applied.0, first);
+    if let Err(failure) = applied.1 {
         let error = failure.error;
         crate::generation_staging::discard_async(failure.prepared);
         return Err(error.context("could not apply generated saved ticking schedules"));
     }
     eprintln!("applied scheduled saved ticking callback to the live session");
-    assert_eq!(original.state(), TickingFutureState::Available);
+    assert_eq!(queue.state(first), Some(TickingFutureState::Unavailable));
+    assert_eq!(queue.running_id(), None);
+    let drained = queue
+        .dispatch_next(|callback| {
+            callback.dispatch(
+                |_| anyhow::bail!("cancelled callback postprocessed"),
+                |_| anyhow::bail!("cancelled callback unpacked"),
+                |_| anyhow::bail!("cancelled callback notified"),
+            )
+        })?
+        .context("second callback missing")?;
+    assert_eq!(drained.0, second);
+    assert_eq!(queue.state(second), Some(TickingFutureState::Unavailable));
+    assert_eq!(queue.queued_len(), 0);
     assert_eq!(
         session.capture_saved_tick_queues()?.next_sub_tick(),
         after_sub_tick

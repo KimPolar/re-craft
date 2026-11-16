@@ -34,9 +34,20 @@ public class TickingChunkFutureOracle {
     static class Chunk extends LevelChunk {
         boolean fail;
         String label;
+        CountDownLatch entered;
+        CountDownLatch resume;
         Chunk() { super((net.minecraft.world.level.Level) null, new ChunkPos(0, 0)); }
         @Override public void postProcessGeneration(ServerLevel level) {
             events.add(label == null ? "post" : "post:" + label);
+            if (entered != null) {
+                entered.countDown();
+                try {
+                    if (!resume.await(10, TimeUnit.SECONDS)) throw new AssertionError("postprocess timed out");
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(error);
+                }
+            }
             if (fail) throw new IllegalStateException("post failed");
         }
     }
@@ -124,6 +135,36 @@ public class TickingChunkFutureOracle {
         if (name.equals("send-ready")) fixture.holders[4].send.complete(null);
         fixture.executor.drain();
         System.out.println(name + "|" + initial + "|" + beforeLast + "|" + queued + "|" + fixture.snapshot(future));
+    }
+
+    static void runWhilePostprocessing(String name) throws Exception {
+        events.clear();
+        var fixture = new Fixture(-1);
+        var future = fixture.start();
+        for (int i = 0; i < 9; i++) fixture.complete(i, true);
+        events.clear();
+        fixture.chunk.entered = new CountDownLatch(1);
+        fixture.chunk.resume = new CountDownLatch(1);
+        fixture.chunk.fail = name.endsWith("-throw");
+        var threadFailure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var thread = new Thread(() -> {
+            try { fixture.executor.drain(); } catch (Throwable error) { threadFailure.set(error); }
+        }, "postprocess-oracle");
+        thread.setDaemon(true);
+        thread.start();
+        if (!fixture.chunk.entered.await(10, TimeUnit.SECONDS)) throw new AssertionError("postprocess did not start");
+        boolean completed = switch (name) {
+            case "cancel", "cancel-throw" -> future.complete(ChunkHolder.UNLOADED_LEVEL_CHUNK);
+            case "exception" -> future.completeExceptionally(new IllegalStateException("external failure"));
+            case "normal", "normal-throw" -> false;
+            default -> throw new IllegalArgumentException(name);
+        };
+        String during = fixture.snapshot(future);
+        fixture.chunk.resume.countDown();
+        thread.join(10_000);
+        if (thread.isAlive()) throw new AssertionError("postprocess did not finish");
+        if (threadFailure.get() != null) throw new AssertionError(threadFailure.get());
+        System.out.println("running:" + name + "|" + completed + "|" + during + "|" + fixture.snapshot(future));
     }
 
     static void runOverlap(int sharedX, int sharedZ, boolean reverse) throws Exception {
@@ -317,6 +358,11 @@ public class TickingChunkFutureOracle {
             unsafe = (sun.misc.Unsafe) field.get(null);
             System.setOut(out);
             out.println("BEGIN_RESULT");
+            if (args.length > 0 && args[0].equals("running-cancel")) {
+                for (var name : List.of("normal", "cancel", "exception", "cancel-throw", "normal-throw")) runWhilePostprocessing(name);
+                out.println("END_RESULT");
+                return;
+            }
             for (var name : List.of("missing", "success", "failure", "exception", "cancel-before", "cancel-after", "throw-post", "send-ready")) run(name);
             for (int z = -1; z <= 1; z++) for (int x = 0; x <= 1; x++) {
                 runOverlap(x, z, false);

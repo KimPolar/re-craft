@@ -69,9 +69,17 @@ pub struct ChunkDraft {
     changed_block_states: Vec<BlockChange>,
     uncoordinated_block_entities: bool,
     uncoordinated_postprocessing: bool,
+    postprocessing_seal: Option<PostprocessingSeal>,
     checked_chest_inventories: Vec<CheckedChestInventory>,
     pub changed_blocks: usize,
     pub changed_sections: BTreeSet<i8>,
+}
+
+#[derive(Debug)]
+struct PostprocessingSeal {
+    marks: Option<Tag>,
+    block_ticks: Option<Tag>,
+    fluid_ticks: Option<Tag>,
 }
 
 impl ChunkDraft {
@@ -127,6 +135,16 @@ impl ChunkDraft {
             !self.uncoordinated_postprocessing,
             "postprocessing requires coordinated block, tick, light and entity reconciliation"
         );
+        if let Some(seal) = &self.postprocessing_seal {
+            ensure!(
+                unique_field(&self.document.value, "PostProcessing")? == seal.marks.as_ref()
+                    && unique_field(&self.document.value, "block_ticks")?
+                        == seal.block_ticks.as_ref()
+                    && unique_field(&self.document.value, "fluid_ticks")?
+                        == seal.fluid_ticks.as_ref(),
+                "postprocessing or reconciled tick lists changed after validation"
+            );
+        }
         ensure!(
             self.changed_blocks == 0 || self.heightmaps_rebuilt,
             "changed chunk blocks require rebuilt heightmaps"
@@ -232,6 +250,40 @@ impl ChunkDraft {
         // Even an empty list can accompany tick unpacking, entity promotions
         // or upgrade callbacks. A marks-only draft is never a complete save.
         self.uncoordinated_postprocessing = true;
+        self.postprocessing_seal = None;
+        Ok(())
+    }
+
+    /// Confirm that both tick lists in this draft match the reconciled live
+    /// queues. The caller must also prove that the original callback ran in
+    /// order, all its other effects were preserved, and every source chunk and
+    /// data pack it read is bound to the eventual world-save transaction.
+    pub fn confirm_completed_postprocessing(
+        &mut self,
+        block_ticks: &[native_world::loaded::SavedBlockTick],
+        fluid_ticks: &[native_world::loaded::SavedFluidTick],
+    ) -> Result<()> {
+        ensure!(
+            self.uncoordinated_postprocessing,
+            "no completed postprocessing was staged"
+        );
+        let source = crate::nbt::read(&self.source_nbt)?;
+        let mut expected = draft_chunk_blocks(&source, self.position, &[])?;
+        expected.replace_block_ticks(block_ticks)?;
+        expected.replace_fluid_ticks(fluid_ticks)?;
+        for field in ["block_ticks", "fluid_ticks"] {
+            ensure!(
+                unique_field(&self.document.value, field)?
+                    == unique_field(&expected.document.value, field)?,
+                "postprocessing {field} differs from the reconciled queue"
+            );
+        }
+        self.postprocessing_seal = Some(PostprocessingSeal {
+            marks: unique_field(&self.document.value, "PostProcessing")?.cloned(),
+            block_ticks: unique_field(&self.document.value, "block_ticks")?.cloned(),
+            fluid_ticks: unique_field(&self.document.value, "fluid_ticks")?.cloned(),
+        });
+        self.uncoordinated_postprocessing = false;
         Ok(())
     }
 
@@ -1174,6 +1226,7 @@ pub fn draft_chunk_blocks(
             changed_block_states,
             uncoordinated_block_entities: false,
             uncoordinated_postprocessing: false,
+            postprocessing_seal: None,
             checked_chest_inventories: Vec::new(),
             changed_blocks,
             changed_sections,
@@ -1317,6 +1370,7 @@ pub fn draft_chunk_blocks(
         changed_block_states,
         uncoordinated_block_entities: false,
         uncoordinated_postprocessing: false,
+        postprocessing_seal: None,
         checked_chest_inventories: Vec::new(),
         changed_blocks,
         changed_sections,
@@ -1373,6 +1427,54 @@ mod tests {
                 .is_err()
         );
         assert_eq!(draft.document(), &before);
+    }
+
+    #[test]
+    fn completed_postprocessing_requires_matching_sealed_tick_lists() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let mut original = fixture(1, false);
+        let mut marks = native_core::postprocessing::PostProcessing::new(-64, 32).unwrap();
+        assert!(marks.mark(-15, -60, 33));
+        let expected = crate::postprocessing::encode(&marks);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push(("PostProcessing".into(), expected.clone()));
+        let blocks = vec![native_world::loaded::SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: [-15, -60, 33],
+            delay: 2,
+            priority: 0,
+        }];
+        let fluids = vec![native_world::loaded::SavedFluidTick {
+            fluid: "minecraft:water".into(),
+            position: [-14, -60, 33],
+            delay: 5,
+            priority: 0,
+        }];
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        assert!(
+            draft
+                .confirm_completed_postprocessing(&blocks, &fluids)
+                .is_err()
+        );
+        draft
+            .stage_completed_postprocessing(-64, 32, Some(&expected))
+            .unwrap();
+        draft.replace_block_ticks(&blocks).unwrap();
+        draft.replace_fluid_ticks(&fluids).unwrap();
+        assert!(
+            draft
+                .confirm_completed_postprocessing(&[], &fluids)
+                .is_err()
+        );
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
+        draft
+            .confirm_completed_postprocessing(&blocks, &fluids)
+            .unwrap();
+        assert!(draft.validate_for_write(|_| Ok(())).is_ok());
+        draft.replace_fluid_ticks(&[]).unwrap();
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
     }
 
     #[test]

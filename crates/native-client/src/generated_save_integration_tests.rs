@@ -64,6 +64,23 @@ fn private_play_save_world() -> Result<PathBuf> {
     Ok(path)
 }
 
+fn copy_private_world(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_private_world(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            anyhow::bail!("private test world contains an unsupported entry");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires a private generated 26.3 test world"]
 fn existing_generated_world_uses_captured_data_packs() -> Result<()> {
@@ -128,13 +145,18 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     let root = std::fs::canonicalize(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
     )?;
-    let path = std::fs::canonicalize(
+    let fixture = std::fs::canonicalize(
         std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD").context("test world not set")?,
     )?;
     ensure!(
-        path != root && path.starts_with(&root),
+        fixture != root && fixture.starts_with(&root),
         "test world is outside the private directory"
     );
+    let copy = tempfile::Builder::new()
+        .prefix("saved-ticking-save-")
+        .tempdir_in(&root)?;
+    let path = copy.path().join("world");
+    copy_private_world(&fixture, &path)?;
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -153,7 +175,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         video: crate::menu_settings::VideoSettings::default(),
     };
     let crate::PreparedWorld::Play(prepared) =
-        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock))?
+        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock.clone()))?
     else {
         anyhow::bail!("generated world did not open for play")
     };
@@ -385,6 +407,99 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         )?,
         before_nbt
     );
+
+    let blocks = session.draft_block_ticks(center)?;
+    let fluids = session.draft_fluid_ticks(center)?;
+    let mut expected = native_persistence::edit::draft_chunk_blocks(
+        &before_chunk.document,
+        native_persistence::world::ChunkPos {
+            x: center.x,
+            z: center.z,
+        },
+        &[],
+    )?;
+    expected.replace_block_ticks(&blocks)?;
+    expected.replace_fluid_ticks(&fluids)?;
+    expected.stage_completed_postprocessing(
+        -64,
+        384,
+        before_chunk.document.value.get("PostProcessing"),
+    )?;
+    let mut frozen = session
+        .freeze_partial_save()
+        .map_err(|error| error.into_parts().1)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !frozen.poll_lighting().is_settled() {
+        ensure!(Instant::now() < deadline, "saved light did not settle");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let sources = reader.capture_session_save_sources(frozen.source_positions().iter().copied())?;
+    let ids = resources.vanilla_block_ids()?;
+    let tags = native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &ids)?;
+    let registry = resources.vanilla_generated_block_registry()?;
+    let resolve = |saved: &native_persistence::palette::BlockState| -> Result<BlockState> {
+        let name = String::from_utf16(&saved.name.0)?;
+        let mut supplied = std::collections::BTreeMap::new();
+        for (key, value) in &saved.properties {
+            ensure!(
+                supplied
+                    .insert(String::from_utf16(&key.0)?, String::from_utf16(&value.0)?)
+                    .is_none(),
+                "duplicate block property"
+            );
+        }
+        let (name, properties) =
+            registry.resolve(&serde_json::json!({"id": name, "properties": supplied}))?;
+        ensure!(
+            supplied
+                .iter()
+                .all(|(key, value)| properties.get(key) == Some(value)),
+            "unsupported block property"
+        );
+        Ok(BlockState { name, properties })
+    };
+    let plan = frozen.session().draft_captured_partial_save(
+        &sources,
+        &tags,
+        |state| {
+            let state = resolve(state)?;
+            Ok((
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ),
+                FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some(),
+            ))
+        },
+        &resolve,
+        |state| {
+            ensure!(
+                registry.is_canonical_state(&state.name, &state.properties),
+                "unsupported block state"
+            );
+            Ok(())
+        },
+        |_| anyhow::bail!("unexpected POI change"),
+        1,
+    )?;
+    drop(reader);
+    let mut writer = lock.acquire_write()?;
+    let written = writer.write_plan(plan, |_, _| anyhow::bail!("unexpected block edit"))?;
+    assert!(written.backup_directory.exists());
+    drop(writer);
+    let mut reopened = WorldReader::open_with_session(&path, dimension, lock)?;
+    let saved = reopened
+        .read_chunk(center.x, center.z)?
+        .context("saved center missing")?;
+    for field in ["PostProcessing", "block_ticks", "fluid_ticks", "sections"] {
+        assert_eq!(
+            saved.document.value.get(field),
+            expected.document().value.get(field)
+        );
+    }
+    eprintln!("saved reconciled postprocessing to a private generated-world copy");
     Ok(())
 }
 

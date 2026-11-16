@@ -1,15 +1,19 @@
 //! Activate saved tick delays only after the corresponding preparation check.
 //!
-//! This does not establish the Java holder's ticking readiness or authorize a
-//! save. New schedules remain separate from the original pending entries.
+//! This does not establish the Java holder's ticking readiness or a complete
+//! gameplay save. New schedules remain separate from original pending entries.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    CollectedBlockTick, FluidTickKey, GeneratedTickOrder, GenerationTerrainStage, LoadedSession,
-    PendingSavedTickActivation, ScheduledFluid, generated_block_key, generated_fluid_key,
+    CollectedBlockTick, CompletedSavedPostprocessing, FluidTickKey, GeneratedTickOrder,
+    GenerationTerrainStage, LoadedSession, PendingSavedTickActivation, ScheduledFluid,
+    generated_block_key, generated_fluid_key,
 };
 use crate::worldgen::chunk_ticks::{
     CapturedTickAttempt, ChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, ScheduleOutcome,
@@ -136,10 +140,10 @@ impl LoadedSession {
     /// available only after both live tick queues have been activated. A
     /// no-effect result may outlive its captured tick: saved delays are
     /// unpacked at the current level time after rechecking the live queues.
-    /// Completed marks are not saveable until the coordinated persistence
-    /// path exists. The caller
-    /// must preserve the actual holder callback and simulation tick order;
-    /// surviving a later tick does not prove that dispatching later is correct.
+    /// A captured partial save may include completed marks only after it
+    /// rechecks the queues and every original FULL neighbor. The caller must
+    /// preserve the actual holder callback and simulation tick order; surviving
+    /// a later tick does not prove that dispatching later is correct.
     pub fn apply_no_effect_saved_ticking(
         &mut self,
         future: &mut crate::ticking_preparation::TickingPreparation,
@@ -163,11 +167,14 @@ impl LoadedSession {
         let _read_lease = stamp.lock_current()?;
         self.verify_generation_terrain_stage(terrain)?;
         self.verify_no_effect_tick_environment(capture)?;
-        let source = self.verify_ready_saved_ticking_input(future, terrain)?;
+        let mut completion = Some(self.verify_ready_saved_ticking_input(future, terrain)?);
         let dispatched = future.dispatch_prepared(
             |position| {
                 self.activate_pending_saved_ticks(position)?;
-                self.mark_saved_ticking_completed(position, source);
+                self.mark_saved_ticking_completed(
+                    position,
+                    completion.take().expect("one saved ticking callback"),
+                );
                 Ok(())
             },
             |_| Ok(()),
@@ -180,7 +187,8 @@ impl LoadedSession {
     /// Apply a callback whose only effects are scheduled ticks. The caller
     /// must run it at the holder's original executor position; the exact tick
     /// and queues are required because delayed replay could reorder callbacks.
-    /// Completed marks still cannot be written to disk.
+    /// A captured partial save rechecks the completed marks, queues and source
+    /// neighbors; other gameplay effects still require separate validation.
     pub fn apply_scheduled_saved_ticking(
         &mut self,
         future: &mut crate::ticking_preparation::TickingPreparation,
@@ -204,7 +212,7 @@ impl LoadedSession {
         let _read_lease = stamp.lock_current()?;
         self.verify_generation_terrain_stage(terrain)?;
         self.verify_saved_tick_queues(capture)?;
-        let source = self.verify_ready_saved_ticking_input(future, terrain)?;
+        let mut completion = Some(self.verify_ready_saved_ticking_input(future, terrain)?);
         let center = future.center();
         let plan = self.plan_postprocessing_schedules(
             capture,
@@ -245,7 +253,10 @@ impl LoadedSession {
                     .as_mut()
                     .expect("validated fluid index")
                     .queue = Arc::clone(&result.fluid_ticks);
-                self.mark_saved_ticking_completed(position, source);
+                self.mark_saved_ticking_completed(
+                    position,
+                    completion.take().expect("one saved ticking callback"),
+                );
                 Ok(())
             },
             |_| Ok(()),
@@ -259,13 +270,18 @@ impl LoadedSession {
         &self,
         future: &crate::ticking_preparation::TickingPreparation,
         terrain: &GenerationTerrainStage,
-    ) -> Result<[u8; 32]> {
+    ) -> Result<CompletedSavedPostprocessing> {
         let center = future.center();
         let dependencies = crate::ticking_preparation::ticking_dependencies(center);
+        ensure!(
+            !self.completed_saved_postprocessing.contains_key(&center),
+            "saved postprocessing is already recorded for this chunk"
+        );
         ensure!(
             future.dependencies().map(|(pos, _)| pos).eq(dependencies),
             "saved ticking holder dependencies changed"
         );
+        let mut sources = BTreeMap::new();
         for position in dependencies {
             let current = self
                 .world
@@ -293,6 +309,19 @@ impl LoadedSession {
                         .is_some(),
                 "FULL neighbor tick containers are no longer registered"
             );
+            let source = self
+                .world
+                .saved_chunk_source(position)
+                .context("FULL neighbor saved source is missing")?;
+            ensure!(
+                terrain
+                    .chunks
+                    .get(&position)
+                    .and_then(|chunk| chunk.saved_source)
+                    == Some(source),
+                "FULL neighbor saved source changed"
+            );
+            sources.insert(position, source);
         }
         ensure!(
             matches!(
@@ -315,20 +344,30 @@ impl LoadedSession {
             block_time == Some(self.game_time) && fluid_time == Some(self.game_time),
             "saved ticking clock changed"
         );
-        Ok(source)
+        Ok(CompletedSavedPostprocessing {
+            source,
+            dependencies: sources,
+        })
     }
 
-    fn mark_saved_ticking_completed(&mut self, position: ChunkPos, source: [u8; 32]) {
-        self.checked_chunk_preparation.insert(position, source);
+    fn mark_saved_ticking_completed(
+        &mut self,
+        position: ChunkPos,
+        completion: CompletedSavedPostprocessing,
+    ) {
+        self.checked_chunk_preparation
+            .insert(position, completion.source);
         self.rejected_chunk_preparation.remove(&position);
-        // Completed marks still need coordinated persistence.
+        self.unresolved_chunk_preparation
+            .remove(&(position, Some(completion.source)));
+        let previous = self
+            .completed_saved_postprocessing
+            .insert(position, completion);
+        debug_assert!(
+            previous.is_none(),
+            "saved postprocessing was already recorded"
+        );
         self.tick_dirty_chunks.insert(position);
-        if self.unresolved_chunk_preparation.is_none() {
-            self.unresolved_chunk_preparation = Some(format!(
-                "chunk {}, {}: completed postprocessing is not yet coordinated for saving",
-                position.x, position.z
-            ));
-        }
         self.random_tick_revision = None;
     }
 
@@ -628,6 +667,51 @@ impl LoadedSession {
             "saved tick queues changed"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completing_one_saved_callback_preserves_other_unresolved_sources() {
+        let mut session = super::super::tests::session();
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos { x: 1, z: 0 };
+        session
+            .unresolved_chunk_preparation
+            .insert((first, Some([1; 32])), "first".into());
+        session
+            .unresolved_chunk_preparation
+            .insert((first, Some([2; 32])), "other source".into());
+        session
+            .unresolved_chunk_preparation
+            .insert((second, None), "unknown source".into());
+        session.mark_saved_ticking_completed(
+            first,
+            CompletedSavedPostprocessing {
+                source: [1; 32],
+                dependencies: BTreeMap::from([(first, [1; 32])]),
+            },
+        );
+        assert!(
+            !session
+                .unresolved_chunk_preparation
+                .contains_key(&(first, Some([1; 32])))
+        );
+        assert!(
+            session
+                .unresolved_chunk_preparation
+                .contains_key(&(first, Some([2; 32])))
+        );
+        assert!(
+            session
+                .unresolved_chunk_preparation
+                .contains_key(&(second, None))
+        );
+        assert!(session.validate_saved_chunk_preparation().is_err());
+        assert!(session.tick_dirty_chunks.contains(&first));
     }
 }
 

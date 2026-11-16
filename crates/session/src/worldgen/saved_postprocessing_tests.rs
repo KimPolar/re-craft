@@ -953,9 +953,7 @@ fn saved_ticking_rejects_marks_after_saved_ticks_activate() -> Result<()> {
     Ok(())
 }
 
-fn live_callback_fixture(
-    mark_x: i32,
-) -> Result<(
+type LiveCallbackFixture = (
     tempfile::TempDir,
     ChunkArea,
     BTreeSet<String>,
@@ -963,6 +961,17 @@ fn live_callback_fixture(
     crate::loaded::LoadedSession,
     GenerationTerrainStage,
     SavedTickQueueCapture,
+);
+
+fn live_callback_fixture(mark_x: i32) -> Result<LiveCallbackFixture> {
+    Ok(live_callback_fixture_with_guard(mark_x)?.0)
+}
+
+fn live_callback_fixture_with_guard(
+    mark_x: i32,
+) -> Result<(
+    LiveCallbackFixture,
+    native_persistence::save::WorldSessionGuard,
 )> {
     use flate2::{Compression, write::GzEncoder};
     use glam::{IVec3, Vec3};
@@ -1001,7 +1010,12 @@ fn live_callback_fixture(
     )
     .map_err(anyhow::Error::msg)?;
     session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
-    let root = tempfile::tempdir()?;
+    let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/session-save-test-temp");
+    std::fs::create_dir_all(&parent)?;
+    let root = tempfile::Builder::new()
+        .prefix("saved-ticking-")
+        .tempdir_in(parent)?;
     let level = NamedTag {
         name: "".into(),
         value: Tag::Compound(vec![(
@@ -1017,7 +1031,8 @@ fn live_callback_fixture(
     std::fs::write(root.path().join("level.dat"), gzip.finish()?)?;
     let reader = native_persistence::world::WorldReader::open_for_session(root.path(), dimension)?;
     let packs = reader.capture_world_data_packs()?;
-    session.bind_saved_world_session(reader.session_guard().context("missing session lock")?)?;
+    let guard = reader.session_guard().context("missing session lock")?;
+    session.bind_saved_world_session(guard.clone())?;
     session.bind_world_data_packs(packs)?;
     session
         .set_initial_game_time(100)
@@ -1028,7 +1043,10 @@ fn live_callback_fixture(
     );
     let terrain = session.capture_generation_terrain_stage(source, registration.iter().copied())?;
     let ticks = session.capture_saved_tick_queues()?;
-    Ok((root, area, ids, registration, session, terrain, ticks))
+    Ok((
+        (root, area, ids, registration, session, terrain, ticks),
+        guard,
+    ))
 }
 
 fn begin_no_effect_fixture(
@@ -1050,6 +1068,190 @@ fn begin_no_effect_fixture(
     ensure!(ticks.data_packs().is_some(), "fixture packs are missing");
     batch.live.as_mut().unwrap().packs_bound = true;
     Ok(batch)
+}
+
+fn write_ticking_fixture_regions(root: &std::path::Path, area: &ChunkArea) -> Result<()> {
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+
+    let mut regions: BTreeMap<(i32, i32), Vec<u8>> = BTreeMap::new();
+    for (&position, chunk) in &area.chunks {
+        let region = regions
+            .entry((position.x.div_euclid(32), position.z.div_euclid(32)))
+            .or_insert_with(|| vec![0; 8192]);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&native_persistence::nbt::write(&chunk.document)?)?;
+        let compressed = encoder.finish()?;
+        let sectors = (compressed.len() + 5).div_ceil(4096);
+        ensure!(sectors < 256, "fixture chunk is too large");
+        let offset = region.len() / 4096;
+        ensure!(offset < (1 << 24), "fixture region is too large");
+        let index = position.x.rem_euclid(32) as usize + position.z.rem_euclid(32) as usize * 32;
+        region[index * 4..index * 4 + 4]
+            .copy_from_slice(&(((offset as u32) << 8) | sectors as u32).to_be_bytes());
+        let start = region.len();
+        region.resize(start + sectors * 4096, 0);
+        region[start..start + 4].copy_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
+        region[start + 4] = 2;
+        region[start + 5..start + 5 + compressed.len()].copy_from_slice(&compressed);
+    }
+    let directory = root.join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&directory)?;
+    for ((x, z), region) in regions {
+        std::fs::write(directory.join(format!("r.{x}.{z}.mca")), region)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn reconciled_saved_postprocessing_commits_only_with_unchanged_dependencies() -> Result<()> {
+    use native_persistence::world::WorldReader;
+
+    for (mark_x, change_after_capture) in [(7, false), (9, false), (9, true)] {
+        let ((root, area, ids, registration, mut session, terrain, ticks), guard) =
+            live_callback_fixture_with_guard(mark_x)?;
+        write_ticking_fixture_regions(root.path(), &area)?;
+        let dimension = DimensionId::parse("overworld")?;
+        let reader = WorldReader::open_with_session(root.path(), dimension.clone(), guard.clone())?;
+        session.set_new_player_last_death()?;
+        let uuid = session.initialize_new_player()?;
+        session.capture_level_time_source(Arc::clone(&reader.level))?;
+        session.restore_missing_world_clocks(BTreeMap::new(), true)?;
+
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut original = ready_future(center, &registration)?;
+        let mut worker = original.fork_queued_callback()?;
+        let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+        assert!(batch.dispatch(&mut worker, 100)?);
+        let result = batch.finish()?;
+        if mark_x == 7 {
+            session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+        } else {
+            session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+        }
+        let blocks = session.draft_block_ticks(center)?;
+        let fluids = session.draft_fluid_ticks(center)?;
+        let positions = session.partial_save_source_positions()?;
+        ensure!(
+            registration
+                .iter()
+                .all(|position| positions.contains(&SavedChunkPos {
+                    x: position.x,
+                    z: position.z,
+                })),
+            "postprocessing neighbor was not included in the save capture"
+        );
+        let tags = native_resources::heightmap_tags::HeightmapTags::load(&mut Tags, &ids)?;
+        let resolve = |state: &palette::BlockState| -> Result<native_world::loaded::BlockState> {
+            Ok(native_world::loaded::BlockState {
+                name: String::from_utf16(&state.name.0)?,
+                properties: state
+                    .properties
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((String::from_utf16(&key.0)?, String::from_utf16(&value.0)?))
+                    })
+                    .collect::<Result<_>>()?,
+            })
+        };
+        let assemble = |sources: &native_persistence::world::SessionSaveSources| {
+            session.draft_captured_partial_save(
+                sources,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+                resolve,
+                |_| Ok(()),
+                |_| anyhow::bail!("unexpected POI change"),
+                1,
+            )
+        };
+
+        let mut changed = ChunkArea {
+            center: area.center,
+            radius: area.radius,
+            chunks: area.chunks.clone(),
+            missing: area.missing.clone(),
+        };
+        let neighbor = SavedChunkPos { x: -1, z: -1 };
+        let chunk = Arc::make_mut(changed.chunks.get_mut(&neighbor).unwrap());
+        let Tag::Compound(fields) = &mut Arc::make_mut(&mut chunk.document).value else {
+            unreachable!()
+        };
+        fields.push(("changed_neighbor".into(), Tag::Int(1)));
+        write_ticking_fixture_regions(root.path(), &changed)?;
+        let mut changed_reader =
+            WorldReader::open_with_session(root.path(), dimension.clone(), guard.clone())?;
+        let changed_sources =
+            changed_reader.capture_session_save_sources(positions.iter().copied())?;
+        let error = assemble(&changed_sources)
+            .err()
+            .context("changed postprocessing neighbor was accepted")?;
+        ensure!(
+            format!("{error:#}").contains("postprocessing dependency changed"),
+            "unexpected save rejection: {error:#}"
+        );
+        drop(changed_reader);
+        write_ticking_fixture_regions(root.path(), &area)?;
+        let mut current_reader =
+            WorldReader::open_with_session(root.path(), dimension.clone(), guard.clone())?;
+        let current = current_reader.capture_session_save_sources(positions.iter().copied())?;
+        let plan = assemble(&current)?;
+        assert_eq!(plan.chunk_count(), 1);
+        if change_after_capture {
+            write_ticking_fixture_regions(root.path(), &changed)?;
+            let before_level = std::fs::read(root.path().join("level.dat"))?;
+            drop(current_reader);
+            drop(reader);
+            let mut writer = guard.acquire_write()?;
+            assert!(writer.write_plan(plan, |_, _| Ok(())).is_err());
+            drop(writer);
+            assert_eq!(std::fs::read(root.path().join("level.dat"))?, before_level);
+            let mut reopened = WorldReader::open(root.path(), dimension)?;
+            assert_eq!(
+                reopened
+                    .read_chunk(0, 0)?
+                    .context("center chunk missing")?
+                    .document
+                    .as_ref(),
+                area.chunks[&area.center].document.as_ref()
+            );
+            continue;
+        }
+        let original_chunk = &area.chunks[&area.center].document;
+        let mut expected =
+            native_persistence::edit::draft_chunk_blocks(original_chunk, area.center, &[])?;
+        expected.replace_block_ticks(&blocks)?;
+        expected.replace_fluid_ticks(&fluids)?;
+        expected.stage_completed_postprocessing(
+            0,
+            16,
+            original_chunk.value.get("PostProcessing"),
+        )?;
+        drop(current_reader);
+        drop(reader);
+        let mut writer = guard.acquire_write()?;
+        let written = writer.write_plan(plan, |_, _| anyhow::bail!("unexpected block edit"))?;
+        assert!(written.backup_directory.exists());
+        drop(writer);
+        let mut reopened = WorldReader::open(root.path(), dimension)?;
+        let saved = reopened.read_chunk(0, 0)?.context("saved chunk missing")?;
+        for field in ["PostProcessing", "block_ticks", "fluid_ticks", "sections"] {
+            assert_eq!(
+                saved.document.value.get(field),
+                expected.document().value.get(field)
+            );
+        }
+        let unchanged = reopened
+            .read_chunk(neighbor.x, neighbor.z)?
+            .context("neighbor missing")?;
+        assert_eq!(
+            unchanged.document.as_ref(),
+            area.chunks[&neighbor].document.as_ref()
+        );
+        assert_eq!(reopened.singleplayer_uuid_words()?, Some(uuid));
+    }
+    Ok(())
 }
 
 #[test]
@@ -1109,12 +1311,15 @@ fn live_no_effect_callback_activates_only_the_original_holder() -> Result<()> {
             .is_none()
     );
     assert!(session.dirty_chunk_positions().contains(&center));
+    let saved_ticks = session.draft_block_ticks(center)?;
+    assert_eq!(saved_ticks.len(), 1);
+    assert_eq!(saved_ticks[0].block, "minecraft:sand");
+    assert_eq!(saved_ticks[0].position, [8, 8, 8]);
+    let sources = session.partial_save_source_positions()?;
     assert!(
-        session
-            .draft_block_ticks(center)
-            .unwrap_err()
-            .to_string()
-            .contains("postprocessing")
+        registration
+            .iter()
+            .all(|pos| sources.contains(&SavedChunkPos { x: pos.x, z: pos.z }))
     );
     assert!(
         session
@@ -1403,7 +1608,12 @@ fn live_scheduled_callback_installs_added_ticks_for_the_original_holder() -> Res
             .any(|tick| tick.kind == "minecraft:red_sand" && tick.position == [9, 8, 8])
     );
     assert!(session.verify_saved_tick_queues(&ticks).is_err());
-    assert!(session.draft_block_ticks(center).is_err());
+    assert!(
+        session
+            .draft_block_ticks(center)?
+            .iter()
+            .any(|tick| { tick.block == "minecraft:red_sand" && tick.position == [9, 8, 8] })
+    );
     for step in 1..=3 {
         session.update(Duration::from_millis(50));
         session.capture_saved_tick_queues().with_context(|| {

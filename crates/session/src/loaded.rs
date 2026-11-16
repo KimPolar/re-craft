@@ -227,6 +227,13 @@ struct StagedTerrainChunk {
     saved_source: Option<[u8; 32]>,
 }
 
+/// The original saved inputs observed by a completed, reconciled callback.
+/// The full neighborhood must remain unchanged on disk until the save commits.
+struct CompletedSavedPostprocessing {
+    source: [u8; 32],
+    dependencies: BTreeMap<ChunkPos, [u8; 32]>,
+}
+
 /// Block and biome inputs for intermediate generation while live edits and
 /// light updates remain pending. This type cannot authorize publication or a
 /// save; ticks, block entities, POIs, entities and lighting need other proofs.
@@ -1552,11 +1559,9 @@ impl RainView<'_> {
         };
         if !chunk.block_light_correct
             || !(self.sky_lighting.is_current_at(position, self.sky_bounds)
-                || self.sky_lighting.direct_sky_unchanged_at(
-                    self.world,
-                    position,
-                    self.sky_bounds,
-                ))
+                || self
+                    .sky_lighting
+                    .direct_sky_unchanged_at(self.world, position, self.sky_bounds))
         {
             return None;
         }
@@ -1819,7 +1824,8 @@ pub struct LoadedSession {
     world_data_packs: Option<native_persistence::world::WorldDataPackSnapshot>,
     checked_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
     rejected_chunk_preparation: BTreeMap<ChunkPos, [u8; 32]>,
-    unresolved_chunk_preparation: Option<String>,
+    unresolved_chunk_preparation: BTreeMap<(ChunkPos, Option<[u8; 32]>), String>,
+    completed_saved_postprocessing: BTreeMap<ChunkPos, CompletedSavedPostprocessing>,
     pending_saved_tick_activation: BTreeMap<ChunkPos, PendingSavedTickActivation>,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
@@ -2721,7 +2727,10 @@ impl GeneratedTickOrder {
         ) {
             return false;
         }
-        pending || Arc::make_mut(&mut self.queue).unpack_container(pos, time).is_ok()
+        pending
+            || Arc::make_mut(&mut self.queue)
+                .unpack_container(pos, time)
+                .is_ok()
     }
 }
 
@@ -3601,9 +3610,7 @@ impl LoadedSession {
             .context("world session is not bound")?;
         let dimension = native_persistence::world::DimensionId::parse(&self.world.dimension)?;
         let tickets = crate::simulation_tickets::SimulationTickets::from_capture(
-            captured,
-            guard,
-            &dimension,
+            captured, guard, &dimension,
         )?;
         let section = self
             .player_section()
@@ -3735,10 +3742,8 @@ impl LoadedSession {
             state.player.run_updates();
         }
         if changed || previous_loading_center != state.player.player_loading_center() {
-            let dependencies = Self::simulation_full_dependencies(
-                &state.player,
-                state.view_distance,
-            );
+            let dependencies =
+                Self::simulation_full_dependencies(&state.player, state.view_distance);
             if self.simulation_dependencies.as_ref() != &dependencies {
                 self.simulation_dependencies = Arc::new(dependencies);
             }
@@ -5553,7 +5558,25 @@ impl LoadedSession {
                 .context("dirty terrain source is missing")?;
             terrain.insert(position, original.document.as_ref());
         }
-        let partial = self.draft_player_terrain_entities_clocks_and_poi_from(
+        for completed in self.completed_saved_postprocessing.values() {
+            for (&position, &fingerprint) in &completed.dependencies {
+                let key = native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                };
+                let source = captured
+                    .get(&key)
+                    .context("postprocessing dependency was not captured")?
+                    .terrain
+                    .as_ref()
+                    .context("postprocessing dependency is missing")?;
+                ensure!(
+                    native_persistence::nbt::fingerprint(&source.document)? == fingerprint,
+                    "postprocessing dependency changed at {position:?}"
+                );
+            }
+        }
+        let mut partial = self.draft_player_terrain_entities_clocks_and_poi_from(
             player,
             &terrain,
             sources.clocks(),
@@ -5563,6 +5586,18 @@ impl LoadedSession {
             validate_state,
             validate_poi_type,
         )?;
+        for &position in self.completed_saved_postprocessing.keys() {
+            let draft = partial
+                .session
+                .player_and_terrain
+                .chunks
+                .get_mut(&position)
+                .context("completed postprocessing chunk is absent from the save")?;
+            draft.confirm_completed_postprocessing(
+                &self.draft_block_ticks(position)?,
+                &self.draft_fluid_ticks(position)?,
+            )?;
+        }
         for (&position, draft) in &partial.poi {
             let key = native_persistence::world::ChunkPos {
                 x: position.x,
@@ -6431,6 +6466,22 @@ impl LoadedSession {
         };
         draft.replace_block_ticks(&block_ticks)?;
         draft.replace_fluid_ticks(&fluid_ticks)?;
+        if let Some(completed) = self.completed_saved_postprocessing.get(&position) {
+            anyhow::ensure!(
+                native_persistence::nbt::fingerprint(original)? == completed.source,
+                "completed postprocessing source changed"
+            );
+            let height = self
+                .bounds
+                .max_y
+                .checked_sub(self.bounds.min_y)
+                .ok_or_else(|| anyhow::anyhow!("invalid postprocessing height"))?;
+            draft.stage_completed_postprocessing(
+                self.bounds.min_y,
+                height,
+                original.value.get("PostProcessing"),
+            )?;
+        }
         if self.chest_dirty_chunks.contains(&position) {
             self.stage_chest_inventories(position, original, &mut draft)?;
         }
@@ -7180,7 +7231,9 @@ impl LoadedSession {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("generated tick ordering is already installed"))?;
             anyhow::ensure!(
-                registration.as_ref().is_none_or(|previous| previous == saved),
+                registration
+                    .as_ref()
+                    .is_none_or(|previous| previous == saved),
                 "saved tick registrations differ"
             );
             registration = Some(saved.clone());
@@ -7194,7 +7247,9 @@ impl LoadedSession {
                     && !self.generated_ticks_installed
                     && positions.len() == saved.len()
                     && positions.len() == self.world.chunks.len()
-                    && positions.iter().all(|pos| self.world.chunks.contains_key(pos)),
+                    && positions
+                        .iter()
+                        .all(|pos| self.world.chunks.contains_key(pos)),
                 "saved tick ordering cannot be rebuilt after session changes"
             );
             self.generated_block_order = None;
@@ -7324,10 +7379,9 @@ impl LoadedSession {
                     } else {
                         self.rejected_chunk_preparation.remove(&pos);
                     }
-                    if self.unresolved_chunk_preparation.is_none() {
-                        self.unresolved_chunk_preparation =
-                            Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
-                    }
+                    self.unresolved_chunk_preparation
+                        .entry((pos, source))
+                        .or_insert_with(|| format!("chunk {}, {}: {error:#}", pos.x, pos.z));
                 }
             }
         }
@@ -7346,10 +7400,9 @@ impl LoadedSession {
                 Err(error) => {
                     changed |= self.checked_chunk_preparation.remove(&pos).is_some();
                     self.rejected_chunk_preparation.insert(pos, fingerprint);
-                    if self.unresolved_chunk_preparation.is_none() {
-                        self.unresolved_chunk_preparation =
-                            Some(format!("chunk {}, {}: {error:#}", pos.x, pos.z));
-                    }
+                    self.unresolved_chunk_preparation
+                        .entry((pos, Some(fingerprint)))
+                        .or_insert_with(|| format!("chunk {}, {}: {error:#}", pos.x, pos.z));
                 }
             }
         }
@@ -7359,7 +7412,7 @@ impl LoadedSession {
     }
 
     fn validate_saved_chunk_preparation(&self) -> anyhow::Result<()> {
-        if let Some(error) = &self.unresolved_chunk_preparation {
+        if let Some(error) = self.unresolved_chunk_preparation.values().next() {
             anyhow::bail!("saved chunk preparation could not be preserved: {error}");
         }
         anyhow::ensure!(
@@ -9746,7 +9799,8 @@ impl LoadedSession {
             world_data_packs: None,
             checked_chunk_preparation: BTreeMap::new(),
             rejected_chunk_preparation: BTreeMap::new(),
-            unresolved_chunk_preparation: None,
+            unresolved_chunk_preparation: BTreeMap::new(),
+            completed_saved_postprocessing: BTreeMap::new(),
             pending_saved_tick_activation: BTreeMap::new(),
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
@@ -12552,6 +12606,9 @@ impl LoadedSession {
         let mut positions = self.dirty_chunk_positions();
         positions.extend(self.dirty_poi_chunk_positions());
         positions.extend(self.tracked_entity_chunk_positions()?);
+        for completed in self.completed_saved_postprocessing.values() {
+            positions.extend(completed.dependencies.keys().copied());
+        }
         Ok(positions
             .into_iter()
             .map(|pos| native_persistence::world::ChunkPos { x: pos.x, z: pos.z })
@@ -13593,9 +13650,7 @@ impl LoadedSession {
                 |id| {
                     self.world_clocks
                         .iter()
-                        .find(|(clock, _)| {
-                            clock.namespace == id.namespace && clock.path == id.path
-                        })
+                        .find(|(clock, _)| clock.namespace == id.namespace && clock.path == id.path)
                         .map(|(_, clock)| clock.total_ticks)
                 },
                 weather.rain_at(1.0),
@@ -17362,9 +17417,11 @@ impl LoadedSession {
         };
         if let Some(order) = &self.random_tick_chunk_order {
             for &chunk in order.iter() {
-                if self.player_simulation.as_ref().is_some_and(|state| {
-                    !state.player.tracker().in_entity_ticking_range(chunk)
-                }) {
+                if self
+                    .player_simulation
+                    .as_ref()
+                    .is_some_and(|state| !state.player.tracker().in_entity_ticking_range(chunk))
+                {
                     continue;
                 }
                 self.random_tick_sections
@@ -17495,9 +17552,8 @@ impl LoadedSession {
                         );
                         if let Err(error) = result {
                             self.unresolved_other_random_tick = true;
-                            self.unresolved_other_random_tick_detail = Some(format!(
-                                "minecraft:lava at {absolute:?}: {error:#}"
-                            ));
+                            self.unresolved_other_random_tick_detail =
+                                Some(format!("minecraft:lava at {absolute:?}: {error:#}"));
                             lava_active = false;
                             other_active = false;
                             break;
@@ -17805,7 +17861,9 @@ impl LoadedSession {
                     .direct_sky_unchanged_at(&self.world, position, bounds),
             "sky light is not settled at {absolute:?} (visible sky light {sky})"
         );
-        let darken = self.gameplay_sky_darken.context("sky darkening is unavailable")?;
+        let darken = self
+            .gameplay_sky_darken
+            .context("sky darkening is unavailable")?;
         Ok(block.max(sky.saturating_sub(darken)))
     }
 
@@ -17981,7 +18039,10 @@ impl LoadedSession {
     /// Returns `None` when the sampled block is not spreading soil.
     fn random_tick_spreading_soil_at(&mut self, relative: IVec3) -> Option<bool> {
         let absolute = add(self.origin, relative)?;
-        let source = self.world.block(absolute.x, absolute.y, absolute.z)?.clone();
+        let source = self
+            .world
+            .block(absolute.x, absolute.y, absolute.z)?
+            .clone();
         if !matches!(
             source.name.as_str(),
             "minecraft:grass_block" | "minecraft:mycelium"
@@ -29684,7 +29745,9 @@ impl crate::lava_fire::LavaFireWorld for SessionLavaFire<'_> {
         state_position: IVec3,
         _: &mut native_core::random::LegacyRandom,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("lava ignition at {position:?} (fire state at {state_position:?}) is not yet implemented")
+        anyhow::bail!(
+            "lava ignition at {position:?} (fire state at {state_position:?}) is not yet implemented"
+        )
     }
 }
 
@@ -29812,10 +29875,26 @@ impl crate::spreading_soil::SpreadingWorld for SessionSpreadingSoil<'_> {
         let fluid = FluidState::from_block(state).map_err(anyhow::Error::msg)?;
         let bit = match fluid {
             None => 1,
-            Some(FluidState { kind: FluidKind::Water, source: true, .. }) => 1 << 1,
-            Some(FluidState { kind: FluidKind::Water, source: false, .. }) => 1 << 2,
-            Some(FluidState { kind: FluidKind::Lava, source: true, .. }) => 1 << 3,
-            Some(FluidState { kind: FluidKind::Lava, source: false, .. }) => 1 << 4,
+            Some(FluidState {
+                kind: FluidKind::Water,
+                source: true,
+                ..
+            }) => 1 << 1,
+            Some(FluidState {
+                kind: FluidKind::Water,
+                source: false,
+                ..
+            }) => 1 << 2,
+            Some(FluidState {
+                kind: FluidKind::Lava,
+                source: true,
+                ..
+            }) => 1 << 3,
+            Some(FluidState {
+                kind: FluidKind::Lava,
+                source: false,
+                ..
+            }) => 1 << 4,
         };
         Ok(tag & bit != 0)
     }
@@ -32186,9 +32265,8 @@ pub(crate) mod tests {
         );
         player.observe_player(section, false, true);
         player.run_updates();
-        session.simulation_dependencies = Arc::new(LoadedSession::simulation_full_dependencies(
-            &player, 12,
-        ));
+        session.simulation_dependencies =
+            Arc::new(LoadedSession::simulation_full_dependencies(&player, 12));
         session.player_simulation = Some(PlayerSimulationState {
             player,
             spectators_generate_chunks: true,
@@ -32234,7 +32312,10 @@ pub(crate) mod tests {
                 .iter()
                 .any(|entry| entry.0 == farther)
         );
-        assert_eq!(session.player_simulation.as_ref().unwrap().view_distance, 12);
+        assert_eq!(
+            session.player_simulation.as_ref().unwrap().view_distance,
+            12
+        );
         session.set_simulation_distance(32);
         let outside_loading = ChunkPos {
             x: section.x + 28,
@@ -35128,7 +35209,9 @@ pub(crate) mod tests {
         let grass = world.intern_state(state("minecraft:grass_block", &[("snowy", "false")]));
         for x in 7..=9 {
             for z in 7..=9 {
-                world.set_block_id(origin.x + x, 7, origin.z + z, dirt).unwrap();
+                world
+                    .set_block_id(origin.x + x, 7, origin.z + z, dirt)
+                    .unwrap();
             }
         }
         world
@@ -35201,7 +35284,11 @@ pub(crate) mod tests {
             assert!(session.random_tick_spreading_soil_at(origin).is_some());
             let absolute = session.origin + target;
             assert_eq!(
-                session.world.block(absolute.x, absolute.y, absolute.z).unwrap().name,
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
                 expected
             );
             assert_eq!(session.unresolved_spreading_soil_tick, unresolved);
@@ -35232,10 +35319,18 @@ pub(crate) mod tests {
             // zero; isolate the pending sky work in this test.
             session.pending_light.clear();
             assert!(!session.sky_lighting.settled());
-            assert!(session.random_tick_spreading_soil_at(IVec3::new(8, 8, 8)).is_some());
+            assert!(
+                session
+                    .random_tick_spreading_soil_at(IVec3::new(8, 8, 8))
+                    .is_some()
+            );
             let target = session.origin + IVec3::new(9, 7, 9);
             assert_eq!(
-                session.world.block(target.x, target.y, target.z).unwrap().name,
+                session
+                    .world
+                    .block(target.x, target.y, target.z)
+                    .unwrap()
+                    .name,
                 expected,
                 "pending edit at {position:?}"
             );
@@ -35268,13 +35363,19 @@ pub(crate) mod tests {
         assert!(session.set_with_notify(IVec3::new(1, 1, 0), stone, false));
         assert!(!session.sky_lighting.settled());
         assert_eq!(
-            session.spreading_soil_brightness(source + IVec3::Y).unwrap(),
+            session
+                .spreading_soil_brightness(source + IVec3::Y)
+                .unwrap(),
             13
         );
         assert!(session.random_tick_spreading_soil_at(source).is_some());
         let target = session.origin + IVec3::new(9, 7, 9);
         assert_eq!(
-            session.world.block(target.x, target.y, target.z).unwrap().name,
+            session
+                .world
+                .block(target.x, target.y, target.z)
+                .unwrap()
+                .name,
             "minecraft:grass_block"
         );
         assert!(!session.unresolved_spreading_soil_tick);
@@ -35306,25 +35407,30 @@ pub(crate) mod tests {
         session.pending_light.clear();
         assert!(!session.sky_lighting.settled());
         assert_eq!(
-            session.spreading_soil_brightness(source + IVec3::Y).unwrap(),
+            session
+                .spreading_soil_brightness(source + IVec3::Y)
+                .unwrap(),
             14
         );
         assert!(session.set_with_notify(IVec3::new(7, 8, 8), stone, false));
         session.pending_light.clear();
-        assert!(session.spreading_soil_brightness(source + IVec3::Y).is_err());
+        assert!(
+            session
+                .spreading_soil_brightness(source + IVec3::Y)
+                .is_err()
+        );
     }
 
     #[test]
     fn spreading_soil_participates_in_the_section_random_tick() {
         let seed = (0..10_000)
             .find(|seed| {
-                let [x, y, z] = native_core::random::BlockRandomPosition::new(*seed)
-                    .next_section_offset();
+                let [x, y, z] =
+                    native_core::random::BlockRandomPosition::new(*seed).next_section_offset();
                 (2..14).contains(&x) && (2..14).contains(&z) && (2..14).contains(&y)
             })
             .unwrap();
-        let [x, y, z] =
-            native_core::random::BlockRandomPosition::new(seed).next_section_offset();
+        let [x, y, z] = native_core::random::BlockRandomPosition::new(seed).next_section_offset();
         let position = IVec3::new(x, y, z);
         let (mut world, origin, player) = fixture();
         let grass = world.intern_state(state("minecraft:grass_block", &[("snowy", "false")]));
@@ -35361,7 +35467,11 @@ pub(crate) mod tests {
         session.set_random_tick_speed(1);
         session.advance_random_block_ticks();
         assert_eq!(
-            session.world.block(absolute.x, absolute.y, absolute.z).unwrap().name,
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
             "minecraft:dirt"
         );
         assert!(!session.unresolved_spreading_soil_tick);
@@ -78298,9 +78408,7 @@ pub(crate) mod tests {
         tracker.run_updates();
         let nearby: Vec<_> = tracker
             .entity_ticking_order()
-            .filter(|pos| {
-                (pos.x - center.x).abs() <= 1 && (pos.z - center.z).abs() <= 1
-            })
+            .filter(|pos| (pos.x - center.x).abs() <= 1 && (pos.z - center.z).abs() <= 1)
             .collect();
         let (first, second) = nearby
             .iter()
@@ -78341,10 +78449,9 @@ pub(crate) mod tests {
         }
         session.revision += 1;
         session.set_random_tick_speed(1);
-        assert!(session.set_simulation_random_tick_chunks(
-            &tracker,
-            &BTreeSet::from([first, second])
-        ));
+        assert!(
+            session.set_simulation_random_tick_chunks(&tracker, &BTreeSet::from([first, second]))
+        );
         let mut expected = native_core::random::BlockRandomPosition::new(123);
         let first_offset = expected.next_section_offset();
         let second_offset = expected.next_section_offset();
@@ -78373,10 +78480,9 @@ pub(crate) mod tests {
         assert_eq!(session.active_random_tick_sections[0].0, excluded);
 
         tracker.add_ticket(center, 2, 20);
-        assert!(!session.set_simulation_random_tick_chunks(
-            &tracker,
-            &BTreeSet::from([first, second])
-        ));
+        assert!(
+            !session.set_simulation_random_tick_chunks(&tracker, &BTreeSet::from([first, second]))
+        );
         session.refresh_random_tick_sections();
         assert_eq!(session.active_random_tick_sections[0].0, excluded);
     }

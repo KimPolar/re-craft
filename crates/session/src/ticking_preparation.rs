@@ -12,6 +12,13 @@ use std::{
 use anyhow::{Result, ensure};
 use native_world::loaded::ChunkPos;
 
+#[path = "entity_ticking.rs"]
+mod entity;
+pub use entity::{
+    EntityListenerId, EntityLoadingLinks, EntityRequestId, EntityTickingHolder,
+    EntityTickingTransition, TickingExecutorEvent, entity_ticking_dependencies,
+};
+
 /// Identity of a specific FULL generation future. Holder futures include their
 /// epoch; Java can return the same unavailable future for different holders.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -347,16 +354,23 @@ impl TickingPreparation {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TickingRequestId(pub u64);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FullSubscriber {
+    Block(TickingRequestId),
+    Entity(EntityRequestId),
+}
+
 /// Coordinate overlapping ticking requests and the ordered main-thread queue.
 /// FULL completion events must be supplied in their observed delivery order.
 #[derive(Default)]
 pub struct TickingPreparations {
     identity: Arc<()>,
     futures: BTreeMap<FullFutureId, Option<FullFutureResult>>,
-    subscribers: BTreeMap<FullFutureId, Vec<TickingRequestId>>,
+    subscribers: BTreeMap<FullFutureId, Vec<FullSubscriber>>,
     requests: BTreeMap<TickingRequestId, TickingPreparation>,
     queued: VecDeque<TickingRequestId>,
     running: Option<TickingRequestId>,
+    entity: Option<entity::EntityTracker>,
 }
 
 impl TickingPreparations {
@@ -391,6 +405,7 @@ impl TickingPreparations {
         }
         if preparation.has_queued_callback() {
             self.queued.push_back(id);
+            self.note_block_queued(id);
         } else if preparation.state() == TickingFutureState::Waiting {
             // A request has at most nine dependencies, so deduplicate without
             // allocating for every chunk entering the ticking range.
@@ -400,7 +415,10 @@ impl TickingPreparations {
                 if future.result.is_none() && !subscribed[..count].contains(&future.id) {
                     subscribed[count] = future.id;
                     count += 1;
-                    self.subscribers.entry(future.id).or_default().push(id);
+                    self.subscribers
+                        .entry(future.id)
+                        .or_default()
+                        .push(FullSubscriber::Block(id));
                 }
             }
         }
@@ -419,21 +437,29 @@ impl TickingPreparations {
             return Ok(false);
         }
         *state = Some(result);
-        for request_id in self
+        for subscriber in self
             .subscribers
             .remove(&id)
             .unwrap_or_default()
             .into_iter()
             .rev()
         {
-            let preparation = self
-                .requests
-                .get_mut(&request_id)
-                .expect("registered ticking request");
-            let already_queued = preparation.has_queued_callback();
-            preparation.complete(id, result)?;
-            if !already_queued && preparation.has_queued_callback() {
-                self.queued.push_back(request_id);
+            match subscriber {
+                FullSubscriber::Block(request_id) => {
+                    let preparation = self
+                        .requests
+                        .get_mut(&request_id)
+                        .expect("registered ticking request");
+                    let already_queued = preparation.has_queued_callback();
+                    preparation.complete(id, result)?;
+                    if !already_queued && preparation.has_queued_callback() {
+                        self.queued.push_back(request_id);
+                        self.note_block_queued(request_id);
+                    }
+                }
+                FullSubscriber::Entity(request_id) => {
+                    self.complete_entity_dependency(request_id, id, result)?;
+                }
             }
         }
         Ok(true)
@@ -564,7 +590,7 @@ impl TickingPreparations {
         self.requests.remove(&id);
         for future_id in future_ids {
             if let Some(subscribers) = self.subscribers.get_mut(&future_id) {
-                subscribers.retain(|&request| request != id);
+                subscribers.retain(|&request| request != FullSubscriber::Block(id));
                 if subscribers.is_empty() {
                     self.subscribers.remove(&future_id);
                 }
@@ -578,7 +604,8 @@ impl TickingPreparations {
         ensure!(
             self.requests.values().all(|preparation| preparation
                 .dependencies()
-                .all(|(_, future)| future.id != id)),
+                .all(|(_, future)| future.id != id))
+                && self.entity_future_is_unused(id),
             "FULL future is still used by a ticking request"
         );
         Ok(self.futures.remove(&id).is_some())

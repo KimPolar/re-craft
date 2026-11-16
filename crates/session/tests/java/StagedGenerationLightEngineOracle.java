@@ -244,6 +244,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(!state.isSolid() || !state.canOcclude() || state.hasBlockEntity() || !state.getFluidState().isEmpty() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state) || state.getPostProcessPos(null,BlockPos.ZERO)!=null || !LightEngine.hasDifferentLightProperties(state,Blocks.MAGMA_BLOCK.defaultBlockState()))
                     throw new AssertionError("unsupported magma ore source "+state);
         }
+        if(magmaActive) for(var name:List.of("stone","cinnabar","sulfur","deepslate","netherrack","basalt","blackstone","ancient_debris","dirt","grass_block","mud","clay","sand","sandstone","gravel","packed_ice","snow_block","podzol","coarse_dirt","rooted_dirt","mycelium","tuff","calcite","smooth_basalt","amethyst_block","budding_amethyst","granite","diorite","andesite","bedrock","red_sand","moss_block")) {
+            var block=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
+            for(var state:block.getStateDefinition().getPossibleStates())
+                if(!state.isSolid() || !state.canOcclude() || state.hasBlockEntity() || !state.getFluidState().isEmpty() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state) || state.getPostProcessPos(null,BlockPos.ZERO)!=null || state.getLightDampening()!=15 || state.getLightEmission()!=0 || state.useShapeForLightOcclusion() || LightEngine.hasDifferentLightProperties(state,Blocks.STONE.defaultBlockState()) || !LightEngine.hasDifferentLightProperties(state,Blocks.MAGMA_BLOCK.defaultBlockState()))
+                    throw new AssertionError("unsupported magma opaque source "+state);
+        }
         boolean lichenActive=vineActive && args[1].endsWith("_lichen");
         boolean dryLichen=lichenActive && args[1].contains("_dry_lichen");
         boolean lakeActive=vineActive && args[1].contains("_lake_");
@@ -439,8 +445,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     var axis=args[1].contains("_deepslate_x_") ? Direction.Axis.X : args[1].contains("_deepslate_z_") ? Direction.Axis.Z : Direction.Axis.Y;
                     var source=Blocks.DEEPSLATE.defaultBlockState().setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,axis);
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
-                } else if(Arrays.stream(new String[]{"sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","gravel","red_sand","sand"}).anyMatch(name->args[1].contains("_"+name+"_"))) {
-                    var name=Arrays.stream(new String[]{"sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","gravel","red_sand","sand"}).filter(n->args[1].contains("_"+n+"_")).findFirst().orElseThrow();
+                } else if(Arrays.stream(new String[]{"sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","gravel","red_sand","sand","dirt","clay","mud","packed_ice"}).anyMatch(name->args[1].contains("_"+name+"_"))) {
+                    var name=Arrays.stream(new String[]{"sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","gravel","red_sand","sand","dirt","clay","mud","packed_ice"}).filter(n->args[1].contains("_"+n+"_")).findFirst().orElseThrow();
                     var source=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name)).defaultBlockState();
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
                 } else if(args[1].contains("_redstone_ore_")) {

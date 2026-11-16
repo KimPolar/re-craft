@@ -6853,6 +6853,15 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
     }
 }
 
+// The source must have known light properties. Equal sky behavior with magma
+// and differing block-light behavior means this is an emission change, so the
+// registered chunk needs a check even though its sky column is unchanged.
+fn magma_opaque_source(old: &BlockState, magma: &BlockState) -> bool {
+    disk_safe_solid(&old.name) == Some(true)
+        && native_world::sky_light::same_sky_behavior(old, magma) == Some(true)
+        && native_world::block_light::same_light_behavior(old, magma) == Some(false)
+}
+
 // These vanilla blocks have no block entity, POI, or setBlock postprocessing.
 // Reject unknown data-pack effects until their semantics can be preserved.
 fn geode_safe_state(state: &BlockState) -> Result<()> {
@@ -8897,10 +8906,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
                         && (lake_source
-                            || (matches!(
-                                old.name.as_str(),
-                                "minecraft:gravel" | "minecraft:sand" | "minecraft:red_sand"
-                            ) && old.properties.is_empty())
+                            || magma_opaque_source(&old, state)
                             || generated_ore_state(&old)?
                             || super::generated_potent_sulfur::is_valid_state(&old))
                         && state.name == "minecraft:magma_block"
@@ -13984,6 +13990,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_underwater_magma_opaque_sources_match_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_dirt_magma_block",
+            "vine_active_self_clay_magma_block",
+            "vine_active_mud_magma_block",
+            "vine_active_self_packed_ice_magma_block",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_magma_replaces_potent_sulfur_like_java_light() {
         check_staged_light_modes(&[
             "vine_active_potent_sulfur_magma_block",
@@ -14636,15 +14653,39 @@ mod tests {
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();
                 } else if [
-                    "sulfur", "cinnabar", "granite", "diorite", "andesite", "tuff", "calcite",
-                    "gravel", "red_sand", "sand",
+                    "sulfur",
+                    "cinnabar",
+                    "granite",
+                    "diorite",
+                    "andesite",
+                    "tuff",
+                    "calcite",
+                    "gravel",
+                    "red_sand",
+                    "sand",
+                    "dirt",
+                    "clay",
+                    "mud",
+                    "packed_ice",
                 ]
                 .into_iter()
                 .any(|name| mode.contains(&format!("_{name}_")))
                 {
                     let name = [
-                        "sulfur", "cinnabar", "granite", "diorite", "andesite", "tuff", "calcite",
-                        "gravel", "red_sand", "sand",
+                        "sulfur",
+                        "cinnabar",
+                        "granite",
+                        "diorite",
+                        "andesite",
+                        "tuff",
+                        "calcite",
+                        "gravel",
+                        "red_sand",
+                        "sand",
+                        "dirt",
+                        "clay",
+                        "mud",
+                        "packed_ice",
                     ]
                     .into_iter()
                     .find(|name| mode.contains(&format!("_{name}_")))
@@ -26163,6 +26204,66 @@ mod tests {
         let world = terrain.snapshot();
         assert_eq!(world.block(8, 5, 8).unwrap().name, "minecraft:water");
         assert_eq!(world.saved_fluid_ticks[&center][0].position, [8, 5, 8]);
+    }
+
+    #[test]
+    fn magma_opaque_sources_require_known_matching_sky_behavior() {
+        let magma = state("magma_block");
+        for name in [
+            "stone",
+            "cinnabar",
+            "sulfur",
+            "netherrack",
+            "blackstone",
+            "ancient_debris",
+            "dirt",
+            "mud",
+            "clay",
+            "sand",
+            "sandstone",
+            "gravel",
+            "packed_ice",
+            "snow_block",
+            "coarse_dirt",
+            "rooted_dirt",
+            "tuff",
+            "calcite",
+            "smooth_basalt",
+            "amethyst_block",
+            "budding_amethyst",
+            "granite",
+            "diorite",
+            "andesite",
+            "bedrock",
+            "red_sand",
+            "moss_block",
+        ] {
+            assert!(magma_opaque_source(&state(name), &magma), "{name}");
+        }
+        for name in ["basalt", "deepslate"] {
+            for axis in ["x", "y", "z"] {
+                let mut source = state(name);
+                source.properties.insert("axis".into(), axis.into());
+                assert!(magma_opaque_source(&source, &magma), "{name} {axis}");
+            }
+        }
+        for name in ["grass_block", "podzol", "mycelium"] {
+            for snowy in ["false", "true"] {
+                let mut source = state(name);
+                source.properties.insert("snowy".into(), snowy.into());
+                assert!(magma_opaque_source(&source, &magma), "{name} {snowy}");
+            }
+        }
+        for name in ["ice", "magma_block", "unknown"] {
+            assert!(!magma_opaque_source(&state(name), &magma), "{name}");
+        }
+        let mut cactus = state("cactus");
+        cactus.properties.insert("age".into(), "0".into());
+        assert!(!magma_opaque_source(&cactus, &magma));
+        let mut malformed = state("dirt");
+        malformed.properties.insert("unknown".into(), "true".into());
+        assert!(!magma_opaque_source(&malformed, &magma));
+        assert!(!magma_opaque_source(&state("stone"), &state("stone")));
     }
 
     #[test]

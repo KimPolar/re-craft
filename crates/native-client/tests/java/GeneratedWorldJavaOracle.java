@@ -393,13 +393,16 @@ public class GeneratedWorldJavaOracle {
         var rulesFile = NbtIo.readCompressed(rulesPath, NbtAccounter.unlimitedHeap());
         var originalRules = rulesFile.get("data");
         var rules = GameRuleMap.CODEC.parse(NbtOps.INSTANCE, originalRules).getOrThrow();
-        if (rules.size() != 14 || !rules.get(GameRules.SPAWN_MOBS) ||
+        int expectedRandomTickSpeed = args.length > 11 ? Integer.parseInt(args[11]) : 3;
+        if (rules.size() != 16 || !rules.get(GameRules.SPAWN_MOBS) ||
+            !rules.get(GameRules.SPECTATORS_GENERATE_CHUNKS) ||
             !rules.get(GameRules.ADVANCE_TIME) || !rules.get(GameRules.ADVANCE_WEATHER) ||
             !rules.get(GameRules.WATER_SOURCE_CONVERSION) || rules.get(GameRules.LAVA_SOURCE_CONVERSION) ||
             !rules.get(GameRules.BLOCK_DROPS) || !rules.get(GameRules.ENTITY_DROPS) ||
             !rules.get(GameRules.NATURAL_HEALTH_REGENERATION) || !rules.get(GameRules.FALL_DAMAGE) ||
             rules.get(GameRules.KEEP_INVENTORY) || rules.get(GameRules.IMMEDIATE_RESPAWN) ||
-            !rules.get(GameRules.SHOW_DEATH_MESSAGES) || rules.get(GameRules.RANDOM_TICK_SPEED) != 3 ||
+            !rules.get(GameRules.SHOW_DEATH_MESSAGES) || rules.get(GameRules.RANDOM_TICK_SPEED) != expectedRandomTickSpeed ||
+            rules.get(GameRules.FIRE_SPREAD_RADIUS_AROUND_PLAYER) != 128 ||
             rules.get(GameRules.RESPAWN_RADIUS) != 10)
             throw new AssertionError("world game rules differ: " + rules);
         var rewrittenRules = GameRuleMap.CODEC.encodeStart(NbtOps.INSTANCE, rules).getOrThrow();

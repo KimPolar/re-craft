@@ -3,6 +3,9 @@ use super::*;
 use native_persistence::world::ChunkPos;
 use std::{path::PathBuf, process::Command, time::Duration};
 
+#[path = "generated_world_fixture_java.rs"]
+mod fixture_roundtrip;
+
 /// Java stores compounds as maps and may write their keys in a different order.
 /// Lists retain their order and numeric values are compared bit-for-bit.
 fn same_nbt(a: &native_persistence::nbt::Tag, b: &native_persistence::nbt::Tag) -> bool {

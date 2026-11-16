@@ -695,6 +695,317 @@ fn completed_ticking_fixture() -> Result<(ChunkArea, SavedTickingResult)> {
     Ok((area, result))
 }
 
+fn live_ticking_fixture() -> Result<(
+    ChunkArea,
+    BTreeSet<String>,
+    Vec<ChunkPos>,
+    crate::loaded::LoadedSession,
+    Arc<native_world::loaded::World>,
+    GenerationTerrainStage,
+)> {
+    use glam::{IVec3, Vec3};
+    let (area, mut ids, registration) = ticking_fixture()?;
+    ids.insert("minecraft:air".into());
+    let dimension = DimensionId::parse("overworld")?;
+    let source = Arc::new(area.materialize(&dimension)?);
+    let bounds = BuildBounds {
+        min_y: 0,
+        max_y: 16,
+    };
+    let mut session = crate::loaded::LoadedSession::new(
+        source.as_ref().clone(),
+        IVec3::ZERO,
+        bounds,
+        crate::PlayerState {
+            position: Vec3::new(8.5, 10.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: crate::PlayerPose::Standing,
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    assert!(session.set_block_for_postprocessing_test(
+        IVec3::new(8, 8, 8),
+        BlockState {
+            name: "minecraft:red_sand".into(),
+            properties: BTreeMap::new(),
+        },
+    ));
+    let terrain = session
+        .capture_generation_terrain_stage(Arc::clone(&source), registration.iter().copied())?;
+    Ok((area, ids, registration, session, source, terrain))
+}
+
+fn classify_live_fixture(
+    state: &native_persistence::palette::BlockState,
+) -> Result<native_persistence::heightmap::BlockHeightFlags> {
+    ensure!(
+        [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:sand",
+            "minecraft:red_sand",
+            "minecraft:gravel"
+        ]
+        .iter()
+        .any(|name| state.name.matches(name)),
+        "unknown fixture heightmap state"
+    );
+    let is_air = state.name.matches("minecraft:air");
+    Ok(native_persistence::heightmap::BlockHeightFlags {
+        is_air,
+        blocks_motion: !is_air,
+        blocks_motion_no_leaves: !is_air,
+        has_fluid: false,
+    })
+}
+
+fn begin_live_fixture(
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    registration: &[ChunkPos],
+    terrain: &GenerationTerrainStage,
+) -> Result<SavedTickingBatch> {
+    SavedTickingBatch::begin_with_live_terrain(
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area,
+            dimension: &DimensionId::parse("overworld")?,
+            defaults: &BTreeMap::new(),
+            block_ids: ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration,
+            game_time: 100,
+            next_sub_tick: 2,
+            light: None,
+        },
+        terrain,
+        |state| {
+            ensure!(
+                ids.contains(&state.name) && state.properties.is_empty(),
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+}
+
+#[test]
+fn saved_ticking_uses_live_blocks_and_rejects_stale_terrain() -> Result<()> {
+    use crate::ticking_preparation::{FullFuture, FullFutureId, FullFutureResult};
+    let (area, ids, registration, mut session, source, terrain) = live_ticking_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    session.verify_generation_terrain_stage(&terrain)?;
+    let mut future = TickingPreparation::start(center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(registration.iter().position(|&pos| pos == position)? as u64),
+            result: Some(FullFutureResult::Full),
+        })
+    })?;
+    let mut batch = begin_live_fixture(&area, &ids, &registration, &terrain)?;
+    assert!(batch.dispatch(&mut future, 100)?);
+    let result = batch.finish()?;
+    assert_eq!(source.block(8, 8, 8).unwrap().name, "minecraft:sand");
+    assert_eq!(
+        result.region.world.block(8, 8, 8).unwrap().name,
+        "minecraft:red_sand"
+    );
+    let ticks = result.block_ticks.container(center).unwrap().pack(100);
+    assert!(ticks.iter().any(|tick| tick.kind == "minecraft:sand"
+        && tick.position == [8, 8, 8]
+        && tick.delay == 0));
+    assert!(ticks.iter().any(|tick| tick.kind == "minecraft:red_sand"
+        && tick.position == [8, 8, 8]
+        && tick.delay == 2));
+    assert_eq!(
+        native_persistence::nbt::fingerprint(&area.chunks[&area.center].document)?,
+        source.saved_chunk_source(center).unwrap()
+    );
+    assert!(
+        terrain
+            .saved_postprocessing_world(
+                &source,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                |state| {
+                    ensure!(state.name != "minecraft:red_sand", "unsupported live state");
+                    Ok(())
+                },
+            )
+            .is_err()
+    );
+
+    struct NoMotionTags;
+    impl ResourceProvider for NoMotionTags {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            Ok((path.ends_with("blocks_motion_in_heightmap.json")
+                || path.ends_with("blocks_motion_in_heightmap_no_leaves.json"))
+            .then(|| br#"{"values":[]}"#.to_vec()))
+        }
+    }
+    let incompatible = SavedTickingBatch::begin_with_live_terrain(
+        &mut NoMotionTags,
+        SavedPostprocessingInputs {
+            area: &area,
+            dimension: &DimensionId::parse("overworld")?,
+            defaults: &BTreeMap::new(),
+            block_ids: &ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration: &registration,
+            game_time: 100,
+            next_sub_tick: 2,
+            light: None,
+        },
+        &terrain,
+        |state| {
+            ensure!(ids.contains(&state.name), "unknown fixture state");
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    let Err(error) = incompatible else {
+        panic!("incompatible heightmap tags were accepted");
+    };
+    assert!(format!("{error:#}").contains("does not match source blocks"));
+
+    let mut changed = ChunkArea {
+        center: area.center,
+        radius: area.radius,
+        chunks: area.chunks.clone(),
+        missing: area.missing.clone(),
+    };
+    let neighbor = SavedChunkPos { x: -1, z: -1 };
+    let chunk = Arc::make_mut(changed.chunks.get_mut(&neighbor).unwrap());
+    let Tag::Compound(fields) = &mut Arc::make_mut(&mut chunk.document).value else {
+        unreachable!()
+    };
+    fields.push(("changed".into(), Tag::Byte(1)));
+    assert!(begin_live_fixture(&changed, &ids, &registration, &terrain).is_err());
+
+    let mut forged = source.as_ref().clone();
+    let red = forged.intern_state(BlockState {
+        name: "minecraft:red_sand".into(),
+        properties: BTreeMap::new(),
+    });
+    let chunk = Arc::make_mut(forged.chunks.get_mut(&center).unwrap());
+    Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+        .blocks
+        .as_mut()
+        .unwrap()[0] = red;
+    assert_eq!(
+        forged.saved_chunk_source(center),
+        source.saved_chunk_source(center)
+    );
+    assert!(
+        terrain
+            .saved_postprocessing_world(
+                &forged,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                |_| Ok(()),
+            )
+            .is_err()
+    );
+
+    assert!(session.set_block_for_postprocessing_test(
+        glam::IVec3::new(7, 8, 8),
+        BlockState {
+            name: "minecraft:red_sand".into(),
+            properties: BTreeMap::new()
+        },
+    ));
+    assert!(session.verify_generation_terrain_stage(&terrain).is_err());
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn saved_postprocessing_with_live_blocks_matches_java() -> Result<()> {
+    let (area, ids, registration, session, _, terrain) = live_ticking_fixture()?;
+    session.verify_generation_terrain_stage(&terrain)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let source = &area.chunks[&area.center];
+    let draft = terrain
+        .saved_edited_chunk_draft(center, source, classify_live_fixture)?
+        .unwrap();
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("live.nbt");
+    std::fs::write(&path, native_persistence::nbt::write(draft.document())?)?;
+    let expected = super::super::postprocessing_world::tests::java_results_with_args(
+        "SavedFullPostprocessingOracle",
+        include_str!("../../tests/java/SavedFullPostprocessingOracle.java"),
+        &[path.to_str().context("invalid NBT path")?],
+    );
+    let dimension = DimensionId::parse("overworld")?;
+    let mut stage = begin_saved_postprocessing_with_live_terrain(
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area: &area,
+            dimension: &dimension,
+            defaults: &BTreeMap::new(),
+            block_ids: &ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration: &registration,
+            game_time: 100,
+            next_sub_tick: 2,
+            light: None,
+        },
+        &terrain,
+        |state| {
+            ensure!(
+                ids.contains(&state.name) && state.properties.is_empty(),
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+    )?;
+    stage.select_initial_targets(BTreeSet::from([center]))?;
+    while !stage.poll(center, 256)? {}
+    let result = stage.finish()?;
+    let mut actual = result
+        .ticks()
+        .chunk(center)
+        .unwrap()
+        .blocks
+        .pack(100)
+        .into_iter()
+        .map(|tick| {
+            format!(
+                "{} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.push(format!("counter {}", result.ticks().next_sub_tick()));
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[test]
 fn completed_saved_marks_draft_checks_sources_and_keeps_other_chunks_untouched() -> Result<()> {
     let (area, mut result) = completed_ticking_fixture()?;

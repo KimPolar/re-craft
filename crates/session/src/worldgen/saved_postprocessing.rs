@@ -22,7 +22,7 @@ use native_world::{
 };
 
 use crate::{
-    loaded::BuildBounds,
+    loaded::{BuildBounds, GenerationTerrainStage},
     saved_chunk_activation::{SavedTickInputs, read_saved_work},
     ticking_preparation::{TickingFutureState, TickingPreparation, ticking_dependencies},
 };
@@ -155,6 +155,35 @@ impl SavedTickingBatch {
             .collect();
         let game_time = input.game_time;
         let mut stage = begin_saved_postprocessing(provider, input, validate_state)?;
+        configure(&mut stage)?;
+        Ok(Self {
+            stage,
+            available,
+            game_time,
+            started: false,
+            failed: false,
+        })
+    }
+
+    /// Run an isolated pass over captured live blocks instead of stale saved
+    /// terrain. The saved tick containers are still reconstructed from disk;
+    /// callers must separately capture live ticks and other session effects.
+    pub fn begin_with_live_terrain(
+        provider: &mut impl ResourceProvider,
+        input: SavedPostprocessingInputs<'_>,
+        terrain: &GenerationTerrainStage,
+        validate_state: impl FnMut(&BlockState) -> Result<()>,
+        configure: impl FnOnce(&mut GeneratedPostprocessing) -> Result<()>,
+    ) -> Result<Self> {
+        let available = input
+            .area
+            .chunks
+            .keys()
+            .map(|pos| ChunkPos { x: pos.x, z: pos.z })
+            .collect();
+        let game_time = input.game_time;
+        let mut stage =
+            begin_saved_postprocessing_with_live_terrain(provider, input, terrain, validate_state)?;
         configure(&mut stage)?;
         Ok(Self {
             stage,
@@ -314,6 +343,27 @@ pub fn dispatch_saved_ticking(
 pub fn begin_saved_postprocessing(
     provider: &mut impl ResourceProvider,
     input: SavedPostprocessingInputs<'_>,
+    validate_state: impl FnMut(&BlockState) -> Result<()>,
+) -> Result<GeneratedPostprocessing> {
+    begin_saved_postprocessing_inner(provider, input, None, validate_state)
+}
+
+/// Prepare an isolated pass using source-bound live block edits. This does not
+/// bind live tick queues, block entities, POIs, lighting or the level clock.
+/// The captured terrain must be rechecked before any result is used.
+pub fn begin_saved_postprocessing_with_live_terrain(
+    provider: &mut impl ResourceProvider,
+    input: SavedPostprocessingInputs<'_>,
+    terrain: &GenerationTerrainStage,
+    validate_state: impl FnMut(&BlockState) -> Result<()>,
+) -> Result<GeneratedPostprocessing> {
+    begin_saved_postprocessing_inner(provider, input, Some(terrain), validate_state)
+}
+
+fn begin_saved_postprocessing_inner(
+    provider: &mut impl ResourceProvider,
+    input: SavedPostprocessingInputs<'_>,
+    live_terrain: Option<&GenerationTerrainStage>,
     mut validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<GeneratedPostprocessing> {
     ensure!(
@@ -352,11 +402,9 @@ pub fn begin_saved_postprocessing(
             }
         }
     }
-    let world = Arc::new(
-        input
-            .area
-            .materialize_with_defaults(input.dimension, input.defaults)?,
-    );
+    let mut world = input
+        .area
+        .materialize_with_defaults(input.dimension, input.defaults)?;
     let mut checked_states = BTreeSet::new();
     for chunk in world.chunks.values() {
         for section in chunk.sections.values() {
@@ -369,6 +417,11 @@ pub fn begin_saved_postprocessing(
             }
         }
     }
+    if let Some(terrain) = live_terrain {
+        world = terrain.saved_postprocessing_world(&world, input.bounds, &mut validate_state)?;
+    }
+    let world = Arc::new(world);
+    let tags = CapturedPostprocessingTags::load(provider, input.block_ids)?;
 
     let mut tasks = BTreeMap::new();
     let mut containers = BTreeMap::new();
@@ -448,7 +501,17 @@ pub fn begin_saved_postprocessing(
                 fluids: ChunkTicks::from_saved(pos, fluid_ticks)?,
             },
         );
-        heightmaps.insert(pos, saved_heightmaps(&source.document, input.bounds)?);
+        let draft = if let Some(terrain) = live_terrain {
+            terrain.saved_edited_chunk_draft(pos, source, |state| {
+                heightmap_block_flags(state, input.defaults, &tags.heightmaps, &mut validate_state)
+            })?
+        } else {
+            None
+        };
+        let document = draft
+            .as_ref()
+            .map_or(source.document.as_ref(), |draft| draft.document());
+        heightmaps.insert(pos, saved_heightmaps(document, input.bounds)?);
     }
     let ticks = RegionTicks::new_ordered(
         containers,
@@ -456,7 +519,6 @@ pub fn begin_saved_postprocessing(
         input.next_sub_tick,
         input.registration,
     )?;
-    let tags = CapturedPostprocessingTags::load(provider, input.block_ids)?;
     let mut stage = GeneratedPostprocessing::new(
         world,
         input.bounds.min_y,
@@ -470,6 +532,39 @@ pub fn begin_saved_postprocessing(
     stage.set_block_entities(block_entities)?;
     tags.apply(&mut stage);
     Ok(stage)
+}
+
+/// Classify rebuilt maps using the same captured pack stack as the callbacks.
+/// The caller's registry validator must reject unknown or noncanonical states.
+fn heightmap_block_flags(
+    saved: &native_persistence::palette::BlockState,
+    defaults: &BTreeMap<String, BTreeMap<String, String>>,
+    tags: &native_resources::heightmap_tags::HeightmapTags,
+    validate_state: &mut impl FnMut(&BlockState) -> Result<()>,
+) -> Result<native_persistence::heightmap::BlockHeightFlags> {
+    let name = String::from_utf16(&saved.name.0).context("invalid block state name")?;
+    let mut properties = defaults.get(&name).cloned().unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    for (key, value) in &saved.properties {
+        let key = String::from_utf16(&key.0).context("invalid block property name")?;
+        let value = String::from_utf16(&value.0).context("invalid block property value")?;
+        ensure!(seen.insert(key.clone()), "duplicate block property");
+        properties.insert(key, value);
+    }
+    let state = BlockState { name, properties };
+    validate_state(&state)?;
+    let motion = tags.for_block(&state.name)?;
+    Ok(native_persistence::heightmap::BlockHeightFlags {
+        is_air: matches!(
+            state.name.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        ),
+        blocks_motion: motion.blocks_motion,
+        blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+        has_fluid: native_world::fluid::FluidState::from_block(&state)
+            .map_err(anyhow::Error::msg)?
+            .is_some(),
+    })
 }
 
 fn unique_field<'a>(value: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {

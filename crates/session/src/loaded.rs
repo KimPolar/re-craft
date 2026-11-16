@@ -435,9 +435,130 @@ impl GenerationTerrainStage {
         Ok(GenerationTerrainOverlay { world })
     }
 
+    /// Apply the captured block edits to a freshly decoded saved world. Unlike
+    /// the generation-only overlay, retain its saved tick and block-entity
+    /// inputs so an isolated postprocessing pass can inspect them. Callers
+    /// must separately capture live ticks, entities, lighting, POIs and clocks
+    /// before any result can be attached to the running session.
+    pub(crate) fn saved_postprocessing_world(
+        &self,
+        source: &World,
+        bounds: BuildBounds,
+        mut validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+    ) -> anyhow::Result<World> {
+        use anyhow::{Context, ensure};
+
+        ensure!(
+            bounds == self.bounds,
+            "postprocessing dimension bounds differ"
+        );
+        ensure!(
+            source.dimension == self.saved_world.dimension
+                && source.block_edits().next().is_none()
+                && source.live_block_entities.is_empty(),
+            "postprocessing terrain is not an untouched saved world"
+        );
+        let positions: Vec<_> = source.chunks.keys().copied().collect();
+        ensure!(!positions.is_empty(), "no saved postprocessing terrain");
+        let mut result = source.clone();
+        for position in positions {
+            let captured = self
+                .chunks
+                .get(&position)
+                .context("postprocessing chunk is outside the staged terrain")?;
+            let saved = self
+                .saved_world
+                .chunks
+                .get(&position)
+                .context("staged saved terrain is missing")?;
+            let original = source
+                .chunks
+                .get(&position)
+                .context("postprocessing source chunk is missing")?;
+            let fingerprint = source
+                .saved_chunk_source(position)
+                .context("postprocessing source fingerprint is missing")?;
+            ensure!(
+                self.saved_world.saved_chunk_source(position) == Some(fingerprint)
+                    && captured
+                        .saved_source
+                        .is_none_or(|expected| expected == fingerprint),
+                "postprocessing saved source differs at {position:?}"
+            );
+            // A source fingerprint is metadata supplied by the caller. Check
+            // the decoded blocks and biomes too, independently of registry IDs.
+            validate_staged_terrain_chunk(
+                source,
+                original,
+                &self.saved_world,
+                saved,
+                &BTreeMap::new(),
+            )?;
+            for (&(x, y, z), edit) in &captured.edits {
+                ensure!(
+                    (bounds.min_y..bounds.max_y).contains(&y),
+                    "staged block edit is outside the dimension"
+                );
+                let old = self
+                    .live_world
+                    .state(edit.original.context("edited source block is unknown")?)
+                    .context("edited source state is unknown")?;
+                ensure!(
+                    result.block(x, y, z) == Some(old),
+                    "postprocessing block source changed at {x},{y},{z}"
+                );
+                let replacement = self
+                    .live_world
+                    .state(edit.current)
+                    .context("edited block state is unknown")?
+                    .clone();
+                validate_state(&replacement)?;
+                let id = result.intern_state(replacement);
+                result
+                    .set_block_id(x, y, z, id)
+                    .map_err(|error| anyhow::anyhow!("cannot stage block edit: {error:?}"))?;
+            }
+            // Saved light may no longer match the live blocks. A separately
+            // captured light-engine snapshot is required for light queries.
+            let chunk = Arc::make_mut(result.chunks.get_mut(&position).unwrap());
+            chunk.block_light_correct = false;
+            for section in chunk.sections.values_mut() {
+                if section.block_light.is_some() || section.sky_light.is_some() {
+                    let section = Arc::make_mut(section);
+                    section.block_light = None;
+                    section.sky_light = None;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Rebuild heightmaps for a captured FULL chunk with live block edits.
     /// Stale original maps and unsupported block states are rejected.
     pub fn saved_heightmaps_after_edits(
+        &self,
+        position: ChunkPos,
+        source: &native_persistence::world::LoadedChunk,
+        classify: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<native_persistence::heightmap::BlockHeightFlags>,
+    ) -> anyhow::Result<native_persistence::heightmap::SavedGenerationHeightmaps> {
+        let bounds = native_persistence::heightmap::HeightBounds {
+            min_y: self.bounds.min_y,
+            max_y: self.bounds.max_y,
+        };
+        let draft = self.saved_edited_chunk_draft(position, source, classify)?;
+        native_persistence::heightmap::SavedGenerationHeightmaps::read(
+            draft
+                .as_ref()
+                .map_or(source.document.as_ref(), |draft| draft.document()),
+            bounds,
+        )
+    }
+
+    /// Construct the original FULL chunk plus its captured live block edits.
+    /// This remains an incomplete draft and cannot authorize a world save.
+    pub(crate) fn saved_edited_chunk_draft(
         &self,
         position: ChunkPos,
         source: &native_persistence::world::LoadedChunk,
@@ -445,11 +566,11 @@ impl GenerationTerrainStage {
             &native_persistence::palette::BlockState,
         )
             -> anyhow::Result<native_persistence::heightmap::BlockHeightFlags>,
-    ) -> anyhow::Result<native_persistence::heightmap::SavedGenerationHeightmaps> {
+    ) -> anyhow::Result<Option<native_persistence::edit::ChunkDraft>> {
         use anyhow::{Context, ensure};
         use native_persistence::{
             edit::{BlockChange, draft_chunk_blocks},
-            heightmap::{HeightBounds, SavedGenerationHeightmaps},
+            heightmap::HeightBounds,
             palette,
         };
 
@@ -474,7 +595,7 @@ impl GenerationTerrainStage {
             max_y: self.bounds.max_y,
         };
         if captured.edits.is_empty() {
-            return SavedGenerationHeightmaps::read(&source.document, bounds);
+            return Ok(None);
         }
         ensure!(
             source
@@ -528,7 +649,7 @@ impl GenerationTerrainStage {
         }
         let mut draft = draft_chunk_blocks(&source.document, source.position, &changes)?;
         draft.rebuild_heightmaps(bounds, &mut classify)?;
-        SavedGenerationHeightmaps::read(draft.document(), bounds)
+        Ok(Some(draft))
     }
 }
 
@@ -19132,6 +19253,16 @@ impl LoadedSession {
 
     fn set(&mut self, relative: IVec3, id: BlockStateId) -> bool {
         self.set_with_notify(relative, id, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_block_for_postprocessing_test(
+        &mut self,
+        position: IVec3,
+        state: BlockState,
+    ) -> bool {
+        let id = self.intern_block(state);
+        self.set_with_notify(position, id, false)
     }
 
     fn set_with_notify(&mut self, relative: IVec3, id: BlockStateId, notify: bool) -> bool {

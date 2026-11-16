@@ -1774,6 +1774,7 @@ pub struct LoadedSession {
     active_random_tick_sections: Vec<(ChunkPos, i8, RandomTickCounts)>,
     random_tick_chunk_order: Option<Arc<[ChunkPos]>>,
     player_simulation: Option<PlayerSimulationState>,
+    entity_ticking_chunks: Option<Arc<BTreeSet<ChunkPos>>>,
     simulation_dependencies: Arc<BTreeSet<ChunkPos>>,
     gameplay_sky_level: Option<Arc<native_resources::sky_light::SkyLevel>>,
     gameplay_sky_darken: Option<u8>,
@@ -3622,6 +3623,7 @@ impl LoadedSession {
             view_distance,
         });
         self.simulation_dependencies = Arc::new(dependencies);
+        self.refresh_entity_ticking_chunks();
         self.random_tick_revision = None;
         Ok(())
     }
@@ -3693,6 +3695,7 @@ impl LoadedSession {
         if self.simulation_dependencies.as_ref() != &dependencies {
             self.simulation_dependencies = Arc::new(dependencies);
         }
+        self.refresh_entity_ticking_chunks();
         self.random_tick_revision = None;
     }
 
@@ -3741,8 +3744,25 @@ impl LoadedSession {
             }
             if changed {
                 self.random_tick_revision = None;
+                self.refresh_entity_ticking_chunks();
             }
         }
+    }
+
+    /// Keep one shared membership set for entity systems; loaded chunks can
+    /// remain visible even when their simulation ticket no longer ticks them.
+    fn refresh_entity_ticking_chunks(&mut self) {
+        let Some(state) = &self.player_simulation else {
+            return;
+        };
+        let chunks: BTreeSet<_> = state.player.tracker().entity_ticking_order().collect();
+        if self.entity_ticking_chunks.as_deref() == Some(&chunks) {
+            return;
+        }
+        let chunks = Arc::new(chunks);
+        self.dropped_items.set_ticking_chunks(Arc::clone(&chunks));
+        self.experience_orbs.set_ticking_chunks(Arc::clone(&chunks));
+        self.entity_ticking_chunks = Some(chunks);
     }
 
     /// Install the Java simulation order for chunks whose ticking futures the
@@ -9682,6 +9702,7 @@ impl LoadedSession {
             active_random_tick_sections: Vec::new(),
             random_tick_chunk_order: None,
             player_simulation: None,
+            entity_ticking_chunks: None,
             simulation_dependencies: Arc::new(BTreeSet::new()),
             gameplay_sky_level: None,
             gameplay_sky_darken: None,
@@ -22403,10 +22424,18 @@ impl LoadedSession {
         let before = self.falling_sand.len();
         let removed_before = self.removed_falling_sand.len();
         let mut remaining = Vec::new();
+        let ticking_chunks = self.entity_ticking_chunks.clone();
         // Landing can change the world during this loop. Reuse area checks
         // only until the next block change, and always recheck start overlap.
         let mut path_cache = ItemPathRegionCache::default();
         for mut entity in std::mem::take(&mut self.falling_sand) {
+            if ticking_chunks.as_ref().is_some_and(|chunks| {
+                !crate::items::ItemEntities::active_in(chunks, entity.motion.position)
+            }) {
+                entity.previous = entity.motion.position;
+                remaining.push(entity);
+                continue;
+            }
             let mut impact_distance = None;
             entity.previous = entity.motion.position;
             let relative = entity.motion.position - self.origin.as_dvec3();

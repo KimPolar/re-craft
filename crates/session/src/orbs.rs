@@ -163,6 +163,7 @@ pub(crate) struct Orbs {
     next_entity_id: i32,
     next_section_sequence: u64,
     active_chunks: Option<BTreeSet<native_world::loaded::ChunkPos>>,
+    ticking_chunks: Option<Arc<BTreeSet<native_world::loaded::ChunkPos>>>,
     damage_tags: Option<Arc<OxygenEnchantments>>,
     uncoordinated_lifecycle: bool,
     saved_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
@@ -188,6 +189,7 @@ impl Default for Orbs {
             next_entity_id: 1,
             next_section_sequence: 0,
             active_chunks: None,
+            ticking_chunks: None,
             damage_tags: None,
             uncoordinated_lifecycle: false,
             saved_pickups: BTreeMap::new(),
@@ -354,6 +356,14 @@ impl Orbs {
         }
         self.active_chunks = Some(chunks);
         self.update_snapshot();
+    }
+
+    /// A loaded orb can remain visible while simulation tickets pause its tick.
+    pub(crate) fn set_ticking_chunks(
+        &mut self,
+        chunks: Arc<BTreeSet<native_world::loaded::ChunkPos>>,
+    ) {
+        self.ticking_chunks = Some(chunks);
     }
 
     pub fn spawn_saved(&mut self, saved: crate::saved_orb::SavedOrb) {
@@ -918,6 +928,7 @@ impl Orbs {
         };
         let can_pickup = alive && mode != GameMode::Spectator;
         let active_chunks = &self.active_chunks;
+        let ticking_chunks = &self.ticking_chunks;
         let damage_tags = self.damage_tags.as_deref();
         let mut removed = vec![false; self.entities.len()];
         let removals_before = self.removed_saved.len() + self.removed_created.len();
@@ -928,6 +939,12 @@ impl Orbs {
                 continue;
             }
             let entity = &mut self.entities[index];
+            if ticking_chunks.as_ref().is_some_and(|chunks| {
+                !crate::items::ItemEntities::active_in(chunks, entity.visual.position)
+            }) {
+                entity.visual.previous_position = entity.visual.position;
+                continue;
+            }
             let relative = entity.visual.position - origin.as_dvec3();
             let bounds = orb_bounds(relative);
             entity.visual.previous_position = entity.visual.position;

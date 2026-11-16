@@ -9,6 +9,202 @@ use native_persistence::{
 use std::io::Write;
 
 #[test]
+fn entity_ticks_follow_simulation_distance_without_unloading_visible_entities() {
+    use crate::simulation_player::PlayerSimulation;
+    use crate::simulation_tickets::SimulationTickets;
+
+    for direction in [-1, 1] {
+        let template = super::tests::session();
+        let home = template.player_chunk().unwrap();
+        let near = ChunkPos {
+            x: home.x + direction * 5,
+            z: home.z,
+        };
+        let far = ChunkPos {
+            x: home.x + direction * 6,
+            z: home.z,
+        };
+        let mut world = template.world.as_ref().clone();
+        for position in [near, far] {
+            let mut chunk = world.chunks[&home].as_ref().clone();
+            chunk.position = position;
+            world.chunks.insert(position, Arc::new(chunk));
+        }
+        let mut session =
+            LoadedSession::new(world, template.origin, template.bounds, template.player).unwrap();
+        session.set_game_mode(GameMode::Spectator);
+        session.set_random_tick_speed(0);
+        let mut player = PlayerSimulation::new(SimulationTickets::default(), 5);
+        player.observe_player(session.player_section().unwrap(), true, true);
+        player.run_updates();
+        session.player_simulation = Some(PlayerSimulationState {
+            player,
+            spectators_generate_chunks: true,
+            view_distance: 12,
+        });
+        session.refresh_entity_ticking_chunks();
+        for chunk in [near, far] {
+            let at = |z: i32| {
+                DVec3::new(
+                    f64::from(chunk.x * 16 + 8),
+                    4.0,
+                    f64::from(chunk.z * 16 + z),
+                )
+            };
+            session
+                .dropped_items
+                .spawn_saved(crate::saved_item::SavedItemState {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position: at(4),
+                    velocity: DVec3::new(0.1, 0.0, 0.0),
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    pickup_delay: i16::MAX,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                    owner: None,
+                    thrower: None,
+                    stack: ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![]))
+                        .unwrap(),
+                });
+            session
+                .experience_orbs
+                .spawn_saved(crate::saved_orb::SavedOrb {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position: at(8),
+                    velocity: DVec3::new(0.1, 0.0, 0.0),
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    value: 1,
+                    count: 1,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                });
+            let motion = crate::falling_block::AirborneMotion {
+                position: at(12),
+                velocity: DVec3::new(0.1, 0.0, 0.0),
+                age: 0,
+                no_gravity: true,
+            };
+            session.falling_sand.push(FallingSand {
+                previous: motion.position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
+                impact_distance_verified: true,
+                stalactite: None,
+                motion,
+                kind: FallingKind::Sand,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: None,
+                created: None,
+            });
+        }
+        let before_items = session.dropped_items.snapshot();
+        let before_orbs = session.experience_orbs.snapshot();
+        let before_falling: Vec<_> = session
+            .falling_sand
+            .iter()
+            .map(|e| e.motion.position)
+            .collect();
+        session.update(TICK);
+        let items = session.dropped_items.snapshot();
+        let orbs = session.experience_orbs.snapshot();
+        assert_eq!(items.len(), 2);
+        assert_eq!(orbs.len(), 2);
+        assert_eq!([items[0].age, items[1].age], [1, 0]);
+        assert_eq!([orbs[0].age, orbs[1].age], [1, 0]);
+        assert_eq!(
+            [
+                session.falling_sand[0].motion.age,
+                session.falling_sand[1].motion.age
+            ],
+            [1, 0]
+        );
+        assert_ne!(items[0].position, before_items[0].position);
+        assert_eq!(items[1].position, before_items[1].position);
+        assert_ne!(orbs[0].position, before_orbs[0].position);
+        assert_eq!(orbs[1].position, before_orbs[1].position);
+        assert_ne!(session.falling_sand[0].motion.position, before_falling[0]);
+        assert_eq!(session.falling_sand[1].motion.position, before_falling[1]);
+
+        let item_ids: Vec<_> = items.iter().map(|item| item.entity_id).collect();
+        session.set_simulation_distance(6);
+        session.update(TICK);
+        let items = session.dropped_items.snapshot();
+        let orbs = session.experience_orbs.snapshot();
+        assert_eq!([items[0].age, items[1].age], [2, 1]);
+        assert_eq!([orbs[0].age, orbs[1].age], [2, 1]);
+        assert_eq!(
+            [
+                session.falling_sand[0].motion.age,
+                session.falling_sand[1].motion.age
+            ],
+            [2, 1]
+        );
+        assert_eq!(
+            items.iter().map(|item| item.entity_id).collect::<Vec<_>>(),
+            item_ids
+        );
+
+        session.set_simulation_distance(4);
+        let items_before_pause = session.dropped_items.snapshot();
+        let orbs_before_pause = session.experience_orbs.snapshot();
+        let falling_before_pause: Vec<_> = session
+            .falling_sand
+            .iter()
+            .map(|e| e.motion.position)
+            .collect();
+        for _ in 0..5 {
+            session.update(Duration::from_millis(10));
+        }
+        let items = session.dropped_items.snapshot();
+        let orbs = session.experience_orbs.snapshot();
+        for index in 0..2 {
+            assert_eq!(items[index].age, items_before_pause[index].age);
+            assert_eq!(items[index].position, items_before_pause[index].position);
+            assert_eq!(items[index].previous_position, items[index].position);
+            assert_eq!(orbs[index].age, orbs_before_pause[index].age);
+            assert_eq!(orbs[index].position, orbs_before_pause[index].position);
+            assert_eq!(orbs[index].previous_position, orbs[index].position);
+            assert_eq!(
+                session.falling_sand[index].motion.position,
+                falling_before_pause[index]
+            );
+            assert_eq!(
+                session.falling_sand[index].previous,
+                falling_before_pause[index]
+            );
+        }
+        // Moving the player changes the ticket range without unloading these
+        // visible entities or resetting their tick counts and identities.
+        session.motion.position.x += f64::from(direction * 32);
+        session.update_player_simulation();
+        session.update(TICK);
+        let items = session.dropped_items.snapshot();
+        let orbs = session.experience_orbs.snapshot();
+        for index in 0..2 {
+            assert_eq!(items[index].age, items_before_pause[index].age + 1);
+            assert_eq!(orbs[index].age, orbs_before_pause[index].age + 1);
+            assert_ne!(
+                session.falling_sand[index].motion.position,
+                falling_before_pause[index]
+            );
+            assert_eq!(items[index].entity_id, item_ids[index]);
+        }
+    }
+}
+
+#[test]
 fn locked_saved_tickets_drive_live_player_dependencies_and_reject_stale_capture() {
     let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/session-save-test-temp");

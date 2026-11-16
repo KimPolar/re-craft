@@ -846,6 +846,7 @@ pub(crate) struct ItemEntities {
     next_section_sequence: u64,
     player_uuid: Option<[i32; 4]>,
     active_chunks: Option<BTreeSet<native_world::loaded::ChunkPos>>,
+    ticking_chunks: Option<Arc<BTreeSet<native_world::loaded::ChunkPos>>>,
     damage_rules: Option<ItemDamageRules>,
 }
 
@@ -875,6 +876,7 @@ impl Default for ItemEntities {
             next_section_sequence: 0,
             player_uuid: None,
             active_chunks: None,
+            ticking_chunks: None,
             damage_rules: None,
         }
     }
@@ -1718,6 +1720,14 @@ impl ItemEntities {
     }
     pub fn set_player_uuid(&mut self, uuid: Option<[i32; 4]>) {
         self.player_uuid = uuid;
+    }
+
+    /// Simulation tickets gate entity ticks independently of chunk visibility.
+    pub(crate) fn set_ticking_chunks(
+        &mut self,
+        chunks: Arc<BTreeSet<native_world::loaded::ChunkPos>>,
+    ) {
+        self.ticking_chunks = Some(chunks);
     }
 
     pub fn set_active_chunks(&mut self, chunks: BTreeSet<native_world::loaded::ChunkPos>) {
@@ -2701,6 +2711,7 @@ impl ItemEntities {
         };
         let player_uuid = self.player_uuid;
         let active_chunks = &self.active_chunks;
+        let ticking_chunks = &self.ticking_chunks;
         let damage_rules = &self.damage_rules;
         let mut removed = vec![false; self.entities.len()];
         let mut created_removal_causes = vec![None; self.entities.len()];
@@ -2716,6 +2727,14 @@ impl ItemEntities {
             }
             let entity = &mut self.entities[index];
             if !Self::active(active_chunks, entity.item.position) {
+                continue;
+            }
+            if ticking_chunks
+                .as_ref()
+                .is_some_and(|chunks| !Self::active_in(chunks, entity.item.position))
+            {
+                // Keep the visible item still while its entity tick is paused.
+                entity.item.previous_position = entity.item.position;
                 continue;
             }
             if entity._damage_state.invulnerable_time > 0 {

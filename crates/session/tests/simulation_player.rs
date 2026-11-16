@@ -314,6 +314,58 @@ fn spawning_collection_and_shuffle_match_java_26_3() {
 #[cfg(windows)]
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn entity_tick_ranges_and_chunk_boundaries_match_java_26_3() {
+    let stdout = run_java_oracle(
+        "SimulationEntityTicksOracle",
+        include_str!("java/SimulationEntityTicksOracle.java"),
+    );
+    let xs: [f64; 11] = [
+        -96.001, -96.0, -95.999, -16.001, -16.0, -0.0001, 0.0, 15.999, 16.0, 80.0, 96.0,
+    ];
+    let zs: [f64; 7] = [-96.0, -16.001, -16.0, -0.0001, 0.0, 15.999, 16.0];
+    let mut player = PlayerSimulation::new(SimulationTickets::default(), 5);
+    player.observe_player(PlayerSection { x: 0, y: 4, z: 0 }, false, true);
+    let mut expected = Vec::new();
+    for round in 0..4 {
+        match round {
+            1 => player.set_distance(6),
+            2 => player.observe_player(PlayerSection { x: -1, y: 4, z: 1 }, false, true),
+            3 => {
+                player.remove_player();
+                player.add_ticket(ChunkPos { x: -6, z: 0 }, TicketKind::Forced, 31);
+            }
+            _ => {}
+        }
+        player.run_updates();
+        for kind in 0..3 {
+            for (x_index, x) in xs.iter().enumerate() {
+                for (z_index, z) in zs.iter().enumerate() {
+                    let chunk = ChunkPos {
+                        x: (x / 16.0).floor() as i32,
+                        z: (z / 16.0).floor() as i32,
+                    };
+                    expected.push(format!(
+                        "ENTITY {round} {kind} {x_index} {z_index} {} {} {}",
+                        chunk.x,
+                        chunk.z,
+                        player.tracker().in_entity_ticking_range(chunk)
+                    ));
+                }
+            }
+        }
+    }
+    let actual: Vec<_> = stdout
+        .lines()
+        .map(|line| line.split_once("[STDOUT]: ").map_or(line, |(_, line)| line))
+        .filter(|line| line.starts_with("ENTITY "))
+        .collect();
+    assert_eq!(actual.len(), 4 * 3 * xs.len() * zs.len());
+    assert_eq!(actual, expected);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
 fn scheduled_tick_simulation_filter_matches_java_26_3() {
     use native_session::worldgen::chunk_ticks::{ChunkTicks, IndexedRegionQueue, SavedTick};
 

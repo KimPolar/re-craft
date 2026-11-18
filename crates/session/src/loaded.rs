@@ -3796,14 +3796,33 @@ impl LoadedSession {
     }
 
     /// ServerLevel.shouldTickBlocksAt uses the simulation ticket level, not
-    /// the render window or the loading ticket level. A saved chunk whose
-    /// postprocessing has not been handled cannot tick yet either.
+    /// the render window or the loading ticket level. Saved chunks also need
+    /// their own preparation and access to the FULL neighbors on which the
+    /// Java holder's ticking future depends.
     fn simulation_allows_block_ticks(&self, pos: ChunkPos) -> bool {
         self.saved_chunk_preparation_verified(pos)
             && self
                 .player_simulation
                 .as_ref()
                 .is_none_or(|state| state.player.tracker().in_block_ticking_range(pos))
+            && self.ticking_neighbors_resident(pos)
+    }
+
+    /// This is only a necessary condition for saved-world ticking. Resident
+    /// FULL chunks do not prove that the holder's ticking future or its queued
+    /// postprocessing callback has completed.
+    fn ticking_neighbors_resident(&self, pos: ChunkPos) -> bool {
+        if self.saved_world_session.is_none() || self.player_simulation.is_none() {
+            return true;
+        }
+        crate::ticking_preparation::ticking_dependencies(pos)
+            .into_iter()
+            .all(|neighbor| {
+                self.world
+                    .chunks
+                    .get(&neighbor)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            })
     }
 
     /// This only excludes known-unprepared or uncaptured saved chunks. It is
@@ -17740,6 +17759,7 @@ impl LoadedSession {
         for (&chunk_pos, chunk) in &self.world.chunks {
             if chunk.status.as_deref() != Some("minecraft:full")
                 || !self.saved_chunk_preparation_verified(chunk_pos)
+                || !self.ticking_neighbors_resident(chunk_pos)
             {
                 continue;
             }
@@ -34595,6 +34615,260 @@ pub(crate) mod tests {
             .bind_saved_world_session(reader.session_guard().unwrap())
             .unwrap();
         (directory, reader, session)
+    }
+
+    fn incomplete_saved_ticking_session() -> (
+        tempfile::TempDir,
+        native_persistence::world::WorldReader,
+        LoadedSession,
+        ChunkPos,
+        ChunkPos,
+        ChunkPos,
+    ) {
+        let (directory, reader, mut session) = locked_session_for_save();
+        let home = session.player_chunk().unwrap();
+        let east = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let missing = ChunkPos {
+            x: home.x - 1,
+            z: home.z - 1,
+        };
+        let lit = session.intern_block(state("minecraft:redstone_ore", &[("lit", "true")]));
+        let template = {
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&home).unwrap());
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+                .blocks
+                .as_mut()
+                .unwrap()[1 + 16 + 2 * 256] = lit;
+            chunk.clone()
+        };
+        {
+            let world = Arc::make_mut(&mut session.world);
+            for dx in -1..=2 {
+                for dz in -1..=1 {
+                    let pos = ChunkPos {
+                        x: home.x + dx,
+                        z: home.z + dz,
+                    };
+                    if pos == home || pos == missing {
+                        continue;
+                    }
+                    let mut chunk = template.clone();
+                    chunk.position = pos;
+                    world.chunks.insert(pos, Arc::new(chunk));
+                }
+            }
+            for (index, pos) in [home, east].into_iter().enumerate() {
+                let fingerprint = [index as u8 + 1; 32];
+                world.remember_saved_chunk_source(pos, fingerprint);
+                session.checked_chunk_preparation.insert(pos, fingerprint);
+            }
+        }
+        // The locked fixture was created before its synthetic prepared source
+        // existed, so binding it registered an empty, unactivated container.
+        // This fixture instead represents chunks whose preparation has finished.
+        let pending = session.pending_saved_tick_activation.remove(&home).unwrap();
+        assert!(pending.blocks.is_empty() && pending.fluids.is_empty());
+        let mut player = crate::simulation_player::PlayerSimulation::new(
+            crate::simulation_tickets::SimulationTickets::default(),
+            5,
+        );
+        player.observe_player(session.player_section().unwrap(), false, true);
+        player.run_updates();
+        session.player_simulation = Some(PlayerSimulationState {
+            player,
+            spectators_generate_chunks: true,
+            view_distance: 12,
+        });
+        (directory, reader, session, home, east, missing)
+    }
+
+    fn stream_full_ticking_neighbor(session: &mut LoadedSession, home: ChunkPos, pos: ChunkPos) {
+        let mut source = (*session.world).clone();
+        let mut chunk = source.chunks[&home].as_ref().clone();
+        chunk.position = pos;
+        source.chunks.insert(pos, Arc::new(chunk));
+        session.queue_loaded_chunk(pos, source);
+        session.apply_streaming();
+        assert_eq!(
+            session.world.chunks[&pos].status.as_deref(),
+            Some("minecraft:full")
+        );
+    }
+
+    #[test]
+    fn saved_ticks_wait_for_resident_full_neighbors_without_blocking_other_chunks() {
+        let (_directory, _reader, mut session, home, east, missing) =
+            incomplete_saved_ticking_session();
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        session.schedule_sand(IVec3::new(2, 2, 2), FallingKind::Sand);
+        session.schedule_sand(IVec3::new(18, 2, 2), FallingKind::Sand);
+        session.schedule_fluid(IVec3::new(3, 2, 3), water, 0);
+        session.schedule_fluid(IVec3::new(19, 2, 3), water, 0);
+        let (&sand_order, &sand_key) = session.sand_ticks.first_key_value().unwrap();
+        let (&fluid_order, &fluid) = session.fluid_ticks.first_key_value().unwrap();
+        session.tick = 2;
+
+        session.refresh_random_tick_sections();
+        assert!(
+            !session
+                .active_random_tick_sections
+                .iter()
+                .any(|v| v.0 == home)
+        );
+        assert!(
+            session
+                .active_random_tick_sections
+                .iter()
+                .any(|v| v.0 == east)
+        );
+        session.advance_block_ticks();
+        let ready = session.collect_due_fluid_ticks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].1.key.x, session.origin.x + 19);
+        assert_eq!(session.sand_ticks.len(), 1);
+        assert_eq!(session.sand_ticks.get(&sand_order), Some(&sand_key));
+        assert!(session.sand_pending.contains(&sand_key));
+        assert_eq!(
+            session.fluid_ticks.get(&fluid_order).unwrap().key,
+            fluid.key
+        );
+        assert!(session.fluid_pending.contains(&fluid.key));
+
+        let mut partial = session.world.chunks[&home].as_ref().clone();
+        partial.position = missing;
+        partial.status = Some("minecraft:noise".into());
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(missing, Arc::new(partial));
+        session.revision += 1;
+        session.refresh_random_tick_sections();
+        assert!(
+            !session
+                .active_random_tick_sections
+                .iter()
+                .any(|v| v.0 == home)
+        );
+        session.advance_block_ticks();
+        assert!(session.collect_due_fluid_ticks().is_empty());
+        assert_eq!(session.sand_ticks.get(&sand_order), Some(&sand_key));
+        assert_eq!(
+            session.fluid_ticks.get(&fluid_order).unwrap().key,
+            fluid.key
+        );
+
+        Arc::make_mut(&mut session.world).chunks.remove(&missing);
+        stream_full_ticking_neighbor(&mut session, home, missing);
+        session.refresh_random_tick_sections();
+        assert!(
+            session
+                .active_random_tick_sections
+                .iter()
+                .any(|v| v.0 == home)
+        );
+        session.advance_block_ticks();
+        assert!(session.sand_ticks.is_empty());
+        assert!(!session.sand_pending.contains(&sand_key));
+        let ready = session.collect_due_fluid_ticks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, fluid_order);
+        assert_eq!(ready[0].1.key, fluid.key);
+        assert!(!session.fluid_pending.contains(&fluid.key));
+        assert!(session.collect_due_fluid_ticks().is_empty());
+    }
+
+    #[test]
+    fn indexed_saved_ticks_preserve_block_and_fluid_queues_until_neighbors_arrive() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let (_directory, _reader, mut session, home, east, missing) =
+            incomplete_saved_ticking_session();
+        let registration: Vec<_> = session.world.chunks.keys().copied().collect();
+        let chunks = registration
+            .iter()
+            .copied()
+            .map(|pos| {
+                let relative = if pos == home {
+                    Some(IVec3::new(2, 2, 2))
+                } else if pos == east {
+                    Some(IVec3::new(18, 2, 2))
+                } else {
+                    None
+                };
+                let make = |kind: &str| {
+                    relative
+                        .map(|relative| SavedTick {
+                            kind: kind.into(),
+                            position: (session.origin + relative).to_array(),
+                            delay: 0,
+                            priority: if pos == home { -1 } else { 0 },
+                        })
+                        .into_iter()
+                        .collect()
+                };
+                (
+                    pos,
+                    ConvertedChunkTicks {
+                        blocks: ChunkTicks::from_saved(pos, make("minecraft:sand")).unwrap(),
+                        fluids: ChunkTicks::from_saved(pos, make("minecraft:water")).unwrap(),
+                    },
+                )
+            })
+            .collect();
+        let region = RegionTicks::new_ordered(chunks, 42, 0, &registration).unwrap();
+        let snapshot = region.activated_snapshot();
+        session.install_generated_ticks(&snapshot).unwrap();
+        session
+            .install_generated_block_order(
+                &snapshot,
+                region
+                    .captured_indexed_queue(TickRegistry::Block, &registration)
+                    .unwrap(),
+            )
+            .unwrap();
+        session
+            .install_generated_fluid_order(
+                &snapshot,
+                region
+                    .captured_indexed_queue(TickRegistry::Fluid, &registration)
+                    .unwrap(),
+            )
+            .unwrap();
+        let (&sand_order, &sand_key) = session.sand_ticks.first_key_value().unwrap();
+        let (&fluid_order, &fluid) = session.fluid_ticks.first_key_value().unwrap();
+        let blocks = session.collect_generated_block_ticks().unwrap();
+        let fluids = session.collect_due_fluid_ticks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1.identity().1[0], session.origin.x + 18);
+        assert_eq!(fluids.len(), 1);
+        assert_eq!(fluids[0].1.key.x, session.origin.x + 18);
+        assert_eq!(session.sand_ticks.get(&sand_order), Some(&sand_key));
+        assert_eq!(
+            session.fluid_ticks.get(&fluid_order).unwrap().key,
+            fluid.key
+        );
+
+        stream_full_ticking_neighbor(&mut session, home, missing);
+        assert!(session.simulation_allows_block_ticks(home));
+        let blocks = session.collect_generated_block_ticks().unwrap();
+        let fluids = session.collect_due_fluid_ticks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, sand_order);
+        assert_eq!(blocks[0].1.identity().1[0], session.origin.x + 2);
+        assert_eq!(fluids.len(), 1);
+        assert_eq!(fluids[0].0, fluid_order);
+        assert_eq!(fluids[0].1.key, fluid.key);
+        assert!(session.collect_generated_block_ticks().unwrap().is_empty());
+        assert!(session.collect_due_fluid_ticks().is_empty());
     }
 
     #[test]

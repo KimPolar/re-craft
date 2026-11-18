@@ -2923,6 +2923,19 @@ pub struct WorldReadStamp {
     epoch: u64,
 }
 
+/// Disk reads are temporarily unavailable while a source capture or writer
+/// owns the world I/O reservation. Callers may retry with a still-current stamp.
+#[derive(Debug)]
+pub struct WorldIoBusy;
+
+impl std::fmt::Display for WorldIoBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("world write is in progress")
+    }
+}
+
+impl std::error::Error for WorldIoBusy {}
+
 /// Keeps a writer from proceeding while a current read result is attached.
 pub struct WorldReadLease<'a> {
     _guard: MutexGuard<'a, ()>,
@@ -3072,10 +3085,9 @@ impl WorldSessionGuard {
     }
 
     pub(crate) fn ensure_reader_available(&self) -> Result<()> {
-        ensure!(
-            !self.shared.writer_active.load(Ordering::Acquire),
-            "world write is in progress"
-        );
+        if self.shared.writer_active.load(Ordering::Acquire) {
+            return Err(WorldIoBusy.into());
+        }
         Ok(())
     }
 
@@ -8923,7 +8935,7 @@ mod tests {
         let session = reader.session_guard().unwrap();
         let stamp = session.read_stamp().unwrap();
         let capture = session.acquire_capture().unwrap();
-        assert!(session.read_stamp().is_err());
+        assert!(session.read_stamp().err().unwrap().is::<WorldIoBusy>());
         assert!(stamp.is_current());
         assert!(stamp.lock_current().is_ok());
         assert!(session.acquire_write().is_err());
@@ -8951,7 +8963,7 @@ mod tests {
         acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!stamp.is_current());
         assert!(stamp.lock_current().is_err());
-        assert!(session.read_stamp().is_err());
+        assert!(session.read_stamp().err().unwrap().is::<WorldIoBusy>());
         release_tx.send(()).unwrap();
         writer.join().unwrap();
         let fresh = session.read_stamp().unwrap();

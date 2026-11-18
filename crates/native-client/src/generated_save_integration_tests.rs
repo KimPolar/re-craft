@@ -965,6 +965,182 @@ fn saved_holder_stream_waits_for_an_actual_outside_chunk() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires the generated seed -1 portal fixture and Minecraft 26.3"]
+fn saved_holder_missing_chunk_starts_real_generation_without_completing_early() -> Result<()> {
+    use crate::{
+        chunk_stream::{
+            MissingGenerationBiomeWorker, MissingGenerationPrepareWorker,
+            MissingGenerationTerrainWorker,
+        },
+        saved_full_stream::SavedFullStream,
+    };
+    use native_persistence::chunk_tickets::TicketKind;
+    use native_session::{
+        distance_updates::DistanceUpdates, loading_holders::LoadingHolders,
+        simulation_player::PlayerSimulation, simulation_tickets::SimulationTickets,
+        ticking_preparation::FullFutureResult,
+    };
+
+    let root = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+    )?;
+    let fixture = std::fs::canonicalize(
+        std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD").context("test world not set")?,
+    )?;
+    ensure!(
+        fixture != root && fixture.starts_with(&root),
+        "test world is outside the private directory"
+    );
+    let copy = tempfile::Builder::new()
+        .prefix("saved-holder-generation-")
+        .tempdir_in(&root)?;
+    let path = copy.path().join("world");
+    copy_private_world(&fixture, &path)?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let dimension = DimensionId::parse("overworld")?;
+    let reader = WorldReader::open_for_session(&path, dimension.clone())?;
+    ensure!(reader.saved_world_seed()? == Some(-1), "wrong test seed");
+    let lock = reader.session_guard().context("test world lock missing")?;
+    drop(reader);
+    let options = crate::ViewOptions {
+        dimension: None,
+        chunk: Some((20, 20)),
+        radius: 1,
+        smoke_test: false,
+        block_report: None,
+        play: true,
+        video: crate::menu_settings::VideoSettings::default(),
+    };
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock.clone()))?
+    else {
+        anyhow::bail!("generated world did not open for play")
+    };
+    let crate::PreparedPlayWorld {
+        mut session,
+        mut streamer,
+        ..
+    } = *prepared;
+    let mut player = PlayerSimulation::new(SimulationTickets::with_loading_tracker(), 2);
+    // Keep this request away from the fixture's saved, partially processed
+    // chunks so the test exercises generation without advancing gameplay.
+    let center = ChunkPos { x: 1_000, z: 1_000 };
+    player.add_ticket(center, TicketKind::Forced, 32);
+    let mut updates = DistanceUpdates::default();
+    let mut holders = LoadingHolders::new()?;
+    assert!(updates.run(&mut player, &mut holders)?);
+    assert!(!updates.run(&mut player, &mut holders)?);
+    let mut bridge = SavedFullStream::start(path, dimension, lock, &session, &holders)?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let generation = loop {
+        bridge.service(&mut holders, &mut streamer, &mut session)?;
+        if let Some(generation) = bridge.begin_missing_generation(&holders, &streamer, &session)? {
+            break generation;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "missing holder request timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let target = generation.position();
+    eprintln!("generating holder-requested missing chunk {target:?}");
+    assert_ne!(holders.full_result(target), Some(FullFutureResult::Full));
+    let mut capture = bridge
+        .start_missing_capture(generation, &holders, &streamer, &session)
+        .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let captured = loop {
+        // The event loop keeps servicing other holder requests while the
+        // generation worker temporarily reserves the world's disk reads.
+        bridge.service(&mut holders, &mut streamer, &mut session)?;
+        if let Some(captured) = capture.try_result(&bridge, &holders, &streamer, &session)? {
+            break captured;
+        }
+        ensure!(Instant::now() < deadline, "holder capture timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(captured.targets(), &[target]);
+    let generation = capture.into_generation();
+    assert!(bridge.missing_generation_is_current(&generation, &holders, &streamer, &session)?);
+    let mut prepare =
+        MissingGenerationPrepareWorker::start(captured, &streamer, &session, game.clone())
+            .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let prepared = loop {
+        if let Some(prepared) = prepare.try_result(&streamer, &session)? {
+            break prepared;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "holder generation setup timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(bridge.missing_generation_is_current(&generation, &holders, &streamer, &session)?);
+    let mut biomes = MissingGenerationBiomeWorker::start(prepared, &streamer, &session)
+        .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let biomed = loop {
+        if let Some(biomed) = biomes.try_result(&streamer, &session)? {
+            break biomed;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "holder biome generation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(bridge.missing_generation_is_current(&generation, &holders, &streamer, &session)?);
+    let biome = biomed
+        .biome_chunk(target)
+        .context("generated biome missing")?;
+    compare_private_generated_biomes_with_java(&game, target, &biome)?;
+    let mut terrain = MissingGenerationTerrainWorker::start(
+        biomed,
+        &streamer,
+        &session,
+        1,
+        std::collections::BTreeMap::new(),
+    )
+    .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let generated = loop {
+        if let Some(generated) = terrain.try_result(&streamer, &session)? {
+            break generated;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "holder terrain generation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(generated.generated(), &[target]);
+    assert!(bridge.missing_generation_is_current(&generation, &holders, &streamer, &session)?);
+    assert!(!session.has_resident_or_parked_chunk(target));
+    assert_ne!(holders.full_result(target), Some(FullFutureResult::Full));
+    crate::generation_staging::discard_async(generated);
+    assert!(bridge.end_missing_generation(generation, true)?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        bridge.service(&mut holders, &mut streamer, &mut session)?;
+        if bridge
+            .unavailable_positions()
+            .any(|position| position == target)
+        {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "missing chunk rescan timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_ne!(holders.full_result(target), Some(FullFutureResult::Full));
+    bridge.return_pending(&mut holders)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a private generated 26.3 test world"]
 fn generated_world_prepares_missing_terrain_while_saved_chunks_wait() -> Result<()> {
     use crate::chunk_stream::{

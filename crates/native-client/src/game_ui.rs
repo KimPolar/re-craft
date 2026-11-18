@@ -85,6 +85,7 @@ enum PauseButton {
     Framerate,
     Vsync,
     Fullscreen,
+    VideoBrightness,
     GuiScale,
     Inactivity,
     VideoAttackIndicator,
@@ -1576,6 +1577,7 @@ impl GameUi {
                             VideoControl::Framerate => PauseButton::Framerate,
                             VideoControl::Vsync => PauseButton::Vsync,
                             VideoControl::Fullscreen => PauseButton::Fullscreen,
+                            VideoControl::Brightness => PauseButton::VideoBrightness,
                             VideoControl::GuiScale => PauseButton::GuiScale,
                             VideoControl::Inactivity => PauseButton::Inactivity,
                             VideoControl::AttackIndicator => PauseButton::VideoAttackIndicator,
@@ -1883,6 +1885,20 @@ impl GameUi {
                 }
                 PauseAction::None
             }
+            PauseButton::VideoBrightness => {
+                if mouse {
+                    let (width, _) = self.logical_size();
+                    self.video_dirty |= self.video_ui.start_control_slider(
+                        width,
+                        self.cursor.0,
+                        VideoControl::Brightness,
+                        &mut self.video,
+                    );
+                } else {
+                    self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
+                }
+                PauseAction::None
+            }
             PauseButton::VideoDistance => {
                 if mouse {
                     let (width, _) = self.logical_size();
@@ -1986,6 +2002,7 @@ impl GameUi {
                 | PauseButton::VideoSimulationDistance
                 | PauseButton::VideoBlend
                 | PauseButton::VideoWeather
+                | PauseButton::VideoBrightness
                 | PauseButton::GlintSpeed
                 | PauseButton::FovEffectScale
                 | PauseButton::GlintStrength
@@ -2068,6 +2085,7 @@ impl GameUi {
                     Some(PauseButton::Framerate) => Some(VideoControl::Framerate),
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
                     Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
+                    Some(PauseButton::VideoBrightness) => Some(VideoControl::Brightness),
                     Some(PauseButton::GuiScale) => Some(VideoControl::GuiScale),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
@@ -2245,6 +2263,7 @@ impl GameUi {
                     {
                         buttons.push(PauseButton::Fullscreen);
                     }
+                    buttons.push(PauseButton::VideoBrightness);
                     buttons.push(PauseButton::VideoBlend);
                     buttons.push(PauseButton::VideoDistance);
                     buttons.push(PauseButton::VideoSimulationDistance);
@@ -2285,6 +2304,7 @@ impl GameUi {
                     self.pause_focus,
                     Some(
                         PauseButton::VideoBlur
+                            | PauseButton::VideoBrightness
                             | PauseButton::VideoDistance
                             | PauseButton::VideoSimulationDistance
                             | PauseButton::VideoBlend
@@ -2298,6 +2318,8 @@ impl GameUi {
                     h,
                     if self.pause_focus == Some(PauseButton::VideoBlur) {
                         VideoControl::MenuBlur
+                    } else if self.pause_focus == Some(PauseButton::VideoBrightness) {
+                        VideoControl::Brightness
                     } else if self.pause_focus == Some(PauseButton::VideoBlend) {
                         VideoControl::BiomeBlend
                     } else if self.pause_focus == Some(PauseButton::VideoWeather) {
@@ -2412,6 +2434,15 @@ impl GameUi {
                 .arrow(key == KeyCode::ArrowRight, &mut self.video);
             self.last_draw = None;
         } else if self.pause_page == PausePage::Video
+            && self.pause_focus == Some(PauseButton::VideoBrightness)
+            && self.video_ui.keyboard_adjust
+            && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
+        {
+            self.video_dirty |= self
+                .video_ui
+                .brightness_arrow(key == KeyCode::ArrowRight, &mut self.video);
+            self.last_draw = None;
+        } else if self.pause_page == PausePage::Video
             && self.pause_focus == Some(PauseButton::VideoWeather)
             && self.video_ui.keyboard_adjust
             && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
@@ -2482,6 +2513,7 @@ impl GameUi {
                     | PauseButton::MouseWheelSensitivity
                     | PauseButton::Framerate
                     | PauseButton::VideoBlur
+                    | PauseButton::VideoBrightness
                     | PauseButton::GlintSpeed
                     | PauseButton::FovEffectScale
                     | PauseButton::GlintStrength
@@ -4053,6 +4085,7 @@ impl GameUi {
                     Some(PauseButton::Framerate) => Some(VideoControl::Framerate),
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
                     Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
+                    Some(PauseButton::VideoBrightness) => Some(VideoControl::Brightness),
                     Some(PauseButton::GuiScale) => Some(VideoControl::GuiScale),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
@@ -6325,6 +6358,28 @@ mod inventory_tests {
         assert_eq!(ui.video_settings().max_fps, 250);
         ui.pause_scroll(-100.0);
         assert_eq!(ui.pause_focus, None);
+        ui.pause_key(KeyCode::Tab, false);
+        assert_eq!(ui.pause_focus, Some(PauseButton::VideoBrightness));
+        ui.pause_key(KeyCode::Enter, false);
+        ui.pause_key(KeyCode::ArrowRight, false);
+        assert_eq!(
+            ui.video_settings().brightness.value(),
+            0.5 + f64::from(1.0_f32 / 142.0)
+        );
+        let brightness = ui.video_ui.control_rect(w, VideoControl::Brightness);
+        ui.cursor_moved(
+            f64::from(brightness.x + 4) * scale,
+            f64::from(brightness.y + 5) * scale,
+        );
+        assert_eq!(ui.click(), PauseAction::None);
+        assert_eq!(ui.video_settings().brightness.value(), 0.0);
+        ui.cursor_moved(
+            f64::from(brightness.x + brightness.w - 4) * scale,
+            f64::from(brightness.y + 5) * scale,
+        );
+        assert_eq!(ui.video_settings().brightness.value(), 1.0);
+        ui.pause_release();
+        assert!(ui.video_needs_save());
         ui.pause_key(KeyCode::Tab, false);
         assert_eq!(ui.pause_focus, Some(PauseButton::VideoBlend));
         ui.pause_key(KeyCode::Enter, false);

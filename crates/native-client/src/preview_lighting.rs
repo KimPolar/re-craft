@@ -55,6 +55,15 @@ pub fn apply_night_vision(mut settings: LightmapSettings, factor: f32) -> Lightm
     settings
 }
 
+/// The user brightness setting affects visual lighting, not simulation light.
+pub fn apply_brightness(
+    mut settings: LightmapSettings,
+    brightness: crate::menu_settings::UnitInterval,
+) -> LightmapSettings {
+    settings.brightness = brightness.value() as f32;
+    settings
+}
+
 /// Java derives the flat-world flag from the overworld generator for all dimensions.
 pub fn is_flat_world(
     source: &mut impl ResourceProvider,
@@ -1666,5 +1675,24 @@ mod tests {
             overridden.lightmap.ambient_color,
             [18.0 / 255.0, 52.0 / 255.0, 86.0 / 255.0]
         );
+    }
+
+    #[test]
+    fn brightness_changes_dark_lightmap_entries() {
+        use crate::menu_settings::UnitInterval;
+        let base = LightmapSettings::default();
+        let dark = apply_brightness(base.clone(), UnitInterval::new(0.0));
+        let normal = apply_brightness(base.clone(), UnitInterval::new(0.5));
+        let bright = apply_brightness(base.clone(), UnitInterval::new(1.0));
+        let dark_cave = dark.sample(0, 0);
+        let normal_cave = normal.sample(0, 0);
+        let bright_cave = bright.sample(0, 0);
+        for index in 0..3 {
+            assert!(dark_cave[index] < normal_cave[index]);
+            assert!(normal_cave[index] < bright_cave[index]);
+        }
+        assert_eq!(dark.sample(15, 15), bright.sample(15, 15));
+        assert_eq!(normal.block_tint, base.block_tint);
+        assert_eq!(normal.ambient_color, base.ambient_color);
     }
 }

@@ -2,7 +2,7 @@
 use crate::{
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
-    menu_settings::{AttackIndicator, InactivityFpsLimit, VideoSettings},
+    menu_settings::{AttackIndicator, InactivityFpsLimit, UnitInterval, VideoSettings},
 };
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ pub enum VideoControl {
     Framerate,
     Vsync,
     Fullscreen,
+    Brightness,
     GuiScale,
     Inactivity,
     MenuBlur,
@@ -197,6 +198,23 @@ fn slider_from_weather(value: u8) -> f64 {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BrightnessLabel {
+    Minimum,
+    Default,
+    Maximum,
+    Value(i32),
+}
+
+fn brightness_label(value: f64) -> BrightnessLabel {
+    match (value * 100.0) as i32 {
+        0 => BrightnessLabel::Minimum,
+        50 => BrightnessLabel::Default,
+        100 => BrightnessLabel::Maximum,
+        value => BrightnessLabel::Value(value),
+    }
+}
+
 pub struct VideoUi {
     scroll: f64,
     slider: f64,
@@ -255,6 +273,7 @@ impl VideoUi {
             y: match control {
                 VideoControl::Inactivity | VideoControl::GuiScale => 105,
                 VideoControl::Fullscreen => 130,
+                VideoControl::Brightness => 155,
                 VideoControl::MenuBlur => 366,
                 VideoControl::WeatherRadius => 441,
                 VideoControl::AttackIndicator => 527,
@@ -277,6 +296,7 @@ impl VideoUi {
             VideoControl::Framerate,
             VideoControl::Vsync,
             VideoControl::Fullscreen,
+            VideoControl::Brightness,
             VideoControl::Inactivity,
             VideoControl::GuiScale,
             VideoControl::MenuBlur,
@@ -323,6 +343,12 @@ impl VideoUi {
     ) -> bool {
         let rect = self.control_rect(width, control);
         let value = (f64::from(x - rect.x - 4) / f64::from(rect.w - 8)).clamp(0.0, 1.0);
+        if control == VideoControl::Brightness {
+            let next = UnitInterval::new(value);
+            let changed = video.brightness != next;
+            video.brightness = next;
+            return changed;
+        }
         if control == VideoControl::WeatherRadius {
             self.weather_slider = value;
             let next = weather_from_slider(value);
@@ -412,6 +438,14 @@ impl VideoUi {
         let changed = next != video.weather_radius;
         video.weather_radius = next;
         self.weather_slider = slider_from_weather(next);
+        changed
+    }
+
+    pub fn brightness_arrow(&mut self, right: bool, video: &mut VideoSettings) -> bool {
+        let delta = if right { 1.0_f32 } else { -1.0_f32 } / 142.0_f32;
+        let next = UnitInterval::new(video.brightness.value() + f64::from(delta));
+        let changed = video.brightness != next;
+        video.brightness = next;
         changed
     }
 
@@ -590,7 +624,54 @@ impl VideoUi {
                         let on_screen = (cursor.0, cursor.1 - TOP);
                         let hovered = (TOP..height - FOOTER).contains(&cursor.1)
                             && rect.contains(on_screen.0, on_screen.1);
-                        if label.key == "options.accessibility.menu_background_blurriness" {
+                        if label.key == "options.gamma" {
+                            let highlighted = hovered || focused == Some(VideoControl::Brightness);
+                            let background = if highlighted {
+                                &assets.slider_highlighted
+                            } else {
+                                &assets.slider
+                            };
+                            let handle = if highlighted {
+                                &assets.slider_handle_highlighted
+                            } else {
+                                &assets.slider_handle
+                            };
+                            list.gui_sprite(&background.image, rect, background.scaling);
+                            list.gui_sprite(
+                                &handle.image,
+                                Rect {
+                                    x: rect.x
+                                        + (video.brightness.value() * f64::from(rect.w - 8)) as i32,
+                                    y: rect.y,
+                                    w: 8,
+                                    h: 20,
+                                },
+                                handle.scaling,
+                            );
+                            let value = match brightness_label(video.brightness.value()) {
+                                BrightnessLabel::Minimum => {
+                                    assets.translate("options.gamma.min", "Moody").to_owned()
+                                }
+                                BrightnessLabel::Default => assets
+                                    .translate("options.gamma.default", "Default")
+                                    .to_owned(),
+                                BrightnessLabel::Maximum => {
+                                    assets.translate("options.gamma.max", "Bright").to_owned()
+                                }
+                                BrightnessLabel::Value(value) => value.to_string(),
+                            };
+                            let text = crate::text_component::format_plain(
+                                assets.translate("options.generic_value", "%s: %s"),
+                                &[tr(label), &value],
+                            );
+                            list.text_centered(
+                                Some(assets),
+                                rect.x + rect.w / 2,
+                                rect.y + 6,
+                                &text,
+                                [255, 255, 255],
+                            );
+                        } else if label.key == "options.accessibility.menu_background_blurriness" {
                             let slider = if self.dragging_slider == Some(VideoControl::MenuBlur) {
                                 self.blur_slider
                             } else {
@@ -858,6 +939,42 @@ impl VideoUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn brightness_slider_changes_immediately_and_uses_java_labels() {
+        let mut video = VideoSettings::default();
+        let mut ui = VideoUi::new(video);
+        let rect = ui.control_rect(426, VideoControl::Brightness);
+        assert_eq!(
+            rect,
+            Rect {
+                x: 58,
+                y: 155,
+                w: 150,
+                h: 20
+            }
+        );
+        assert_eq!(
+            ui.hit(426, 240, (rect.x + 5, rect.y + 5)),
+            Some(VideoControl::Brightness)
+        );
+        assert_eq!(brightness_label(0.009), BrightnessLabel::Minimum);
+        assert_eq!(brightness_label(0.01), BrightnessLabel::Value(1));
+        assert_eq!(brightness_label(0.509), BrightnessLabel::Default);
+        assert_eq!(brightness_label(0.51), BrightnessLabel::Value(51));
+        assert_eq!(brightness_label(0.999), BrightnessLabel::Value(99));
+        assert_eq!(brightness_label(1.0), BrightnessLabel::Maximum);
+        assert!(ui.start_control_slider(426, rect.x + 4, VideoControl::Brightness, &mut video));
+        assert_eq!(video.brightness.value(), 0.0);
+        assert!(
+            ui.pointer_move(426, 240, (rect.x + rect.w - 4, rect.y), &mut video)
+                .1
+        );
+        assert_eq!(video.brightness.value(), 1.0);
+        ui.release(video);
+        assert!(!ui.brightness_arrow(true, &mut video));
+        assert!(ui.brightness_arrow(false, &mut video));
+        assert_eq!(video.brightness.value(), 1.0 + f64::from(-1.0_f32 / 142.0));
+    }
     #[test]
     fn attack_indicator_control_scrolls_into_view_and_accepts_pointer() {
         let mut ui = VideoUi::new(VideoSettings::default());
@@ -1145,6 +1262,8 @@ public class VideoSliderOracle {
                 System.out.println(fps.getX()+","+(fps.getY()+2)+","+list.maxScrollAmount());
                 var blurEntry=(net.minecraft.client.gui.layouts.LayoutElement)list.children().get(13);
                 System.out.println(blurEntry.getX()+","+(blurEntry.getY()+2)+","+list.maxScrollAmount());
+                var brightnessEntry=(net.minecraft.client.gui.layouts.LayoutElement)list.children().get(5);
+                System.out.println(brightnessEntry.getX()+","+(brightnessEntry.getY()+2)+","+list.maxScrollAmount());
             }
             for(int width : new int[]{320,426,640}) for(int height : new int[]{240,360}) for(int scroll : new int[]{0,12,47}) {
                 var screen=new TestScreen(width,height);
@@ -1172,6 +1291,17 @@ public class VideoSliderOracle {
                 System.out.println(Double.doubleToRawLongBits(slider.getValue()));
                 slider.keyPressed(new KeyEvent(79,0,0));
                 System.out.println(Double.doubleToRawLongBits(slider.getValue()));
+            }
+            var caption=net.minecraft.client.Options.class.getDeclaredMethod("lambda$new$89", Component.class, Double.class);
+            caption.setAccessible(true);
+            for(int i=0; i<=10000; i++) {
+                var label=(Component)caption.invoke(null, Component.literal("Brightness"), i/10000.0);
+                var content=(net.minecraft.network.chat.contents.TranslatableContents)label.getContents();
+                if(!content.getKey().equals("options.generic_value")) throw new AssertionError(content.getKey());
+                var value=(Component)content.getArgs()[1];
+                if(value.getContents() instanceof net.minecraft.network.chat.contents.TranslatableContents translated)
+                    System.out.println(translated.getKey());
+                else System.out.println(value.getString());
             }
         } catch (Exception e) { throw new RuntimeException(e); }
     }
@@ -1375,6 +1505,17 @@ public class VideoSliderOracle {
                         [blur.x, blur.y, VideoUi::max_scroll(height)],
                         expected_blur.as_slice()
                     );
+                    let expected_brightness: Vec<i32> = lines
+                        .next()
+                        .unwrap()
+                        .split(',')
+                        .map(|part| part.parse().unwrap())
+                        .collect();
+                    let brightness = ui.control_rect(width, VideoControl::Brightness);
+                    assert_eq!(
+                        [brightness.x, brightness.y, VideoUi::max_scroll(height)],
+                        expected_brightness.as_slice()
+                    );
                 }
             }
         }
@@ -1450,6 +1591,9 @@ public class VideoSliderOracle {
             let mut video = VideoSettings::default();
             let mut panorama_ui = crate::accessibility_ui::AccessibilityUi::default();
             let mut panorama = VideoSettings::default();
+            let mut brightness = VideoSettings::default();
+            let mut brightness_ui = VideoUi::new(brightness);
+            brightness_ui.start_control_slider(426, x, VideoControl::Brightness, &mut brightness);
             ui.start_slider(
                 426,
                 x,
@@ -1457,6 +1601,11 @@ public class VideoSliderOracle {
                 &mut video,
             );
             let expected: i64 = lines.next().unwrap().parse().unwrap();
+            assert_eq!(
+                brightness.brightness.value().to_bits() as i64,
+                expected,
+                "brightness mouse x {x}"
+            );
             panorama_ui.start_slider(
                 426,
                 x,
@@ -1479,6 +1628,12 @@ public class VideoSliderOracle {
                 &mut video,
             );
             let expected: i64 = lines.next().unwrap().parse().unwrap();
+            brightness_ui.brightness_arrow(false, &mut brightness);
+            assert_eq!(
+                brightness.brightness.value().to_bits() as i64,
+                expected,
+                "brightness left x {x}"
+            );
             panorama_ui.arrow(
                 crate::accessibility_ui::AccessibilityControl::PanoramaSpeed,
                 false,
@@ -1500,6 +1655,12 @@ public class VideoSliderOracle {
                 &mut video,
             );
             let expected: i64 = lines.next().unwrap().parse().unwrap();
+            brightness_ui.brightness_arrow(true, &mut brightness);
+            assert_eq!(
+                brightness.brightness.value().to_bits() as i64,
+                expected,
+                "brightness right x {x}"
+            );
             panorama_ui.arrow(
                 crate::accessibility_ui::AccessibilityControl::PanoramaSpeed,
                 true,
@@ -1516,9 +1677,19 @@ public class VideoSliderOracle {
                 "glint right x {x}"
             );
         }
+        for i in 0..=10000 {
+            let expected = lines.next().unwrap();
+            let actual = match brightness_label(f64::from(i) / 10000.0) {
+                BrightnessLabel::Minimum => "options.gamma.min".to_owned(),
+                BrightnessLabel::Default => "options.gamma.default".to_owned(),
+                BrightnessLabel::Maximum => "options.gamma.max".to_owned(),
+                BrightnessLabel::Value(value) => value.to_string(),
+            };
+            assert_eq!(actual, expected, "brightness label sample {i}");
+        }
         assert!(lines.next().is_none());
         println!(
-            "Compared 10,001 positions for each slider, FPS and FOV values and keyboard steps, and 18 list layouts with Java 26.3"
+            "Compared slider mappings, 10,001 brightness labels, keyboard steps, and 18 list layouts with Java 26.3"
         );
     }
 
@@ -1543,6 +1714,33 @@ public class VideoSliderOracle {
         let ui = VideoUi::new(VideoSettings::default());
         ui.draw(&mut canvas, &assets, VideoSettings::default(), (0, 0), None);
         let before = canvas.pixels.clone();
+        let mut bright = Canvas::new(426, 240);
+        bright.fill(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 426,
+                h: 240,
+            },
+            [24, 24, 24, 255],
+        );
+        ui.draw(
+            &mut bright,
+            &assets,
+            VideoSettings {
+                brightness: UnitInterval::new(1.0),
+                ..VideoSettings::default()
+            },
+            (0, 0),
+            None,
+        );
+        let rect = ui.control_rect(426, VideoControl::Brightness);
+        assert!((rect.y..rect.y + rect.h).any(|y| {
+            (rect.x..rect.x + rect.w).any(|x| {
+                let index = (y * canvas.width + x) as usize;
+                before[index] != bright.pixels[index]
+            })
+        }));
         let mut changed = Canvas::new(426, 240);
         changed.fill(
             Rect {

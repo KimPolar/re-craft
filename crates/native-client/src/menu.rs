@@ -97,6 +97,7 @@ enum ButtonId {
     VideoFps,
     VideoVsync,
     VideoFullscreen,
+    VideoBrightness,
     VideoGuiScale,
     VideoInactivity,
     VideoAttackIndicator,
@@ -1615,6 +1616,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoFps => Some(VideoControl::Framerate),
             ButtonId::VideoVsync => Some(VideoControl::Vsync),
             ButtonId::VideoFullscreen => Some(VideoControl::Fullscreen),
+            ButtonId::VideoBrightness => Some(VideoControl::Brightness),
             ButtonId::VideoGuiScale => Some(VideoControl::GuiScale),
             ButtonId::VideoInactivity => Some(VideoControl::Inactivity),
             ButtonId::VideoAttackIndicator => Some(VideoControl::AttackIndicator),
@@ -2234,6 +2236,7 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoInactivity, VideoControl::Inactivity),
                     (ButtonId::VideoGuiScale, VideoControl::GuiScale),
                     (ButtonId::VideoFullscreen, VideoControl::Fullscreen),
+                    (ButtonId::VideoBrightness, VideoControl::Brightness),
                     (ButtonId::VideoBlend, VideoControl::BiomeBlend),
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
                     (
@@ -2257,6 +2260,7 @@ impl<'a> Menu<'a> {
                         matches!(
                             id,
                             ButtonId::VideoBlur
+                                | ButtonId::VideoBrightness
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
@@ -2695,6 +2699,15 @@ impl<'a> Menu<'a> {
                     &mut self.state.video,
                 );
             }
+            ButtonId::VideoBrightness => {
+                let (width, _) = self.logical_size();
+                self.state.video_dirty |= self.video_ui.start_control_slider(
+                    width,
+                    self.cursor.0,
+                    VideoControl::Brightness,
+                    &mut self.state.video,
+                );
+            }
             ButtonId::VideoDistance => {
                 let (width, _) = self.logical_size();
                 self.video_ui.start_control_slider(
@@ -2890,6 +2903,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoSimulationDistance
                     | ButtonId::VideoBlend
                     | ButtonId::VideoWeather
+                    | ButtonId::VideoBrightness
                     | ButtonId::VideoVsync
                     | ButtonId::VideoFullscreen
                     | ButtonId::VideoGuiScale
@@ -3455,6 +3469,7 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoFps) => Some(VideoControl::Framerate),
                         Some(ButtonId::VideoVsync) => Some(VideoControl::Vsync),
                         Some(ButtonId::VideoFullscreen) => Some(VideoControl::Fullscreen),
+                        Some(ButtonId::VideoBrightness) => Some(VideoControl::Brightness),
                         Some(ButtonId::VideoGuiScale) => Some(VideoControl::GuiScale),
                         Some(ButtonId::VideoInactivity) => Some(VideoControl::Inactivity),
                         Some(ButtonId::VideoAttackIndicator) => Some(VideoControl::AttackIndicator),
@@ -3644,6 +3659,7 @@ impl<'a> Menu<'a> {
                     ButtonId::VideoFps
                         | ButtonId::VideoVsync
                         | ButtonId::VideoFullscreen
+                        | ButtonId::VideoBrightness
                         | ButtonId::VideoGuiScale
                         | ButtonId::VideoInactivity
                         | ButtonId::VideoAttackIndicator
@@ -4026,6 +4042,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
+                                | ButtonId::VideoBrightness
                                 | ButtonId::OptionsFov
                                 | ButtonId::FovEffectScale
                                 | ButtonId::GlintSpeed
@@ -4050,6 +4067,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoSimulationDistance
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
+                                | ButtonId::VideoBrightness
                                 | ButtonId::VideoVsync
                                 | ButtonId::VideoFullscreen
                                 | ButtonId::VideoGuiScale
@@ -4573,6 +4591,14 @@ impl ApplicationHandler for Menu<'_> {
                         .fov_ui
                         .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
                 } else if self.state.screen == Screen::Video
+                    && self.focused == Some(ButtonId::VideoBrightness)
+                    && self.video_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.state.video_dirty |= self
+                        .video_ui
+                        .brightness_arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
+                } else if self.state.screen == Screen::Video
                     && self.focused == Some(ButtonId::VideoWeather)
                     && self.video_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -4677,6 +4703,7 @@ impl ApplicationHandler for Menu<'_> {
                                 self.focused,
                                 Some(
                                     ButtonId::VideoBlur
+                                        | ButtonId::VideoBrightness
                                         | ButtonId::VideoDistance
                                         | ButtonId::VideoSimulationDistance
                                         | ButtonId::VideoBlend
@@ -4690,6 +4717,8 @@ impl ApplicationHandler for Menu<'_> {
                                 h,
                                 if self.focused == Some(ButtonId::VideoBlur) {
                                     VideoControl::MenuBlur
+                                } else if self.focused == Some(ButtonId::VideoBrightness) {
+                                    VideoControl::Brightness
                                 } else if self.focused == Some(ButtonId::VideoBlend) {
                                     VideoControl::BiomeBlend
                                 } else if self.focused == Some(ButtonId::VideoWeather) {
@@ -4720,6 +4749,7 @@ impl ApplicationHandler for Menu<'_> {
                             self.focused,
                             Some(
                                 ButtonId::VideoFps
+                                    | ButtonId::VideoBrightness
                                     | ButtonId::VideoBlur
                                     | ButtonId::VideoDistance
                                     | ButtonId::VideoSimulationDistance
@@ -4782,6 +4812,7 @@ impl ApplicationHandler for Menu<'_> {
                         } else if matches!(
                             id,
                             ButtonId::VideoFps
+                                | ButtonId::VideoBrightness
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoSimulationDistance
@@ -7106,6 +7137,14 @@ public class GuiScaleOracle {
         assert!(
             fullscreen.active
                 && menu.button_contains(fullscreen, (fullscreen.rect.x + 1, fullscreen.rect.y + 1))
+        );
+        let brightness = buttons
+            .iter()
+            .find(|button| button.id == ButtonId::VideoBrightness)
+            .unwrap();
+        assert!(
+            brightness.active
+                && menu.button_contains(brightness, (brightness.rect.x + 1, brightness.rect.y + 1))
         );
     }
 

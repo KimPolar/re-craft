@@ -234,6 +234,8 @@ pub struct VideoSettings {
     pub simulation_distance: u8,
     /// Radius of the square biome-color average, in blocks.
     pub biome_blend: u8,
+    /// Brightness slider value used by the world lightmap.
+    pub brightness: UnitInterval,
     /// Java 26.3 precipitation effect radius, in blocks.
     pub weather_radius: u8,
     pub vsync: bool,
@@ -315,6 +317,7 @@ impl Default for VideoSettings {
             render_distance: 12,
             simulation_distance: 12,
             biome_blend: 2,
+            brightness: UnitInterval::new(0.5),
             weather_radius: 10,
             vsync: true,
             fullscreen: false,
@@ -413,6 +416,7 @@ impl VideoSettings {
                 70
             },
             glint_speed: self.glint_speed.valid_or(0.5),
+            brightness: self.brightness.valid_or(0.5),
             fov_effect_scale: self.fov_effect_scale.valid_or(1.0),
             glint_strength: self.glint_strength.valid_or(0.75),
             panorama_speed: self.panorama_speed.valid_or(1.0),
@@ -535,6 +539,24 @@ pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brightness_defaults_and_survives_other_settings_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("options.json");
+        let defaults: Settings = serde_json::from_str("{\"video\":{}} ").unwrap();
+        assert_eq!(defaults.video.brightness.value(), 0.5);
+        let video = VideoSettings {
+            brightness: UnitInterval::new(0.73),
+            ..defaults.video
+        };
+        save_video_to(&path, video).unwrap();
+        save_sound_to(&path, SoundSettings::default()).unwrap();
+        let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded.video.brightness, video.brightness);
+        let invalid: Settings = serde_json::from_str("{\"video\":{\"brightness\":2.0}}").unwrap();
+        assert_eq!(invalid.video.valid().brightness.value(), 0.5);
+    }
 
     #[test]
     fn attack_indicator_defaults_and_persists_across_other_saves() {

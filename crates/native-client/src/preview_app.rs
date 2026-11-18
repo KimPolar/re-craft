@@ -1492,6 +1492,8 @@ impl Viewer {
                     play.session.partial_tick().clamp(0.0, 1.0),
                 ),
             );
+            let settings =
+                crate::preview_lighting::apply_brightness(settings, self.video.brightness);
             if play.applied_lightmap_settings.as_ref() != Some(&settings) {
                 play.sky_lightmap = Some(Arc::new(settings.table()));
                 play.applied_lightmap_settings = Some(settings);

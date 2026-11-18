@@ -29,6 +29,7 @@ pub mod distance_updates;
 mod equipment_attributes;
 mod fire_contact;
 mod frosted_ice;
+pub mod full_generation;
 mod gameplay_keys;
 mod honey;
 pub use equipment_attributes::ArmorValues;

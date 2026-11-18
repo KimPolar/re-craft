@@ -44,6 +44,7 @@ pub mod gamemode_command;
 mod interaction;
 pub mod inventory;
 pub mod items;
+mod kelp_random_tick;
 mod knockback;
 mod known_movement;
 mod lava_fire;

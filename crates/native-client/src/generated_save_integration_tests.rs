@@ -967,6 +967,16 @@ fn saved_holder_stream_waits_for_an_actual_outside_chunk() -> Result<()> {
 #[test]
 #[ignore = "requires the generated seed -1 portal fixture and Minecraft 26.3"]
 fn saved_holder_missing_chunk_starts_real_generation_without_completing_early() -> Result<()> {
+    verify_saved_holder_missing_generation(false)
+}
+
+#[test]
+#[ignore = "requires the private seed -1 portal fixture; kelp and bubble fluid ticks remain incomplete"]
+fn saved_holder_missing_chunk_generates_after_play_ticks() -> Result<()> {
+    verify_saved_holder_missing_generation(true)
+}
+
+fn verify_saved_holder_missing_generation(advance_ticks: bool) -> Result<()> {
     use crate::{
         chunk_stream::{
             MissingGenerationBiomeWorker, MissingGenerationPrepareWorker,
@@ -1024,9 +1034,12 @@ fn saved_holder_missing_chunk_starts_real_generation_without_completing_early() 
         ..
     } = *prepared;
     let mut player = PlayerSimulation::new(SimulationTickets::with_loading_tracker(), 2);
-    // Keep this request away from the fixture's saved, partially processed
-    // chunks so the test exercises generation without advancing gameplay.
-    let center = ChunkPos { x: 1_000, z: 1_000 };
+    let center = if advance_ticks {
+        ChunkPos { x: 21, z: 20 }
+    } else {
+        // The no-tick case exercises a fully missing generation area.
+        ChunkPos { x: 1_000, z: 1_000 }
+    };
     player.add_ticket(center, TicketKind::Forced, 32);
     let mut updates = DistanceUpdates::default();
     let mut holders = LoadingHolders::new()?;
@@ -1034,9 +1047,17 @@ fn saved_holder_missing_chunk_starts_real_generation_without_completing_early() 
     assert!(!updates.run(&mut player, &mut holders)?);
     let mut bridge = SavedFullStream::start(path, dimension, lock, &session, &holders)?;
     let deadline = Instant::now() + Duration::from_secs(90);
+    let mut play_ticks = 0;
     let generation = loop {
         bridge.service(&mut holders, &mut streamer, &mut session)?;
-        if let Some(generation) = bridge.begin_missing_generation(&holders, &streamer, &session)? {
+        if advance_ticks {
+            session.update(Duration::from_millis(50));
+            play_ticks += 1;
+        }
+        if (!advance_ticks || play_ticks >= 20)
+            && let Some(generation) =
+                bridge.begin_missing_generation(&holders, &streamer, &session)?
+        {
             break generation;
         }
         ensure!(

@@ -2039,6 +2039,7 @@ pub struct LoadedSession {
     bubble_deferred_revision: Option<u64>,
     bubble_pending: BTreeSet<BubbleTickKey>,
     unresolved_bubble_tick: bool,
+    unresolved_kelp_shape: bool,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
@@ -2065,6 +2066,7 @@ pub struct LoadedSession {
     snow_support_tags: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
     snowy_tag: Option<Arc<BTreeSet<String>>>,
     bubble_column_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
+    kelp_unsupported_blocks: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
@@ -5893,6 +5895,10 @@ impl LoadedSession {
             "bubble column effects are not yet fully tracked for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_kelp_shape,
+            "kelp neighbor or fluid effects are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_leaf_shape,
             "leaf shape updates are not yet fully tracked for saving"
         );
@@ -7817,21 +7823,43 @@ impl LoadedSession {
             "a brushable block or falling entity could not be preserved"
         );
         self.validate_simulation_ticket_progress()?;
-        anyhow::ensure!(
-            !self.unresolved_lichen_shape
-                && !self.unresolved_fence_shape
-                && !self.unresolved_leaf_shape
-                && !self.unresolved_leaf_decay
-                && !self.unresolved_crop_shape
-                && !self.unresolved_speleothem_shape
-                && !self.unresolved_stalactite_lifecycle
-                && !self.unresolved_crop_tick
-                && !self.unresolved_spreading_soil_tick
-                && !self.unresolved_other_random_tick
-                && !self.unresolved_ice_tick
-                && !self.unresolved_bubble_tick,
-            "a block update could not be resolved before generation"
-        );
+        let unresolved = [
+            (self.unresolved_lichen_shape, "lichen shape"),
+            (self.unresolved_fence_shape, "fence shape"),
+            (self.unresolved_leaf_shape, "leaf shape"),
+            (self.unresolved_leaf_decay, "leaf decay"),
+            (self.unresolved_crop_shape, "crop shape"),
+            (self.unresolved_speleothem_shape, "speleothem shape"),
+            (self.unresolved_stalactite_lifecycle, "stalactite lifecycle"),
+            (self.unresolved_crop_tick, "crop tick"),
+            (self.unresolved_spreading_soil_tick, "spreading soil tick"),
+            (self.unresolved_other_random_tick, "other random tick"),
+            (self.unresolved_ice_tick, "ice tick"),
+            (self.unresolved_bubble_tick, "bubble column tick"),
+            (self.unresolved_kelp_shape, "kelp neighbor or fluid update"),
+        ];
+        if unresolved.iter().any(|(active, _)| *active) {
+            let names = unresolved
+                .into_iter()
+                .filter_map(|(active, name)| active.then_some(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = self
+                .unresolved_other_random_tick_detail
+                .as_deref()
+                .filter(|_| self.unresolved_other_random_tick)
+                .or_else(|| {
+                    self.unresolved_spreading_soil_detail
+                        .as_deref()
+                        .filter(|_| self.unresolved_spreading_soil_tick)
+                });
+            if let Some(detail) = detail {
+                anyhow::bail!(
+                    "a block update could not be resolved before generation: {names} ({detail})"
+                );
+            }
+            anyhow::bail!("a block update could not be resolved before generation: {names}");
+        }
         Ok(())
     }
 
@@ -8786,6 +8814,10 @@ impl LoadedSession {
         self.bubble_deferred_revision = None;
         self.location_failure_revision = None;
         self.location_last_position = None;
+    }
+
+    pub fn set_kelp_unsupported_blocks(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.kelp_unsupported_blocks = Some(tag);
     }
 
     pub fn set_bounce_suppression_tag(&mut self, tag: Arc<BTreeSet<String>>) {
@@ -10102,6 +10134,7 @@ impl LoadedSession {
             bubble_deferred_revision: None,
             bubble_pending: BTreeSet::new(),
             unresolved_bubble_tick: false,
+            unresolved_kelp_shape: false,
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
@@ -10130,6 +10163,7 @@ impl LoadedSession {
             snow_support_tags: None,
             snowy_tag: None,
             bubble_column_tags: None,
+            kelp_unsupported_blocks: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
             saved_clock_source: None,
@@ -13110,6 +13144,10 @@ impl LoadedSession {
         ensure!(
             !self.unresolved_bubble_tick,
             "bubble column effects are not yet fully tracked for saving"
+        );
+        ensure!(
+            !self.unresolved_kelp_shape,
+            "kelp neighbor or fluid effects are not yet fully tracked for saving"
         );
         ensure!(
             !self.unresolved_leaf_shape,
@@ -17821,6 +17859,10 @@ impl LoadedSession {
                         );
                         self.level_random = random;
                         result.err().map(|error| format!("{error:#}"))
+                    } else if state.name == "minecraft:kelp" {
+                        self.random_tick_kelp(&state, absolute)
+                            .err()
+                            .map(|error| format!("minecraft:kelp at {absolute:?}: {error:#}"))
                     } else {
                         Some(format!("{} at {absolute:?}", state.name))
                     };
@@ -18357,6 +18399,195 @@ impl LoadedSession {
                 .get_or_insert_with(|| format!("at {absolute:?}: {error:#}"));
         }
         Some(self.revision != before)
+    }
+
+    fn random_tick_kelp(&mut self, state: &BlockState, absolute: IVec3) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut random = self.level_random.clone();
+        let result = crate::kelp_random_tick::random_tick(state, absolute, &mut random, |above| {
+            let relative = subtract(above, self.origin).context("kelp position is unavailable")?;
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                relative,
+                self.states[0],
+            ) else {
+                anyhow::bail!("kelp growth neighbor is unavailable")
+            };
+            self.world
+                .state(id)
+                .cloned()
+                .context("kelp growth neighbor is invalid")
+        });
+        self.level_random = random;
+        if let Some(growth) = result? {
+            self.apply_kelp_growth(absolute, growth)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the verified water, inert-block, and kelp neighbor callbacks for
+    /// natural upward growth. Other neighbors are rejected before either write.
+    fn apply_kelp_growth(
+        &mut self,
+        absolute: IVec3,
+        growth: crate::kelp_random_tick::KelpGrowth,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+
+        ensure!(
+            !self.notifying_blocks && self.block_notifications.is_empty(),
+            "kelp growth cannot interrupt pending neighbor callbacks"
+        );
+        let unsupported = self
+            .kelp_unsupported_blocks
+            .as_ref()
+            .context("kelp support tag is unavailable")?;
+        ensure!(
+            !unsupported.contains("minecraft:kelp_plant"),
+            "kelp growth needs an unsupported plant survival tick"
+        );
+        self.bubble_column_tags
+            .as_ref()
+            .context("bubble column tags are unavailable")?;
+        let lower = subtract(absolute, self.origin).context("kelp position is unavailable")?;
+        let upper = subtract(growth.position, self.origin).context("kelp target is unavailable")?;
+        ensure!(add(lower, IVec3::Y) == Some(upper), "invalid kelp target");
+
+        // The source water, lateral shape callbacks, and the two vertical
+        // endpoints are checked before making either change.
+        let read = |position: IVec3| -> anyhow::Result<(BlockStateId, KelpGrowthNeighbor)> {
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                position,
+                self.states[0],
+            ) else {
+                anyhow::bail!("kelp growth neighbor is unavailable")
+            };
+            let state = self
+                .world
+                .state(id)
+                .context("invalid kelp neighbor state")?;
+            let neighbor =
+                kelp_growth_neighbor(state).context("unsupported kelp growth neighbor")?;
+            Ok((id, neighbor))
+        };
+        let mut upper_neighbors = BTreeMap::new();
+        let mut lower_neighbors = BTreeMap::new();
+        for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
+            for (base, neighbors) in [(upper, &mut upper_neighbors), (lower, &mut lower_neighbors)]
+            {
+                let position = add(base, direction).context("kelp neighbor overflow")?;
+                neighbors.insert(direction.to_array(), read(position)?);
+            }
+        }
+        let below = add(lower, IVec3::NEG_Y).context("kelp support overflow")?;
+        let ceiling = add(upper, IVec3::Y).context("kelp ceiling overflow")?;
+        let lower_end = read(below)?;
+        let upper_end = read(ceiling)?;
+        ensure!(
+            !matches!(lower_end.1, KelpGrowthNeighbor::Head)
+                && !matches!(
+                    upper_end.1,
+                    KelpGrowthNeighbor::Head | KelpGrowthNeighbor::Body
+                ),
+            "kelp growth needs an unsupported vertical plant callback"
+        );
+        for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z, IVec3::Y] {
+            let (id, neighbor) = if direction == IVec3::Y {
+                upper_end
+            } else {
+                upper_neighbors[&direction.to_array()]
+            };
+            if neighbor == KelpGrowthNeighbor::Water
+                && self.simulated_fluid(id).is_some_and(|fluid| fluid.source)
+            {
+                let position = add(upper, direction).context("kelp neighbor overflow")?;
+                let support = add(position, IVec3::NEG_Y).context("water support overflow")?;
+                if support != upper {
+                    let _ = read(support)?;
+                }
+            }
+        }
+
+        let head = self.intern_block(BlockState {
+            name: "minecraft:kelp".into(),
+            properties: BTreeMap::from([("age".into(), growth.age.to_string())]),
+        });
+        let body = self.intern_block(BlockState {
+            name: "minecraft:kelp_plant".into(),
+            properties: BTreeMap::new(),
+        });
+        let upper_check = self
+            .check_block_set(upper, head, false, false)
+            .context("kelp head placement is unavailable")?;
+        self.check_block_set(lower, body, false, false)
+            .context("kelp body conversion is unavailable")?;
+        ensure!(
+            self.apply_block_set(upper, head, false, upper_check),
+            "kelp head placement failed"
+        );
+        // No callbacks run between these writes; the second check remains
+        // valid because its complete neighborhood was preflighted above.
+        let lower_check = self
+            .check_block_set(lower, body, false, false)
+            .expect("preflighted kelp body remains writable");
+        assert!(self.apply_block_set(lower, body, false, lower_check));
+
+        let delay = self.fluid_settings().delay(FluidKind::Water);
+        let schedule = |session: &mut Self, position: IVec3, id: BlockStateId| {
+            if let Some(fluid) = session.simulated_fluid(id) {
+                session.schedule_fluid(position, fluid, delay);
+            }
+        };
+        // Level.setBlock sends neighborChanged west, east, down, up, north,
+        // south before its shape pass; only liquid blocks react here.
+        for direction in [IVec3::NEG_X, IVec3::X, IVec3::Y, IVec3::NEG_Z, IVec3::Z] {
+            let (id, neighbor) = if direction == IVec3::Y {
+                upper_end
+            } else {
+                upper_neighbors[&direction.to_array()]
+            };
+            if neighbor == KelpGrowthNeighbor::Water {
+                let position = add(upper, direction).expect("preflighted kelp neighbor");
+                schedule(self, position, id);
+                self.schedule_water_bubble_check(position, id);
+            }
+        }
+        // Shape updates visit west, east, north, south, down, up. The down
+        // callback converts the old head and runs the body's own shape pass.
+        for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
+            let (id, neighbor) = upper_neighbors[&direction.to_array()];
+            if neighbor != KelpGrowthNeighbor::Inert {
+                schedule(
+                    self,
+                    add(upper, direction).expect("preflighted neighbor"),
+                    id,
+                );
+            }
+        }
+        for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
+            let (id, neighbor) = lower_neighbors[&direction.to_array()];
+            if neighbor != KelpGrowthNeighbor::Inert {
+                schedule(
+                    self,
+                    add(lower, direction).expect("preflighted neighbor"),
+                    id,
+                );
+            }
+        }
+        if lower_end.1 != KelpGrowthNeighbor::Inert {
+            schedule(self, below, lower_end.0);
+        }
+        schedule(self, upper, head);
+        if upper_end.1 == KelpGrowthNeighbor::Water {
+            schedule(self, ceiling, upper_end.0);
+            self.schedule_water_bubble_check(ceiling, upper_end.0);
+        }
+        Ok(())
     }
 
     /// Returns `None` when this is not an immature crop.
@@ -20234,6 +20465,9 @@ impl LoadedSession {
         let fluid = self.fluids.get(id.0 as usize).copied().flatten()?;
         let state = self.world.state(id)?;
         if bubble_column_drag(state).is_some() {
+            return Some(fluid);
+        }
+        if crate::kelp_random_tick::part(state).is_some() {
             return Some(fluid);
         }
         if leaf_state_distance(state).is_some() {
@@ -24316,6 +24550,18 @@ impl LoadedSession {
                 }
                 continue;
             };
+            if direction.y != 0
+                && self.world.state(id).is_some_and(|state| {
+                    matches!(
+                        state.name.as_str(),
+                        "minecraft:kelp" | "minecraft:kelp_plant"
+                    )
+                })
+            {
+                // Vertical updates can transform or schedule a plant. The
+                // dedicated growth path handles its proven callback sequence.
+                self.unresolved_kelp_shape = true;
+            }
             if direction == IVec3::NEG_Y {
                 self.update_snowy_below(position, neighbor, id);
             }
@@ -24828,6 +25074,11 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::BubbleWater(fluid);
         }
+        if crate::kelp_random_tick::part(state).is_some()
+            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        {
+            return fluid_sim::Cell::OpenWater(fluid);
+        }
         if native_world::fluid::is_copper_grate(&state.name)
             && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
         {
@@ -25276,10 +25527,19 @@ impl LoadedSession {
                 .world
                 .state(id)
                 .is_some_and(|state| state.name == "minecraft:bubble_column");
+            let is_kelp = self.world.state(id).is_some_and(|state| {
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:kelp" | "minecraft:kelp_plant"
+                )
+            });
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             let Some(fluid) = self.simulated_fluid(id) else {
                 if is_bubble_column {
                     self.unresolved_bubble_tick = true;
+                }
+                if is_kelp {
+                    self.unresolved_kelp_shape = true;
                 }
                 continue;
             };
@@ -25287,7 +25547,7 @@ impl LoadedSession {
                 continue;
             }
             const WATER_TYPES: u8 = (1 << 1) | (1 << 2);
-            let bubble_complete = is_bubble_column.then(|| {
+            let bubble_complete = (is_bubble_column || is_kelp).then(|| {
                 std::cell::Cell::new(
                     !self.notifying_blocks
                         && self.block_notifications.is_empty()
@@ -25320,6 +25580,9 @@ impl LoadedSession {
             };
             if is_bubble_column && (!bubble_complete || retry_wash || result.is_err()) {
                 self.unresolved_bubble_tick = true;
+            }
+            if is_kelp && (!bubble_complete || retry_wash || result.is_err()) {
+                self.unresolved_kelp_shape = true;
             }
             match result {
                 Ok(()) => {}
@@ -28060,8 +28323,35 @@ struct SessionFluidTick<'a> {
     settings: fluid_sim::Settings,
     kind: FluidKind,
     retry_wash: bool,
-    // Only a bubble-column tick can use this proof to authorize saving.
+    // Bubble and kelp fluid ticks use this proof to authorize saving.
     bubble_complete: Option<std::cell::Cell<bool>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KelpGrowthNeighbor {
+    Inert,
+    Water,
+    Head,
+    Body,
+}
+
+fn kelp_growth_neighbor(state: &BlockState) -> Option<KelpGrowthNeighbor> {
+    if bubble_proof_water(state).is_some() {
+        return Some(KelpGrowthNeighbor::Water);
+    }
+    match crate::kelp_random_tick::part(state) {
+        Some(crate::kelp_random_tick::KelpPart::Head(_)) => {
+            return Some(KelpGrowthNeighbor::Head);
+        }
+        Some(crate::kelp_random_tick::KelpPart::Body) => return Some(KelpGrowthNeighbor::Body),
+        None => {}
+    }
+    (state.properties.is_empty()
+        && (matches!(
+            state.name.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:glass"
+        ) || crate::worldgen::inert_generated_full_cube(&state.name)))
+    .then_some(KelpGrowthNeighbor::Inert)
 }
 
 fn fluid_tag_bits(tag: &BTreeSet<String>) -> u8 {
@@ -28165,8 +28455,9 @@ impl SessionFluidTick<'_> {
                     && matches!(FluidState::from_block(state), Ok(Some(actual)) if actual == fluid)
             }
             fluid_sim::Cell::OpenWater(fluid) => {
-                native_world::collision::glow_lichen_faces(state).is_some()
-                    && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+                (crate::kelp_random_tick::part(state).is_some()
+                    || (native_world::collision::glow_lichen_faces(state).is_some()
+                        && state.properties.get("waterlogged").map(String::as_str) == Some("true")))
                     && fluid.kind == FluidKind::Water
                     && fluid.amount == 8
                     && fluid.source
@@ -28243,7 +28534,7 @@ impl SessionFluidTick<'_> {
                 return;
             };
             let simulated = self.session.simulation_cell(neighbor);
-            // Read-only waterlogged lichen is understood, but a neighboring
+            // Read-only waterlogged lichen and kelp are understood, but a neighboring
             // block change also invokes shape callbacks. Keep rejecting that
             // case until those callbacks are proven for this fluid path.
             if matches!(simulated, fluid_sim::Cell::OpenWater(_)) {
@@ -30426,6 +30717,48 @@ impl crate::bubble_column::ColumnWorld for BubbleTickStage<'_> {
                         self.push(BubbleTickAction::Block(neighbor, BubbleTickKind::Column, 5))?;
                     }
                 }
+                "minecraft:chest" | "minecraft:trapped_chest" => {
+                    anyhow::ensure!(
+                        state.properties.len() == 3
+                            && matches!(
+                                state.properties.get("facing").map(String::as_str),
+                                Some("north" | "south" | "east" | "west")
+                            )
+                            && matches!(
+                                state.properties.get("type").map(String::as_str),
+                                Some("single" | "left" | "right")
+                            )
+                            && matches!(
+                                state.properties.get("waterlogged").map(String::as_str),
+                                Some("true" | "false")
+                            ),
+                        "invalid bubble-adjacent chest state"
+                    );
+                    anyhow::ensure!(
+                        native_world::collision::chest_connection(&state) != Some(-direction),
+                        "bubble update would split a double chest"
+                    );
+                    if state.properties["waterlogged"] == "true" {
+                        let fluid = FluidState::from_block(&state)
+                            .map_err(anyhow::Error::msg)?
+                            .context("chest fluid is unavailable")?;
+                        self.push(BubbleTickAction::Fluid(neighbor, fluid))?;
+                    }
+                }
+                "minecraft:kelp" | "minecraft:kelp_plant" => {
+                    let part = crate::kelp_random_tick::part(&state)
+                        .context("invalid bubble-adjacent kelp state")?;
+                    anyhow::ensure!(
+                        direction.y == 0
+                            || (direction == IVec3::NEG_Y
+                                && matches!(part, crate::kelp_random_tick::KelpPart::Head(_))),
+                        "bubble update needs an unsupported vertical kelp callback"
+                    );
+                    let fluid = FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .context("kelp fluid is unavailable")?;
+                    self.push(BubbleTickAction::Fluid(neighbor, fluid))?;
+                }
                 "minecraft:air"
                 | "minecraft:cave_air"
                 | "minecraft:void_air"
@@ -30434,6 +30767,8 @@ impl crate::bubble_column::ColumnWorld for BubbleTickStage<'_> {
                 | "minecraft:magma_block"
                 | "minecraft:soul_sand"
                     if state.properties.is_empty() => {}
+                _ if state.properties.is_empty()
+                    && crate::worldgen::inert_generated_full_cube(&state.name) => {}
                 _ => anyhow::bail!("unsupported bubble neighbor {}", state.name),
             }
         }
@@ -33754,6 +34089,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.set_kelp_unsupported_blocks(Arc::new(BTreeSet::new()));
         session.set_fall_damage_resetting_tag(Arc::new(BTreeSet::new()));
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
@@ -53385,6 +53721,18 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn bubble_water_spread_matches_java_fluid_tick() {
+        contained_water_spread_matches_java(false);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn kelp_water_spread_matches_java_fluid_tick() {
+        contained_water_spread_matches_java(true);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn contained_water_spread_matches_java(kelp: bool) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -53420,7 +53768,8 @@ pub(crate) mod tests {
                 .arg("-cp")
                 .arg(&cp)
                 .arg("BubbleWaterFluidOracle")
-                .arg(&output),
+                .arg(&output)
+                .arg(if kelp { "kelp" } else { "bubble" }),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -53447,20 +53796,25 @@ pub(crate) mod tests {
         };
         let center = IVec3::new(8, 10, 8);
         let sides = [IVec3::NEG_Z, IVec3::Z, IVec3::NEG_X, IVec3::X];
+        let contained = if kelp {
+            fluid_sim::Cell::OpenWater(source)
+        } else {
+            fluid_sim::Cell::BubbleWater(source)
+        };
         for row in rows {
             let below = row["below"].as_u64().unwrap();
             let mask = row["mask"].as_u64().unwrap();
             let variant = row["variant"].as_u64().unwrap();
             let holes = row["holes"].as_bool().unwrap();
             let mut cells = std::collections::HashMap::new();
-            cells.insert(center, fluid_sim::Cell::BubbleWater(source));
+            cells.insert(center, contained);
             cells.insert(
                 center - IVec3::Y,
                 match below {
                     0 => fluid_sim::Cell::Air,
                     1 => fluid_sim::Cell::Solid,
                     2 => fluid_sim::Cell::Fluid(source),
-                    _ => fluid_sim::Cell::BubbleWater(source),
+                    _ => contained,
                 },
             );
             for (index, side) in sides.iter().enumerate() {
@@ -53470,7 +53824,7 @@ pub(crate) mod tests {
                         match variant {
                             0 => fluid_sim::Cell::Air,
                             1 => fluid_sim::Cell::Fluid(source),
-                            2 => fluid_sim::Cell::BubbleWater(source),
+                            2 => contained,
                             3 => fluid_sim::Cell::Fluid(flowing),
                             _ => fluid_sim::Cell::OpenWater(source),
                         },
@@ -53508,6 +53862,279 @@ pub(crate) mod tests {
                 })
                 .collect();
             assert_eq!(serde_json::json!(actual), row["changes"], "{row}");
+        }
+    }
+
+    #[test]
+    fn kelp_head_and_body_expose_contained_source_water() {
+        let mut session = session();
+        let position = IVec3::new(8, 10, 8);
+        let source = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        for block in [
+            state("minecraft:kelp", &[("age", "17")]),
+            state("minecraft:kelp_plant", &[]),
+        ] {
+            let id = session.intern_block(block);
+            assert!(session.set_with_notify(position, id, false));
+            assert_eq!(session.simulated_fluid(id), Some(source));
+            assert_eq!(
+                session.simulation_cell(position),
+                fluid_sim::Cell::OpenWater(source)
+            );
+        }
+        let invalid = session.intern_block(state("minecraft:kelp", &[("age", "26")]));
+        assert!(session.set_with_notify(position, invalid, false));
+        assert_eq!(session.simulated_fluid(invalid), None);
+        assert_eq!(session.simulation_cell(position), fluid_sim::Cell::Unknown);
+    }
+
+    #[test]
+    fn kelp_growth_rejects_unsupported_neighbors_before_block_changes() {
+        let center = IVec3::new(8, 10, 8);
+        for unsupported in [false, true] {
+            let mut session = session();
+            let head = session.intern_block(state("minecraft:kelp", &[("age", "7")]));
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            let pressure = session.intern_block(state(
+                "minecraft:stone_pressure_plate",
+                &[("powered", "false")],
+            ));
+            assert!(session.set_with_notify(center, head, false));
+            assert!(session.set_with_notify(center + IVec3::Y, water, false));
+            if unsupported {
+                session.set_kelp_unsupported_blocks(Arc::new(BTreeSet::from([
+                    "minecraft:kelp_plant".into(),
+                ])));
+            } else {
+                assert!(session.set_with_notify(center + IVec3::X, pressure, false));
+            }
+            let before = session.revision;
+            let absolute = session.origin + center;
+            assert!(
+                session
+                    .apply_kelp_growth(
+                        absolute,
+                        crate::kelp_random_tick::KelpGrowth {
+                            position: absolute + IVec3::Y,
+                            age: 8,
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(session.revision, before);
+            assert_eq!(
+                session.world.block(absolute.x, absolute.y, absolute.z),
+                Some(&state("minecraft:kelp", &[("age", "7")]))
+            );
+            assert_eq!(
+                session.world.block(absolute.x, absolute.y + 1, absolute.z),
+                Some(&state("minecraft:water", &[("level", "0")]))
+            );
+            assert!(session.fluid_ticks.is_empty());
+        }
+    }
+
+    #[test]
+    fn vertical_kelp_neighbor_changes_block_saving() {
+        let mut session = session();
+        let center = IVec3::new(8, 10, 8);
+        let head = session.intern_block(state("minecraft:kelp", &[("age", "7")]));
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set_with_notify(center, head, false));
+        assert!(session.set(center + IVec3::Y, stone));
+        assert!(session.unresolved_kelp_shape);
+        assert!(
+            session
+                .draft_block_ticks(session.player_chunk().unwrap())
+                .is_err()
+        );
+        assert!(session.validate_generation_stage_block_readiness().is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn kelp_growth_and_neighbor_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("KelpGrowthOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(&source, include_str!("../tests/java/KelpGrowthOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("KelpGrowthOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 18_432);
+        let center = IVec3::new(8, 10, 8);
+        for row in rows {
+            let mut session = session();
+            let age = row["age"].as_u64().unwrap() as u8;
+            let original = state("minecraft:kelp", &[("age", &age.to_string())]);
+            let target = match row["target"].as_u64().unwrap() {
+                0 => state("minecraft:water", &[("level", "0")]),
+                1 => state("minecraft:water", &[("level", "1")]),
+                _ => state("minecraft:stone", &[]),
+            };
+            let floor = match row["support"].as_u64().unwrap() {
+                0 => state("minecraft:stone", &[]),
+                1 => state("minecraft:kelp_plant", &[]),
+                2 => state("minecraft:water", &[("level", "1")]),
+                _ => state("minecraft:air", &[]),
+            };
+            let ceiling = match row["ceiling"].as_u64().unwrap() {
+                0 => state("minecraft:stone", &[]),
+                1 => state("minecraft:water", &[("level", "0")]),
+                2 => state("minecraft:air", &[]),
+                _ => state("minecraft:water", &[("level", "1")]),
+            };
+            let mut put = |position: IVec3, block: BlockState| {
+                let absolute = session.origin + position;
+                if session.world.block(absolute.x, absolute.y, absolute.z) != Some(&block) {
+                    let id = session.intern_block(block);
+                    assert!(session.set_with_notify(position, id, false));
+                }
+            };
+            put(center - IVec3::Y, floor);
+            put(center, original.clone());
+            put(center + IVec3::Y, target.clone());
+            put(center + IVec3::Y * 2, ceiling);
+            for (index, direction) in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z]
+                .into_iter()
+                .enumerate()
+            {
+                let side = match row["sides"].as_u64().unwrap() {
+                    0 => state("minecraft:stone", &[]),
+                    1 => state("minecraft:water", &[("level", "0")]),
+                    2 => state("minecraft:water", &[("level", "1")]),
+                    3 => state("minecraft:kelp", &[("age", "17")]),
+                    4 => state("minecraft:kelp_plant", &[]),
+                    _ if index % 2 == 0 => state("minecraft:stone", &[]),
+                    _ => state("minecraft:water", &[("level", "0")]),
+                };
+                put(center + direction, side.clone());
+                put(center + IVec3::Y + direction, side);
+            }
+            session.level_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            let subtick_before = session.next_sub_tick;
+            let absolute = session.origin + center;
+            session
+                .random_tick_kelp(&original, absolute)
+                .unwrap_or_else(|error| panic!("{error:#}: {row}"));
+            let grew = !row["changes"].as_array().unwrap().is_empty();
+            let expected_changes = if grew {
+                serde_json::json!([
+                    [8, 11, 8, "minecraft:kelp", age + 1, 3],
+                    [8, 10, 8, "minecraft:kelp_plant", -1, 2]
+                ])
+            } else {
+                serde_json::json!([])
+            };
+            assert_eq!(row["changes"], expected_changes, "{row}");
+            let lower = if grew {
+                state("minecraft:kelp_plant", &[])
+            } else {
+                original
+            };
+            let upper = if grew {
+                state("minecraft:kelp", &[("age", &(age + 1).to_string())])
+            } else {
+                target
+            };
+            assert_eq!(
+                session.world.block(absolute.x, absolute.y, absolute.z),
+                Some(&lower),
+                "{row}"
+            );
+            assert_eq!(
+                session.world.block(absolute.x, absolute.y + 1, absolute.z),
+                Some(&upper),
+                "{row}"
+            );
+            assert!(row["blockTicks"].as_array().unwrap().is_empty(), "{row}");
+            assert!(session.bubble_ticks.is_empty(), "{row}");
+            assert_eq!(row["gameEvents"], 0, "{row}");
+            assert_eq!(
+                session.next_sub_tick - subtick_before,
+                row["fluidCalls"].as_array().unwrap().len() as i64,
+                "{row}"
+            );
+            let mut fluid: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    let tick = serde_json::json!([
+                        if key.source {
+                            "minecraft:water"
+                        } else {
+                            "minecraft:flowing_water"
+                        },
+                        key.x - session.origin.x,
+                        key.y - session.origin.y,
+                        key.z - session.origin.z,
+                        order.0
+                    ]);
+                    let first_call = row["fluidCalls"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .position(|call| *call == tick)
+                        .expect("scheduled fluid appears in Java calls");
+                    assert_eq!(order.2 - subtick_before, first_call as i64, "{row}");
+                    (order.3, tick)
+                })
+                .collect();
+            fluid.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(fluid.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["fluidTicks"],
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
         }
     }
 
@@ -53570,6 +54197,20 @@ pub(crate) mod tests {
         complete.set(true);
         live.observe_bubble_cell(position, fluid_sim::Cell::OpenWater(source));
         assert!(!complete.get());
+
+        for kelp in [
+            state("minecraft:kelp", &[("age", "17")]),
+            state("minecraft:kelp_plant", &[]),
+        ] {
+            let id = live.session.intern_block(kelp);
+            assert!(live.session.set_with_notify(position, id, false));
+            complete.set(true);
+            let observed = live.session.simulation_cell(position);
+            live.observe_bubble_cell(position, observed);
+            assert!(complete.get());
+            live.observe_bubble_change(position + IVec3::X, fluid_sim::Cell::Air, source);
+            assert!(!complete.get());
+        }
     }
 
     #[test]
@@ -53597,7 +54238,10 @@ pub(crate) mod tests {
                 assert!(session.set_with_notify(pos, id, false));
             }
             if unsupported {
-                let id = session.intern_block(state("minecraft:oak_planks", &[]));
+                let id = session.intern_block(state(
+                    "minecraft:stone_pressure_plate",
+                    &[("powered", "false")],
+                ));
                 assert!(session.set_with_notify(IVec3::new(9, 11, 8), id, false));
             }
             let position = session.origin + IVec3::new(8, 10, 8);
@@ -53730,7 +54374,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 4320);
+        assert_eq!(rows.len(), 10368);
         let block = |id: u64| match id {
             0 => state("minecraft:air", &[]),
             1 => state("minecraft:water", &[("level", "0")]),
@@ -53738,6 +54382,33 @@ pub(crate) mod tests {
             3 => state("minecraft:bubble_column", &[("drag", "true")]),
             4 => state("minecraft:bubble_column", &[("drag", "false")]),
             5 => state("minecraft:stone", &[]),
+            6 => state("minecraft:mossy_stone_bricks", &[]),
+            7 => state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "single"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            8 => state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "single"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+            9 => state(
+                "minecraft:trapped_chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "single"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+            10 => state("minecraft:kelp", &[("age", "17")]),
+            11 => state("minecraft:kelp_plant", &[]),
             _ => unreachable!(),
         };
         let center = IVec3::new(8, 10, 8);
@@ -53793,6 +54464,16 @@ pub(crate) mod tests {
             assert!(session.bubble_deferred.is_empty(), "{row}");
             assert!(!session.unresolved_bubble_tick, "{row}");
             assert_eq!(row["gameEvents"], 0, "{row}");
+            if side >= 6 {
+                let side_position = session.origin + center + IVec3::X;
+                assert_eq!(
+                    session
+                        .world
+                        .block(side_position.x, side_position.y, side_position.z),
+                    Some(&block(side)),
+                    "{row}"
+                );
+            }
             let states: Vec<_> = (0..3)
                 .map(|i| {
                     let pos = absolute + IVec3::Y * i;

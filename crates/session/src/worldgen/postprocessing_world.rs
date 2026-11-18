@@ -1707,7 +1707,7 @@ enum DryBlock {
 // Full cubes whose block states have no properties and whose Java shape
 // callbacks are inert. Keep this explicit: other blocks can schedule ticks,
 // hold fluids, or expose non-full collision faces.
-fn inert_generated_full_cube(name: &str) -> bool {
+pub(crate) fn inert_generated_full_cube(name: &str) -> bool {
     matches!(
         name,
         "minecraft:stone"

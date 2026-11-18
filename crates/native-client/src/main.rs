@@ -34,9 +34,9 @@ mod frame_pacer;
 mod fresh_generation;
 mod game_ui;
 mod generated_item;
-mod generation_pipeline;
 #[cfg(all(test, target_os = "windows"))]
 mod generated_save_integration_tests;
+mod generation_pipeline;
 mod generation_staging;
 mod generation_worker;
 mod ground_items;
@@ -72,10 +72,10 @@ mod preview_lighting;
 mod rain_fog;
 mod recipe_book_ui;
 mod renderer;
+mod saved_full_stream;
+mod saved_ticking_worker;
 mod screen_blur;
 mod screenshot;
-mod saved_ticking_worker;
-mod saved_full_stream;
 mod sky_background;
 mod sky_weather;
 mod smoke_particles;
@@ -1705,6 +1705,13 @@ fn prepare_world_with_session(
                 ) {
                     Ok(tags) => session.set_bubble_column_tags(Arc::new(tags)),
                     Err(error) => eprintln!("Bubble-column block tags are unavailable: {error:#}"),
+                }
+                match native_resources::respawn_tags::load_kelp_unsupported_blocks(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tag) => session.set_kelp_unsupported_blocks(Arc::new(tag)),
+                    Err(error) => eprintln!("Kelp support tag is unavailable: {error:#}"),
                 }
             }
             Err(error) => {

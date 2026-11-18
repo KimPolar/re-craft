@@ -29,6 +29,12 @@ public class BubbleTickCallbackOracle {
         case 3 -> Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,true);
         case 4 -> Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,false);
         case 5 -> Blocks.STONE.defaultBlockState();
+        case 6 -> Blocks.MOSSY_STONE_BRICKS.defaultBlockState();
+        case 7 -> Blocks.CHEST.defaultBlockState();
+        case 8 -> Blocks.CHEST.defaultBlockState().setValue(ChestBlock.WATERLOGGED,true);
+        case 9 -> Blocks.TRAPPED_CHEST.defaultBlockState().setValue(ChestBlock.WATERLOGGED,true);
+        case 10 -> Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,17);
+        case 11 -> Blocks.KELP_PLANT.defaultBlockState();
         default -> throw new AssertionError();
     }; }
     static String name(BlockState state) {
@@ -81,7 +87,7 @@ public class BubbleTickCallbackOracle {
             BuiltInRegistries.FLUID.prepareTagReload(new TagLoader.LoadResult<>(Registries.FLUID, Map.of(
                 FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
                 FluidTags.BUBBLE_COLUMN_CAN_OCCUPY,waterTagged?List.of(Fluids.WATER.builtInRegistryHolder()):List.of()))).apply();
-            for(int root:new int[]{1,3,4}) for(int above=0;above<6;above++) for(int top=0;top<6;top++) for(int side=0;side<5;side++) {
+            for(int root:new int[]{1,3,4}) for(int above=0;above<6;above++) for(int top=0;top<6;top++) for(int side=0;side<12;side++) {
                 world.blocks=new HashMap<>(); world.random=new LegacyRandomSource(1); world.updater=new CollectingNeighborUpdater(world,100000);
                 world.blockTicks=new JsonArray(); world.fluidTicks=new JsonArray(); world.pending=new HashSet<>(); world.gameEvents=0;
                 world.blocks.put(CENTER.below(),cell(5)); world.blocks.put(CENTER,cell(root)); world.blocks.put(CENTER.above(),cell(above)); world.blocks.put(CENTER.above(2),cell(top));

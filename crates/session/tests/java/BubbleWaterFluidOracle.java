@@ -39,10 +39,14 @@ public class BubbleWaterFluidOracle {
         BuiltInRegistries.FLUID.prepareTagReload(new TagLoader.LoadResult<>(Registries.FLUID,Map.of(FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder())))).apply();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var world=(World)unsafe.allocateInstance(World.class); world.rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
+        boolean kelp=args.length>1 && args[1].equals("kelp");
         var rows=new JsonArray();
         for(int below=0;below<4;below++) for(int mask=0;mask<16;mask++) for(int variant=0;variant<5;variant++) for(boolean holes:new boolean[]{false,true}) for(boolean drag:new boolean[]{false,true}) {
             world.blocks=new HashMap<>(); world.changes=new JsonArray();
-            var bubble=Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,drag);
+            var bubble=kelp ? (drag
+                ? Blocks.KELP.defaultBlockState().setValue(GrowingPlantHeadBlock.AGE,7)
+                : Blocks.KELP_PLANT.defaultBlockState())
+                : Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,drag);
             world.blocks.put(CENTER,bubble);
             var down=switch(below) { case 0->Blocks.AIR.defaultBlockState(); case 1->Blocks.STONE.defaultBlockState(); case 2->Blocks.WATER.defaultBlockState(); default->bubble; };
             world.blocks.put(CENTER.below(),down);

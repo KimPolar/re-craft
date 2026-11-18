@@ -26,6 +26,25 @@ pub struct RespawnBlockTags {
     fire: BTreeSet<String>,
 }
 
+/// Resolve the active block tag used by kelp survival checks.
+pub fn load_kelp_unsupported_blocks(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:cannot_support_kelp")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve kelp support tag")
+}
+
 /// Resolve the active fire tag for falling-block support checks.
 pub fn load_fire_tag(
     provider: &mut impl ResourceProvider,
@@ -402,6 +421,33 @@ mod tests {
             load_climbable_tag(&mut provider, &registry).unwrap(),
             BTreeSet::from(["minecraft:stone".into()])
         );
+    }
+
+    #[test]
+    fn kelp_support_tag_resolves_pack_replacements_and_rejects_unknown_blocks() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/cannot_support_kelp.json".into(),
+                vec![
+                    br#"{"values":["minecraft:dirt"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#example:kelp_support"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/example/tags/block/kelp_support.json".into(),
+                vec![br#"{"values":["minecraft:kelp_plant"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = BTreeSet::from(["minecraft:dirt".into(), "minecraft:kelp_plant".into()]);
+        assert_eq!(
+            load_kelp_unsupported_blocks(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:kelp_plant".into()])
+        );
+        assert!(load_kelp_unsupported_blocks(
+            &mut provider,
+            &BTreeSet::from(["minecraft:dirt".into()]),
+        )
+        .is_err());
     }
 
     #[test]

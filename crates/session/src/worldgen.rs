@@ -72,9 +72,11 @@ pub mod postprocessing_drops;
 mod postprocessing_world;
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use postprocessing_world::tests::java_results_with_args as postprocessing_java_results;
-pub(crate) use postprocessing_world::{fence_connection, speleothem_thickness};
-pub mod saved_postprocessing;
+pub(crate) use postprocessing_world::{
+    fence_connection, inert_generated_full_cube, speleothem_thickness,
+};
 pub mod ruined_portal;
+pub mod saved_postprocessing;
 pub mod saved_structure_starts;
 pub mod schedule;
 pub mod shipwreck;

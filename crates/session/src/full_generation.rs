@@ -70,6 +70,15 @@ impl FullGenerationHolder {
         FullGenerationOwner(Arc::clone(&self.owner))
     }
 
+    /// Whether the last applied holder status permits requesting FULL.
+    pub fn allows_full(&self) -> bool {
+        self.allowed
+    }
+
+    pub(crate) fn owns(&self, owner: &FullGenerationOwner) -> bool {
+        Arc::ptr_eq(&self.owner, &owner.0)
+    }
+
     /// Apply the holder's ticket level during the highest-status pass. A
     /// pending future is completed as unavailable and removed when FULL is no
     /// longer allowed. Already completed FULL futures remain in the holder.
@@ -120,7 +129,7 @@ impl FullGenerationHolder {
         ids: &mut FullFutureIds,
     ) -> Result<Option<(FullFutureId, FullFutureResult)>> {
         ensure!(
-            Arc::ptr_eq(&self.owner, &owner.0),
+            self.owns(owner),
             "FULL generation result belongs to another holder"
         );
         if let Some(future) = &mut self.full {

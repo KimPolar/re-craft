@@ -49,6 +49,7 @@ mod known_movement;
 mod lava_fire;
 pub mod loaded;
 pub mod loading_chunks;
+pub mod loading_holders;
 mod location_enchantments;
 pub mod lodestone;
 pub mod mining;

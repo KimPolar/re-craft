@@ -5,7 +5,7 @@
 //! completed holder future, and this module does not publish world changes.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Weak},
 };
 
@@ -465,6 +465,21 @@ impl TickingPreparations {
         Ok(true)
     }
 
+    /// A generation future can complete before a ticking request subscribes.
+    /// The holder retains that result; deliver it here only if this executor
+    /// already knows its identity.
+    pub(crate) fn complete_if_registered(
+        &mut self,
+        id: FullFutureId,
+        result: FullFutureResult,
+    ) -> Result<bool> {
+        if self.futures.contains_key(&id) {
+            self.complete(id, result)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn state(&self, id: TickingRequestId) -> Option<TickingFutureState> {
         self.requests.get(&id).map(TickingPreparation::state)
     }
@@ -481,6 +496,11 @@ impl TickingPreparations {
 
     pub fn queued_len(&self) -> usize {
         self.queued.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_full_future_count(&self) -> usize {
+        self.futures.len()
     }
 
     /// The running callback has left the queue but still occupies the
@@ -609,6 +629,18 @@ impl TickingPreparations {
             "FULL future is still used by a ticking request"
         );
         Ok(self.futures.remove(&id).is_some())
+    }
+
+    /// Remove cached future identities that no active or draining block or
+    /// entity request still references. A holder retains its own completion
+    /// and can register the same future again if it is requested later.
+    pub(crate) fn prune_unused_full_futures(&mut self) {
+        let mut used = BTreeSet::new();
+        for request in self.requests.values() {
+            used.extend(request.dependencies().map(|(_, future)| future.id));
+        }
+        self.collect_entity_full_futures(&mut used);
+        self.futures.retain(|id, _| used.contains(id));
     }
 }
 

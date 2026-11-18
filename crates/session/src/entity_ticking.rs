@@ -167,6 +167,11 @@ impl TickingPreparations {
         }
     }
 
+    /// Inspect the next event without changing the shared executor order.
+    pub fn peek_executor_event(&self) -> Option<TickingExecutorEvent> {
+        self.entity.as_ref()?.events.front().copied()
+    }
+
     /// Pop one observed event. Normal entity events schedule the listener on
     /// its owning executor; exceptional events only discard its registration.
     pub fn next_executor_event(&mut self) -> Option<TickingExecutorEvent> {
@@ -406,6 +411,14 @@ impl TickingPreparations {
             })
         })
     }
+
+    pub(super) fn collect_entity_full_futures(&self, used: &mut BTreeSet<FullFutureId>) {
+        if let Some(entity) = &self.entity {
+            for request in entity.requests.values() {
+                used.extend(request.dependencies.iter().map(|entry| entry.future.id));
+            }
+        }
+    }
 }
 
 /// Retains player-loading release tokens until the corresponding holder
@@ -477,6 +490,12 @@ impl EntityLoadingLinks {
 
     pub fn pending_len(&self) -> usize {
         self.registrations.len()
+    }
+
+    pub(crate) fn has_pending_at(&self, position: ChunkPos) -> bool {
+        self.registrations
+            .values()
+            .any(|token| token.position() == position)
     }
 }
 

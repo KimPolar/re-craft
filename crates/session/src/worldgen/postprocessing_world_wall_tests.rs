@@ -169,7 +169,22 @@ fn wall_fluid_faces_match_java() {
         "WallFluidShapeOracle",
         include_str!("../../tests/java/WallFluidShapeOracle.java"),
     );
-    assert_eq!(rows, ["checked 2503872"]);
+    assert_eq!(rows.first().map(String::as_str), Some("checked 2503872"));
+    let mut materials = BTreeSet::new();
+    for row in &rows[1..] {
+        let name = row.strip_prefix("material ").expect("wall material result");
+        let mut sample = wall(0, true, true);
+        sample.name = name.into();
+        assert!(
+            native_world::wall::Wall::from_state(&sample).is_some(),
+            "{name}"
+        );
+        assert!(
+            materials.insert(name.to_owned()),
+            "duplicate material {name}"
+        );
+    }
+    assert!(materials.len() >= 30, "wall registry was incomplete");
 }
 
 #[test]

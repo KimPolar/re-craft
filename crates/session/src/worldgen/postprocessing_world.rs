@@ -2262,6 +2262,80 @@ fn wall_connection(
         .with_context(|| format!("unsupported wall neighbor support: {}", neighbor.name))
 }
 
+/// Compute a wall shape after one neighbor change. Scheduling and cascading
+/// writes remain the caller's responsibility.
+pub(crate) fn wall_shape_after_neighbor(
+    tags: &native_resources::ore_feature::OreBlockTags,
+    state: &BlockState,
+    direction: [i32; 3],
+    neighbor: &BlockState,
+    above: &BlockState,
+    above_pos: [i32; 3],
+) -> Result<BlockState> {
+    use native_world::wall::{Above, Side, Wall};
+    let wall = Wall::from_state(state).context("invalid wall state")?;
+    if direction == [0, -1, 0] {
+        return Ok(state.clone());
+    }
+    let changed = match direction {
+        [0, 0, -1] => Some(0),
+        [1, 0, 0] => Some(1),
+        [0, 0, 1] => Some(2),
+        [-1, 0, 0] => Some(3),
+        [0, 1, 0] => None,
+        _ => bail!("invalid wall update direction"),
+    };
+    let mut connected = wall.shape.sides.map(|side| side != Side::None);
+    if let Some(index) = changed {
+        connected[index] = wall_connection(tags, neighbor, direction)?;
+    }
+    let boxes = if supported_speleothem(above) {
+        native_world::collision::positioned_speleothem_shape(
+            above,
+            glam::IVec3::from_array(above_pos),
+        )
+        .map(<[_]>::to_vec)
+    } else {
+        native_world::collision::block_shape(above)
+    }
+    .or_else(|| {
+        (above.properties.is_empty() && inert_generated_full_cube(&above.name)).then(|| {
+            vec![native_world::collision::Aabb {
+                min: glam::Vec3::ZERO,
+                max: glam::Vec3::ONE,
+            }]
+        })
+    })
+    .with_context(|| format!("unsupported collision above wall: {above:?}"))?;
+    let post_override = tags.contains(
+        &native_resources::packs::ResourceId::parse("minecraft:wall_post_override")?,
+        &above.name,
+    )?;
+    let top = Above::from_collision(
+        &boxes,
+        Wall::from_state(above).is_some_and(|value| value.shape.up),
+        post_override,
+    );
+    let shape = native_world::wall::shape(connected, top);
+    let mut next = state.clone();
+    for (name, side) in ["north", "east", "south", "west"]
+        .into_iter()
+        .zip(shape.sides)
+    {
+        next.properties.insert(
+            name.into(),
+            match side {
+                Side::None => "none",
+                Side::Low => "low",
+                Side::Tall => "tall",
+            }
+            .into(),
+        );
+    }
+    next.properties.insert("up".into(), shape.up.to_string());
+    Ok(next)
+}
+
 impl GeneratedBlockView<'_> {
     fn update_generated_wall_shape(
         &mut self,
@@ -2270,78 +2344,21 @@ impl GeneratedBlockView<'_> {
         direction: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
-        use native_world::wall::{Above, Side, Wall};
-        let wall = Wall::from_state(state).context("invalid wall state")?;
+        let wall = native_world::wall::Wall::from_state(state).context("invalid wall state")?;
         if wall.waterlogged {
             self.schedule_contained_water(pos)?;
         }
         if direction == [0, -1, 0] {
             return Ok(state.clone());
         }
-        let changed = match direction {
-            [0, 0, -1] => Some(0),
-            [1, 0, 0] => Some(1),
-            [0, 0, 1] => Some(2),
-            [-1, 0, 0] => Some(3),
-            [0, 1, 0] => None,
-            _ => bail!("invalid wall update direction"),
-        };
         let tags = self.wall_tags.context("wall connection tags unavailable")?;
-        let mut connected = wall.shape.sides.map(|side| side != Side::None);
-        if let Some(index) = changed {
-            connected[index] = wall_connection(tags, neighbor, direction)?;
-        }
         let above_pos = [pos[0], pos[1].wrapping_add(1), pos[2]];
-        let above = if changed.is_none() {
+        let above = if direction == [0, 1, 0] {
             neighbor.clone()
         } else {
             self.read(above_pos)?
         };
-        let boxes = if supported_speleothem(&above) {
-            native_world::collision::positioned_speleothem_shape(
-                &above,
-                glam::IVec3::from_array(above_pos),
-            )
-            .map(<[_]>::to_vec)
-        } else {
-            native_world::collision::block_shape(&above)
-        }
-        .or_else(|| {
-            (above.properties.is_empty() && inert_generated_full_cube(&above.name)).then(|| {
-                vec![native_world::collision::Aabb {
-                    min: glam::Vec3::ZERO,
-                    max: glam::Vec3::ONE,
-                }]
-            })
-        })
-        .with_context(|| format!("unsupported collision above wall: {above:?}"))?;
-        let post_override = tags.contains(
-            &native_resources::packs::ResourceId::parse("minecraft:wall_post_override")?,
-            &above.name,
-        )?;
-        let top = Above::from_collision(
-            &boxes,
-            Wall::from_state(&above).is_some_and(|value| value.shape.up),
-            post_override,
-        );
-        let shape = native_world::wall::shape(connected, top);
-        let mut next = state.clone();
-        for (name, side) in ["north", "east", "south", "west"]
-            .into_iter()
-            .zip(shape.sides)
-        {
-            next.properties.insert(
-                name.into(),
-                match side {
-                    Side::None => "none",
-                    Side::Low => "low",
-                    Side::Tall => "tall",
-                }
-                .into(),
-            );
-        }
-        next.properties.insert("up".into(), shape.up.to_string());
-        Ok(next)
+        wall_shape_after_neighbor(tags, state, direction, neighbor, &above, above_pos)
     }
 
     fn speleothem_in_direction(&self, state: &BlockState, direction: &str) -> Result<bool> {

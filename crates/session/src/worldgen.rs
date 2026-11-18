@@ -73,7 +73,7 @@ mod postprocessing_world;
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use postprocessing_world::tests::java_results_with_args as postprocessing_java_results;
 pub(crate) use postprocessing_world::{
-    fence_connection, inert_generated_full_cube, speleothem_thickness,
+    fence_connection, inert_generated_full_cube, speleothem_thickness, wall_shape_after_neighbor,
 };
 pub mod ruined_portal;
 pub mod saved_postprocessing;

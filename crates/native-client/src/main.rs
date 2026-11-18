@@ -1655,6 +1655,22 @@ fn prepare_world_with_session(
                     Ok(tags) => session.set_fence_connection_tags(Arc::new(tags)),
                     Err(error) => eprintln!("Fence connection tags are unavailable: {error:#}"),
                 }
+                let wall_tags = [
+                    "minecraft:walls",
+                    "minecraft:wall_post_override",
+                    "minecraft:shulker_boxes",
+                ]
+                .into_iter()
+                .map(native_resources::packs::ResourceId::parse)
+                .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+                match native_resources::ore_feature::OreBlockTags::load(
+                    &mut resources,
+                    &registry,
+                    &wall_tags,
+                ) {
+                    Ok(tags) => session.set_wall_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Wall connection tags are unavailable: {error:#}"),
+                }
                 let speleothem_tag =
                     native_resources::packs::ResourceId::parse("minecraft:speleothems")?;
                 match native_resources::ore_feature::OreBlockTags::load(

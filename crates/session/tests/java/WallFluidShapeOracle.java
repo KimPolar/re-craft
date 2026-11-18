@@ -1,12 +1,14 @@
-import java.util.List;
+import java.util.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.BooleanOp;
 
 /** Check whether full wall collision shapes are equivalent to an open fluid face. */
 public class WallFluidShapeOracle {
@@ -38,6 +40,30 @@ public class WallFluidShapeOracle {
                         }
                     }
             }
-        out.println("BEGIN_RESULT");out.println("checked "+count);out.println("END_RESULT");
+        var materials = new ArrayList<String>();
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            var block = BuiltInRegistries.BLOCK.getValue(id);
+            if (!(block instanceof WallBlock)) continue;
+            if (block.getClass() != WallBlock.class) throw new AssertionError("custom wall class: " + id);
+            materials.add(id.toString());
+            for (var state : block.getStateDefinition().getPossibleStates()) {
+                var reference = Blocks.STONE_BRICK_WALL.defaultBlockState()
+                    .setValue(WallBlock.NORTH, state.getValue(WallBlock.NORTH))
+                    .setValue(WallBlock.EAST, state.getValue(WallBlock.EAST))
+                    .setValue(WallBlock.SOUTH, state.getValue(WallBlock.SOUTH))
+                    .setValue(WallBlock.WEST, state.getValue(WallBlock.WEST))
+                    .setValue(WallBlock.UP, state.getValue(WallBlock.UP))
+                    .setValue(WallBlock.WATERLOGGED, state.getValue(WallBlock.WATERLOGGED));
+                if (Shapes.joinIsNotEmpty(state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
+                        reference.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), BooleanOp.NOT_SAME))
+                    throw new AssertionError("wall material collision differs: " + state);
+                if (state.getFluidState().isSource() != state.getValue(WallBlock.WATERLOGGED))
+                    throw new AssertionError("wall material fluid differs: " + state);
+            }
+        }
+        Collections.sort(materials);
+        out.println("BEGIN_RESULT"); out.println("checked " + count);
+        for (var material : materials) out.println("material " + material);
+        out.println("END_RESULT");
     }
 }

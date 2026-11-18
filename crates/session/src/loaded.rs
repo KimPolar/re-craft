@@ -10,6 +10,10 @@ mod frosted_ice_save_tests;
 mod bubble_save_tests;
 
 #[cfg(test)]
+#[path = "loaded_live_bubble_tests.rs"]
+mod live_bubble_tests;
+
+#[cfg(test)]
 #[path = "loaded_block_tick_save_tests.rs"]
 mod block_tick_save_tests;
 
@@ -2040,6 +2044,8 @@ pub struct LoadedSession {
     bubble_pending: BTreeSet<BubbleTickKey>,
     unresolved_bubble_tick: bool,
     unresolved_kelp_shape: bool,
+    unresolved_wall_shape: bool,
+    unresolved_seagrass_shape: bool,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
@@ -2067,6 +2073,7 @@ pub struct LoadedSession {
     snowy_tag: Option<Arc<BTreeSet<String>>>,
     bubble_column_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     kelp_unsupported_blocks: Option<Arc<BTreeSet<String>>>,
+    wall_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
@@ -2869,6 +2876,18 @@ fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect(),
     }
+}
+
+fn loaded_block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    block_shape(state).or_else(|| {
+        (state.properties.is_empty() && crate::worldgen::inert_generated_full_cube(&state.name))
+            .then(|| {
+                vec![Aabb {
+                    min: Vec3::ZERO,
+                    max: Vec3::ONE,
+                }]
+            })
+    })
 }
 
 fn stair_octants(state: &BlockState, shape: Option<&[Aabb]>) -> Option<u8> {
@@ -5899,6 +5918,14 @@ impl LoadedSession {
             "kelp neighbor or fluid effects are not yet fully tracked for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_wall_shape,
+            "wall neighbor or fluid effects are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
+            !self.unresolved_seagrass_shape,
+            "seagrass neighbor or fluid effects are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_leaf_shape,
             "leaf shape updates are not yet fully tracked for saving"
         );
@@ -7837,6 +7864,11 @@ impl LoadedSession {
             (self.unresolved_ice_tick, "ice tick"),
             (self.unresolved_bubble_tick, "bubble column tick"),
             (self.unresolved_kelp_shape, "kelp neighbor or fluid update"),
+            (self.unresolved_wall_shape, "wall neighbor or fluid update"),
+            (
+                self.unresolved_seagrass_shape,
+                "seagrass neighbor or fluid update",
+            ),
         ];
         if unresolved.iter().any(|(active, _)| *active) {
             let names = unresolved
@@ -8820,6 +8852,10 @@ impl LoadedSession {
         self.kelp_unsupported_blocks = Some(tag);
     }
 
+    pub fn set_wall_tags(&mut self, tags: Arc<native_resources::ore_feature::OreBlockTags>) {
+        self.wall_tags = Some(tags);
+    }
+
     pub fn set_bounce_suppression_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.bounce_suppression_tag = Some(tag);
     }
@@ -9732,7 +9768,7 @@ impl LoadedSession {
         ];
         let shapes: Vec<_> = world
             .states()
-            .map(|(_, state)| block_shape(state))
+            .map(|(_, state)| loaded_block_shape(state))
             .collect();
         let stair_octants: Vec<_> = world
             .states()
@@ -10135,6 +10171,8 @@ impl LoadedSession {
             bubble_pending: BTreeSet::new(),
             unresolved_bubble_tick: false,
             unresolved_kelp_shape: false,
+            unresolved_wall_shape: false,
+            unresolved_seagrass_shape: false,
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
@@ -10164,6 +10202,7 @@ impl LoadedSession {
             snowy_tag: None,
             bubble_column_tags: None,
             kelp_unsupported_blocks: None,
+            wall_tags: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
             saved_clock_source: None,
@@ -11059,7 +11098,7 @@ impl LoadedSession {
             })?;
         anyhow::ensure!(imported, "initial spawn chunk is already loaded");
         for (_, state) in self.world.states().skip(old_count) {
-            let shape = block_shape(state);
+            let shape = loaded_block_shape(state);
             self.unsupported_states += usize::from(
                 shape.is_none()
                     && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
@@ -13150,6 +13189,14 @@ impl LoadedSession {
             "kelp neighbor or fluid effects are not yet fully tracked for saving"
         );
         ensure!(
+            !self.unresolved_wall_shape,
+            "wall neighbor or fluid effects are not yet fully tracked for saving"
+        );
+        ensure!(
+            !self.unresolved_seagrass_shape,
+            "seagrass neighbor or fluid effects are not yet fully tracked for saving"
+        );
+        ensure!(
             !self.unresolved_leaf_shape,
             "leaf shape updates are not yet fully tracked for saving"
         );
@@ -15191,7 +15238,7 @@ impl LoadedSession {
                             }
                             respawn_changed = true;
                             for (_, state) in self.world.states().skip(old_count) {
-                                let shape = block_shape(state);
+                                let shape = loaded_block_shape(state);
                                 self.unsupported_states += usize::from(
                                     shape.is_none()
                                         && native_world::collision::positioned_speleothem_shape(
@@ -20470,6 +20517,9 @@ impl LoadedSession {
         if crate::kelp_random_tick::part(state).is_some() {
             return Some(fluid);
         }
+        if seagrass_part(state).is_some() {
+            return Some(fluid);
+        }
         if leaf_state_distance(state).is_some() {
             return Some(fluid);
         }
@@ -20477,6 +20527,9 @@ impl LoadedSession {
             return Some(fluid);
         }
         if native_world::collision::fence_waterlogged(state) == Some(true) {
+            return Some(fluid);
+        }
+        if native_world::wall::Wall::from_state(state).is_some_and(|wall| wall.waterlogged) {
             return Some(fluid);
         }
         if native_world::collision::glow_lichen_faces(state).is_some()
@@ -23733,6 +23786,72 @@ impl LoadedSession {
         true
     }
 
+    /// Handle wall callbacks that leave the shape unchanged. A shape change
+    /// requires cascading shape-only notifications and remains uncommittable.
+    fn update_wall_neighbor(
+        &mut self,
+        position: IVec3,
+        id: BlockStateId,
+        direction: IVec3,
+        other: BlockStateId,
+    ) -> bool {
+        let Some(block) = self.world.state(id).cloned() else {
+            return false;
+        };
+        let Some(wall) = native_world::wall::Wall::from_state(&block) else {
+            return false;
+        };
+        if wall.waterlogged
+            && let Some(fluid) = self.simulated_fluid(id)
+        {
+            self.schedule_fluid(position, fluid, self.fluid_settings().delay(fluid.kind));
+        }
+        if direction == IVec3::NEG_Y {
+            return true;
+        }
+        let result = (|| -> anyhow::Result<BlockState> {
+            use anyhow::Context;
+            let tags = self
+                .wall_tags
+                .as_ref()
+                .context("wall tags are unavailable")?;
+            let neighbor = self
+                .world
+                .state(other)
+                .context("wall neighbor is unavailable")?;
+            let above_pos = add(position, IVec3::Y).context("wall position overflow")?;
+            let absolute = add(self.origin, above_pos).context("wall position overflow")?;
+            let above = if direction == IVec3::Y {
+                neighbor
+            } else {
+                let Cell::State(above) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    above_pos,
+                    self.states[0],
+                ) else {
+                    anyhow::bail!("wall above block is unavailable")
+                };
+                self.world
+                    .state(above)
+                    .context("invalid wall above block")?
+            };
+            crate::worldgen::wall_shape_after_neighbor(
+                tags,
+                &block,
+                direction.to_array(),
+                neighbor,
+                above,
+                absolute.to_array(),
+            )
+        })();
+        if !matches!(result, Ok(ref next) if *next == block) {
+            self.unresolved_wall_shape = true;
+        }
+        true
+    }
+
     fn retry_fence_updates(&mut self) {
         if self.fence_tags.is_none() {
             return;
@@ -24459,6 +24578,15 @@ impl LoadedSession {
         let old_name = self.world.state(old).map(|state| state.name.as_str());
         let new_name = self.world.state(new).map(|state| state.name.as_str());
         let changed_kind = old_name != new_name;
+        if old != new
+            && [old_name, new_name]
+                .into_iter()
+                .any(|name| matches!(name, Some("minecraft:seagrass" | "minecraft:tall_seagrass")))
+        {
+            // Placement and destruction can update support, paired halves,
+            // drops, and water ticks; those effects are not yet certified.
+            self.unresolved_seagrass_shape = true;
+        }
         let new_sand = new_name.and_then(FallingKind::from_id);
         let old_support = self.world.state(old).and_then(button_support_direction);
         let new_support = self.world.state(new).and_then(button_support_direction);
@@ -24550,7 +24678,17 @@ impl LoadedSession {
                 }
                 continue;
             };
+            let kelp = self.world.state(id).and_then(crate::kelp_random_tick::part);
+            let unchanged_head = direction == IVec3::NEG_Y
+                && matches!(kelp, Some(crate::kelp_random_tick::KelpPart::Head(_)))
+                && self.world.state(new).is_some_and(|state| {
+                    !matches!(
+                        state.name.as_str(),
+                        "minecraft:kelp" | "minecraft:kelp_plant"
+                    )
+                });
             if direction.y != 0
+                && !unchanged_head
                 && self.world.state(id).is_some_and(|state| {
                     matches!(
                         state.name.as_str(),
@@ -24561,6 +24699,16 @@ impl LoadedSession {
                 // Vertical updates can transform or schedule a plant. The
                 // dedicated growth path handles its proven callback sequence.
                 self.unresolved_kelp_shape = true;
+            }
+            if self.world.state(id).is_some_and(|state| {
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:seagrass" | "minecraft:tall_seagrass"
+                )
+            }) {
+                // The plant may break or update its paired half. Its full
+                // live neighbor callback is not yet represented here.
+                self.unresolved_seagrass_shape = true;
             }
             if direction == IVec3::NEG_Y {
                 self.update_snowy_below(position, neighbor, id);
@@ -24575,6 +24723,9 @@ impl LoadedSession {
                 position,
                 self.states[0],
             ) {
+                if self.update_wall_neighbor(neighbor, id, -direction, current) {
+                    continue;
+                }
                 if self.update_fence_neighbor(neighbor, id, -direction, current) {
                     continue;
                 }
@@ -24745,12 +24896,14 @@ impl LoadedSession {
                 }
                 continue;
             }
-            self.schedule_column_shape_check(neighbor, direction, id, new);
             if let Some(fluid) = self.simulated_fluid(id)
                 && !(fluid.kind == FluidKind::Lava && self.react_lava(neighbor))
             {
                 self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
             }
+            // BubbleColumnBlock.updateShape schedules its water tick before
+            // the possible bubble-column block tick.
+            self.schedule_column_shape_check(neighbor, direction, id, new);
         }
         // Attached signal sources notify both their own position and their support.
         for (index, support) in [old_support, new_support].into_iter().enumerate() {
@@ -25079,6 +25232,11 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::OpenWater(fluid);
         }
+        if seagrass_part(state).is_some()
+            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        {
+            return fluid_sim::Cell::OpenWater(fluid);
+        }
         if native_world::fluid::is_copper_grate(&state.name)
             && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
         {
@@ -25112,6 +25270,17 @@ impl LoadedSession {
         }
         if native_world::collision::fence_waterlogged(state) == Some(false) {
             return fluid_sim::Cell::FenceDry;
+        }
+        if let Some(wall) = native_world::wall::Wall::from_state(state) {
+            return if wall.waterlogged {
+                self.fluids
+                    .get(id.0 as usize)
+                    .copied()
+                    .flatten()
+                    .map_or(fluid_sim::Cell::Unknown, fluid_sim::Cell::FenceWater)
+            } else {
+                fluid_sim::Cell::FenceDry
+            };
         }
         if let Some((_, waterlogged)) = native_world::collision::ladder_state(state)
             && let Some(support) = ladder_support_direction(state)
@@ -25172,7 +25341,7 @@ impl LoadedSession {
         let id = Arc::make_mut(&mut self.world).intern_state(block);
         if self.world.state_count() != old_count {
             let state = self.world.state(id).expect("new state is interned");
-            let shape = block_shape(state);
+            let shape = loaded_block_shape(state);
             self.unsupported_states += usize::from(
                 shape.is_none()
                     && native_world::collision::positioned_speleothem_shape(state, IVec3::ZERO)
@@ -25221,6 +25390,11 @@ impl LoadedSession {
         kind: FluidKind,
         settings: fluid_sim::Settings,
     ) -> bool {
+        let waterlogging_wall = matches!(change.block, fluid_sim::ChangedBlock::WaterloggedFence)
+            && matches!(
+                cell(&self.world, self.origin, self.bounds, change.position, self.states[0]),
+                Cell::State(id) if self.world.state(id).and_then(native_world::wall::Wall::from_state).is_some()
+            );
         let plant = match change.block {
             fluid_sim::ChangedBlock::Fluid(_) => match cell(
                 &self.world,
@@ -25339,6 +25513,11 @@ impl LoadedSession {
             self.set(change.position, id)
         };
         if changed {
+            if waterlogging_wall {
+                // Shape cascades after placing water into a dry wall still
+                // need a transactional live callback path.
+                self.unresolved_wall_shape = true;
+            }
             if kind == FluidKind::Lava
                 && matches!(
                     change.block,
@@ -25533,6 +25712,17 @@ impl LoadedSession {
                     "minecraft:kelp" | "minecraft:kelp_plant"
                 )
             });
+            let is_wall = self
+                .world
+                .state(id)
+                .and_then(native_world::wall::Wall::from_state)
+                .is_some();
+            let is_seagrass = self.world.state(id).is_some_and(|state| {
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:seagrass" | "minecraft:tall_seagrass"
+                )
+            });
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             let Some(fluid) = self.simulated_fluid(id) else {
                 if is_bubble_column {
@@ -25541,24 +25731,31 @@ impl LoadedSession {
                 if is_kelp {
                     self.unresolved_kelp_shape = true;
                 }
+                if is_wall {
+                    self.unresolved_wall_shape = true;
+                }
+                if is_seagrass {
+                    self.unresolved_seagrass_shape = true;
+                }
                 continue;
             };
             if fluid.kind != scheduled.key.kind || fluid.source != scheduled.key.source {
                 continue;
             }
             const WATER_TYPES: u8 = (1 << 1) | (1 << 2);
-            let bubble_complete = (is_bubble_column || is_kelp).then(|| {
-                std::cell::Cell::new(
-                    !self.notifying_blocks
-                        && self.block_notifications.is_empty()
-                        && self
-                            .farmland_water_tag
-                            .is_some_and(|tag| tag & WATER_TYPES == WATER_TYPES)
-                        && self
-                            .lava_fluid_tag
-                            .is_some_and(|tag| tag & WATER_TYPES == 0),
-                )
-            });
+            let bubble_complete =
+                (is_bubble_column || is_kelp || is_wall || is_seagrass).then(|| {
+                    std::cell::Cell::new(
+                        !self.notifying_blocks
+                            && self.block_notifications.is_empty()
+                            && self
+                                .farmland_water_tag
+                                .is_some_and(|tag| tag & WATER_TYPES == WATER_TYPES)
+                            && self
+                                .lava_fluid_tag
+                                .is_some_and(|tag| tag & WATER_TYPES == 0),
+                    )
+                });
             let (retry_wash, bubble_complete, result) = {
                 let mut live = SessionFluidTick {
                     session: self,
@@ -25583,6 +25780,12 @@ impl LoadedSession {
             }
             if is_kelp && (!bubble_complete || retry_wash || result.is_err()) {
                 self.unresolved_kelp_shape = true;
+            }
+            if is_wall && (!bubble_complete || retry_wash || result.is_err()) {
+                self.unresolved_wall_shape = true;
+            }
+            if is_seagrass && (!bubble_complete || retry_wash || result.is_err()) {
+                self.unresolved_seagrass_shape = true;
             }
             match result {
                 Ok(()) => {}
@@ -28323,8 +28526,29 @@ struct SessionFluidTick<'a> {
     settings: fluid_sim::Settings,
     kind: FluidKind,
     retry_wash: bool,
-    // Bubble and kelp fluid ticks use this proof to authorize saving.
+    // Source-water blocks use this proof to authorize saving.
     bubble_complete: Option<std::cell::Cell<bool>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeagrassPart {
+    Short,
+    Lower,
+    Upper,
+}
+
+fn seagrass_part(state: &BlockState) -> Option<SeagrassPart> {
+    match state.name.as_str() {
+        "minecraft:seagrass" if state.properties.is_empty() => Some(SeagrassPart::Short),
+        "minecraft:tall_seagrass" if state.properties.len() == 1 => {
+            match state.properties.get("half").map(String::as_str) {
+                Some("lower") => Some(SeagrassPart::Lower),
+                Some("upper") => Some(SeagrassPart::Upper),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28410,6 +28634,59 @@ fn bubble_proof_water_level(fluid: FluidState) -> Option<u8> {
     }
 }
 
+// These already had verified live callbacks when a neighboring block changes.
+fn bubble_proof_plain_solid_neighbor(state: &BlockState) -> bool {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:deepslate" | "minecraft:basalt"
+    ) {
+        return state.properties.len() == 1
+            && matches!(
+                state.properties.get("axis").map(String::as_str),
+                Some("x" | "y" | "z")
+            );
+    }
+    state.properties.is_empty()
+        && matches!(
+            state.name.as_str(),
+            "minecraft:stone"
+                | "minecraft:dirt"
+                | "minecraft:coarse_dirt"
+                | "minecraft:cobblestone"
+                | "minecraft:mossy_cobblestone"
+                | "minecraft:cobbled_deepslate"
+                | "minecraft:granite"
+                | "minecraft:diorite"
+                | "minecraft:andesite"
+                | "minecraft:tuff"
+                | "minecraft:sandstone"
+                | "minecraft:red_sandstone"
+                | "minecraft:stone_bricks"
+                | "minecraft:clay"
+                | "minecraft:magma_block"
+                | "minecraft:glass"
+                | "minecraft:bedrock"
+                | "minecraft:obsidian"
+                | "minecraft:netherrack"
+                | "minecraft:end_stone"
+                | "minecraft:blackstone"
+                | "minecraft:nether_bricks"
+                | "minecraft:soul_soil"
+                | "minecraft:moss_block"
+        )
+}
+
+fn bubble_proof_solid_read(state: &BlockState) -> bool {
+    bubble_proof_plain_solid_neighbor(state)
+        || (state.properties.is_empty()
+            && (crate::worldgen::inert_generated_full_cube(&state.name)
+                || matches!(
+                    state.name.as_str(),
+                    "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+                )))
+        || native_world::collision::brushable_state(state)
+}
+
 impl SessionFluidTick<'_> {
     fn observe_bubble_cell(&self, position: IVec3, simulated: fluid_sim::Cell) {
         let Some(complete) = self.bubble_complete.as_ref().filter(|value| value.get()) else {
@@ -28456,6 +28733,7 @@ impl SessionFluidTick<'_> {
             }
             fluid_sim::Cell::OpenWater(fluid) => {
                 (crate::kelp_random_tick::part(state).is_some()
+                    || seagrass_part(state).is_some()
                     || (native_world::collision::glow_lichen_faces(state).is_some()
                         && state.properties.get("waterlogged").map(String::as_str) == Some("true")))
                     && fluid.kind == FluidKind::Water
@@ -28464,46 +28742,42 @@ impl SessionFluidTick<'_> {
                     && !fluid.falling
                     && matches!(FluidState::from_block(state), Ok(Some(actual)) if actual == fluid)
             }
-            fluid_sim::Cell::Solid => {
-                if matches!(
+            fluid_sim::Cell::Solid => bubble_proof_solid_read(state),
+            fluid_sim::Cell::Slab { top, waterlogged } => {
+                self.session.slab_top(state) == Some(top)
+                    && state.properties.get("waterlogged").map(String::as_str)
+                        == Some(if waterlogged { "true" } else { "false" })
+            }
+            fluid_sim::Cell::Stairs {
+                voxels,
+                waterlogged,
+            } => {
+                self.session.stair_voxels(id) == Some(voxels)
+                    && state.properties.get("waterlogged").map(String::as_str)
+                        == Some(if waterlogged { "true" } else { "false" })
+            }
+            fluid_sim::Cell::Chest { waterlogged } => {
+                matches!(
                     state.name.as_str(),
-                    "minecraft:deepslate" | "minecraft:basalt"
-                ) {
-                    state.properties.len() == 1
-                        && matches!(
-                            state.properties.get("axis").map(String::as_str),
-                            Some("x" | "y" | "z")
-                        )
-                } else {
-                    state.properties.is_empty()
-                        && matches!(
-                            state.name.as_str(),
-                            "minecraft:stone"
-                                | "minecraft:dirt"
-                                | "minecraft:coarse_dirt"
-                                | "minecraft:cobblestone"
-                                | "minecraft:mossy_cobblestone"
-                                | "minecraft:cobbled_deepslate"
-                                | "minecraft:granite"
-                                | "minecraft:diorite"
-                                | "minecraft:andesite"
-                                | "minecraft:tuff"
-                                | "minecraft:sandstone"
-                                | "minecraft:red_sandstone"
-                                | "minecraft:stone_bricks"
-                                | "minecraft:clay"
-                                | "minecraft:magma_block"
-                                | "minecraft:glass"
-                                | "minecraft:bedrock"
-                                | "minecraft:obsidian"
-                                | "minecraft:netherrack"
-                                | "minecraft:end_stone"
-                                | "minecraft:blackstone"
-                                | "minecraft:nether_bricks"
-                                | "minecraft:soul_soil"
-                                | "minecraft:moss_block"
-                        )
-                }
+                    "minecraft:chest" | "minecraft:trapped_chest"
+                ) && self
+                    .session
+                    .shapes
+                    .get(id.0 as usize)
+                    .is_some_and(Option::is_some)
+                    && state.properties.get("waterlogged").map(String::as_str)
+                        == Some(if waterlogged { "true" } else { "false" })
+            }
+            fluid_sim::Cell::FenceWater(fluid) => {
+                native_world::wall::Wall::from_state(state).is_some_and(|wall| wall.waterlogged)
+                    && fluid.kind == FluidKind::Water
+                    && fluid.amount == 8
+                    && fluid.source
+                    && !fluid.falling
+                    && matches!(FluidState::from_block(state), Ok(Some(actual)) if actual == fluid)
+            }
+            fluid_sim::Cell::FenceDry => {
+                native_world::wall::Wall::from_state(state).is_some_and(|wall| !wall.waterlogged)
             }
             _ => false,
         };
@@ -28534,10 +28808,37 @@ impl SessionFluidTick<'_> {
                 return;
             };
             let simulated = self.session.simulation_cell(neighbor);
-            // Read-only waterlogged lichen and kelp are understood, but a neighboring
-            // block change also invokes shape callbacks. Keep rejecting that
-            // case until those callbacks are proven for this fluid path.
-            if matches!(simulated, fluid_sim::Cell::OpenWater(_)) {
+            let state = match cell(
+                &self.session.world,
+                self.session.origin,
+                self.session.bounds,
+                neighbor,
+                self.session.states[0],
+            ) {
+                Cell::State(id) => self.session.world.state(id),
+                Cell::Missing => None,
+            };
+            let callbacks_supported = match simulated {
+                fluid_sim::Cell::OpenWater(_) => {
+                    state.is_some_and(|state| match crate::kelp_random_tick::part(state) {
+                        Some(crate::kelp_random_tick::KelpPart::Head(_)) => {
+                            direction.y == 0 || direction == IVec3::NEG_Y
+                        }
+                        Some(crate::kelp_random_tick::KelpPart::Body) => direction.y == 0,
+                        None => false,
+                    })
+                }
+                fluid_sim::Cell::Slab { .. } | fluid_sim::Cell::Stairs { .. } => false,
+                fluid_sim::Cell::Solid => state.is_some_and(bubble_proof_plain_solid_neighbor),
+                fluid_sim::Cell::Chest { .. } => state.is_some_and(|state| {
+                    native_world::collision::chest_connection(state) != Some(-direction)
+                }),
+                fluid_sim::Cell::FenceWater(_) | fluid_sim::Cell::FenceDry => state
+                    .and_then(native_world::wall::Wall::from_state)
+                    .is_some(),
+                _ => true,
+            };
+            if !callbacks_supported {
                 complete.set(false);
                 return;
             }
@@ -53943,9 +54244,9 @@ pub(crate) mod tests {
     fn vertical_kelp_neighbor_changes_block_saving() {
         let mut session = session();
         let center = IVec3::new(8, 10, 8);
-        let head = session.intern_block(state("minecraft:kelp", &[("age", "7")]));
+        let body = session.intern_block(state("minecraft:kelp_plant", &[]));
         let stone = session.intern_block(state("minecraft:stone", &[]));
-        assert!(session.set_with_notify(center, head, false));
+        assert!(session.set_with_notify(center, body, false));
         assert!(session.set(center + IVec3::Y, stone));
         assert!(session.unresolved_kelp_shape);
         assert!(
@@ -54209,6 +54510,8 @@ pub(crate) mod tests {
             live.observe_bubble_cell(position, observed);
             assert!(complete.get());
             live.observe_bubble_change(position + IVec3::X, fluid_sim::Cell::Air, source);
+            assert!(complete.get());
+            live.observe_bubble_change(position - IVec3::Y, fluid_sim::Cell::Air, source);
             assert!(!complete.get());
         }
     }

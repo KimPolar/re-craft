@@ -1026,7 +1026,7 @@ fn active_bubble_fluid_spread_across_chunks_saves_both_tick_queues() {
 #[test]
 fn active_bubble_fluid_tick_with_unknown_neighbors_still_blocks_saving() {
     for unknown in [
-        state("minecraft:oak_planks", &[]),
+        state("minecraft:oak_planks", &[("invalid", "true")]),
         state("minecraft:deepslate", &[]),
         state("minecraft:deepslate", &[("axis", "invalid")]),
         state("minecraft:water", &[]),

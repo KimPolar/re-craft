@@ -45,6 +45,25 @@ pub fn load_kelp_unsupported_blocks(
     .context("cannot resolve kelp support tag")
 }
 
+/// Resolve the active block tag used by seagrass survival checks.
+pub fn load_seagrass_unsupported_blocks(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:cannot_support_seagrass")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve seagrass support tag")
+}
+
 /// Resolve the active fire tag for falling-block support checks.
 pub fn load_fire_tag(
     provider: &mut impl ResourceProvider,
@@ -448,6 +467,35 @@ mod tests {
             &BTreeSet::from(["minecraft:dirt".into()]),
         )
         .is_err());
+    }
+
+    #[test]
+    fn seagrass_support_tag_resolves_pack_replacements_and_rejects_unknown_blocks() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/cannot_support_seagrass.json".into(),
+                vec![
+                    br#"{"values":["minecraft:dirt"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#example:blocked_seagrass"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/example/tags/block/blocked_seagrass.json".into(),
+                vec![br#"{"values":["minecraft:stone"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = BTreeSet::from(["minecraft:dirt".into(), "minecraft:stone".into()]);
+        assert_eq!(
+            load_seagrass_unsupported_blocks(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:stone".into()])
+        );
+        assert!(
+            load_seagrass_unsupported_blocks(
+                &mut provider,
+                &BTreeSet::from(["minecraft:dirt".into()]),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -77,6 +77,7 @@ public class KelpGrowthOracle {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK, Map.of(
             BlockTags.CANNOT_SUPPORT_KELP, List.of(),
+            BlockTags.CANNOT_SUPPORT_SEAGRASS, List.of(),
             BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN, List.of(),
             BlockTags.ENABLES_BUBBLE_COLUMN_PUSH_UP, List.of()))).apply();
         BuiltInRegistries.FLUID.prepareTagReload(new TagLoader.LoadResult<>(Registries.FLUID, Map.of(
@@ -89,7 +90,7 @@ public class KelpGrowthOracle {
         var rows = new JsonArray();
         for (int age : new int[] {0, 7, 24, 25})
         for (int target : new int[] {0, 1, 2})
-        for (int sides : new int[] {0, 1, 2, 3, 4, 5})
+        for (int sides : new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8})
         for (int support : new int[] {0, 1, 2, 3})
         for (int ceiling : new int[] {0, 1, 2, 3})
         for (long sample = 0; sample < 16; sample++) {
@@ -126,8 +127,16 @@ public class KelpGrowthOracle {
                     case 4 -> Blocks.KELP_PLANT.defaultBlockState();
                     default -> index % 2 == 0 ? Blocks.STONE.defaultBlockState() : Blocks.WATER.defaultBlockState();
                 };
-                world.blocks.put(CENTER.relative(side), neighbor);
-                world.blocks.put(CENTER.above().relative(side), neighbor);
+                var lower = sides == 6 ? Blocks.SEAGRASS.defaultBlockState()
+                    : sides == 7 ? Blocks.STONE.defaultBlockState()
+                    : sides == 8 ? Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF, net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER)
+                    : neighbor;
+                var upper = sides == 6 ? Blocks.STONE.defaultBlockState()
+                    : sides == 7 ? Blocks.SEAGRASS.defaultBlockState()
+                    : sides == 8 ? Blocks.TALL_SEAGRASS.defaultBlockState().setValue(DoublePlantBlock.HALF, net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER)
+                    : neighbor;
+                world.blocks.put(CENTER.relative(side), lower);
+                world.blocks.put(CENTER.above().relative(side), upper);
             }
             head.randomTick(world, CENTER, world.random);
             var row = new JsonObject();

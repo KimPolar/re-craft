@@ -1729,6 +1729,13 @@ fn prepare_world_with_session(
                     Ok(tag) => session.set_kelp_unsupported_blocks(Arc::new(tag)),
                     Err(error) => eprintln!("Kelp support tag is unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::load_seagrass_unsupported_blocks(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tag) => session.set_seagrass_unsupported_blocks(Arc::new(tag)),
+                    Err(error) => eprintln!("Seagrass support tag is unavailable: {error:#}"),
+                }
             }
             Err(error) => {
                 return Err(error.context(

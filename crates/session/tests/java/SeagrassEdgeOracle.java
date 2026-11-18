@@ -21,6 +21,7 @@ public class SeagrassEdgeOracle {
         var out = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        out.println("BEGIN_RESULT");
         var attrs = EnvironmentAttributeSystem.builder().build();
         var supports = new ArrayList<>(List.of(
             Blocks.STONE.defaultBlockState(), Blocks.MAGMA_BLOCK.defaultBlockState(),
@@ -91,6 +92,7 @@ public class SeagrassEdgeOracle {
                     var saved = ticks.pack(0);
                     if (saved.size() > 1) throw new AssertionError("water ticks were not deduplicated");
                     var id = BuiltInRegistries.BLOCK.getKey(updated.getBlock());
+                    out.printf("R %d%n", requests.isEmpty() ? -1 : requests.get(0));
                     out.printf("E %d %d %d %s %s %d %d %d %d%n", mask, index, n,
                         direction.getSerializedName(), id, requests.size(), saved.size(),
                         saved.isEmpty() ? -1 : saved.get(0).delay(),
@@ -98,5 +100,6 @@ public class SeagrassEdgeOracle {
                 }
             }
         }
+        out.println("END_RESULT");
     }
 }

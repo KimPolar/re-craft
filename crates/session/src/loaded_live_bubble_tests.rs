@@ -219,7 +219,7 @@ fn seagrass_reads_source_water_but_changes_block_saving() {
     );
 
     let mut session = filled_session();
-    set_raw(
+    let tall = set_raw(
         &mut session,
         center + IVec3::X,
         state("minecraft:tall_seagrass", &[("half", "lower")]),
@@ -227,8 +227,252 @@ fn seagrass_reads_source_water_but_changes_block_saving() {
     let stone = set_raw(&mut session, center, state("minecraft:stone", &[]));
     let air = session.states[0];
     session.notify_one_block(center, air, stone);
+    assert!(!session.unresolved_seagrass_shape);
+    assert!(session.simulated_fluid(tall).is_some());
+    assert!(session.fluid_ticks.is_empty());
+
+    let water = set_raw(
+        &mut session,
+        center + IVec3::X + IVec3::Y,
+        state("minecraft:water", &[("level", "0")]),
+    );
+    assert!(session.update_seagrass_neighbor(center + IVec3::X, tall, IVec3::Y, water));
     assert!(session.unresolved_seagrass_shape);
     assert!(session.validate_generation_stage_block_readiness().is_err());
+}
+
+#[cfg(windows)]
+fn seagrass_support(index: usize) -> BlockState {
+    match index {
+        0 => state("minecraft:stone", &[]),
+        1 => state("minecraft:magma_block", &[]),
+        2 => state("minecraft:air", &[]),
+        3 => state("minecraft:water", &[("level", "0")]),
+        4..=6 => state(
+            "minecraft:stone_slab",
+            &[
+                ("type", ["bottom", "top", "double"][index - 4]),
+                ("waterlogged", "false"),
+            ],
+        ),
+        7..=8 => state(
+            "minecraft:stone_brick_stairs",
+            &[
+                ("facing", "north"),
+                ("half", if index == 7 { "top" } else { "bottom" }),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        ),
+        9..=16 => state(
+            if index < 13 {
+                "minecraft:suspicious_sand"
+            } else {
+                "minecraft:suspicious_gravel"
+            },
+            &[("dusted", &((index - 9) % 4).to_string())],
+        ),
+        17 => state("minecraft:kelp", &[("age", "17")]),
+        18 => state("minecraft:kelp_plant", &[]),
+        19 => state("minecraft:seagrass", &[]),
+        20..=21 => state(
+            "minecraft:tall_seagrass",
+            &[("half", if index == 20 { "lower" } else { "upper" })],
+        ),
+        _ => panic!("invalid support index"),
+    }
+}
+
+#[cfg(windows)]
+fn seagrass_direction(value: &str) -> IVec3 {
+    match value {
+        "west" => IVec3::NEG_X,
+        "east" => IVec3::X,
+        "north" => IVec3::NEG_Z,
+        "south" => IVec3::Z,
+        "down" => IVec3::NEG_Y,
+        "up" => IVec3::Y,
+        _ => panic!("invalid direction"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn seagrass_shape_and_water_ticks_match_java() {
+    let rows = crate::worldgen::postprocessing_java_results(
+        "SeagrassEdgeOracle",
+        include_str!("../tests/java/SeagrassEdgeOracle.java"),
+        &[],
+    );
+    let center = IVec3::new(8, 10, 8);
+    let mut session = filled_session();
+    let mut checked = 0;
+    let delays = rows.iter().filter_map(|row| row.strip_prefix("R "));
+    for (row, delay) in rows
+        .iter()
+        .filter_map(|row| row.strip_prefix("E "))
+        .zip(delays)
+    {
+        let fields: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(fields.len(), 9, "{row}");
+        let mask: u8 = fields[0].parse().unwrap();
+        let mut tags = BTreeSet::new();
+        if mask & 1 != 0 {
+            tags.extend([
+                "minecraft:stone".into(),
+                "minecraft:suspicious_gravel".into(),
+            ]);
+        }
+        if mask & 2 != 0 {
+            tags.extend([
+                "minecraft:magma_block".into(),
+                "minecraft:suspicious_sand".into(),
+            ]);
+        }
+        session.set_seagrass_unsupported_blocks(Arc::new(tags));
+        set_raw(
+            &mut session,
+            center - IVec3::Y,
+            seagrass_support(fields[1].parse().unwrap()),
+        );
+        let plant = set_raw(&mut session, center, state("minecraft:seagrass", &[]));
+        let neighbor = session.intern_block(match fields[2] {
+            "0" => state("minecraft:air", &[]),
+            "1" => state("minecraft:stone", &[]),
+            "2" => state("minecraft:water", &[("level", "0")]),
+            _ => panic!("invalid neighbor"),
+        });
+        let direction = seagrass_direction(fields[3]);
+        let survives = fields[4] == "minecraft:seagrass";
+        assert_eq!(
+            session.seagrass_shape_unchanged(center, SeagrassPart::Short, direction, None),
+            Some(survives),
+            "{row}"
+        );
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.unresolved_seagrass_shape = false;
+        let before = session.next_sub_tick;
+        for _ in 0..2 {
+            assert!(session.update_seagrass_neighbor(center, plant, direction, neighbor));
+        }
+        assert_eq!(session.unresolved_seagrass_shape, !survives, "{row}");
+        assert_eq!(
+            session.next_sub_tick - before,
+            fields[5].parse::<i64>().unwrap(),
+            "{row}"
+        );
+        assert_eq!(
+            session.fluid_ticks.len(),
+            fields[6].parse::<usize>().unwrap(),
+            "{row}"
+        );
+        if survives {
+            assert_eq!(
+                session.fluid_ticks.keys().next().unwrap().0,
+                delay.parse::<i128>().unwrap(),
+                "{row}"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 4 * 22 * 3 * 6);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn tall_seagrass_shape_and_water_ticks_match_java() {
+    let rows = crate::worldgen::postprocessing_java_results(
+        "TallSeagrassEdgeOracle",
+        include_str!("../tests/java/TallSeagrassEdgeOracle.java"),
+        &[],
+    );
+    let center = IVec3::new(8, 10, 8);
+    let mut session = filled_session();
+    let mut checked = 0;
+    for row in rows.iter().filter_map(|row| row.strip_prefix("T ")) {
+        let fields: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(fields.len(), 10, "{row}");
+        let part = if fields[0] == "0" {
+            SeagrassPart::Lower
+        } else {
+            SeagrassPart::Upper
+        };
+        let direction = seagrass_direction(fields[1]);
+        let support = match fields[2].parse::<usize>().unwrap() {
+            i @ 0..=5 => seagrass_support(i),
+            6 => seagrass_support(20),
+            7 => seagrass_support(21),
+            8 => seagrass_support(18),
+            9 => seagrass_support(13),
+            _ => panic!("invalid support"),
+        };
+        let current = match fields[3] {
+            "0" => seagrass_support(20),
+            "1" => state("minecraft:water", &[("level", "0")]),
+            "2" => state("minecraft:water", &[("level", "1")]),
+            "3" => state("minecraft:water", &[("level", "8")]),
+            "4" => state("minecraft:lava", &[("level", "0")]),
+            "5" => state("minecraft:air", &[]),
+            "6" => seagrass_support(21),
+            _ => panic!("invalid live state"),
+        };
+        let neighbor = match fields[4] {
+            "0" => state("minecraft:air", &[]),
+            "1" => state("minecraft:stone", &[]),
+            "2" => seagrass_support(20),
+            "3" => seagrass_support(21),
+            _ => panic!("invalid neighbor"),
+        };
+        let mask: u8 = fields[5].parse().unwrap();
+        let mut tags = BTreeSet::new();
+        if mask & 1 != 0 {
+            tags.insert("minecraft:stone".into());
+        }
+        if mask & 2 != 0 {
+            tags.insert("minecraft:magma_block".into());
+        }
+        session.set_seagrass_unsupported_blocks(Arc::new(tags));
+        session.farmland_water_tag = Some(fields[6].parse::<u8>().unwrap() << 1);
+        set_raw(&mut session, center - IVec3::Y, support);
+        set_raw(&mut session, center, current);
+        let plant = session.intern_block(state(
+            "minecraft:tall_seagrass",
+            &[(
+                "half",
+                if part == SeagrassPart::Lower {
+                    "lower"
+                } else {
+                    "upper"
+                },
+            )],
+        ));
+        let other = session.intern_block(neighbor.clone());
+        let survives = fields[7] == "minecraft:tall_seagrass";
+        assert_eq!(fields[7], fields[8], "{row}");
+        assert_eq!(
+            session.seagrass_shape_unchanged(center, part, direction, seagrass_part(&neighbor)),
+            Some(survives),
+            "{row}"
+        );
+        session.unresolved_seagrass_shape = false;
+        let before = session.next_sub_tick;
+        for _ in 0..2 {
+            assert!(session.update_seagrass_neighbor(center, plant, direction, other));
+        }
+        assert_eq!(session.unresolved_seagrass_shape, !survives, "{row}");
+        assert_eq!(session.next_sub_tick, before, "{row}");
+        let mut random = native_core::random::LegacyRandom::new(17);
+        assert_eq!(
+            random.next_int(),
+            fields[9].parse::<i32>().unwrap(),
+            "{row}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 12_960);
 }
 
 #[cfg(windows)]
@@ -536,10 +780,10 @@ fn source_fluid_callbacks_match_java_for_certified_cases() {
     assert_eq!(read_cases.len(), 102);
     assert!(unsupported_destructions > 0);
     assert!(
-        certified >= 129,
+        certified >= 367,
         "certified source-fluid coverage decreased: {certified}"
     );
-    for (source, variant) in [(0, 0), (0, 6), (0, 9), (1, 0), (2, 0)] {
+    for (source, variant) in [(0, 0), (0, 6), (0, 9), (0, 14), (0, 15), (1, 0), (2, 0)] {
         assert!(
             changed_cases.contains(&(source, variant)),
             "missing certified source {source}, neighbor {variant}"

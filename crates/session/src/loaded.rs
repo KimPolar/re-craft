@@ -2073,6 +2073,7 @@ pub struct LoadedSession {
     snowy_tag: Option<Arc<BTreeSet<String>>>,
     bubble_column_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     kelp_unsupported_blocks: Option<Arc<BTreeSet<String>>>,
+    seagrass_unsupported_blocks: Option<Arc<BTreeSet<String>>>,
     wall_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
@@ -8852,6 +8853,10 @@ impl LoadedSession {
         self.kelp_unsupported_blocks = Some(tag);
     }
 
+    pub fn set_seagrass_unsupported_blocks(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.seagrass_unsupported_blocks = Some(tag);
+    }
+
     pub fn set_wall_tags(&mut self, tags: Arc<native_resources::ore_feature::OreBlockTags>) {
         self.wall_tags = Some(tags);
     }
@@ -10202,6 +10207,7 @@ impl LoadedSession {
             snowy_tag: None,
             bubble_column_tags: None,
             kelp_unsupported_blocks: None,
+            seagrass_unsupported_blocks: None,
             wall_tags: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
@@ -18474,8 +18480,8 @@ impl LoadedSession {
         Ok(())
     }
 
-    /// Apply the verified water, inert-block, and kelp neighbor callbacks for
-    /// natural upward growth. Other neighbors are rejected before either write.
+    /// Apply verified water, kelp, and aquatic-plant callbacks for natural
+    /// upward growth. Other neighbors are rejected before either write.
     fn apply_kelp_growth(
         &mut self,
         absolute: IVec3,
@@ -18528,7 +18534,15 @@ impl LoadedSession {
             for (base, neighbors) in [(upper, &mut upper_neighbors), (lower, &mut lower_neighbors)]
             {
                 let position = add(base, direction).context("kelp neighbor overflow")?;
-                neighbors.insert(direction.to_array(), read(position)?);
+                let neighbor = read(position)?;
+                if let KelpGrowthNeighbor::Seagrass(part) = neighbor.1 {
+                    ensure!(
+                        self.seagrass_shape_unchanged(position, part, -direction, None)
+                            == Some(true),
+                        "kelp growth needs an unsupported seagrass callback"
+                    );
+                }
+                neighbors.insert(direction.to_array(), neighbor);
             }
         }
         let below = add(lower, IVec3::NEG_Y).context("kelp support overflow")?;
@@ -18536,11 +18550,15 @@ impl LoadedSession {
         let lower_end = read(below)?;
         let upper_end = read(ceiling)?;
         ensure!(
-            !matches!(lower_end.1, KelpGrowthNeighbor::Head)
-                && !matches!(
-                    upper_end.1,
-                    KelpGrowthNeighbor::Head | KelpGrowthNeighbor::Body
-                ),
+            !matches!(
+                lower_end.1,
+                KelpGrowthNeighbor::Head | KelpGrowthNeighbor::Seagrass(_)
+            ) && !matches!(
+                upper_end.1,
+                KelpGrowthNeighbor::Head
+                    | KelpGrowthNeighbor::Body
+                    | KelpGrowthNeighbor::Seagrass(_)
+            ),
             "kelp growth needs an unsupported vertical plant callback"
         );
         for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z, IVec3::Y] {
@@ -18608,7 +18626,7 @@ impl LoadedSession {
         // callback converts the old head and runs the body's own shape pass.
         for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
             let (id, neighbor) = upper_neighbors[&direction.to_array()];
-            if neighbor != KelpGrowthNeighbor::Inert {
+            if neighbor.schedules_shape_water() {
                 schedule(
                     self,
                     add(upper, direction).expect("preflighted neighbor"),
@@ -18618,7 +18636,7 @@ impl LoadedSession {
         }
         for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
             let (id, neighbor) = lower_neighbors[&direction.to_array()];
-            if neighbor != KelpGrowthNeighbor::Inert {
+            if neighbor.schedules_shape_water() {
                 schedule(
                     self,
                     add(lower, direction).expect("preflighted neighbor"),
@@ -24573,6 +24591,116 @@ impl LoadedSession {
         true
     }
 
+    /// Check the 26.3 shape callback without mutating a plant or scheduling a
+    /// tick. `neighbor` is the new state in the direction of the update.
+    fn seagrass_shape_unchanged(
+        &self,
+        position: IVec3,
+        part: SeagrassPart,
+        direction: IVec3,
+        neighbor: Option<SeagrassPart>,
+    ) -> Option<bool> {
+        if ![
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_Y,
+            IVec3::Y,
+        ]
+        .contains(&direction)
+        {
+            return None;
+        }
+        if (part == SeagrassPart::Lower
+            && direction == IVec3::Y
+            && neighbor != Some(SeagrassPart::Upper))
+            || (part == SeagrassPart::Upper
+                && direction == IVec3::NEG_Y
+                && neighbor != Some(SeagrassPart::Lower))
+        {
+            return Some(false);
+        }
+        let below = add(position, IVec3::NEG_Y)?;
+        let Cell::State(below) = cell(&self.world, self.origin, self.bounds, below, self.states[0])
+        else {
+            return None;
+        };
+        let support = self.world.state(below)?;
+        if part == SeagrassPart::Upper {
+            return Some(seagrass_part(support) == Some(SeagrassPart::Lower));
+        }
+        if !crate::worldgen::generation_face_sturdy(support, [0, 1, 0]).ok()? {
+            return Some(false);
+        }
+        if self
+            .seagrass_unsupported_blocks
+            .as_ref()?
+            .contains(&support.name)
+        {
+            return Some(false);
+        }
+        if part == SeagrassPart::Short {
+            return Some(true);
+        }
+        let Cell::State(current) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let Some(fluid) = FluidState::from_block(self.world.state(current)?).ok()? else {
+            return Some(false);
+        };
+        let bit = match (fluid.kind, fluid.source) {
+            (FluidKind::Water, true) => 1 << 1,
+            (FluidKind::Water, false) => 1 << 2,
+            (FluidKind::Lava, true) => 1 << 3,
+            (FluidKind::Lava, false) => 1 << 4,
+        };
+        Some(fluid.amount == 8 && self.farmland_water_tag? & bit != 0)
+    }
+
+    /// Handle stable seagrass shape callbacks; destruction and its drops must
+    /// still be validated before they can be committed.
+    fn update_seagrass_neighbor(
+        &mut self,
+        position: IVec3,
+        id: BlockStateId,
+        direction: IVec3,
+        neighbor: BlockStateId,
+    ) -> bool {
+        let Some(block) = self.world.state(id) else {
+            return false;
+        };
+        if !matches!(
+            block.name.as_str(),
+            "minecraft:seagrass" | "minecraft:tall_seagrass"
+        ) {
+            return false;
+        }
+        let Some(part) = seagrass_part(block) else {
+            self.unresolved_seagrass_shape = true;
+            return true;
+        };
+        let other = self.world.state(neighbor).and_then(seagrass_part);
+        if self.seagrass_shape_unchanged(position, part, direction, other) != Some(true) {
+            self.unresolved_seagrass_shape = true;
+            return true;
+        }
+        if part == SeagrassPart::Short {
+            let Some(fluid) = self.simulated_fluid(id) else {
+                self.unresolved_seagrass_shape = true;
+                return true;
+            };
+            self.schedule_fluid(position, fluid, self.fluid_settings().delay(fluid.kind));
+        }
+        true
+    }
+
     fn notify_one_block(&mut self, position: IVec3, old: BlockStateId, new: BlockStateId) {
         let settings = self.fluid_settings();
         let old_name = self.world.state(old).map(|state| state.name.as_str());
@@ -24700,16 +24828,6 @@ impl LoadedSession {
                 // dedicated growth path handles its proven callback sequence.
                 self.unresolved_kelp_shape = true;
             }
-            if self.world.state(id).is_some_and(|state| {
-                matches!(
-                    state.name.as_str(),
-                    "minecraft:seagrass" | "minecraft:tall_seagrass"
-                )
-            }) {
-                // The plant may break or update its paired half. Its full
-                // live neighbor callback is not yet represented here.
-                self.unresolved_seagrass_shape = true;
-            }
             if direction == IVec3::NEG_Y {
                 self.update_snowy_below(position, neighbor, id);
             }
@@ -24723,6 +24841,9 @@ impl LoadedSession {
                 position,
                 self.states[0],
             ) {
+                if self.update_seagrass_neighbor(neighbor, id, -direction, current) {
+                    continue;
+                }
                 if self.update_wall_neighbor(neighbor, id, -direction, current) {
                     continue;
                 }
@@ -28557,6 +28678,16 @@ enum KelpGrowthNeighbor {
     Water,
     Head,
     Body,
+    Seagrass(SeagrassPart),
+}
+
+impl KelpGrowthNeighbor {
+    fn schedules_shape_water(self) -> bool {
+        matches!(
+            self,
+            Self::Water | Self::Head | Self::Body | Self::Seagrass(SeagrassPart::Short)
+        )
+    }
 }
 
 fn kelp_growth_neighbor(state: &BlockState) -> Option<KelpGrowthNeighbor> {
@@ -28569,6 +28700,9 @@ fn kelp_growth_neighbor(state: &BlockState) -> Option<KelpGrowthNeighbor> {
         }
         Some(crate::kelp_random_tick::KelpPart::Body) => return Some(KelpGrowthNeighbor::Body),
         None => {}
+    }
+    if let Some(part) = seagrass_part(state) {
+        return Some(KelpGrowthNeighbor::Seagrass(part));
     }
     (state.properties.is_empty()
         && (matches!(
@@ -28819,15 +28953,21 @@ impl SessionFluidTick<'_> {
                 Cell::Missing => None,
             };
             let callbacks_supported = match simulated {
-                fluid_sim::Cell::OpenWater(_) => {
-                    state.is_some_and(|state| match crate::kelp_random_tick::part(state) {
+                fluid_sim::Cell::OpenWater(_) => state.is_some_and(|state| {
+                    if let Some(part) = seagrass_part(state) {
+                        return self
+                            .session
+                            .seagrass_shape_unchanged(neighbor, part, -direction, None)
+                            == Some(true);
+                    }
+                    match crate::kelp_random_tick::part(state) {
                         Some(crate::kelp_random_tick::KelpPart::Head(_)) => {
                             direction.y == 0 || direction == IVec3::NEG_Y
                         }
                         Some(crate::kelp_random_tick::KelpPart::Body) => direction.y == 0,
                         None => false,
-                    })
-                }
+                    }
+                }),
                 fluid_sim::Cell::Slab { .. } | fluid_sim::Cell::Stairs { .. } => false,
                 fluid_sim::Cell::Solid => state.is_some_and(bubble_proof_plain_solid_neighbor),
                 fluid_sim::Cell::Chest { .. } => state.is_some_and(|state| {
@@ -34391,6 +34531,7 @@ pub(crate) mod tests {
         .unwrap();
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
         session.set_kelp_unsupported_blocks(Arc::new(BTreeSet::new()));
+        session.set_seagrass_unsupported_blocks(Arc::new(BTreeSet::new()));
         session.set_fall_damage_resetting_tag(Arc::new(BTreeSet::new()));
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
@@ -54304,8 +54445,9 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 18_432);
+        assert_eq!(rows.len(), 27_648);
         let center = IVec3::new(8, 10, 8);
+        let mut seagrass_growths = 0;
         for row in rows {
             let mut session = session();
             let age = row["age"].as_u64().unwrap() as u8;
@@ -54342,7 +54484,8 @@ pub(crate) mod tests {
                 .into_iter()
                 .enumerate()
             {
-                let side = match row["sides"].as_u64().unwrap() {
+                let sides = row["sides"].as_u64().unwrap();
+                let side = match sides {
                     0 => state("minecraft:stone", &[]),
                     1 => state("minecraft:water", &[("level", "0")]),
                     2 => state("minecraft:water", &[("level", "1")]),
@@ -54351,8 +54494,23 @@ pub(crate) mod tests {
                     _ if index % 2 == 0 => state("minecraft:stone", &[]),
                     _ => state("minecraft:water", &[("level", "0")]),
                 };
-                put(center + direction, side.clone());
-                put(center + IVec3::Y + direction, side);
+                let lower = match sides {
+                    6 => state("minecraft:seagrass", &[]),
+                    7 => state("minecraft:stone", &[]),
+                    8 => state("minecraft:tall_seagrass", &[("half", "lower")]),
+                    _ => side.clone(),
+                };
+                let upper = match sides {
+                    6 => state("minecraft:stone", &[]),
+                    7 => state("minecraft:seagrass", &[]),
+                    8 => state("minecraft:tall_seagrass", &[("half", "upper")]),
+                    _ => side,
+                };
+                if matches!(sides, 6 | 8) {
+                    put(center + direction - IVec3::Y, state("minecraft:stone", &[]));
+                }
+                put(center + direction, lower);
+                put(center + IVec3::Y + direction, upper);
             }
             session.level_random =
                 native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
@@ -54362,6 +54520,9 @@ pub(crate) mod tests {
                 .random_tick_kelp(&original, absolute)
                 .unwrap_or_else(|error| panic!("{error:#}: {row}"));
             let grew = !row["changes"].as_array().unwrap().is_empty();
+            if grew && row["sides"].as_u64().unwrap() >= 6 {
+                seagrass_growths += 1;
+            }
             let expected_changes = if grew {
                 serde_json::json!([
                     [8, 11, 8, "minecraft:kelp", age + 1, 3],
@@ -54437,6 +54598,7 @@ pub(crate) mod tests {
                 "{row}"
             );
         }
+        assert_eq!(seagrass_growths, 288);
     }
 
     #[test]

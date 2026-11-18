@@ -67,9 +67,164 @@ struct LiveTickingProvenance {
     ticks: SavedTickQueueCapture,
     callbacks: Vec<(ChunkPos, Arc<()>)>,
     packs_bound: bool,
+    registry: Option<Arc<native_resources::block_registry::GeneratedBlockRegistry>>,
+    heightmaps_match: bool,
+    block_entities: BTreeMap<ChunkPos, (Option<SavedBlockEntities>, Option<SavedBlockEntities>)>,
+    block_effects: Option<std::result::Result<ValidatedBlockEffects, String>>,
     region: Option<Arc<()>>,
     sealed_queues: Option<(Arc<IndexedRegionQueue>, Arc<IndexedRegionQueue>)>,
     replayed_queues: Option<(Arc<IndexedRegionQueue>, Arc<IndexedRegionQueue>)>,
+}
+
+struct ValidatedBlockEffects {
+    changes: Vec<native_persistence::poi::PoiBlockChange>,
+    chunks: BTreeSet<ChunkPos>,
+}
+
+/// Run on the preparation worker: decoding unrelated block-entity data and
+/// validating every transition must not stall the main executor.
+fn validate_block_effects(
+    region: &PostprocessedGeneratedRegion,
+    live: &LiveTickingProvenance,
+    center: ChunkPos,
+) -> Result<ValidatedBlockEffects> {
+    let changes = region.ordered_block_changes()?;
+    if changes.is_empty() {
+        ensure!(
+            region.light_checks.is_empty(),
+            "postprocessing light checks have no block changes"
+        );
+        return Ok(ValidatedBlockEffects {
+            changes,
+            chunks: BTreeSet::new(),
+        });
+    }
+    let registry = live
+        .registry
+        .as_ref()
+        .context("postprocessing block registry is unavailable")?;
+    ensure!(
+        live.heightmaps_match,
+        "postprocessing heightmaps differ from the live session"
+    );
+    let dependencies: BTreeSet<_> = ticking_dependencies(center).into_iter().collect();
+    let mut positions = BTreeMap::<ChunkPos, BTreeSet<[i32; 3]>>::new();
+    let mut checks = Vec::new();
+    for change in &changes {
+        let position = native_world::loaded::BlockPosition {
+            x: change.position[0],
+            y: change.position[1],
+            z: change.position[2],
+        };
+        ensure!(
+            dependencies.contains(&position.chunk()),
+            "postprocessing changed an uncaptured neighbor"
+        );
+        positions
+            .entry(position.chunk())
+            .or_default()
+            .insert(change.position);
+        for state in [&change.expected, &change.replacement] {
+            ensure!(
+                registry.is_canonical_state(&state.name, &state.properties)
+                    && registry.has_block_entity(&state.name) == Some(false),
+                "postprocessing block state or entity behavior is unsupported"
+            );
+        }
+        ensure!(
+            change.replacement.name != "minecraft:frosted_ice",
+            "postprocessing frosted-ice placement needs the live random stream"
+        );
+        ensure!(
+            native_world::poi::change(&change.expected, &change.replacement).is_none(),
+            "postprocessing POI changes need live reconciliation"
+        );
+        if !native_world::block_light::same_light_behavior(&change.expected, &change.replacement)
+            .context("postprocessing light behavior is unavailable")?
+        {
+            checks.push(position);
+        }
+    }
+    ensure!(
+        checks == region.light_checks,
+        "postprocessing light history differs"
+    );
+    for (&chunk, changed) in &positions {
+        let (saved, overlay) = live
+            .block_entities
+            .get(&chunk)
+            .context("postprocessing block entities were not captured")?;
+        let saved = saved
+            .as_ref()
+            .context("postprocessing block entities are unavailable")?;
+        ensure!(
+            region.source.saved_block_entities.get(&chunk) == Some(saved),
+            "postprocessing block entities differ from the saved source"
+        );
+        ensure_no_block_entity_at(saved, chunk, changed)?;
+        if let Some(overlay) = overlay {
+            ensure_no_block_entity_at(overlay, chunk, changed)?;
+        }
+    }
+    Ok(ValidatedBlockEffects {
+        changes,
+        chunks: positions.into_keys().collect(),
+    })
+}
+
+fn ensure_no_block_entity_at(
+    entities: &SavedBlockEntities,
+    chunk: ChunkPos,
+    positions: &BTreeSet<[i32; 3]>,
+) -> Result<()> {
+    let bytes = match entities {
+        SavedBlockEntities::Empty => return Ok(()),
+        SavedBlockEntities::Encoded(bytes) => bytes,
+        SavedBlockEntities::Unavailable => bail!("postprocessing block entities are unavailable"),
+    };
+    let document = native_persistence::nbt::read(bytes)?;
+    let Tag::List {
+        element_type,
+        values,
+    } = document.value
+    else {
+        bail!("postprocessing block entities are not a list");
+    };
+    ensure!(
+        element_type == native_persistence::nbt::TagType::Compound
+            || (element_type == native_persistence::nbt::TagType::End && values.is_empty()),
+        "postprocessing block entity list has an unsupported type"
+    );
+    let mut seen = BTreeSet::new();
+    for entity in values {
+        let Tag::Compound(fields) = entity else {
+            bail!("postprocessing block entity is not a compound");
+        };
+        let coordinate = |name: &str| -> Result<i32> {
+            let mut matches = fields.iter().filter(|(key, _)| key.matches(name));
+            let value = match matches.next() {
+                Some((_, Tag::Int(value))) => *value,
+                _ => bail!("postprocessing block entity position is invalid"),
+            };
+            ensure!(
+                matches.next().is_none(),
+                "duplicate block entity coordinate"
+            );
+            Ok(value)
+        };
+        let position = [coordinate("x")?, coordinate("y")?, coordinate("z")?];
+        ensure!(
+            position[0].div_euclid(16) == chunk.x
+                && position[2].div_euclid(16) == chunk.z
+                && seen.insert(position),
+            "postprocessing block entity belongs to another chunk or is duplicated"
+        );
+        ensure!(
+            !positions.contains(&position),
+            "postprocessing changed a block with a stored entity"
+        );
+    }
+    Ok(())
 }
 
 impl SavedTickingResult {
@@ -87,6 +242,10 @@ impl SavedTickingResult {
             lava_rules,
         )?;
         ensure!(
+            self.region.edits.is_empty() && self.region.light_checks.is_empty(),
+            "saved postprocessing has block changes that need live reconciliation"
+        );
+        ensure!(
             live.sealed_queues.as_ref().is_some_and(|(blocks, fluids)| {
                 Arc::ptr_eq(blocks, &self.block_ticks) && Arc::ptr_eq(fluids, &self.fluid_ticks)
             }),
@@ -99,15 +258,20 @@ impl SavedTickingResult {
         Ok(&live.ticks)
     }
 
-    /// Verify an immutable, replayed set of schedule attempts. The live level
-    /// must still check its captured clock, queues, terrain and holder order.
+    /// Verify immutable block changes and replayed schedule attempts. The live
+    /// level must still check its clock, queues, terrain, heightmaps and holder.
     pub(crate) fn verify_scheduled_live_callback(
         &self,
         terrain: &GenerationTerrainStage,
         future: &TickingPreparation,
         water_source_conversion: bool,
         lava_rules: super::postprocessing_world::GeneratedLavaRules,
-    ) -> Result<(&SavedTickQueueCapture, &[CapturedTickAttempt])> {
+    ) -> Result<(
+        &SavedTickQueueCapture,
+        &[CapturedTickAttempt],
+        &[native_persistence::poi::PoiBlockChange],
+        &BTreeSet<ChunkPos>,
+    )> {
         let live = self.verify_live_callback_terrain(
             terrain,
             future,
@@ -127,7 +291,15 @@ impl SavedTickingResult {
             .ticks()
             .live_attempts()
             .context("saved postprocessing schedule history is missing")?;
-        Ok((&live.ticks, attempts))
+        let effects = live
+            .block_effects
+            .as_ref()
+            .context("postprocessing block history was not validated")?
+            .as_ref()
+            .map_err(|error| {
+                anyhow::anyhow!("postprocessing block history could not be reconciled: {error}")
+            })?;
+        Ok((&live.ticks, attempts, &effects.changes, &effects.chunks))
     }
 
     fn verify_live_callback_terrain(
@@ -176,14 +348,12 @@ impl SavedTickingResult {
         );
         ensure!(
             region.chunks == BTreeSet::from([future.center()])
-                && region.edits.is_empty()
                 && region.read_chunks.is_subset(&dependencies)
-                && region.light_checks.is_empty()
                 && region.light_reads.is_empty()
+                && region.light_checkpoint.is_none()
                 && region.lava_fizz_events().is_empty()
-                && region
-                    .block_drops()
-                    .is_none_or(|drops| drops.operations() == 0),
+                && region.block_drops().is_none()
+                && !region.has_block_entity_edits(),
             "saved postprocessing has effects that need live reconciliation"
         );
         ensure!(
@@ -371,6 +541,10 @@ impl SavedTickingBatch {
             Some(queues),
             validate_state,
         )?;
+        let heightmaps_match = terrain.matches_postprocessing_heightmaps(
+            stage.initial_heightmaps(),
+            stage.initial_heightmap_tags(),
+        );
         configure(&mut stage)?;
         Ok(Self {
             stage,
@@ -383,6 +557,10 @@ impl SavedTickingBatch {
                 ticks: ticks.clone(),
                 callbacks: Vec::new(),
                 packs_bound: false,
+                registry: None,
+                heightmaps_match,
+                block_entities: terrain.postprocessing_block_entities(),
+                block_effects: None,
                 region: None,
                 sealed_queues: None,
                 replayed_queues: None,
@@ -420,7 +598,7 @@ impl SavedTickingBatch {
         );
         packs.packs().verify()?;
         let block_ids = provider.vanilla_block_ids()?;
-        let registry = provider.vanilla_generated_block_registry()?;
+        let registry = Arc::new(provider.vanilla_generated_block_registry()?);
         ensure!(
             input.block_ids == &block_ids && input.defaults == &registry.default_states(),
             "postprocessing block registry differs from the session resources"
@@ -443,7 +621,9 @@ impl SavedTickingBatch {
                 Ok(())
             },
         )?;
-        batch.live.as_mut().expect("live provenance").packs_bound = true;
+        let live = batch.live.as_mut().expect("live provenance");
+        live.packs_bound = true;
+        live.registry = Some(registry);
         Ok(batch)
     }
 
@@ -547,6 +727,10 @@ impl SavedTickingBatch {
                     .verify()?;
             }
             if proof.packs_bound && proof.callbacks.len() == 1 {
+                proof.block_effects = Some(
+                    validate_block_effects(&region, proof, proof.callbacks[0].0)
+                        .map_err(|error| format!("{error:#}")),
+                );
                 if let Ok((blocks, fluids)) =
                     proof.ticks.expected_after_unpack(proof.callbacks[0].0)
                 {
@@ -784,7 +968,7 @@ fn begin_saved_postprocessing_inner(
             .saved_fluid_ticks
             .get(&pos)
             .map_or(&[][..], Vec::as_slice);
-        let marks = read_saved_work(
+        let mut marks = read_saved_work(
             activation,
             // The live-session guard must continue rejecting pending entities.
             // Their complete saved payload was validated for this isolated stage above.
@@ -798,6 +982,24 @@ fn begin_saved_postprocessing_inner(
             },
             true,
         )?;
+        if let (Some(terrain), Some(ticks)) = (live_terrain, live_ticks.as_ref()) {
+            let source = world
+                .saved_chunk_source(pos)
+                .context("saved postprocessing source is unavailable")?;
+            if terrain.saved_postprocessing_completed(pos, source) {
+                let current = ticks
+                    .chunk(pos)
+                    .context("completed postprocessing tick containers are unavailable")?;
+                ensure!(
+                    current.blocks.pending_saved().is_none()
+                        && current.fluids.pending_saved().is_none(),
+                    "completed postprocessing still has pending saved ticks"
+                );
+                marks =
+                    native_core::postprocessing::PostProcessing::new(input.bounds.min_y, height)
+                        .context("unsupported saved postprocessing bounds")?;
+            }
+        }
         for tick in blocks {
             let id = ResourceId::parse(&tick.block)?;
             ensure!(

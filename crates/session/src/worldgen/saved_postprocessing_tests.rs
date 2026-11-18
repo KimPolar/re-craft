@@ -1049,6 +1049,458 @@ fn live_callback_fixture_with_guard(
     ))
 }
 
+#[cfg(target_os = "windows")]
+fn live_water_callback_fixture() -> Result<LiveCallbackFixture> {
+    use flate2::{Compression, write::GzEncoder};
+    use glam::{IVec3, Vec3};
+    use std::io::Write;
+
+    let (area, ids, registration) = water_ticking_fixture()?;
+    let defaults = BTreeMap::from([(
+        "minecraft:water".into(),
+        BTreeMap::from([("level".into(), "0".into())]),
+    )]);
+    let dimension = DimensionId::parse("overworld")?;
+    let source = Arc::new(area.materialize_with_defaults(&dimension, &defaults)?);
+    let mut session = crate::loaded::LoadedSession::new(
+        source.as_ref().clone(),
+        IVec3::ZERO,
+        BuildBounds {
+            min_y: 0,
+            max_y: 16,
+        },
+        crate::PlayerState {
+            position: Vec3::new(8.5, 10.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: crate::PlayerPose::Standing,
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+    session.set_has_skylight(true).map_err(anyhow::Error::msg)?;
+    let tags = native_resources::heightmap_tags::HeightmapTags::load(&mut Tags, &ids)?;
+    session.set_spawn_heightmap_tags(Arc::new(tags))?;
+    for position in &registration {
+        session.prepare_initial_spawn_heightmaps(
+            &area.chunks[&SavedChunkPos {
+                x: position.x,
+                z: position.z,
+            }],
+        )?;
+    }
+    let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/session-save-test-temp");
+    std::fs::create_dir_all(&parent)?;
+    let root = tempfile::Builder::new()
+        .prefix("water-ticking-")
+        .tempdir_in(parent)?;
+    let level = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![(
+            "Data".into(),
+            Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Time".into(), Tag::Long(100)),
+            ]),
+        )]),
+    };
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(&native_persistence::nbt::write(&level)?)?;
+    std::fs::write(root.path().join("level.dat"), gzip.finish()?)?;
+    let reader = native_persistence::world::WorldReader::open_for_session(root.path(), dimension)?;
+    let packs = reader.capture_world_data_packs()?;
+    session.bind_saved_world_session(reader.session_guard().context("missing session lock")?)?;
+    session.bind_world_data_packs(packs)?;
+    session
+        .set_initial_game_time(100)
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        session.install_saved_tick_orders(&registration)? == (true, true),
+        "tick indexes not installed"
+    );
+    let terrain = session.capture_generation_terrain_stage(source, registration.iter().copied())?;
+    let ticks = session.capture_saved_tick_queues()?;
+    Ok((root, area, ids, registration, session, terrain, ticks))
+}
+
+#[cfg(target_os = "windows")]
+fn begin_live_water_fixture(
+    area: &ChunkArea,
+    ids: &BTreeSet<String>,
+    terrain: &GenerationTerrainStage,
+    ticks: &SavedTickQueueCapture,
+) -> Result<SavedTickingBatch> {
+    let defaults = BTreeMap::from([(
+        "minecraft:water".into(),
+        BTreeMap::from([("level".into(), "0".into())]),
+    )]);
+    let mut batch = SavedTickingBatch::begin_with_live_session(
+        &mut Tags,
+        SavedPostprocessingInputs {
+            area,
+            dimension: &DimensionId::parse("overworld")?,
+            defaults: &defaults,
+            block_ids: ids,
+            bounds: BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            registration: ticks.registration_order(),
+            game_time: ticks.game_time(),
+            next_sub_tick: ticks.next_sub_tick(),
+            light: None,
+        },
+        terrain,
+        ticks,
+        |state| {
+            let properties_valid = if state.name == "minecraft:water" {
+                state.properties.len() == 1
+                    && state
+                        .properties
+                        .get("level")
+                        .and_then(|level| level.parse::<u8>().ok())
+                        .is_some_and(|level| level <= 15)
+            } else {
+                state.properties == defaults.get(&state.name).cloned().unwrap_or_default()
+            };
+            ensure!(
+                ids.contains(&state.name) && properties_valid,
+                "unknown fixture state"
+            );
+            Ok(())
+        },
+        |stage| {
+            stage.set_water_source_conversion(true)?;
+            stage.set_lava_rules(super::super::postprocessing_world::GeneratedLavaRules {
+                fast_lava: false,
+                source_conversion: false,
+            })?;
+            stage.set_fluid_tags(
+                Some(Arc::new(BTreeSet::from([
+                    "minecraft:air".into(),
+                    "minecraft:water".into(),
+                ]))),
+                Some(Arc::new(BTreeSet::from([
+                    "minecraft:lava".into(),
+                    "minecraft:flowing_lava".into(),
+                ]))),
+            );
+            stage.set_water_fluid_tags(Some(Arc::new(BTreeSet::from([
+                "minecraft:water".into(),
+                "minecraft:flowing_water".into(),
+            ]))));
+            stage.set_bubble_tags(Some(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::new(
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                ),
+            )));
+            Ok(())
+        },
+    )?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+    let registry = resources.vanilla_generated_block_registry()?;
+    let live = batch.live.as_mut().unwrap();
+    live.packs_bound = true;
+    live.registry = Some(Arc::new(registry));
+    Ok(batch)
+}
+
+#[test]
+fn postprocessing_rejects_conflicting_or_ambiguous_block_entities() -> Result<()> {
+    let chunk = ChunkPos { x: 0, z: 0 };
+    let changed = BTreeSet::from([[1, 8, 1]]);
+    let entity = |x, z| {
+        Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(x)),
+            ("y".into(), Tag::Int(8)),
+            ("z".into(), Tag::Int(z)),
+        ])
+    };
+    let encoded = |values: Vec<Tag>| -> Result<SavedBlockEntities> {
+        Ok(SavedBlockEntities::Encoded(
+            native_persistence::nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values,
+                },
+            })?
+            .into(),
+        ))
+    };
+    ensure_no_block_entity_at(&SavedBlockEntities::Empty, chunk, &changed)?;
+    ensure_no_block_entity_at(&encoded(vec![entity(2, 1)])?, chunk, &changed)?;
+    assert!(ensure_no_block_entity_at(&encoded(vec![entity(1, 1)])?, chunk, &changed).is_err());
+    assert!(
+        ensure_no_block_entity_at(&encoded(vec![entity(2, 1), entity(2, 1)])?, chunk, &changed)
+            .is_err()
+    );
+    assert!(ensure_no_block_entity_at(&encoded(vec![entity(16, 1)])?, chunk, &changed).is_err());
+    assert!(ensure_no_block_entity_at(&SavedBlockEntities::Unavailable, chunk, &changed).is_err());
+    let mut duplicate_coordinate = entity(2, 1);
+    let Tag::Compound(fields) = &mut duplicate_coordinate else {
+        unreachable!()
+    };
+    fields.push(("x".into(), Tag::Int(2)));
+    assert!(
+        ensure_no_block_entity_at(&encoded(vec![duplicate_coordinate])?, chunk, &changed).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn live_water_callback_applies_neighbor_changes_and_matches_java() -> Result<()> {
+    use crate::ticking_preparation::TickingFutureState;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) =
+        live_water_callback_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let neighbor = ChunkPos { x: 1, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_live_water_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let result = batch.finish()?;
+    assert!(!result.region.edits.is_empty());
+    assert!(
+        result
+            .region
+            .edits
+            .iter()
+            .any(|position| position.chunk() == neighbor)
+    );
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.verify_saved_tick_queues(&ticks)?;
+    session.apply_scheduled_saved_ticking(&mut original, &terrain, &result)?;
+    assert_eq!(original.state(), TickingFutureState::Available);
+
+    let world = session.world_for_postprocessing_test();
+    for position in &result.region.edits {
+        assert_eq!(
+            world.block(position.x, position.y, position.z),
+            result
+                .region
+                .world
+                .block(position.x, position.y, position.z),
+        );
+    }
+    for position in [center, neighbor] {
+        assert_eq!(
+            session.spawn_heightmaps_for_chunk(position).as_deref(),
+            result
+                .region
+                .heightmaps()
+                .get(&position)
+                .map(|maps| maps.spawn_heightmaps())
+                .as_ref(),
+        );
+    }
+    let block = world.block(16, 8, 8).context("neighbor block is missing")?;
+    let mut actual = vec![format!(
+        "first {} {}",
+        block.name,
+        block.properties.get("level").map_or("-", String::as_str),
+    )];
+    for position in &result.region.light_checks {
+        actual.push(format!(
+            "light {},{},{}",
+            position.x, position.y, position.z
+        ));
+    }
+    let live_ticks = session
+        .capture_saved_tick_queues()?
+        .isolated_region_ticks()?;
+    for (label, position) in [("a", center), ("b", neighbor)] {
+        for tick in live_ticks.chunk(position).unwrap().fluids.pack(100) {
+            actual.push(format!(
+                "{label} {} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority,
+            ));
+        }
+    }
+    actual.push(format!("counter {}", live_ticks.next_sub_tick()));
+    let initial = ticks.next_sub_tick().to_string();
+    let expected = super::super::postprocessing_world::tests::java_results_with_args(
+        "GeneratedWaterSpreadPostprocessingOracle",
+        include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+        &["edge_ticking_first", &initial],
+    );
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3"]
+fn live_water_callback_rejects_changed_terrain_without_partial_effects() -> Result<()> {
+    use crate::ticking_preparation::TickingFutureState;
+
+    let (_root, area, ids, registration, mut session, terrain, ticks) =
+        live_water_callback_fixture()?;
+    let mut original = ready_future(ChunkPos { x: 0, z: 0 }, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_live_water_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let result = batch.finish()?;
+    assert!(session.set_block_for_postprocessing_test(
+        glam::IVec3::new(1, 8, 8),
+        BlockState {
+            name: "minecraft:sand".into(),
+            properties: BTreeMap::new()
+        },
+    ));
+    let before = session.world_for_postprocessing_test();
+    let queues = session.capture_saved_tick_queues()?;
+    assert!(
+        session
+            .apply_scheduled_saved_ticking(&mut original, &terrain, &result)
+            .is_err()
+    );
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    session.verify_saved_tick_queues(&queues)?;
+    assert!(Arc::ptr_eq(
+        &before,
+        &session.world_for_postprocessing_test()
+    ));
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3"]
+fn live_water_callback_rejects_changed_heightmaps_and_block_entities() -> Result<()> {
+    use crate::ticking_preparation::TickingFutureState;
+
+    for change in ["heightmaps", "block_entities"] {
+        let (_root, area, ids, registration, mut session, terrain, ticks) =
+            live_water_callback_fixture()?;
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let mut original = ready_future(ChunkPos { x: 0, z: 0 }, &registration)?;
+        let mut worker = original.fork_queued_callback()?;
+        let mut batch = begin_live_water_fixture(&area, &ids, &terrain, &ticks)?;
+        assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+        let result = batch.finish()?;
+        if change == "heightmaps" {
+            let maps = session.spawn_heightmaps_for_chunk(neighbor).unwrap();
+            session.set_initial_spawn_heightmaps(neighbor, maps.as_ref().clone())?;
+        } else {
+            session.set_block_entities_for_postprocessing_test(neighbor, SavedBlockEntities::Empty);
+        }
+        session.verify_generation_terrain_stage(&terrain)?;
+        let before = session.world_for_postprocessing_test();
+        let queues = session.capture_saved_tick_queues()?;
+        assert!(
+            session
+                .apply_scheduled_saved_ticking(&mut original, &terrain, &result)
+                .is_err()
+        );
+        assert_eq!(original.state(), TickingFutureState::Waiting);
+        session.verify_saved_tick_queues(&queues)?;
+        assert!(Arc::ptr_eq(
+            &before,
+            &session.world_for_postprocessing_test()
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn overlapping_live_water_callbacks_match_java() -> Result<()> {
+    let (_root, area, ids, registration, mut session, terrain, ticks) =
+        live_water_callback_fixture()?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let neighbor = ChunkPos { x: 1, z: 0 };
+    let initial = ticks.next_sub_tick().to_string();
+    let mut first = ready_future(center, &registration)?;
+    let mut worker = first.fork_queued_callback()?;
+    let mut batch = begin_live_water_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let first_result = batch.finish()?;
+    session.apply_scheduled_saved_ticking(&mut first, &terrain, &first_result)?;
+    assert!(session.verify_generation_terrain_stage(&terrain).is_err());
+    let block = session
+        .world_for_postprocessing_test()
+        .block(16, 8, 8)
+        .unwrap()
+        .clone();
+    let mut actual = vec![format!(
+        "first {} {}",
+        block.name,
+        block.properties.get("level").map_or("-", String::as_str)
+    )];
+
+    let defaults = BTreeMap::from([(
+        "minecraft:water".into(),
+        BTreeMap::from([("level".into(), "0".into())]),
+    )]);
+    let source =
+        Arc::new(area.materialize_with_defaults(&DimensionId::parse("overworld")?, &defaults)?);
+    let terrain = session.capture_generation_terrain_stage(source, registration.iter().copied())?;
+    let ticks = session.capture_saved_tick_queues()?;
+    let mut second = ready_future(neighbor, &registration)?;
+    let mut worker = second.fork_queued_callback()?;
+    let mut batch = begin_live_water_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let second_result = batch.finish()?;
+    session.apply_scheduled_saved_ticking(&mut second, &terrain, &second_result)?;
+    let block = session
+        .world_for_postprocessing_test()
+        .block(16, 8, 8)
+        .unwrap()
+        .clone();
+    actual.push(format!(
+        "second {} {}",
+        block.name,
+        block.properties.get("level").map_or("-", String::as_str)
+    ));
+    let live_ticks = session
+        .capture_saved_tick_queues()?
+        .isolated_region_ticks()?;
+    for (label, position) in [("a", center), ("b", neighbor)] {
+        for tick in live_ticks.chunk(position).unwrap().fluids.pack(100) {
+            actual.push(format!(
+                "{label} {} {},{},{} {} {}",
+                tick.kind,
+                tick.position[0],
+                tick.position[1],
+                tick.position[2],
+                tick.delay,
+                tick.priority,
+            ));
+        }
+    }
+    actual.push(format!("counter {}", live_ticks.next_sub_tick()));
+    let expected = super::super::postprocessing_world::tests::java_results_with_args(
+        "GeneratedWaterSpreadPostprocessingOracle",
+        include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+        &["edge_ticking_sequence", &initial],
+    );
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 fn begin_no_effect_fixture(
     area: &ChunkArea,
     ids: &BTreeSet<String>,
@@ -1068,6 +1520,35 @@ fn begin_no_effect_fixture(
     ensure!(ticks.data_packs().is_some(), "fixture packs are missing");
     batch.live.as_mut().unwrap().packs_bound = true;
     Ok(batch)
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn completed_live_callback_invalidates_old_capture_without_replaying_marks() -> Result<()> {
+    let (_root, area, ids, registration, mut session, terrain, ticks) = live_callback_fixture(7)?;
+    let center = ChunkPos { x: 0, z: 0 };
+    let mut original = ready_future(center, &registration)?;
+    let mut worker = original.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &terrain, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let result = batch.finish()?;
+    session.apply_no_effect_saved_ticking(&mut original, &terrain, &result)?;
+    assert!(session.verify_generation_terrain_stage(&terrain).is_err());
+
+    let source = Arc::new(area.materialize(&DimensionId::parse("overworld")?)?);
+    let current = session.capture_generation_terrain_stage(source, registration.iter().copied())?;
+    let ticks = session.capture_saved_tick_queues()?;
+    let mut duplicate = ready_future(center, &registration)?;
+    let mut worker = duplicate.fork_queued_callback()?;
+    let mut batch = begin_no_effect_fixture(&area, &ids, &current, &ticks)?;
+    assert!(batch.dispatch(&mut worker, ticks.game_time())?);
+    let replay = batch.finish()?;
+    assert!(
+        session
+            .apply_no_effect_saved_ticking(&mut duplicate, &current, &replay)
+            .is_err()
+    );
+    Ok(())
 }
 
 fn write_ticking_fixture_regions(root: &std::path::Path, area: &ChunkArea) -> Result<()> {

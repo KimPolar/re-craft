@@ -129,7 +129,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
-        if(args.length>0 && args[0].equals("edge_ticking_sequence")) {
+        if(args.length>0 && (args[0].equals("edge_ticking_sequence") || args[0].equals("edge_ticking_first"))) {
             blocks.clear();lightChecks.clear();fizzEvents.clear();fallingEntities.clear();
             var firstPos=new ChunkPos(0,0);var secondPos=new ChunkPos(1,0);
             var first=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
@@ -153,7 +153,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             set(first,"blockTicks",blockQueues.get(firstPos));set(first,"fluidTicks",fluidQueues.get(firstPos));
             set(second,"blockTicks",blockQueues.get(secondPos));set(second,"fluidTicks",fluidQueues.get(secondPos));
             rules.set(GameRules.WATER_SOURCE_CONVERSION,true,null);
-            counter=2;random=RandomSource.create(42);set(level,"random",random);
+            counter=args.length>1?Long.parseLong(args[1]):2;random=RandomSource.create(42);set(level,"random",random);
             updater=new CollectingNeighborUpdater(level,100000);
             blocks.put(new BlockPos(15,8,8),Blocks.WATER.defaultBlockState());
             blocks.put(new BlockPos(16,8,8),Blocks.AIR.defaultBlockState());
@@ -161,10 +161,14 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             var afterFirst=get(new BlockPos(16,8,8));
             out.printf("first %s %s%n",BuiltInRegistries.BLOCK.getKey(afterFirst.getBlock()),
                 afterFirst.is(Blocks.WATER)?afterFirst.getValue(LiquidBlock.LEVEL):"-");
-            second.postProcessGeneration(level);second.unpackTicks(100);
-            var afterSecond=get(new BlockPos(16,8,8));
-            out.printf("second %s %s%n",BuiltInRegistries.BLOCK.getKey(afterSecond.getBlock()),
-                afterSecond.is(Blocks.WATER)?afterSecond.getValue(LiquidBlock.LEVEL):"-");
+            if(args[0].equals("edge_ticking_sequence")) {
+                second.postProcessGeneration(level);second.unpackTicks(100);
+                var afterSecond=get(new BlockPos(16,8,8));
+                out.printf("second %s %s%n",BuiltInRegistries.BLOCK.getKey(afterSecond.getBlock()),
+                    afterSecond.is(Blocks.WATER)?afterSecond.getValue(LiquidBlock.LEVEL):"-");
+            } else {
+                for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
+            }
             for(var entry:List.of(Map.entry("a",firstPos),Map.entry("b",secondPos))) {
                 for(var tick:fluidQueues.get(entry.getValue()).pack(100)) {
                     var p=tick.pos();out.printf("%s %s %d,%d,%d %d %d%n",entry.getKey(),

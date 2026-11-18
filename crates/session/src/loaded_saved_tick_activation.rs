@@ -11,15 +11,15 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    CollectedBlockTick, CompletedSavedPostprocessing, FluidTickKey, GeneratedTickOrder,
-    GenerationTerrainStage, LoadedSession, PendingSavedTickActivation, ScheduledFluid,
-    generated_block_key, generated_fluid_key,
+    BlockSetCheck, CollectedBlockTick, CompletedSavedPostprocessing, FluidTickKey,
+    GeneratedTickOrder, GenerationTerrainStage, LoadedSession, PendingSavedTickActivation,
+    ScheduledFluid, generated_block_key, generated_fluid_key,
 };
 use crate::worldgen::chunk_ticks::{
     CapturedTickAttempt, ChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, ScheduleOutcome,
     ScheduledTick, TickRegistry,
 };
-use native_world::loaded::ChunkPos;
+use native_world::loaded::{BlockState, ChunkPos};
 
 type Order = (i128, i32, i64, u64);
 
@@ -27,6 +27,21 @@ struct NewTickSchedules {
     blocks: Vec<(Order, CollectedBlockTick)>,
     fluids: Vec<(Order, FluidTickKey)>,
     next_sub_tick: i64,
+}
+
+struct PostprocessingBlockEdit {
+    relative: glam::IVec3,
+    position: glam::IVec3,
+    chunk: ChunkPos,
+    section: i8,
+    index: usize,
+    expected: BlockState,
+    replacement: BlockState,
+}
+
+struct PostprocessingBlockPlan {
+    edits: Vec<PostprocessingBlockEdit>,
+    heightmaps: BTreeMap<ChunkPos, Arc<native_persistence::heightmap::SpawnHeightmaps>>,
 }
 
 /// Immutable live LevelTicks indexes captured at one simulation boundary.
@@ -184,18 +199,17 @@ impl LoadedSession {
         Ok(())
     }
 
-    /// Apply a callback whose only effects are scheduled ticks. The caller
-    /// must run it at the holder's original executor position; the exact tick
-    /// and queues are required because delayed replay could reorder callbacks.
-    /// A captured partial save rechecks the completed marks, queues and source
-    /// neighbors; other gameplay effects still require separate validation.
+    /// Apply captured schedules and supported block changes at the original
+    /// holder callback. The exact tick, queues, terrain and heightmaps must
+    /// still match. Pending lighting and other gameplay effects must settle
+    /// and be checked separately before a world can be saved.
     pub fn apply_scheduled_saved_ticking(
         &mut self,
         future: &mut crate::ticking_preparation::TickingPreparation,
         terrain: &GenerationTerrainStage,
         result: &crate::worldgen::saved_postprocessing::SavedTickingResult,
     ) -> Result<()> {
-        let (capture, attempts) = result.verify_scheduled_live_callback(
+        let (capture, attempts, changes, entity_chunks) = result.verify_scheduled_live_callback(
             terrain,
             future,
             self.water_source_conversion,
@@ -213,6 +227,8 @@ impl LoadedSession {
         self.verify_generation_terrain_stage(terrain)?;
         self.verify_saved_tick_queues(capture)?;
         let mut completion = Some(self.verify_ready_saved_ticking_input(future, terrain)?);
+        self.verify_generation_block_entities(terrain, entity_chunks.iter().copied())?;
+        let mut block_plan = Some(self.plan_postprocessing_blocks(terrain, result, changes)?);
         let center = future.center();
         let plan = self.plan_postprocessing_schedules(
             capture,
@@ -253,6 +269,9 @@ impl LoadedSession {
                     .as_mut()
                     .expect("validated fluid index")
                     .queue = Arc::clone(&result.fluid_ticks);
+                self.install_postprocessing_blocks(
+                    block_plan.take().expect("one saved ticking callback"),
+                );
                 self.mark_saved_ticking_completed(
                     position,
                     completion.take().expect("one saved ticking callback"),
@@ -264,6 +283,126 @@ impl LoadedSession {
         )?;
         ensure!(dispatched, "saved ticking callback was not queued");
         Ok(())
+    }
+
+    fn plan_postprocessing_blocks(
+        &self,
+        terrain: &GenerationTerrainStage,
+        result: &crate::worldgen::saved_postprocessing::SavedTickingResult,
+        changes: &[native_persistence::poi::PoiBlockChange],
+    ) -> Result<PostprocessingBlockPlan> {
+        if changes.is_empty() {
+            return Ok(PostprocessingBlockPlan {
+                edits: Vec::new(),
+                heightmaps: BTreeMap::new(),
+            });
+        }
+        self.sky_lighting
+            .capability()
+            .context("postprocessing dimension sky-light capability is unavailable")?;
+        self.verify_generation_spawn_heightmaps(terrain)?;
+        let mut latest = BTreeMap::<[i32; 3], BlockState>::new();
+        let mut positions = BTreeSet::new();
+        let mut edits = Vec::with_capacity(changes.len());
+        for change in changes {
+            let [x, y, z] = change.position;
+            ensure!(
+                (self.bounds.min_y..self.bounds.max_y).contains(&y),
+                "postprocessing edit is outside the dimension"
+            );
+            let position = glam::IVec3::new(x, y, z);
+            let relative = glam::IVec3::new(
+                x.checked_sub(self.origin.x)
+                    .context("postprocessing X is outside the session")?,
+                y.checked_sub(self.origin.y)
+                    .context("postprocessing Y is outside the session")?,
+                z.checked_sub(self.origin.z)
+                    .context("postprocessing Z is outside the session")?,
+            );
+            let chunk = ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            };
+            let section = i8::try_from(y.div_euclid(16))
+                .context("postprocessing section is outside the session")?;
+            let index = x.rem_euclid(16) as usize
+                + z.rem_euclid(16) as usize * 16
+                + y.rem_euclid(16) as usize * 256;
+            let blocks = self
+                .world
+                .chunks
+                .get(&chunk)
+                .and_then(|chunk| chunk.sections.get(&section))
+                .and_then(|section| section.blocks.as_ref())
+                .context("postprocessing block section is not resident")?;
+            let current = if let Some(previous) = latest.get(&change.position) {
+                previous
+            } else {
+                self.world
+                    .state(blocks[index])
+                    .context("postprocessing block state is missing")?
+            };
+            ensure!(
+                current == &change.expected,
+                "live postprocessing block changed at {:?}",
+                change.position
+            );
+            ensure!(
+                change.expected != change.replacement,
+                "postprocessing recorded an unchanged block"
+            );
+            latest.insert(change.position, change.replacement.clone());
+            positions.insert(chunk);
+            edits.push(PostprocessingBlockEdit {
+                relative,
+                position,
+                chunk,
+                section,
+                index,
+                expected: change.expected.clone(),
+                replacement: change.replacement.clone(),
+            });
+        }
+        let mut heightmaps = BTreeMap::new();
+        for &position in &positions {
+            if self.spawn_heightmaps.contains_key(&position) {
+                let maps = result
+                    .region
+                    .heightmaps()
+                    .get(&position)
+                    .context("postprocessing heightmaps are unavailable")?;
+                heightmaps.insert(position, Arc::new(maps.spawn_heightmaps()));
+            }
+        }
+        Ok(PostprocessingBlockPlan { edits, heightmaps })
+    }
+
+    fn install_postprocessing_blocks(&mut self, plan: PostprocessingBlockPlan) {
+        for edit in plan.edits {
+            let id = self.intern_block(edit.replacement.clone());
+            let old = self.world.chunks[&edit.chunk].sections[&edit.section]
+                .blocks
+                .as_ref()
+                .expect("validated postprocessing section")[edit.index];
+            debug_assert_eq!(self.world.state(old), Some(&edit.expected));
+            self.apply_postprocessed_block_set(
+                edit.relative,
+                id,
+                BlockSetCheck {
+                    pos: edit.position,
+                    chunk_pos: edit.chunk,
+                    section_y: edit.section,
+                    index: edit.index,
+                    original: Some(old),
+                    old,
+                    original_state: Some(edit.expected),
+                    replacement_state: edit.replacement,
+                },
+            );
+        }
+        if !plan.heightmaps.is_empty() {
+            Arc::make_mut(&mut self.spawn_heightmaps).extend(plan.heightmaps);
+        }
     }
 
     fn verify_ready_saved_ticking_input(

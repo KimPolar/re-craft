@@ -89,8 +89,9 @@ fn materialize_saved_block_entity(
             Some(Tag::Long(seed)) => *seed,
             _ => bail!("invalid saved brushable loot seed"),
         };
-        return Ok(super::GeneratedBrushable::from_saved_loot(pos, state, &table, seed)?
-            .block_entity());
+        return Ok(
+            super::GeneratedBrushable::from_saved_loot(pos, state, &table, seed)?.block_entity(),
+        );
     }
     if state.name == "minecraft:chest" && original.get("LootTable").is_some() {
         let Some(Tag::String(table)) = original.get("LootTable") else {
@@ -505,16 +506,40 @@ impl PostprocessedGeneratedRegion {
             self.chunks.contains(&pos) || self.deferred_tasks.contains_key(&pos),
             "block change chunk was not converted"
         );
+        self.block_changes_matching(Some(pos))
+    }
+
+    /// Validate and retain the global order, including transitions into
+    /// neighboring chunks and repeated changes to the same position.
+    pub(crate) fn ordered_block_changes(
+        &self,
+    ) -> Result<Vec<native_persistence::poi::PoiBlockChange>> {
+        self.block_changes_matching(None)
+    }
+
+    fn block_changes_matching(
+        &self,
+        only: Option<ChunkPos>,
+    ) -> Result<Vec<native_persistence::poi::PoiBlockChange>> {
         ensure!(
             self.edits == self.sealed_edits && self.edits.len() == self.edit_states.len(),
             "postprocessing block history differs"
         );
-        let mut changes = Vec::new();
+        let mut changes = if only.is_none() {
+            Vec::with_capacity(self.edits.len())
+        } else {
+            Vec::new()
+        };
         let mut latest = BTreeMap::new();
         for (position, &(before, after)) in self.edits.iter().zip(&self.edit_states) {
-            if position.chunk() != pos {
+            if only.is_some_and(|chunk| chunk != position.chunk()) {
                 continue;
             }
+            ensure!(
+                self.chunks.contains(&position.chunk())
+                    || self.deferred_tasks.contains_key(&position.chunk()),
+                "postprocessing block change is outside the converted chunks"
+            );
             let before = self
                 .world
                 .state(before)
@@ -580,6 +605,10 @@ impl PostprocessedGeneratedRegion {
         self.block_entity_edits
             .get(&pos)
             .is_some_and(|(before, after)| before == old && after == new)
+    }
+
+    pub(super) fn has_block_entity_edits(&self) -> bool {
+        !self.block_entity_edits.is_empty()
     }
     /// Block entities after this chunk's post-generation promotions and writes.
     pub fn block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
@@ -720,6 +749,18 @@ pub(super) fn drain_postprocessing_light(
 }
 
 impl GeneratedPostprocessing {
+    pub(super) fn initial_heightmaps(
+        &self,
+    ) -> &BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps> {
+        &self.heightmaps
+    }
+
+    pub(super) fn initial_heightmap_tags(
+        &self,
+    ) -> Option<&native_resources::heightmap_tags::HeightmapTags> {
+        self.heightmap_tags.as_deref()
+    }
+
     /// Recorded candidates for a registered chunk. A missing outer option
     /// means the chunk is not registered; an inner `None` means unknown.
     /// These records alone do not prove sidecar or live-entity completeness.

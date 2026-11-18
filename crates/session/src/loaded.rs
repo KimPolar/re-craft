@@ -225,6 +225,10 @@ struct StagedTerrainChunk {
     live: Option<Arc<native_world::loaded::Chunk>>,
     edits: BTreeMap<(i32, i32, i32), RecordedBlockEdit>,
     saved_source: Option<[u8; 32]>,
+    spawn_heightmaps: Option<Arc<SpawnHeightmaps>>,
+    saved_block_entities: Option<native_world::loaded::SavedBlockEntities>,
+    live_block_entities: Option<native_world::loaded::SavedBlockEntities>,
+    completed_postprocessing: Option<[u8; 32]>,
 }
 
 /// The original saved inputs observed by a completed, reconciled callback.
@@ -248,6 +252,7 @@ pub struct GenerationTerrainStage {
     block_light_generation: u64,
     block_light: BTreeMap<BlockPosition, native_world::block_light::LightChange>,
     sky_light: crate::sky_lighting::SkyGenerationGuard,
+    heightmap_tags: Option<Arc<HeightmapTags>>,
 }
 
 /// Immutable inputs captured on the simulation thread. Comparing every block
@@ -335,6 +340,60 @@ impl GenerationTerrainStageDraft {
 impl GenerationTerrainStage {
     pub(crate) fn identity(&self) -> &Arc<()> {
         &self.identity
+    }
+
+    /// The isolated pass starts from saved maps. Before using its updated
+    /// maps, verify they agree with the live maps and active heightmap tags.
+    pub(crate) fn matches_postprocessing_heightmaps(
+        &self,
+        maps: &BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
+        tags: Option<&HeightmapTags>,
+    ) -> bool {
+        self.heightmap_tags
+            .as_deref()
+            .zip(tags)
+            .is_some_and(|(live, captured)| live == captured)
+            && self.chunks.iter().all(|(position, chunk)| {
+                chunk.spawn_heightmaps.as_ref().is_none_or(|live| {
+                    maps.get(position)
+                        .is_some_and(|saved| saved.spawn_heightmaps() == **live)
+                })
+            })
+    }
+
+    pub(crate) fn postprocessing_block_entities(
+        &self,
+    ) -> BTreeMap<
+        ChunkPos,
+        (
+            Option<native_world::loaded::SavedBlockEntities>,
+            Option<native_world::loaded::SavedBlockEntities>,
+        ),
+    > {
+        self.chunks
+            .iter()
+            .map(|(&position, chunk)| {
+                (
+                    position,
+                    (
+                        chunk.saved_block_entities.clone(),
+                        chunk.live_block_entities.clone(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// A completed live callback supersedes the original saved marks. The
+    /// source identity must still match the exact chunk used by the worker.
+    pub(crate) fn saved_postprocessing_completed(
+        &self,
+        position: ChunkPos,
+        source: [u8; 32],
+    ) -> bool {
+        self.chunks.get(&position).is_some_and(|chunk| {
+            chunk.saved_source == Some(source) && chunk.completed_postprocessing == Some(source)
+        })
     }
 
     fn chunk_at(&self, x: i32, z: i32) -> Option<(&World, &native_world::loaded::Chunk)> {
@@ -7850,6 +7909,13 @@ impl LoadedSession {
                     live,
                     edits,
                     saved_source,
+                    spawn_heightmaps: self.spawn_heightmaps.get(&position).cloned(),
+                    saved_block_entities: self.world.saved_block_entities.get(&position).cloned(),
+                    live_block_entities: self.world.live_block_entities.get(&position).cloned(),
+                    completed_postprocessing: self
+                        .completed_saved_postprocessing
+                        .get(&position)
+                        .map(|completed| completed.source),
                 },
             );
         }
@@ -7870,8 +7936,72 @@ impl LoadedSession {
                     .map(|(&pos, value)| (pos, value.change))
                     .collect(),
                 sky_light: self.sky_lighting.capture_generation_guard(),
+                heightmap_tags: self.heightmap_tags.clone(),
             },
         })
+    }
+
+    fn verify_generation_spawn_heightmaps(
+        &self,
+        stage: &GenerationTerrainStage,
+    ) -> anyhow::Result<()> {
+        let same_tags = match (&stage.heightmap_tags, &self.heightmap_tags) {
+            (Some(captured), Some(current)) => Arc::ptr_eq(captured, current),
+            (None, None) => true,
+            _ => false,
+        };
+        anyhow::ensure!(
+            same_tags,
+            "live heightmap tags changed during postprocessing"
+        );
+        for (&position, captured) in &stage.chunks {
+            let same = match (
+                &captured.spawn_heightmaps,
+                self.spawn_heightmaps.get(&position),
+            ) {
+                (Some(before), Some(current)) => Arc::ptr_eq(before, current),
+                (None, None) => true,
+                _ => false,
+            };
+            anyhow::ensure!(same, "live heightmaps changed at {position:?}");
+        }
+        Ok(())
+    }
+
+    fn verify_generation_block_entities(
+        &self,
+        stage: &GenerationTerrainStage,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<()> {
+        use native_world::loaded::SavedBlockEntities;
+
+        let same =
+            |before: Option<&SavedBlockEntities>, current: Option<&SavedBlockEntities>| match (
+                before, current,
+            ) {
+                (None, None)
+                | (Some(SavedBlockEntities::Empty), Some(SavedBlockEntities::Empty)) => true,
+                (Some(SavedBlockEntities::Encoded(a)), Some(SavedBlockEntities::Encoded(b))) => {
+                    Arc::ptr_eq(a, b)
+                }
+                _ => false,
+            };
+        for position in positions {
+            let captured = stage.chunks.get(&position).ok_or_else(|| {
+                anyhow::anyhow!("postprocessing block entity chunk was not captured")
+            })?;
+            anyhow::ensure!(
+                same(
+                    captured.saved_block_entities.as_ref(),
+                    self.world.saved_block_entities.get(&position)
+                ) && same(
+                    captured.live_block_entities.as_ref(),
+                    self.world.live_block_entities.get(&position)
+                ),
+                "live block entities changed at {position:?}"
+            );
+        }
+        Ok(())
     }
 
     /// Recheck an intermediate snapshot without treating it as save approval.
@@ -7909,6 +8039,11 @@ impl LoadedSession {
             anyhow::ensure!(
                 same_chunk
                     && self.world.saved_chunk_source(position) == expected.saved_source
+                    && self
+                        .completed_saved_postprocessing
+                        .get(&position)
+                        .map(|completed| completed.source)
+                        == expected.completed_postprocessing
                     && self
                         .block_edits
                         .get(&position)
@@ -19413,6 +19548,22 @@ impl LoadedSession {
     }
 
     #[cfg(test)]
+    pub(crate) fn world_for_postprocessing_test(&self) -> Arc<World> {
+        Arc::clone(&self.world)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_block_entities_for_postprocessing_test(
+        &mut self,
+        position: ChunkPos,
+        entities: native_world::loaded::SavedBlockEntities,
+    ) {
+        Arc::make_mut(&mut self.world)
+            .live_block_entities
+            .insert(position, entities);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_block_for_postprocessing_test(
         &mut self,
         position: IVec3,
@@ -19660,6 +19811,29 @@ impl LoadedSession {
         notify: bool,
         checked: BlockSetCheck,
     ) -> bool {
+        self.apply_block_set_inner(relative, id, notify, checked, false)
+    }
+
+    /// Replay an already validated postprocessing write. Its neighbor and
+    /// on-place effects were captured by the worker, and its heightmaps are
+    /// installed from that same pass after all writes have been applied.
+    fn apply_postprocessed_block_set(
+        &mut self,
+        relative: IVec3,
+        id: BlockStateId,
+        checked: BlockSetCheck,
+    ) {
+        self.apply_block_set_inner(relative, id, false, checked, true);
+    }
+
+    fn apply_block_set_inner(
+        &mut self,
+        relative: IVec3,
+        id: BlockStateId,
+        notify: bool,
+        checked: BlockSetCheck,
+        postprocessed: bool,
+    ) -> bool {
         let BlockSetCheck {
             pos,
             chunk_pos,
@@ -19740,7 +19914,8 @@ impl LoadedSession {
                 z: pos.z,
             },
         );
-        if self.spawn_heightmaps.contains_key(&chunk_pos)
+        if !postprocessed
+            && self.spawn_heightmaps.contains_key(&chunk_pos)
             && let Some(maps) = Arc::make_mut(&mut self.spawn_heightmaps).remove(&chunk_pos)
         {
             let mut maps = Arc::unwrap_or_clone(maps);
@@ -19830,7 +20005,7 @@ impl LoadedSession {
                     change: light_change,
                     last_attempt: None,
                 });
-            if !overlaps_pending {
+            if !postprocessed && !overlaps_pending {
                 self.try_pending_light(position);
             }
         }
@@ -19838,7 +20013,8 @@ impl LoadedSession {
         // LevelChunk calls the new state's onPlace for every changed state,
         // including an age change within frosted ice. Tick replay stages the
         // same callback in advance so that its random source is transactional.
-        if !self.applying_ice_tick
+        if !postprocessed
+            && !self.applying_ice_tick
             && self
                 .world
                 .state(id)

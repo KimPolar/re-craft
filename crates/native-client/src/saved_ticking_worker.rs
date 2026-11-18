@@ -52,8 +52,9 @@ struct Work {
     ticks: SavedTickQueueCapture,
 }
 
-/// A completed private pass. Block, light and entity effects still need
-/// reconciliation; schedule-only results require the exact captured tick.
+/// A completed private pass. Supported block changes and schedules can be
+/// reconciled at the captured tick; lighting, entities and saving still need
+/// their own completion checks.
 pub(crate) struct PreparedSavedTicking {
     terrain: GenerationTerrainStage,
     result: SavedTickingResult,
@@ -90,8 +91,8 @@ impl PreparedSavedTicking {
         }
     }
 
-    /// Apply schedule-only effects at the captured tick and callback position.
-    /// Save coordination and the remaining chunk-holder lifecycle are separate.
+    /// Apply supported block and schedule effects at the captured tick and
+    /// callback position. Save coordination and holder lifecycle are separate.
     pub fn apply_scheduled(
         self,
         session: &mut LoadedSession,

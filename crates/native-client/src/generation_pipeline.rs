@@ -14,6 +14,10 @@ use crate::{
     world_creation::FrozenWorldCreation,
 };
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "generation_pipeline_extension_tests.rs"]
+mod extension_recovery_tests;
+
 pub struct InitialWorldOptions {
     /// Existing directory in which the private staging tree is created.
     pub staging_parent: PathBuf,
@@ -48,7 +52,7 @@ pub enum InitialWorldResult {
     },
     Failed {
         error: anyhow::Error,
-        /// Staging failures retain their input so a caller can retry.
+        /// Staging or extension start failures retain their input for retry.
         generation: Option<GenerationReady>,
     },
 }
@@ -231,7 +235,7 @@ impl InitialWorldPipeline {
         }
     }
 
-    /// Retry a cancelled or failed staging operation with its original settings.
+    /// Retry retained generation with its original remaining work and settings.
     /// A new parent can be supplied after a directory or permissions error.
     pub fn retry_staging(
         &mut self,
@@ -244,16 +248,47 @@ impl InitialWorldPipeline {
                 error: anyhow::anyhow!("initial world pipeline is still running"),
             });
         }
-        let worker = InitialWorldStagingWorker::start_recoverable(
-            generation,
-            parent.clone(),
-            self.structures,
-            self.options.last_played_ms,
-            self.options.region_timestamp,
-        )?;
-        self.options.staging_parent = parent;
-        self.cancelled = false;
-        self.state = State::Staging(worker);
+        self.start_remaining_work(generation, parent)
+    }
+
+    fn start_remaining_work(
+        &mut self,
+        generation: GenerationReady,
+        parent: PathBuf,
+    ) -> std::result::Result<(), StagingStartError> {
+        if let Some((targets, resources)) = &self.extension {
+            let worker = GenerationWorker::extend_postprocessed_initial(
+                generation,
+                targets.clone(),
+                self.options.player_random_seed,
+                resources.clone(),
+            )
+            .map_err(|failure| StagingStartError {
+                generation: failure.generation,
+                error: failure
+                    .error
+                    .context("cannot start initial world extension"),
+            })?;
+            self.extension = None;
+            self.options.staging_parent = parent;
+            self.cancelled = false;
+            self.state = State::Generating(worker);
+        } else {
+            let worker = InitialWorldStagingWorker::start_recoverable(
+                generation,
+                parent.clone(),
+                self.structures,
+                self.options.last_played_ms,
+                self.options.region_timestamp,
+            )
+            .map_err(|failure| StagingStartError {
+                generation: failure.generation,
+                error: failure.error.context("cannot start initial world staging"),
+            })?;
+            self.options.staging_parent = parent;
+            self.cancelled = false;
+            self.state = State::Staging(worker);
+        }
         Ok(())
     }
 
@@ -263,41 +298,13 @@ impl InitialWorldPipeline {
             State::Generating(worker) => match worker.try_result() {
                 Ok(None) => None,
                 Ok(Some(GenerationResult::Ready(generation))) if !self.cancelled => {
-                    if let Some((targets, resources)) = self.extension.take() {
-                        return match GenerationWorker::extend_postprocessed_initial(
-                            generation,
-                            targets,
-                            self.options.player_random_seed,
-                            resources,
-                        ) {
-                            Ok(worker) => {
-                                self.state = State::Generating(worker);
-                                None
-                            }
-                            Err(error) => {
-                                self.state = State::Finished;
-                                Some(InitialWorldResult::Failed {
-                                    error: error.context("cannot start initial world extension"),
-                                    generation: None,
-                                })
-                            }
-                        };
-                    }
-                    match InitialWorldStagingWorker::start_recoverable(
-                        generation,
-                        self.options.staging_parent.clone(),
-                        self.structures,
-                        self.options.last_played_ms,
-                        self.options.region_timestamp,
-                    ) {
-                        Ok(worker) => {
-                            self.state = State::Staging(worker);
-                            None
-                        }
+                    match self.start_remaining_work(generation, self.options.staging_parent.clone())
+                    {
+                        Ok(()) => None,
                         Err(failure) => {
                             self.state = State::Finished;
                             Some(InitialWorldResult::Failed {
-                                error: failure.error.context("cannot start initial world staging"),
+                                error: failure.error,
                                 generation: Some(failure.generation),
                             })
                         }

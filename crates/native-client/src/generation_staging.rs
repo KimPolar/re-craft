@@ -75,7 +75,7 @@ pub enum StagingResult {
     },
 }
 
-/// Failure to start staging leaves the generated world available for retry.
+/// A failed staging or extension start returns the generated world for retry.
 pub struct StagingStartError {
     pub generation: GenerationReady,
     pub error: anyhow::Error,

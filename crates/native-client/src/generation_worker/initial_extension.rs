@@ -2,6 +2,7 @@
 use super::*;
 
 /// Resources used to recreate the initial generation's immutable context.
+#[derive(Clone)]
 pub(crate) struct InitialExtensionResources {
     pub minecraft_dir: std::path::PathBuf,
     pub preset: String,
@@ -9,78 +10,99 @@ pub(crate) struct InitialExtensionResources {
     pub selection: Option<native_resources::datapacks::DataPackSettings>,
 }
 
+/// Starting an extension must not consume the expensive completed generation.
+pub(crate) struct InitialExtensionStartError {
+    pub generation: GenerationReady,
+    pub error: anyhow::Error,
+}
+
 impl GenerationWorker {
     /// Generate only the requested additional chunks before initial-world
     /// staging. The input must still own its original generation context; this
     /// does not attach chunks to a live session or authorize publication.
     pub(crate) fn extend_postprocessed_initial(
-        mut ready: GenerationReady,
+        ready: GenerationReady,
         targets: BTreeSet<ChunkPos>,
         player_random_seed: i64,
         resources: InitialExtensionResources,
-    ) -> Result<Self> {
-        ensure!(
-            !targets.is_empty(),
-            "no additional initial generation targets"
-        );
-        ensure!(
-            ready.batch.supports_structure_expansion(),
-            "structure-aware generation context is unavailable"
-        );
-        ensure!(
-            ready.postprocessed.is_some() && ready.hut_generation.is_some(),
-            "original postprocessed generation context is unavailable"
-        );
-        let spawn = ready
-            .player_spawn
-            .context("initial player spawn is missing")?;
-        let initial = ready
-            .initial_respawn
-            .clone()
-            .context("initial respawn settings are missing")?;
-        let level = ready
-            .level_settings
-            .as_ref()
-            .context("initial level settings are missing")?;
-        let rules = level.game_rules;
-        ensure!(
-            initial.radius == rules.respawn_radius
-                && initial.adventure == (level.session.mode == native_session::GameMode::Adventure),
-            "initial player settings changed"
-        );
-        let clocks = Arc::clone(
-            ready
-                .initial_clocks
+    ) -> std::result::Result<Self, InitialExtensionStartError> {
+        let setup = (|| -> Result<_> {
+            ensure!(
+                !targets.is_empty(),
+                "no additional initial generation targets"
+            );
+            ensure!(
+                ready.batch.supports_structure_expansion(),
+                "structure-aware generation context is unavailable"
+            );
+            ensure!(
+                ready.postprocessed.is_some() && ready.hut_generation.is_some(),
+                "original postprocessed generation context is unavailable"
+            );
+            let spawn = ready
+                .player_spawn
+                .context("initial player spawn is missing")?;
+            let initial = ready
+                .initial_respawn
+                .clone()
+                .context("initial respawn settings are missing")?;
+            let level = ready
+                .level_settings
                 .as_ref()
-                .context("initial clocks are missing")?,
-        );
-        ensure!(
-            clocks.spawn_mobs == rules.spawn_mobs && clocks.advance_time == rules.advance_time,
-            "initial clock rules changed"
-        );
-        ensure!(
-            ready
-                .postprocessed
-                .as_ref()
-                .context("postprocessing is missing")?
-                .region
-                .water_source_conversion()
-                == Some(rules.water_source_conversion),
-            "initial postprocessing rules changed"
-        );
-        let border = native_session::respawn::RespawnBorder::from_saved(initial.border, 0)?;
-        let disabled = if rules.spawn_mobs {
-            ready.batch.mob_generation_disabled()?
-        } else {
-            false
+                .context("initial level settings are missing")?;
+            let rules = level.game_rules;
+            ensure!(
+                initial.radius == rules.respawn_radius
+                    && initial.adventure
+                        == (level.session.mode == native_session::GameMode::Adventure),
+                "initial player settings changed"
+            );
+            let clocks = Arc::clone(
+                ready
+                    .initial_clocks
+                    .as_ref()
+                    .context("initial clocks are missing")?,
+            );
+            ensure!(
+                clocks.spawn_mobs == rules.spawn_mobs && clocks.advance_time == rules.advance_time,
+                "initial clock rules changed"
+            );
+            ensure!(
+                ready
+                    .postprocessed
+                    .as_ref()
+                    .context("postprocessing is missing")?
+                    .region
+                    .water_source_conversion()
+                    == Some(rules.water_source_conversion),
+                "initial postprocessing rules changed"
+            );
+            let border = native_session::respawn::RespawnBorder::from_saved(initial.border, 0)?;
+            let disabled = if rules.spawn_mobs {
+                ready.batch.mob_generation_disabled()?
+            } else {
+                false
+            };
+            let player = InitialPlayerSpawnOptions {
+                radius: initial.radius,
+                adventure: initial.adventure,
+                random_seed: player_random_seed,
+                saved_border: Some(initial.border),
+            };
+            Ok((spawn, initial, rules, clocks, border, disabled, player))
+        })();
+        let (spawn, initial, rules, clocks, border, disabled, player) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                return Err(InitialExtensionStartError {
+                    generation: ready,
+                    error,
+                });
+            }
         };
-        let player = InitialPlayerSpawnOptions {
-            radius: initial.radius,
-            adventure: initial.adventure,
-            random_seed: player_random_seed,
-            saved_border: Some(initial.border),
-        };
-        Self::spawn(move |cancelled, progress| {
+        let task = move |mut ready: GenerationReady,
+                         cancelled: &AtomicBool,
+                         progress: &Mutex<GenerationProgress>| {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -216,7 +238,14 @@ impl GenerationWorker {
                 snapshot.verify()?;
             }
             Ok(Some(expanded))
+        };
+        Self::spawn_owned(ready, task, |task| {
+            thread::Builder::new()
+                .name("minecraft-world-generator".into())
+                .spawn(task)
+                .map(|_| ())
         })
+        .map_err(|(generation, error)| InitialExtensionStartError { generation, error })
     }
 }
 
@@ -375,6 +404,63 @@ fn validate_chunk_blocks(
 mod tests {
     use super::*;
     use native_world::loaded::{BIOME_COUNT, BLOCK_COUNT, BlockPosition, Chunk, Section, World};
+
+    #[test]
+    fn failed_generation_worker_launch_returns_payload_for_retry() {
+        let start = |payload| {
+            GenerationWorker::spawn_owned(
+                payload,
+                |_: String, _, _| panic!("failed worker must not run"),
+                |_| Err(std::io::Error::other("thread unavailable")),
+            )
+        };
+        let (payload, error) = match start(String::from("completed generation")) {
+            Ok(_) => panic!("worker unexpectedly started"),
+            Err(failure) => failure,
+        };
+        assert_eq!(payload, "completed generation");
+        assert!(format!("{error:#}").contains("thread unavailable"));
+
+        let (payload, error) = match GenerationWorker::spawn_owned(
+            payload,
+            |_: String, _, _| panic!("dropped worker must not run"),
+            |task| {
+                drop(task);
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("worker unexpectedly accepted the payload"),
+            Err(failure) => failure,
+        };
+        assert_eq!(payload, "completed generation");
+        assert!(format!("{error:#}").contains("before accepting generation"));
+
+        let (sender, receiver) = mpsc::channel();
+        let worker = match GenerationWorker::spawn_owned(
+            payload,
+            move |payload, _, _| {
+                sender.send(payload).unwrap();
+                Ok(None)
+            },
+            |task| thread::Builder::new().spawn(task).map(|_| ()),
+        ) {
+            Ok(worker) => worker,
+            Err(_) => panic!("worker did not start"),
+        };
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            "completed generation"
+        );
+        assert!(matches!(
+            worker
+                .result
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            GenerationResult::Cancelled
+        ));
+    }
 
     #[test]
     fn previous_chunks_accept_recorded_blocks_and_light_only_sections() -> Result<()> {

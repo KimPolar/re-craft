@@ -2808,6 +2808,27 @@ impl GenerationWorker {
         + Send
         + 'static,
     ) -> Result<Self> {
+        Self::spawn_owned(
+            (),
+            move |(), cancelled, progress| task(cancelled, progress),
+            |task| {
+                thread::Builder::new()
+                    .name("minecraft-world-generator".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(_, error)| error)
+    }
+
+    /// Keep the payload on the caller until the worker has accepted it.
+    fn spawn_owned<T: Send + 'static>(
+        payload: T,
+        task: impl FnOnce(T, &AtomicBool, &Mutex<GenerationProgress>) -> Result<Option<GenerationReady>>
+        + Send
+        + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> std::result::Result<Self, (T, anyhow::Error)> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(GenerationProgress {
             phase: GenerationPhase::Planning,
@@ -2819,10 +2840,10 @@ impl GenerationWorker {
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_progress = Arc::clone(&progress);
         let (sender, result) = mpsc::channel();
-        thread::Builder::new()
-            .name("minecraft-world-generator".into())
-            .spawn(move || {
-                let outcome = match task(&worker_cancelled, &worker_progress) {
+        crate::generation_staging::spawn_with_payload(
+            payload,
+            move |payload| {
+                let outcome = match task(payload, &worker_cancelled, &worker_progress) {
                     Ok(Some(ready)) if !worker_cancelled.load(Ordering::Relaxed) => {
                         GenerationResult::Ready(ready)
                     }
@@ -2836,8 +2857,15 @@ impl GenerationWorker {
                 };
                 set_phase(&worker_progress, phase);
                 let _ = sender.send(outcome);
-            })
-            .context("cannot start world generation worker")?;
+            },
+            spawn,
+        )
+        .map_err(|(payload, error)| {
+            (
+                payload,
+                anyhow::Error::new(error).context("cannot start world generation worker"),
+            )
+        })?;
         Ok(Self {
             cancelled,
             progress,

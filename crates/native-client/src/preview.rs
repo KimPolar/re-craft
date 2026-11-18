@@ -3830,7 +3830,7 @@ mod tests {
             hardcore: true,
             allow_commands: false,
         };
-        let mut ready = crate::generation_worker::GenerationReady {
+        let ready = crate::generation_worker::GenerationReady {
             batch,
             mesh: job,
             worldgen_settings_draft: Some(worldgen_draft.clone()),
@@ -3850,6 +3850,28 @@ mod tests {
             initial_respawn: None,
             postprocessed: None,
         };
+        let failure = match crate::generation_worker::GenerationWorker::extend_postprocessed_initial(
+            ready,
+            BTreeSet::new(),
+            1234,
+            crate::generation_worker::initial_extension::InitialExtensionResources {
+                minecraft_dir: std::path::PathBuf::new(),
+                preset: String::new(),
+                dimension: String::new(),
+                selection: None,
+            },
+        ) {
+            Ok(_) => panic!("empty extension unexpectedly started"),
+            Err(failure) => failure,
+        };
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("no additional initial generation targets")
+        );
+        let mut ready = failure.generation;
+        assert!(Arc::ptr_eq(&previous_world, &ready.mesh.world));
         let mut height_session = ready
             .start_session(native_session::PlayerState {
                 position: glam::Vec3::new(8.5, 16.0, 8.5),

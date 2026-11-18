@@ -6778,6 +6778,7 @@ impl PreparedExistingGenerator {
                             RestoredStructurePiece::Mineshaft(_) => "mineshaft",
                             RestoredStructurePiece::Jigsaw(_) => "jigsaw",
                             RestoredStructurePiece::RuinedPortal(_) => "ruined_portal",
+                            RestoredStructurePiece::OceanRuin(_) => "ocean_ruin",
                         };
                         bail!(
                             "saved structure decoration type is not supported: {}:{} at {},{} ({kind}, {} pieces)",
@@ -8966,7 +8967,7 @@ impl PreparedExistingGenerator {
                     .map(|template| {
                         ensure!(
                             template.data_version == Some(5023),
-                            "unsupported portal template data version"
+                            "unsupported structure template data version"
                         );
                         Ok(template.size)
                     })

@@ -26,6 +26,7 @@ pub enum RestoredStructurePiece {
     Mineshaft(SavedMineshaftPiece),
     Jigsaw(SavedJigsawPiece),
     RuinedPortal(super::ruined_portal::SavedRuinedPortalPiece),
+    OceanRuin(super::ocean_ruin::SavedOceanRuinPiece),
 }
 
 impl RestoredStructurePiece {
@@ -36,6 +37,7 @@ impl RestoredStructurePiece {
             Self::Mineshaft(piece) => piece.piece.bounds,
             Self::Jigsaw(piece) => piece.piece.bounds,
             Self::RuinedPortal(piece) => piece.bounds,
+            Self::OceanRuin(piece) => piece.bounds,
         }
     }
 }
@@ -363,6 +365,9 @@ pub fn restore_saved_structure_starts_with_templates(
     mut template_size: impl FnMut(&ResourceId) -> Result<Option<[i32; 3]>>,
 ) -> Result<BTreeMap<ResourceId, RestoredStructureStart>> {
     let mut result = BTreeMap::new();
+    // All pieces in this capture use the same frozen resource stack. Avoid
+    // repeatedly decompressing one template when it appears in several pieces.
+    let mut template_sizes = BTreeMap::<ResourceId, [i32; 3]>::new();
     let Some(starts_field) = starts_field else {
         return Ok(result);
     };
@@ -425,7 +430,12 @@ pub fn restore_saved_structure_starts_with_templates(
         ensure!(
             matches!(
                 kind.path.as_str(),
-                "buried_treasure" | "swamp_hut" | "mineshaft" | "jigsaw" | "ruined_portal"
+                "buried_treasure"
+                    | "swamp_hut"
+                    | "mineshaft"
+                    | "jigsaw"
+                    | "ruined_portal"
+                    | "ocean_ruin"
             ),
             "unsupported saved structure type {}",
             kind.path
@@ -442,18 +452,31 @@ pub fn restore_saved_structure_starts_with_templates(
                     RestoredStructurePiece::Mineshaft(SavedMineshaftPiece::from_tag(value)?)
                 }
                 "jigsaw" => RestoredStructurePiece::Jigsaw(SavedJigsawPiece::from_tag(value)?),
-                "ruined_portal" => {
+                "ruined_portal" | "ocean_ruin" => {
                     let Some(Tag::String(name)) = field(value, "Template")? else {
-                        bail!("saved portal template is missing")
+                        bail!("saved {} template is missing", kind.path)
                     };
-                    let name =
-                        String::from_utf16(&name.0).context("invalid saved portal template")?;
+                    let name = String::from_utf16(&name.0)
+                        .with_context(|| format!("invalid saved {} template", kind.path))?;
                     let template = ResourceId::parse(&name)?;
-                    let size = template_size(&template)?
-                        .with_context(|| format!("saved portal template {name} is missing"))?;
-                    RestoredStructurePiece::RuinedPortal(
-                        super::ruined_portal::SavedRuinedPortalPiece::from_tag(value, size)?,
-                    )
+                    let size = if let Some(&size) = template_sizes.get(&template) {
+                        size
+                    } else {
+                        let size = template_size(&template)?.with_context(|| {
+                            format!("saved {} template {name} is missing", kind.path)
+                        })?;
+                        template_sizes.insert(template, size);
+                        size
+                    };
+                    if kind.path == "ruined_portal" {
+                        RestoredStructurePiece::RuinedPortal(
+                            super::ruined_portal::SavedRuinedPortalPiece::from_tag(value, size)?,
+                        )
+                    } else {
+                        RestoredStructurePiece::OceanRuin(
+                            super::ocean_ruin::SavedOceanRuinPiece::from_tag(value, size)?,
+                        )
+                    }
                 }
                 _ => bail!("unsupported saved structure type {}", kind.path),
             });
@@ -698,6 +721,134 @@ mod tests {
         assert!(
             restore_saved_structure_starts(ChunkPos { x: -2, z: 3 }, Some(&unsupported), config)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restores_ocean_ruin_pieces_in_order_and_rejects_lossy_data() -> Result<()> {
+        let piece = |position: [i32; 3], bounds: [i32; 6], rotation: &str, temperature: &str| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:orp".into())),
+                ("BB".into(), Tag::IntArray(bounds.into())),
+                ("O".into(), Tag::Int(2)),
+                ("GD".into(), Tag::Int(0)),
+                ("TPX".into(), Tag::Int(position[0])),
+                ("TPY".into(), Tag::Int(position[1])),
+                ("TPZ".into(), Tag::Int(position[2])),
+                (
+                    "Template".into(),
+                    Tag::String("minecraft:underwater_ruin/warm_1".into()),
+                ),
+                ("Rot".into(), Tag::String(rotation.into())),
+                ("Integrity".into(), Tag::Float(0.7)),
+                ("BiomeType".into(), Tag::String(temperature.into())),
+                ("IsLarge".into(), Tag::Byte(1)),
+            ])
+        };
+        let first = piece([-37, 90, 52], [-37, 90, 52, -31, 93, 56], "NONE", "WARM");
+        let second = piece(
+            [-37, 53, 52],
+            [-41, 53, 52, -37, 56, 58],
+            "CLOCKWISE_90",
+            "COLD",
+        );
+        let mut original = start("example:ruin", vec![first, second]);
+        let Tag::Compound(fields) = &mut original else {
+            unreachable!()
+        };
+        fields.push(("custom".into(), Tag::String("keep".into())));
+        let data = Tag::Compound(vec![("example:ruin".into(), original.clone())]);
+        let id = ResourceId::parse("example:ruin")?;
+        let pos = ChunkPos { x: -2, z: 3 };
+        let config = |_: &ResourceId| -> Result<Option<Value>> {
+            Ok(Some(json!({
+                "type": "minecraft:ocean_ruin",
+                "terrain_adaptation": "beard_thin"
+            })))
+        };
+        let template = ResourceId::parse("minecraft:underwater_ruin/warm_1")?;
+        let mut template_reads = 0;
+        let restored =
+            restore_saved_structure_starts_with_templates(pos, Some(&data), config, |id| {
+                assert_eq!(id, &template);
+                template_reads += 1;
+                Ok(Some([7, 4, 5]))
+            })?;
+        assert_eq!(template_reads, 1);
+        let RestoredStructureStart::Present {
+            pieces,
+            original: actual,
+            references,
+            ..
+        } = &restored[&id]
+        else {
+            panic!("ruin start missing")
+        };
+        assert_eq!(actual, &original);
+        assert_eq!(*references, 2);
+        let [
+            RestoredStructurePiece::OceanRuin(first),
+            RestoredStructurePiece::OceanRuin(second),
+        ] = pieces.as_slice()
+        else {
+            panic!("ruin piece order changed")
+        };
+        assert_eq!(first.selection.position, [-37, 90, 52]);
+        assert_eq!(second.selection.position, [-37, 53, 52]);
+        assert_eq!(
+            first.temperature,
+            native_resources::ocean_ruin::Temperature::Warm
+        );
+        assert_eq!(
+            second.temperature,
+            native_resources::ocean_ruin::Temperature::Cold
+        );
+        let terrain = restored[&id].terrain_pieces()?;
+        assert_eq!(terrain.len(), 2);
+        assert_eq!(terrain[0].bounds, first.bounds);
+        assert_eq!(terrain[1].bounds, second.bounds);
+        assert!(
+            terrain
+                .iter()
+                .all(|piece| piece.projection == PieceProjection::NonPool
+                    && piece.ground_delta == 0
+                    && piece.junctions.is_empty())
+        );
+        assert!(
+            restore_saved_structure_starts_with_templates(pos, Some(&data), config, |_| Ok(None))
+                .is_err()
+        );
+        assert!(
+            restore_saved_structure_starts_with_templates(pos, Some(&data), config, |_| Ok(Some(
+                [8, 4, 5]
+            )))
+            .is_err()
+        );
+        let mut unsupported = data.clone();
+        let Tag::Compound(starts) = &mut unsupported else {
+            unreachable!()
+        };
+        let Tag::Compound(fields) = &mut starts[0].1 else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Children"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(fields) = &mut values[1] else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        assert!(
+            restore_saved_structure_starts_with_templates(pos, Some(&unsupported), config, |_| Ok(
+                Some([7, 4, 5])
+            ))
+            .is_err()
         );
         Ok(())
     }

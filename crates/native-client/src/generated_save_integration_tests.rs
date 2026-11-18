@@ -1101,8 +1101,30 @@ fn verify_saved_holder_missing_generation(advance_ticks: bool) -> Result<()> {
         std::thread::sleep(Duration::from_millis(2));
     };
     assert!(bridge.missing_generation_is_current(&generation, &holders, &streamer, &session)?);
-    let mut biomes = MissingGenerationBiomeWorker::start(prepared, &streamer, &session)
-        .map_err(|failure| failure.error)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut prepared = prepared;
+    let mut pending_retries = 0;
+    let mut biomes = loop {
+        match MissingGenerationBiomeWorker::start(prepared, &streamer, &session) {
+            Ok(worker) => break worker,
+            Err(failure) if advance_ticks && failure.pending().is_some() => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "pending streamed terrain did not settle: {:#}",
+                    failure.error
+                );
+                prepared = failure.prepared;
+                pending_retries += 1;
+                bridge.service(&mut holders, &mut streamer, &mut session)?;
+                session.update(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(failure) => return Err(failure.error),
+        }
+    };
+    if pending_retries > 0 {
+        eprintln!("retried biome capture after {pending_retries} pending tick(s)");
+    }
     let deadline = Instant::now() + Duration::from_secs(120);
     let biomed = loop {
         if let Some(biomed) = biomes.try_result(&streamer, &session)? {

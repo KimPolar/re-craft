@@ -370,8 +370,64 @@ mod tests {
             anyhow::bail!("Java pieces missing")
         };
         ensure!(values.len() == fixtures.len(), "Java piece count differs");
-        for (tag, (_, saved)) in values.iter().zip(fixtures) {
-            assert_eq!(SavedOceanRuinPiece::from_tag(tag, [7, 4, 5])?, saved);
+        for (tag, (_, saved)) in values.iter().zip(&fixtures) {
+            assert_eq!(&SavedOceanRuinPiece::from_tag(tag, [7, 4, 5])?, saved);
+        }
+        let id = ResourceId::parse("minecraft:ocean_ruin_warm")?;
+        let start = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:ocean_ruin_warm".into())),
+            ("ChunkX".into(), Tag::Int(-3)),
+            ("ChunkZ".into(), Tag::Int(3)),
+            ("references".into(), Tag::Int(2)),
+            (
+                "Children".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: values.clone(),
+                },
+            ),
+        ]);
+        let data = Tag::Compound(vec![("minecraft:ocean_ruin_warm".into(), start.clone())]);
+        let restored =
+            crate::worldgen::saved_structure_starts::restore_saved_structure_starts_with_templates(
+                native_world::loaded::ChunkPos { x: -3, z: 3 },
+                Some(&data),
+                |_| {
+                    Ok(Some(serde_json::json!({
+                        "type": "minecraft:ocean_ruin",
+                        "terrain_adaptation": "beard_thin"
+                    })))
+                },
+                |template| {
+                    ensure!(
+                        *template == ResourceId::parse("minecraft:underwater_ruin/warm_1")?,
+                        "unexpected template"
+                    );
+                    Ok(Some([7, 4, 5]))
+                },
+            )?;
+        let crate::worldgen::saved_structure_starts::RestoredStructureStart::Present {
+            pieces,
+            original,
+            references,
+            ..
+        } = &restored[&id]
+        else {
+            anyhow::bail!("ocean ruin start missing")
+        };
+        assert_eq!(original, &start);
+        assert_eq!(*references, 2);
+        assert_eq!(pieces.len(), fixtures.len());
+        let terrain = restored[&id].terrain_pieces()?;
+        for ((piece, terrain), (_, saved)) in pieces.iter().zip(&terrain).zip(&fixtures) {
+            assert!(
+                matches!(piece, crate::worldgen::saved_structure_starts::RestoredStructurePiece::OceanRuin(actual) if actual == saved)
+            );
+            assert_eq!(terrain.bounds, saved.bounds);
+            assert_eq!(
+                terrain.projection,
+                native_core::beardifier::PieceProjection::NonPool
+            );
         }
         Ok(())
     }

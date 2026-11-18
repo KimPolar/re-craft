@@ -356,3 +356,5 @@ cargo test -p native-client --test inspect experimental_world_play_updates_mesh_
 기존 월드의 플레이와 안전한 저장, 전체 리소스팩·데이터팩, 실제 월드 생성, 바닐라 물리와 생존 규칙, 엔티티·레드스톤, UI·오디오 및 원본 대비 성능 측정은 아직 구현되지 않았습니다. 자동 테스트를 통과한 범위 밖의 바닐라 호환성은 보장하지 않습니다.
 
 구현 순서와 완료 조건은 [남은 개발 계획](docs/ROADMAP.md)을 참조하세요.
+
+새 월드의 플레이·저장을 연결할 때 확인한 후처리 문제와 검증 순서는 [새 월드의 플레이 및 저장 연결](docs/worldgen-live-readiness.md)에 정리했습니다.

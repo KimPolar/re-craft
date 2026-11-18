@@ -75,6 +75,7 @@ mod renderer;
 mod screen_blur;
 mod screenshot;
 mod saved_ticking_worker;
+mod saved_full_stream;
 mod sky_background;
 mod sky_weather;
 mod smoke_particles;

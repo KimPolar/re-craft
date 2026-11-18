@@ -419,6 +419,17 @@ impl TickingPreparations {
             }
         }
     }
+
+    pub(super) fn collect_entity_full_positions(&self, positions: &mut BTreeSet<ChunkPos>) {
+        if let Some(entity) = &self.entity {
+            for request in entity.requests.values() {
+                positions.extend(request.dependencies.iter().filter_map(|entry| {
+                    matches!(entry.future.result, None | Some(FullFutureResult::Full))
+                        .then_some(entry.position)
+                }));
+            }
+        }
+    }
 }
 
 /// Retains player-loading release tokens until the corresponding holder

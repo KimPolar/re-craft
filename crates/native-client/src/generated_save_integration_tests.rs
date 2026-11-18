@@ -485,6 +485,29 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         before_nbt
     );
 
+    save_reconciled_ticking_chunk(
+        session,
+        reader,
+        &mut resources,
+        lock,
+        &path,
+        dimension,
+        center,
+        &before_chunk,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_reconciled_ticking_chunk(
+    session: native_session::loaded::LoadedSession,
+    mut reader: WorldReader,
+    resources: &mut native_resources::packs::ResourceStack,
+    lock: native_persistence::save::WorldSessionGuard,
+    path: &std::path::Path,
+    dimension: DimensionId,
+    center: ChunkPos,
+    before_chunk: &native_persistence::world::LoadedChunk,
+) -> Result<()> {
     let blocks = session.draft_block_ticks(center)?;
     let fluids = session.draft_fluid_ticks(center)?;
     let mut expected = native_persistence::edit::draft_chunk_blocks(
@@ -512,7 +535,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     }
     let sources = reader.capture_session_save_sources(frozen.source_positions().iter().copied())?;
     let ids = resources.vanilla_block_ids()?;
-    let tags = native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &ids)?;
+    let tags = native_resources::heightmap_tags::HeightmapTags::load(resources, &ids)?;
     let registry = resources.vanilla_generated_block_registry()?;
     let resolve = |saved: &native_persistence::palette::BlockState| -> Result<BlockState> {
         let name = String::from_utf16(&saved.name.0)?;
@@ -566,7 +589,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     let written = writer.write_plan(plan, |_, _| anyhow::bail!("unexpected block edit"))?;
     assert!(written.backup_directory.exists());
     drop(writer);
-    let mut reopened = WorldReader::open_with_session(&path, dimension, lock)?;
+    let mut reopened = WorldReader::open_with_session(path, dimension, lock)?;
     let saved = reopened
         .read_chunk(center.x, center.z)?
         .context("saved center missing")?;
@@ -577,6 +600,367 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         );
     }
     eprintln!("saved reconciled postprocessing to a private generated-world copy");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the generated seed -1 portal fixture with FULL ticking neighbors"]
+fn saved_holder_stream_runs_a_real_ticking_callback() -> Result<()> {
+    use crate::{
+        saved_full_stream::{SavedFullStream, SavedFullUnavailable},
+        saved_ticking_worker::{SavedTickingRequest, SavedTickingWorker},
+    };
+    use native_persistence::chunk_tickets::TicketKind;
+    use native_session::{
+        distance_updates::DistanceUpdates,
+        loaded::BuildBounds,
+        loading_holders::LoadingHolders,
+        simulation_player::PlayerSimulation,
+        simulation_tickets::SimulationTickets,
+        ticking_preparation::{TickingExecutorEvent, TickingFutureState},
+        worldgen::GeneratedLavaRules,
+    };
+    use std::sync::Arc;
+
+    let root = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+    )?;
+    let fixture = std::fs::canonicalize(
+        std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD").context("test world not set")?,
+    )?;
+    ensure!(
+        fixture != root && fixture.starts_with(&root),
+        "test world is outside the private directory"
+    );
+    let copy = tempfile::Builder::new()
+        .prefix("saved-holder-stream-")
+        .tempdir_in(&root)?;
+    let path = copy.path().join("world");
+    copy_private_world(&fixture, &path)?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let dimension = DimensionId::parse("overworld")?;
+    let mut reader = WorldReader::open_for_session(&path, dimension.clone())?;
+    ensure!(reader.saved_world_seed()? == Some(-1), "wrong test seed");
+    let lock = reader.session_guard().context("test world lock missing")?;
+    let center = ChunkPos { x: 20, z: 20 };
+    let absent = ChunkPos {
+        x: 1_000_000,
+        z: 1_000_000,
+    };
+    let options = || crate::ViewOptions {
+        dimension: None,
+        chunk: Some((center.x, center.z)),
+        radius: 1,
+        smoke_test: false,
+        block_report: None,
+        play: true,
+        video: crate::menu_settings::VideoSettings::default(),
+    };
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options(), None, Some(lock.clone()))?
+    else {
+        anyhow::bail!("generated world did not open for play")
+    };
+    let crate::PreparedPlayWorld {
+        mut session,
+        resources,
+        mut streamer,
+        ..
+    } = *prepared;
+    let rules = reader.fluid_game_rules()?;
+
+    let mut player = PlayerSimulation::new(SimulationTickets::with_loading_tracker(), 2);
+    player.add_ticket(center, TicketKind::Forced, 32);
+    player.add_ticket(absent, TicketKind::Forced, 32);
+    let mut updates = DistanceUpdates::default();
+    let mut holders = LoadingHolders::new()?;
+    assert!(updates.run(&mut player, &mut holders)?);
+    assert!(!updates.run(&mut player, &mut holders)?);
+    assert_eq!(holders.block_state(center)?, TickingFutureState::Waiting);
+    let mut broken = SavedFullStream::start(
+        copy.path().join("missing-world"),
+        dimension.clone(),
+        lock.clone(),
+        &session,
+        &holders,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Err(error) = broken.service(&mut holders, &mut streamer, &mut session) {
+            ensure!(
+                format!("{error:#}").contains("cannot resolve world directory"),
+                "unexpected saved FULL reader error: {error:#}"
+            );
+            break;
+        }
+        ensure!(Instant::now() < deadline, "missing world read timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(broken.retry_failed() > 0);
+    broken.return_pending(&mut holders)?;
+    drop(broken);
+    let mut bridge = SavedFullStream::start(
+        path.clone(),
+        dimension.clone(),
+        lock.clone(),
+        &session,
+        &holders,
+    )?;
+    let mut other = LoadingHolders::new()?;
+    assert!(
+        bridge
+            .service(&mut other, &mut streamer, &mut session)
+            .is_err()
+    );
+    bridge.service(&mut holders, &mut streamer, &mut session)?;
+    // A save invalidates the outstanding reads even when it changes no file.
+    drop(lock.acquire_write()?);
+    assert!(
+        bridge
+            .service(&mut holders, &mut streamer, &mut session)
+            .is_err()
+    );
+    assert_eq!(holders.block_state(center)?, TickingFutureState::Waiting);
+    bridge.return_pending(&mut holders)?;
+    drop(bridge);
+    drop(streamer);
+    drop(session);
+    drop(resources);
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options(), None, Some(lock.clone()))?
+    else {
+        anyhow::bail!("generated world did not reopen after the write epoch changed")
+    };
+    let crate::PreparedPlayWorld {
+        mut session,
+        mut resources,
+        mut streamer,
+        ..
+    } = *prepared;
+    let packs = resources
+        .data_pack_snapshot()
+        .context("session packs missing")?;
+    let selection = resources
+        .data_pack_snapshot_selection()
+        .context("session pack selection missing")?
+        .clone();
+    let before_sub_tick = session.capture_saved_tick_queues()?.next_sub_tick();
+    let before_chunk = reader
+        .read_chunk(center.x, center.z)?
+        .context("saved center missing")?;
+    let mut bridge = SavedFullStream::start(
+        path.clone(),
+        dimension.clone(),
+        lock.clone(),
+        &session,
+        &holders,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        bridge.service(&mut holders, &mut streamer, &mut session)?;
+        if holders.peek_executor_event().is_some()
+            && bridge.unavailable_positions().next().is_some()
+        {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "saved holder reads timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (missing, reason) = bridge
+        .take_unavailable()
+        .context("missing request not retained")?;
+    assert_eq!(reason, SavedFullUnavailable::Missing);
+    holders.defer_generation_request(missing)?;
+    assert_eq!(holders.block_state(absent)?, TickingFutureState::Waiting);
+    let event = holders
+        .peek_executor_event()
+        .context("ticking event missing")?;
+    let TickingExecutorEvent::BlockQueued(expected) = event else {
+        anyhow::bail!("unexpected holder event")
+    };
+    let (id, fork) = holders
+        .preparations_mut()
+        .fork_next_background()?
+        .context("saved callback missing")?;
+    assert_eq!(id, expected);
+    let mut worker = SavedTickingWorker::start(
+        &fork,
+        &session,
+        SavedTickingRequest {
+            minecraft_dir: game.clone(),
+            world_dir: path.clone(),
+            world_session: lock.clone(),
+            dimension: dimension.clone(),
+            bounds: BuildBounds {
+                min_y: -64,
+                max_y: 320,
+            },
+            packs: Arc::clone(&packs),
+            selection,
+            water_source_conversion: rules.water_source_conversion,
+            lava_rules: GeneratedLavaRules {
+                fast_lava: false,
+                source_conversion: rules.lava_source_conversion,
+            },
+        },
+    )?;
+    assert_eq!(holders.next_executor_event(), Some(event));
+    assert_eq!(
+        holders.preparations_mut().begin_next_background(&fork)?,
+        Some(expected)
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let prepared = loop {
+        if let Some(result) = worker.try_result()? {
+            break result;
+        }
+        ensure!(Instant::now() < deadline, "saved ticking worker timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(prepared.result().region.edits.len(), 0);
+    assert_eq!(
+        prepared
+            .result()
+            .region
+            .ticks()
+            .next_sub_tick()
+            .wrapping_sub(before_sub_tick),
+        12
+    );
+    let (applied_id, applied) = holders
+        .preparations_mut()
+        .finish_background(|callback| Ok(prepared.apply_scheduled(&mut session, callback)))?
+        .context("running callback missing")?;
+    assert_eq!(applied_id, expected);
+    if let Err(failure) = applied {
+        crate::generation_staging::discard_async(failure.prepared);
+        return Err(failure
+            .error
+            .context("could not apply the real saved callback"));
+    }
+    assert_eq!(holders.block_state(center)?, TickingFutureState::Available);
+    assert_eq!(
+        session
+            .capture_saved_tick_queues()?
+            .next_sub_tick()
+            .wrapping_sub(before_sub_tick),
+        12
+    );
+    bridge.return_pending(&mut holders)?;
+    drop(bridge);
+    drop(holders);
+    drop(streamer);
+    drop(worker);
+    save_reconciled_ticking_chunk(
+        session,
+        reader,
+        &mut resources,
+        lock,
+        &path,
+        dimension,
+        center,
+        &before_chunk,
+    )
+}
+
+#[test]
+#[ignore = "requires a private generated 26.3 test world"]
+fn saved_holder_stream_waits_for_an_actual_outside_chunk() -> Result<()> {
+    use crate::saved_full_stream::SavedFullStream;
+    use native_persistence::chunk_tickets::TicketKind;
+    use native_session::{
+        distance_updates::DistanceUpdates,
+        loading_holders::LoadingHolders,
+        simulation_player::PlayerSimulation,
+        simulation_tickets::SimulationTickets,
+        ticking_preparation::{FullFutureResult, TickingFutureState},
+    };
+
+    let root = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+    )?;
+    let fixture = std::fs::canonicalize(
+        std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD").context("test world not set")?,
+    )?;
+    ensure!(
+        fixture != root && fixture.starts_with(&root),
+        "test world is outside the private directory"
+    );
+    let copy = tempfile::Builder::new()
+        .prefix("saved-holder-outside-")
+        .tempdir_in(&root)?;
+    let path = copy.path().join("world");
+    copy_private_world(&fixture, &path)?;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let dimension = DimensionId::parse("overworld")?;
+    let mut reader = WorldReader::open_for_session(&path, dimension.clone())?;
+    let lock = reader.session_guard().context("test world lock missing")?;
+    let target = ChunkPos { x: 22, z: 20 };
+    let center = ChunkPos { x: 21, z: 20 };
+    ensure!(
+        reader
+            .read_chunk(target.x, target.z)?
+            .is_some_and(|chunk| chunk.is_full()),
+        "outside FULL fixture is missing"
+    );
+    let options = crate::ViewOptions {
+        dimension: None,
+        chunk: Some((20, 20)),
+        radius: 1,
+        smoke_test: false,
+        block_report: None,
+        play: true,
+        video: crate::menu_settings::VideoSettings::default(),
+    };
+    let crate::PreparedWorld::Play(prepared) =
+        crate::prepare_world_with_session(&path, &game, &[], options, None, Some(lock.clone()))?
+    else {
+        anyhow::bail!("generated world did not open for play")
+    };
+    let crate::PreparedPlayWorld {
+        mut session,
+        mut streamer,
+        ..
+    } = *prepared;
+    assert!(!session.has_resident_or_parked_chunk(target));
+    let mut player = PlayerSimulation::new(SimulationTickets::with_loading_tracker(), 2);
+    player.add_ticket(center, TicketKind::Forced, 32);
+    let mut updates = DistanceUpdates::default();
+    let mut holders = LoadingHolders::new()?;
+    assert!(updates.run(&mut player, &mut holders)?);
+    assert!(!updates.run(&mut player, &mut holders)?);
+    let mut bridge = SavedFullStream::start(path, dimension, lock, &session, &holders)?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        bridge.service(&mut holders, &mut streamer, &mut session)?;
+        if !session.has_resident_or_parked_chunk(target) {
+            assert_ne!(holders.full_result(target), Some(FullFutureResult::Full));
+        }
+        if holders.full_result(target) == Some(FullFutureResult::Full)
+            && bridge.unavailable_positions().next().is_some()
+        {
+            break;
+        }
+        session.update(Duration::from_millis(50));
+        ensure!(Instant::now() < deadline, "outside FULL stream timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(session.has_resident_or_parked_chunk(target));
+    assert!(
+        !session
+            .snapshot()
+            .world
+            .loaded()
+            .context("live world missing")?
+            .chunks
+            .contains_key(&target)
+    );
+    assert_eq!(holders.block_state(center)?, TickingFutureState::Waiting);
+    bridge.return_pending(&mut holders)?;
     Ok(())
 }
 

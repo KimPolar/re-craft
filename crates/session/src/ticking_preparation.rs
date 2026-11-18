@@ -642,6 +642,17 @@ impl TickingPreparations {
         self.collect_entity_full_futures(&mut used);
         self.futures.retain(|id, _| used.contains(id));
     }
+
+    pub(crate) fn required_full_positions(&self) -> BTreeSet<ChunkPos> {
+        let mut positions = BTreeSet::new();
+        for request in self.requests.values() {
+            positions.extend(request.dependencies().filter_map(|(position, future)| {
+                matches!(future.result, None | Some(FullFutureResult::Full)).then_some(position)
+            }));
+        }
+        self.collect_entity_full_positions(&mut positions);
+        positions
+    }
 }
 
 /// A holder's loading-ticket transition and currently exposed ticking future.

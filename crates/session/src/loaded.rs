@@ -1888,6 +1888,7 @@ pub struct LoadedSession {
     player_simulation: Option<PlayerSimulationState>,
     entity_ticking_chunks: Option<Arc<BTreeSet<ChunkPos>>>,
     simulation_dependencies: Arc<BTreeSet<ChunkPos>>,
+    holder_dependencies: Arc<BTreeSet<ChunkPos>>,
     gameplay_sky_level: Option<Arc<native_resources::sky_light::SkyLevel>>,
     gameplay_sky_darken: Option<u8>,
     flight_speed: f32,
@@ -9952,6 +9953,7 @@ impl LoadedSession {
             player_simulation: None,
             entity_ticking_chunks: None,
             simulation_dependencies: Arc::new(BTreeSet::new()),
+            holder_dependencies: Arc::new(BTreeSet::new()),
             gameplay_sky_level: None,
             gameplay_sky_darken: None,
             flight_speed: 0.05,
@@ -13680,6 +13682,88 @@ impl LoadedSession {
         self.world.chunks.contains_key(&pos) || self.parked_chunks.contains_key(&pos)
     }
 
+    /// Keep holder-requested FULL chunks available even outside the visible
+    /// window. The matching streamer still has to load or generate them.
+    pub fn set_holder_dependencies(
+        &mut self,
+        stamp: &native_persistence::save::WorldReadStamp,
+        dimension: &native_persistence::world::DimensionId,
+        positions: Arc<BTreeSet<ChunkPos>>,
+    ) -> anyhow::Result<()> {
+        self.validate_saved_holder_world(stamp, dimension)?;
+        if !Arc::ptr_eq(&self.holder_dependencies, &positions) {
+            self.holder_dependencies = positions;
+        }
+        Ok(())
+    }
+
+    pub fn holder_dependencies(&self) -> &Arc<BTreeSet<ChunkPos>> {
+        &self.holder_dependencies
+    }
+
+    /// Check the identity and epoch of a saved-world holder request. A caller
+    /// attaching a result must also keep the stamp's read lease during attach.
+    pub fn validate_saved_holder_world(
+        &self,
+        stamp: &native_persistence::save::WorldReadStamp,
+        dimension: &native_persistence::world::DimensionId,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let session = self
+            .saved_world_session
+            .as_ref()
+            .context("saved holder world session is not bound")?;
+        anyhow::ensure!(
+            stamp.belongs_to_session(session) && stamp.is_current(),
+            "saved holder world changed or belongs to another session"
+        );
+        anyhow::ensure!(
+            native_persistence::world::DimensionId::parse(&self.world.dimension)? == *dimension,
+            "saved holder dimension differs"
+        );
+        Ok(())
+    }
+
+    /// Check that an independently read FULL chunk is attached to this live
+    /// session with the same saved NBT source. `false` means it has not yet
+    /// attached; this check does not by itself complete a holder future.
+    /// The caller must hold the read lease while using a successful result.
+    pub fn saved_full_chunk_attached(
+        &self,
+        stamp: &native_persistence::save::WorldReadStamp,
+        dimension: &native_persistence::world::DimensionId,
+        pos: ChunkPos,
+        source: [u8; 32],
+    ) -> anyhow::Result<bool> {
+        self.validate_saved_holder_world(stamp, dimension)?;
+        if self
+            .incoming
+            .iter()
+            .any(|incoming| incoming.pos == pos && incoming.world.is_some())
+        {
+            return Ok(false);
+        }
+        let Some(chunk) = self
+            .world
+            .chunks
+            .get(&pos)
+            .or_else(|| self.parked_chunks.get(&pos))
+        else {
+            return Ok(false);
+        };
+        if chunk.status.as_deref() != Some("minecraft:full") {
+            return Ok(false);
+        }
+        let Some(current) = self.world.saved_chunk_source(pos) else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            current == source,
+            "saved FULL chunk source differs at {pos:?}"
+        );
+        Ok(true)
+    }
+
     pub fn player_chunk(&self) -> Option<ChunkPos> {
         let x = i64::from(self.origin.x).checked_add(self.motion.position.x.floor() as i64)?;
         let z = i64::from(self.origin.z).checked_add(self.motion.position.z.floor() as i64)?;
@@ -14594,6 +14678,7 @@ impl LoadedSession {
         let required_shapes = self.required_shape_update_chunks();
         let required_sky = self.sky_lighting.required_chunks();
         let required_simulation = Arc::clone(&self.simulation_dependencies);
+        let required_holders = Arc::clone(&self.holder_dependencies);
         if let Some(window) = self.pending_respawn_window.take()
             && self.respawn_window != window
         {
@@ -14649,6 +14734,7 @@ impl LoadedSession {
                         !required_shapes.contains(pos)
                             && !required_sky.contains(pos)
                             && !required_simulation.contains(pos)
+                            && !required_holders.contains(pos)
                             && !self
                                 .respawn_window
                                 .is_some_and(|extra| within_window(*pos, extra))
@@ -14710,6 +14796,7 @@ impl LoadedSession {
                     } else if unsaved.contains(&pos)
                         || required_sky.contains(&pos)
                         || required_simulation.contains(&pos)
+                        || required_holders.contains(&pos)
                         || self
                             .respawn_window
                             .is_some_and(|extra| within_window(pos, extra))
@@ -14798,6 +14885,7 @@ impl LoadedSession {
                     !required_shapes.contains(pos)
                         && !required_sky.contains(pos)
                         && !required_simulation.contains(pos)
+                        && !required_holders.contains(pos)
                         && !self
                             .respawn_window
                             .is_some_and(|window| within_window(*pos, window))
@@ -14827,6 +14915,7 @@ impl LoadedSession {
                     && !required_shapes.contains(pos)
                     && !required_sky.contains(pos)
                     && !required_simulation.contains(pos)
+                    && !required_holders.contains(pos)
                     && !self
                         .respawn_window
                         .is_some_and(|window| within_window(*pos, window))
@@ -14875,6 +14964,14 @@ impl LoadedSession {
             stamp,
         }) = self.incoming.pop_front()
         {
+            if stamp.as_ref().is_some_and(|stamp| {
+                self.saved_world_session
+                    .as_ref()
+                    .is_some_and(|session| !stamp.belongs_to_session(session))
+            }) {
+                self.stale_streamed_chunks.insert(pos);
+                continue;
+            }
             let _read_lease = match &stamp {
                 Some(stamp) => match stamp.lock_current() {
                     Ok(lease) => Some(lease),
@@ -14896,6 +14993,7 @@ impl LoadedSession {
                 && !required_shapes.contains(&pos)
                 && !required_sky.contains(&pos)
                 && !required_simulation.contains(&pos)
+                && !required_holders.contains(&pos)
             {
                 continue;
             }
@@ -33719,6 +33817,94 @@ pub(crate) mod tests {
             .bind_saved_world_session(reader.session_guard().unwrap())
             .unwrap();
         (directory, reader, session)
+    }
+
+    #[test]
+    fn saved_holder_requires_the_same_world_source_and_retains_parked_terrain() {
+        use native_persistence::world::DimensionId;
+        let (_directory, reader, mut session) = locked_session_for_save();
+        let guard = reader.session_guard().unwrap();
+        let stamp = guard.read_stamp().unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let home = session.player_chunk().unwrap();
+        let source = [7; 32];
+        assert!(
+            !session
+                .saved_full_chunk_attached(&stamp, &dimension, home, source)
+                .unwrap()
+        );
+        Arc::make_mut(&mut session.world).remember_saved_chunk_source(home, source);
+        assert!(
+            session
+                .saved_full_chunk_attached(&stamp, &dimension, home, source)
+                .unwrap()
+        );
+        assert!(
+            session
+                .saved_full_chunk_attached(&stamp, &dimension, home, [8; 32])
+                .is_err()
+        );
+        assert!(
+            session
+                .saved_full_chunk_attached(
+                    &stamp,
+                    &DimensionId::parse("the_nether").unwrap(),
+                    home,
+                    source,
+                )
+                .is_err()
+        );
+        let (_other_directory, other_reader, _) = locked_session_for_save();
+        let other_stamp = other_reader.session_guard().unwrap().read_stamp().unwrap();
+        assert!(
+            session
+                .set_holder_dependencies(&other_stamp, &dimension, Arc::new(BTreeSet::from([home])))
+                .is_err()
+        );
+        session
+            .set_holder_dependencies(&stamp, &dimension, Arc::new(BTreeSet::from([home])))
+            .unwrap();
+        session.queue_chunk_window(
+            ChunkPos {
+                x: home.x + 4,
+                z: home.z,
+            },
+            0,
+        );
+        session.update(TICK);
+        assert!(session.parked_chunks.contains_key(&home));
+        assert!(
+            session
+                .saved_full_chunk_attached(&stamp, &dimension, home, source)
+                .unwrap()
+        );
+        drop(guard.acquire_write().unwrap());
+        assert!(
+            session
+                .saved_full_chunk_attached(&stamp, &dimension, home, source)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn streaming_rejects_a_chunk_from_another_locked_world() {
+        let (_directory, _reader, mut session) = locked_session_for_save();
+        let (_other_directory, other_reader, _) = locked_session_for_save();
+        let foreign = other_reader.session_guard().unwrap().read_stamp().unwrap();
+        let home = session.player_chunk().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut source = session.world.as_ref().clone();
+        let mut chunk = source.chunks[&home].as_ref().clone();
+        chunk.position = neighbor;
+        source.chunks.insert(neighbor, Arc::new(chunk));
+        session.queue_chunk_window(home, 1);
+        session.queue_streamed_chunk(neighbor, Some(source), None, None, None, Some(foreign));
+        session.update(TICK);
+        assert!(!session.has_resident_or_parked_chunk(neighbor));
+        assert!(session.take_stale_streamed_chunks().contains(&neighbor));
     }
 
     fn wait_save_capture(

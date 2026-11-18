@@ -79,6 +79,17 @@ impl FullGenerationHolder {
         Arc::ptr_eq(&self.owner, &owner.0)
     }
 
+    pub(crate) fn has_full_future(&self) -> bool {
+        self.full.is_some()
+    }
+
+    pub(crate) fn full_result(&self) -> Option<FullFutureResult> {
+        if !self.allowed {
+            return None;
+        }
+        self.full?.result
+    }
+
     /// Apply the holder's ticket level during the highest-status pass. A
     /// pending future is completed as unavailable and removed when FULL is no
     /// longer allowed. Already completed FULL futures remain in the holder.

@@ -5,7 +5,10 @@
 //! queued ticking callbacks in their emitted order. Merely creating a holder
 //! or requesting its FULL future never marks a chunk ready.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, ensure};
 use native_world::loaded::ChunkPos;
@@ -17,9 +20,9 @@ use crate::{
     simulation_player::{PlayerLoadingRelease, PlayerSimulation},
     ticking_preparation::{
         EntityListenerId, EntityLoadingLinks, EntityRequestId, EntityTickingHolder,
-        EntityTickingTransition, FullFuture, TickingExecutorEvent, TickingFutureState,
-        TickingHolder, TickingHolderTransition, TickingPreparations, TickingRequestId,
-        entity_ticking_dependencies, ticking_dependencies,
+        EntityTickingTransition, FullFuture, FullFutureResult, TickingExecutorEvent,
+        TickingFutureState, TickingHolder, TickingHolderTransition, TickingPreparations,
+        TickingRequestId, entity_ticking_dependencies, ticking_dependencies,
     },
 };
 
@@ -53,6 +56,10 @@ pub struct FullGenerationRequest {
     task: u64,
 }
 
+/// Identity of one holder coordinator, including across world reopenings.
+#[derive(Clone)]
+pub struct LoadingHoldersOwner(Arc<()>);
+
 impl FullGenerationRequest {
     pub fn position(&self) -> ChunkPos {
         self.position
@@ -63,6 +70,7 @@ impl FullGenerationRequest {
 /// This coordinator is tied to one distance-manager driver and one world.
 pub struct LoadingHolders {
     identity: DistanceDriverIdentity,
+    owner: Arc<()>,
     holders: BTreeMap<ChunkPos, Holder>,
     positions: BTreeMap<u64, ChunkPos>,
     full_ids: FullFutureIds,
@@ -71,6 +79,8 @@ pub struct LoadingHolders {
     requests: VecDeque<FullGenerationRequest>,
     retired_blocks: BTreeMap<TickingRequestId, ChunkPos>,
     retired_entities: BTreeMap<EntityRequestId, ChunkPos>,
+    required_full: Arc<BTreeSet<ChunkPos>>,
+    required_full_dirty: bool,
     next_holder: u64,
     next_block: u64,
     next_entity: u64,
@@ -83,6 +93,7 @@ impl LoadingHolders {
         let links = EntityLoadingLinks::new(&preparations)?;
         Ok(Self {
             identity: DistanceDriverIdentity::default(),
+            owner: Arc::new(()),
             holders: BTreeMap::new(),
             positions: BTreeMap::new(),
             full_ids: FullFutureIds::default(),
@@ -91,11 +102,58 @@ impl LoadingHolders {
             requests: VecDeque::new(),
             retired_blocks: BTreeMap::new(),
             retired_entities: BTreeMap::new(),
+            required_full: Arc::new(BTreeSet::new()),
+            required_full_dirty: false,
             next_holder: 0,
             next_block: 0,
             next_entity: 0,
             next_task: 0,
         })
+    }
+
+    pub fn owner(&self) -> LoadingHoldersOwner {
+        LoadingHoldersOwner(Arc::clone(&self.owner))
+    }
+
+    pub fn belongs_to_owner(&self, owner: &LoadingHoldersOwner) -> bool {
+        Arc::ptr_eq(&self.owner, &owner.0)
+    }
+
+    /// Check a dispatched request without completing it. A demoted holder may
+    /// no longer need a saved read, while a replacement holder cannot reuse it.
+    pub fn generation_request_needed(&self, request: &FullGenerationRequest) -> Result<bool> {
+        let holder = self
+            .holders
+            .get(&request.position)
+            .context("FULL request holder no longer exists")?;
+        ensure!(
+            holder.generation_task
+                == Some(GenerationTask {
+                    id: request.task,
+                    state: GenerationTaskState::Dispatched,
+                })
+                && holder.generation.owns(&request.owner),
+            "FULL generation request is no longer current"
+        );
+        Ok(holder.generation.allows_full())
+    }
+
+    /// Chunks whose FULL data is still needed by a live holder or by an older
+    /// queued/running callback. This is a retention and prefetch hint, not a
+    /// statement that their futures have completed.
+    pub fn required_full_positions(&mut self) -> &Arc<BTreeSet<ChunkPos>> {
+        if self.required_full_dirty {
+            let mut required = self.preparations.required_full_positions();
+            required.extend(self.holders.iter().filter_map(|(&position, holder)| {
+                (holder.generation.allows_full() && holder.generation.has_full_future())
+                    .then_some(position)
+            }));
+            if self.required_full.as_ref() != &required {
+                self.required_full = Arc::new(required);
+            }
+            self.required_full_dirty = false;
+        }
+        &self.required_full
     }
 
     /// Take one FULL request without waiting for generation or disk I/O.
@@ -206,6 +264,12 @@ impl LoadingHolders {
         }
     }
 
+    /// Return the last applied FULL result for this holder, if one exists.
+    /// A waiting future or disallowed FULL status does not count as success.
+    pub fn full_result(&self, position: ChunkPos) -> Option<FullFutureResult> {
+        self.holders.get(&position)?.generation.full_result()
+    }
+
     pub fn entity_state(&self, position: ChunkPos) -> Result<TickingFutureState> {
         match self.holders.get(&position) {
             Some(holder) => holder.entity.state(&self.preparations),
@@ -226,6 +290,7 @@ impl LoadingHolders {
     }
 
     pub fn preparations_mut(&mut self) -> &mut TickingPreparations {
+        self.required_full_dirty = true;
         &mut self.preparations
     }
 
@@ -249,6 +314,7 @@ impl LoadingHolders {
             .retain(|id, _| !matches!(self.preparations.retire_entity(*id), Ok(true) | Ok(false)));
         if before != self.retired_blocks.len() + self.retired_entities.len() {
             self.preparations.prune_unused_full_futures();
+            self.required_full_dirty = true;
         }
     }
 
@@ -272,6 +338,7 @@ impl LoadingHolders {
         let identity = holder.identity;
         self.holders.remove(&position);
         self.positions.remove(&identity.id);
+        self.required_full_dirty = true;
         self.reap_retired();
         Ok(true)
     }
@@ -368,6 +435,7 @@ impl DistanceUpdateDriver for LoadingHolders {
 
     fn update_highest_allowed_status(&mut self, identity: HolderIdentity) -> Result<()> {
         let position = self.position(identity)?;
+        self.required_full_dirty = true;
         let holder = self.holders.get_mut(&position).expect("scheduled holder");
         if let Some((id, result)) = holder
             .generation
@@ -380,6 +448,7 @@ impl DistanceUpdateDriver for LoadingHolders {
 
     fn update_futures(&mut self, identity: HolderIdentity) -> Result<()> {
         let position = self.position(identity)?;
+        self.required_full_dirty = true;
         let block_needed = self.holders[&position].block.needs_new_ticking_request();
         let block_futures = if block_needed {
             self.full_futures(ticking_dependencies(position))?

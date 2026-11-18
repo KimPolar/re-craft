@@ -5,6 +5,7 @@
 //! does not infer holder readiness, publish chunks, or authorize a world save.
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -14,14 +15,17 @@ use std::{
     thread,
 };
 
-use anyhow::{Result, ensure};
-use native_persistence::world::{ChunkArea, DimensionId};
+use anyhow::{Context, Result, ensure};
+use native_persistence::{
+    save::{WorldReadStamp, WorldSessionGuard},
+    world::{ChunkArea, ChunkPos as SavedChunkPos, DimensionId, WorldReader},
+};
 use native_resources::{
     datapack_snapshot::DataPackSnapshot, datapacks::DataPackSettings, packs::ResourceStack,
 };
 use native_session::{
     loaded::{
-        BuildBounds, GenerationTerrainStage, GenerationTerrainStageDraft, LoadedSession,
+        BuildBounds, GenerationTerrainLiveDraft, GenerationTerrainStage, LoadedSession,
         SavedTickQueueCapture,
     },
     ticking_preparation::{TickingPreparation, ticking_dependencies},
@@ -30,15 +34,14 @@ use native_session::{
         saved_postprocessing::{SavedPostprocessingInputs, SavedTickingBatch, SavedTickingResult},
     },
 };
-use native_world::loaded::World;
 
 /// Frozen settings from the same live session and data-pack snapshot.
 pub(crate) struct SavedTickingRequest {
     pub minecraft_dir: PathBuf,
+    pub world_dir: PathBuf,
+    pub world_session: WorldSessionGuard,
     pub dimension: DimensionId,
     pub bounds: BuildBounds,
-    pub area: ChunkArea,
-    pub saved_terrain: Arc<World>,
     pub packs: Arc<DataPackSnapshot>,
     pub selection: DataPackSettings,
     pub water_source_conversion: bool,
@@ -48,8 +51,9 @@ pub(crate) struct SavedTickingRequest {
 struct Work {
     request: SavedTickingRequest,
     callback: TickingPreparation,
-    terrain: GenerationTerrainStageDraft,
+    terrain: GenerationTerrainLiveDraft,
     ticks: SavedTickQueueCapture,
+    stamp: WorldReadStamp,
 }
 
 /// A completed private pass. Supported block changes and schedules can be
@@ -128,13 +132,12 @@ impl SavedTickingWorker {
         request: SavedTickingRequest,
     ) -> Result<Self> {
         let center = original.center();
-        ensure!(
-            request.area.center.x == center.x && request.area.center.z == center.z,
-            "saved postprocessing area has the wrong center"
-        );
         let callback = original.fork_queued_callback()?;
-        let terrain = session.capture_generation_terrain_stage_draft(
-            Arc::clone(&request.saved_terrain),
+        let stamp = request.world_session.read_stamp()?;
+        let terrain = session.capture_saved_ticking_terrain_draft(
+            &stamp,
+            &request.dimension,
+            request.bounds,
             ticking_dependencies(center),
         )?;
         let ticks = session.capture_saved_tick_queues()?;
@@ -143,6 +146,7 @@ impl SavedTickingWorker {
             callback,
             terrain,
             ticks,
+            stamp,
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -212,10 +216,12 @@ fn prepare(mut work: Work, cancelled: &AtomicBool) -> Result<PreparedSavedTickin
             !cancelled.load(Ordering::Acquire),
             "saved ticking preparation was cancelled"
         );
+        ensure!(
+            work.stamp.is_current(),
+            "saved ticking world changed during preparation"
+        );
         Ok(())
     };
-    check()?;
-    let terrain = work.terrain.validate_checked(check)?;
     check()?;
     let mut provider = ResourceStack::open(&work.request.minecraft_dir)?;
     let warnings = provider
@@ -230,10 +236,25 @@ fn prepare(mut work: Work, cancelled: &AtomicBool) -> Result<PreparedSavedTickin
         .vanilla_generated_block_registry()?
         .default_states();
     check()?;
+    let mut reader = WorldReader::open_with_session(
+        &work.request.world_dir,
+        work.request.dimension.clone(),
+        work.request.world_session.clone(),
+    )?;
+    check()?;
+    let area = read_saved_full_area(&mut reader, work.callback.center(), check)?;
+    check()?;
+    let saved_terrain =
+        Arc::new(area.materialize_with_defaults(&work.request.dimension, &defaults)?);
+    let terrain = work
+        .terrain
+        .bind_saved_source(saved_terrain)?
+        .validate_checked(check)?;
+    check()?;
     let mut batch = SavedTickingBatch::begin_with_bound_live_session(
         &mut provider,
         SavedPostprocessingInputs {
-            area: &work.request.area,
+            area: &area,
             dimension: &work.request.dimension,
             defaults: &defaults,
             block_ids: &ids,
@@ -257,4 +278,45 @@ fn prepare(mut work: Work, cancelled: &AtomicBool) -> Result<PreparedSavedTickin
     let result = batch.finish()?;
     check()?;
     Ok(PreparedSavedTicking { terrain, result })
+}
+
+/// Keep cancellation and epoch checks between individual chunk reads so a
+/// cancelled or superseded request does not need to decode the entire area.
+pub(super) fn read_saved_full_area(
+    reader: &mut WorldReader,
+    center: native_world::loaded::ChunkPos,
+    check: impl Fn() -> Result<()>,
+) -> Result<ChunkArea> {
+    center.x.checked_sub(1).context("chunk X range overflow")?;
+    center.x.checked_add(1).context("chunk X range overflow")?;
+    center.z.checked_sub(1).context("chunk Z range overflow")?;
+    center.z.checked_add(1).context("chunk Z range overflow")?;
+    let mut chunks = BTreeMap::new();
+    for position in ticking_dependencies(center) {
+        check()?;
+        let chunk = reader.read_chunk(position.x, position.z)?;
+        check()?;
+        let chunk = chunk
+            .with_context(|| format!("saved ticking FULL neighbor is missing at {position:?}"))?;
+        ensure!(
+            chunk.is_full(),
+            "saved ticking neighbor is not FULL at {position:?}"
+        );
+        chunks.insert(
+            SavedChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            Arc::new(chunk),
+        );
+    }
+    Ok(ChunkArea {
+        center: SavedChunkPos {
+            x: center.x,
+            z: center.z,
+        },
+        radius: 1,
+        chunks,
+        missing: Vec::new(),
+    })
 }

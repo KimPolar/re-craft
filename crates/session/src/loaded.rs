@@ -261,6 +261,13 @@ pub struct GenerationTerrainStageDraft {
     stage: GenerationTerrainStage,
 }
 
+/// Live inputs captured before a worker opens the saved terrain. The source
+/// must be bound and validated before these inputs can be used for generation.
+pub struct GenerationTerrainLiveDraft {
+    stage: GenerationTerrainStage,
+    require_saved_sources: bool,
+}
+
 /// A detached block and biome view. Lighting, ticks, entities, POI and saved
 /// chunk status have not been reconciled and this cannot authorize a save.
 pub struct GenerationTerrainOverlay {
@@ -334,6 +341,47 @@ impl GenerationTerrainStageDraft {
         }
         check()?;
         Ok(self.stage)
+    }
+}
+
+impl GenerationTerrainLiveDraft {
+    /// Bind the decoded source after disk I/O, then validate the returned
+    /// draft on the worker. No live session state is changed by this step.
+    pub fn bind_saved_source(
+        mut self,
+        source: Arc<World>,
+    ) -> anyhow::Result<GenerationTerrainStageDraft> {
+        use anyhow::Context;
+        anyhow::ensure!(
+            source.dimension == self.stage.live_world.dimension,
+            "generation terrain dimension differs"
+        );
+        anyhow::ensure!(
+            source.block_edits().next().is_none() && source.live_block_entities.is_empty(),
+            "generation terrain source contains live edits"
+        );
+        for (&position, captured) in &self.stage.chunks {
+            if captured.live.is_some() {
+                source.chunks.get(&position).with_context(|| {
+                    format!("live terrain is absent from captured input at {position:?}")
+                })?;
+                if self.require_saved_sources || captured.saved_source.is_some() {
+                    anyhow::ensure!(
+                        captured.saved_source.is_some()
+                            && captured.saved_source == source.saved_chunk_source(position),
+                        "saved terrain source differs at {position:?}"
+                    );
+                }
+            } else if captured.saved_source.is_some() {
+                anyhow::ensure!(
+                    source.chunks.contains_key(&position)
+                        && source.saved_chunk_source(position) == captured.saved_source,
+                    "saved terrain source differs at {position:?}"
+                );
+            }
+        }
+        self.stage.saved_world = source;
+        Ok(GenerationTerrainStageDraft { stage: self.stage })
     }
 }
 
@@ -7855,16 +7903,17 @@ impl LoadedSession {
         source: Arc<World>,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> anyhow::Result<GenerationTerrainStageDraft> {
-        use anyhow::Context;
+        self.capture_generation_terrain_live_draft(positions)?
+            .bind_saved_source(source)
+    }
+
+    /// Capture only shared live state on the simulation thread. A worker can
+    /// later read and bind saved terrain without blocking the event loop.
+    pub fn capture_generation_terrain_live_draft(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<GenerationTerrainLiveDraft> {
         self.validate_generation_stage_block_readiness()?;
-        anyhow::ensure!(
-            source.dimension == self.world.dimension,
-            "generation terrain dimension differs"
-        );
-        anyhow::ensure!(
-            source.block_edits().next().is_none() && source.live_block_entities.is_empty(),
-            "generation terrain source contains live edits"
-        );
         let deferred_shapes = self.capture_deferred_generation_shapes()?;
         let pending = self.generation_stage_pending(deferred_shapes.as_ref())?;
         let mut chunks = BTreeMap::new();
@@ -7879,29 +7928,11 @@ impl LoadedSession {
             let live = self.generation_terrain_chunk(position).chunk;
             let edits = self.block_edits.get(&position).cloned().unwrap_or_default();
             let saved_source = self.world.saved_chunk_source(position);
-            if live.is_some() {
-                source.chunks.get(&position).with_context(|| {
-                    format!("live terrain is absent from captured input at {position:?}")
-                })?;
-                let source_fingerprint = source.saved_chunk_source(position);
-                if self.require_saved_chunk_sources || saved_source.is_some() {
-                    anyhow::ensure!(
-                        saved_source.is_some() && saved_source == source_fingerprint,
-                        "saved terrain source differs at {position:?}"
-                    );
-                }
-            } else {
+            if live.is_none() {
                 anyhow::ensure!(
                     !self.has_unsaved_chunk_changes(position) && edits.is_empty(),
                     "changed generation terrain is not resident at {position:?}"
                 );
-                if saved_source.is_some() {
-                    anyhow::ensure!(
-                        source.chunks.contains_key(&position)
-                            && source.saved_chunk_source(position) == saved_source,
-                        "saved terrain source differs at {position:?}"
-                    );
-                }
             }
             chunks.insert(
                 position,
@@ -7920,13 +7951,13 @@ impl LoadedSession {
             );
         }
         anyhow::ensure!(!chunks.is_empty(), "no generation terrain inputs");
-        Ok(GenerationTerrainStageDraft {
+        Ok(GenerationTerrainLiveDraft {
             stage: GenerationTerrainStage {
                 session: Arc::clone(&self.generation_identity),
                 identity: Arc::new(()),
                 bounds: self.bounds,
                 live_world: Arc::clone(&self.world),
-                saved_world: source,
+                saved_world: Arc::new(World::new(self.world.dimension.clone())),
                 chunks,
                 deferred_shapes,
                 block_light_generation: self.light_generation,
@@ -7938,7 +7969,34 @@ impl LoadedSession {
                 sky_light: self.sky_lighting.capture_generation_guard(),
                 heightmap_tags: self.heightmap_tags.clone(),
             },
+            require_saved_sources: self.require_saved_chunk_sources,
         })
+    }
+
+    /// Capture saved ticking inputs only for the same locked world, dimension
+    /// and build bounds. The caller still supplies actual holder readiness.
+    pub fn capture_saved_ticking_terrain_draft(
+        &self,
+        stamp: &native_persistence::save::WorldReadStamp,
+        dimension: &native_persistence::world::DimensionId,
+        bounds: BuildBounds,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<GenerationTerrainLiveDraft> {
+        use anyhow::Context;
+        let session = self
+            .saved_world_session
+            .as_ref()
+            .context("saved ticking world session is not bound")?;
+        anyhow::ensure!(
+            stamp.belongs_to_session(session) && stamp.is_current(),
+            "saved ticking reader belongs to another or changed world"
+        );
+        anyhow::ensure!(
+            native_persistence::world::DimensionId::parse(&self.world.dimension)? == *dimension
+                && self.bounds == bounds,
+            "saved ticking dimension or build bounds differ"
+        );
+        self.capture_generation_terrain_live_draft(positions)
     }
 
     fn verify_generation_spawn_heightmaps(
@@ -34678,6 +34736,42 @@ pub(crate) mod tests {
                 .capture_generation_terrain_with_deferred_shapes(&saved, [home, neighbor])
                 .is_err()
         );
+        let mut wrong_dimension = saved.as_ref().clone();
+        wrong_dimension.dimension = "minecraft:the_nether".into();
+        assert!(
+            session
+                .capture_generation_terrain_live_draft([home])
+                .unwrap()
+                .bind_saved_source(Arc::new(wrong_dimension))
+                .is_err()
+        );
+        let mut missing_source = saved.as_ref().clone();
+        missing_source.chunks.remove(&home);
+        assert!(
+            session
+                .capture_generation_terrain_live_draft([home])
+                .unwrap()
+                .bind_saved_source(Arc::new(missing_source))
+                .is_err()
+        );
+        assert!(
+            session
+                .capture_generation_terrain_live_draft([home])
+                .unwrap()
+                .bind_saved_source(Arc::clone(&session.world))
+                .is_err()
+        );
+        let detached = session
+            .capture_generation_terrain_live_draft([home])
+            .unwrap();
+        let edits = session.block_edits.remove(&home).unwrap();
+        let detached = detached
+            .bind_saved_source(Arc::clone(&saved))
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(session.verify_generation_terrain_stage(&detached).is_err());
+        session.block_edits.insert(home, edits);
         let draft = session
             .capture_generation_terrain_stage_draft(Arc::clone(&saved), [home, neighbor])
             .unwrap();

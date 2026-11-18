@@ -130,7 +130,9 @@ fn existing_generated_world_uses_captured_data_packs() -> Result<()> {
 #[test]
 #[ignore = "requires the generated seed -1 portal fixture with FULL ticking neighbors"]
 fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() -> Result<()> {
-    use crate::saved_ticking_worker::{SavedTickingRequest, SavedTickingWorker};
+    use crate::saved_ticking_worker::{
+        SavedTickingRequest, SavedTickingWorker, read_saved_full_area,
+    };
     use native_session::{
         loaded::BuildBounds,
         ticking_preparation::{
@@ -140,7 +142,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         },
         worldgen::GeneratedLavaRules,
     };
-    use std::sync::Arc;
+    use std::{cell::Cell, sync::Arc};
 
     let root = std::fs::canonicalize(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
@@ -193,40 +195,23 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         .data_pack_snapshot_selection()
         .context("pack selection missing")?
         .clone();
-    let defaults = resources
-        .vanilla_generated_block_registry()?
-        .default_states();
     let rules = reader.fluid_game_rules()?;
-    let make_request = |reader: &mut WorldReader| -> Result<SavedTickingRequest> {
-        let area = reader.read_area(
-            native_persistence::world::ChunkPos {
-                x: center.x,
-                z: center.z,
-            },
-            1,
-        )?;
-        ensure!(
-            area.chunks.len() == 9 && area.chunks.values().all(|chunk| chunk.is_full()),
-            "FULL neighbors missing"
-        );
-        let saved_terrain = Arc::new(area.materialize_with_defaults(&dimension, &defaults)?);
-        Ok(SavedTickingRequest {
-            minecraft_dir: game.clone(),
-            dimension: dimension.clone(),
-            bounds: BuildBounds {
-                min_y: -64,
-                max_y: 320,
-            },
-            area,
-            saved_terrain,
-            packs: Arc::clone(&packs),
-            selection: selection.clone(),
-            water_source_conversion: rules.water_source_conversion,
-            lava_rules: GeneratedLavaRules {
-                fast_lava: false,
-                source_conversion: rules.lava_source_conversion,
-            },
-        })
+    let make_request = || SavedTickingRequest {
+        minecraft_dir: game.clone(),
+        world_dir: path.clone(),
+        world_session: lock.clone(),
+        dimension: dimension.clone(),
+        bounds: BuildBounds {
+            min_y: -64,
+            max_y: 320,
+        },
+        packs: Arc::clone(&packs),
+        selection: selection.clone(),
+        water_source_conversion: rules.water_source_conversion,
+        lava_rules: GeneratedLavaRules {
+            fast_lava: false,
+            source_conversion: rules.lava_source_conversion,
+        },
     };
     let dependencies = ticking_dependencies(center);
     let original = TickingPreparation::start(center, |position| {
@@ -243,7 +228,22 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     let before_nbt = native_persistence::nbt::fingerprint(&before_chunk.document)?;
     let before_sub_tick = session.capture_saved_tick_queues()?.next_sub_tick();
 
-    let mut cancelled = SavedTickingWorker::start(&original, &session, make_request(&mut reader)?)?;
+    // Cancellation must be observable during the 3x3 read, not only after all
+    // nine saved chunks have been decoded.
+    let checks = Cell::new(0);
+    let cancelled_read = read_saved_full_area(&mut reader, center, || {
+        checks.set(checks.get() + 1);
+        ensure!(checks.get() < 5, "interrupted during chunk reads");
+        Ok(())
+    });
+    ensure!(
+        cancelled_read
+            .err()
+            .is_some_and(|error| error.to_string().contains("interrupted during chunk reads")),
+        "chunk reading ignored cancellation"
+    );
+
+    let mut cancelled = SavedTickingWorker::start(&original, &session, make_request())?;
     cancelled.cancel();
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
@@ -267,6 +267,83 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
     assert_eq!(original.state(), TickingFutureState::Waiting);
     assert!(original.has_queued_callback());
 
+    let mut wrong_dimension = make_request();
+    wrong_dimension.dimension = DimensionId::parse("the_nether")?;
+    ensure!(
+        SavedTickingWorker::start(&original, &session, wrong_dimension).is_err(),
+        "another dimension was accepted"
+    );
+    let mut wrong_bounds = make_request();
+    wrong_bounds.bounds.max_y += 16;
+    ensure!(
+        SavedTickingWorker::start(&original, &session, wrong_bounds).is_err(),
+        "different build bounds were accepted"
+    );
+    assert!(original.has_queued_callback());
+
+    // Opening and decoding the world happens on the worker. A bad path must
+    // fail there without consuming the original holder callback.
+    let mut invalid_request = make_request();
+    invalid_request.world_dir = copy.path().join("missing-world");
+    let mut invalid = SavedTickingWorker::start(&original, &session, invalid_request)?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match invalid.try_result() {
+            Err(error) => {
+                ensure!(
+                    format!("{error:#}").contains("cannot resolve world directory"),
+                    "unexpected source error: {error:#}"
+                );
+                break;
+            }
+            Ok(None) => {}
+            Ok(Some(_)) => anyhow::bail!("missing world unexpectedly produced a result"),
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "invalid saved ticking source timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(original.state(), TickingFutureState::Waiting);
+    assert!(original.has_queued_callback());
+
+    // Disk contents cannot stand in for a missing FULL dependency, even if a
+    // caller supplies a queued holder callback for that position.
+    let missing_center = ChunkPos {
+        x: 1_000_000,
+        z: 1_000_000,
+    };
+    let missing_dependencies = ticking_dependencies(missing_center);
+    let missing_callback = TickingPreparation::start(missing_center, |position| {
+        Some(FullFuture {
+            id: FullFutureId(
+                missing_dependencies
+                    .iter()
+                    .position(|&entry| entry == position)? as u64,
+            ),
+            result: Some(FullFutureResult::Full),
+        })
+    })?;
+    let mut missing = SavedTickingWorker::start(&missing_callback, &session, make_request())?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match missing.try_result() {
+            Err(error) => {
+                ensure!(
+                    format!("{error:#}").contains("saved ticking FULL neighbor is missing"),
+                    "unexpected missing-neighbor error: {error:#}"
+                );
+                break;
+            }
+            Ok(None) => {}
+            Ok(Some(_)) => anyhow::bail!("missing neighbors unexpectedly produced a result"),
+        }
+        ensure!(Instant::now() < deadline, "missing-neighbor test timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(missing_callback.has_queued_callback());
+
     let first = TickingRequestId(1);
     let second = TickingRequestId(2);
     let mut queue = TickingPreparations::default();
@@ -285,7 +362,7 @@ fn generated_saved_ticking_worker_preserves_live_callback_and_handles_effects() 
         .fork_next_background()?
         .context("callback not queued")?;
     assert_eq!(expected, first);
-    let mut worker = SavedTickingWorker::start(&fork, &session, make_request(&mut reader)?)?;
+    let mut worker = SavedTickingWorker::start(&fork, &session, make_request())?;
     let running = queue
         .begin_next_background(&fork)?
         .context("callback not queued")?;

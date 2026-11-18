@@ -161,15 +161,15 @@ fn validate_saved_decoration_references(
 
 type SavedStructureKey = (ResourceId, native_world::loaded::ChunkPos);
 
-/// A mineshaft has no structure-level after-place effect in Java 26.3. Its
-/// pieces can therefore be omitted for this pass only when none intersects
-/// the chunk horizontally. Ignoring Y here is deliberately conservative.
-fn mineshaft_may_touch_chunk(
+/// A structure with no after-place effect can be omitted only if none of its
+/// pieces intersects the chunk horizontally. Ignoring Y is conservative.
+fn saved_pieces_may_touch_chunk(
     target: native_world::loaded::ChunkPos,
     pieces: &[native_session::worldgen::saved_structure_starts::RestoredStructurePiece],
+    mut bounds: impl FnMut(
+        &native_session::worldgen::saved_structure_starts::RestoredStructurePiece,
+    ) -> Result<native_core::beardifier::BoundingBox>,
 ) -> Result<bool> {
-    use native_session::worldgen::saved_structure_starts::RestoredStructurePiece;
-
     let min_x = target
         .x
         .checked_mul(16)
@@ -186,16 +186,37 @@ fn mineshaft_may_touch_chunk(
         .context("structure chunk Z overflow")?;
     let mut touches = false;
     for piece in pieces {
-        let RestoredStructurePiece::Mineshaft(piece) = piece else {
-            bail!("mineshaft contains another structure piece type");
-        };
-        let bounds = piece.piece.bounds;
+        let bounds = bounds(piece)?;
         touches |= bounds.min[0] <= max_x
             && bounds.max[0] >= min_x
             && bounds.min[2] <= max_z
             && bounds.max[2] >= min_z;
     }
     Ok(touches)
+}
+
+/// Java 26.3 mineshafts have no structure-level after-place effect.
+fn mineshaft_may_touch_chunk(
+    target: native_world::loaded::ChunkPos,
+    pieces: &[native_session::worldgen::saved_structure_starts::RestoredStructurePiece],
+) -> Result<bool> {
+    use native_session::worldgen::saved_structure_starts::RestoredStructurePiece;
+    saved_pieces_may_touch_chunk(target, pieces, |piece| match piece {
+        RestoredStructurePiece::Mineshaft(piece) => Ok(piece.piece.bounds),
+        _ => bail!("mineshaft contains another structure piece type"),
+    })
+}
+
+/// Java 26.3 ocean ruins inherit the no-op structure-level after-place hook.
+fn ocean_ruin_may_touch_chunk(
+    target: native_world::loaded::ChunkPos,
+    pieces: &[native_session::worldgen::saved_structure_starts::RestoredStructurePiece],
+) -> Result<bool> {
+    use native_session::worldgen::saved_structure_starts::RestoredStructurePiece;
+    saved_pieces_may_touch_chunk(target, pieces, |piece| match piece {
+        RestoredStructurePiece::OceanRuin(piece) => Ok(piece.bounds),
+        _ => bail!("ocean ruin contains another structure piece type"),
+    })
 }
 
 #[derive(Clone)]
@@ -6771,6 +6792,20 @@ impl PreparedExistingGenerator {
                             continue;
                         }
                     }
+                    let is_ocean_ruin = pieces
+                        .iter()
+                        .all(|piece| matches!(piece, RestoredStructurePiece::OceanRuin(_)));
+                    if is_ocean_ruin
+                        && !ocean_ruin_may_touch_chunk(
+                            native_world::loaded::ChunkPos {
+                                x: target.x,
+                                z: target.z,
+                            },
+                            pieces,
+                        )?
+                    {
+                        continue;
+                    }
                     let [RestoredStructurePiece::BuriedTreasure(bounds)] = pieces.as_slice() else {
                         let kind = match &pieces[0] {
                             RestoredStructurePiece::BuriedTreasure(_) => "buried_treasure",
@@ -10983,6 +11018,169 @@ mod tests {
         Ok(())
     }
 
+    fn saved_ocean_piece(
+        min: [i32; 3],
+        max: [i32; 3],
+    ) -> Result<native_session::worldgen::saved_structure_starts::RestoredStructurePiece> {
+        use native_session::worldgen::{
+            ocean_ruin::SavedOceanRuinPiece, saved_structure_starts::RestoredStructurePiece,
+        };
+        let mut size = [0; 3];
+        for axis in 0..3 {
+            size[axis] = max[axis]
+                .checked_sub(min[axis])
+                .and_then(|value| value.checked_add(1))
+                .context("invalid test ocean ruin bounds")?;
+        }
+        let tag = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:orp".into())),
+            (
+                "BB".into(),
+                Tag::IntArray(min.into_iter().chain(max).collect()),
+            ),
+            ("O".into(), Tag::Int(2)),
+            ("GD".into(), Tag::Int(0)),
+            ("TPX".into(), Tag::Int(min[0])),
+            ("TPY".into(), Tag::Int(min[1])),
+            ("TPZ".into(), Tag::Int(min[2])),
+            (
+                "Template".into(),
+                Tag::String("minecraft:underwater_ruin/warm_1".into()),
+            ),
+            ("Rot".into(), Tag::String("NONE".into())),
+            ("Integrity".into(), Tag::Float(0.8)),
+            ("BiomeType".into(), Tag::String("WARM".into())),
+            ("IsLarge".into(), Tag::Byte(0)),
+        ]);
+        Ok(RestoredStructurePiece::OceanRuin(
+            SavedOceanRuinPiece::from_tag(&tag, size)?,
+        ))
+    }
+
+    #[test]
+    fn saved_ocean_filter_preserves_touching_and_checks_every_piece() -> Result<()> {
+        use native_core::beardifier::BoundingBox;
+        use native_session::worldgen::saved_structure_starts::RestoredStructurePiece;
+        use native_world::loaded::ChunkPos;
+
+        let target = ChunkPos { x: -1, z: 2 };
+        let outside = saved_ocean_piece([0, 0, 32], [7, 7, 39])?;
+        let touching = saved_ocean_piece([-1, 1000, 47], [6, 1007, 54])?;
+        assert!(!ocean_ruin_may_touch_chunk(
+            target,
+            std::slice::from_ref(&outside)
+        )?);
+        assert!(ocean_ruin_may_touch_chunk(
+            target,
+            &[outside.clone(), touching]
+        )?);
+        let wrong =
+            RestoredStructurePiece::BuriedTreasure(BoundingBox::new([0, 0, 0], [1, 1, 1]).unwrap());
+        assert!(ocean_ruin_may_touch_chunk(target, &[outside, wrong]).is_err());
+        assert!(ocean_ruin_may_touch_chunk(ChunkPos { x: i32::MAX, z: 0 }, &[]).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the private seed -1 world and Minecraft Java Edition 26.3"]
+    fn captured_saved_ocean_plan_skips_only_nonintersecting_pieces() -> Result<()> {
+        use native_session::worldgen::{
+            saved_structure_starts::RestoredStructureStart, schedule::GenerationStage,
+            structure_references::restore_saved_structure_references,
+        };
+        use native_world::loaded::ChunkPos;
+
+        let root = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp"),
+        )?;
+        let fixture = std::fs::canonicalize(
+            std::env::var_os("RECRAFT_SAVED_TICKING_TEST_WORLD")
+                .context("private saved ticking world not set")?,
+        )?;
+        ensure!(
+            fixture != root && fixture.starts_with(&root),
+            "test world is outside the private directory"
+        );
+        let temporary = tempfile::Builder::new()
+            .prefix("saved-ocean-plan-")
+            .tempdir_in(&root)?;
+        let world = temporary.path().join("world");
+        crate::generated_save_integration_tests::copy_private_world(&fixture, &world)?;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut reader = WorldReader::open_for_session(&world, DimensionId::parse("overworld")?)?;
+        ensure!(reader.saved_world_seed()? == Some(-1), "wrong test seed");
+        let source = ChunkPos { x: 21, z: 21 };
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(source, GenerationStage::StructureStarts)?;
+        let mut generator = prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
+        let id = ResourceId::parse("minecraft:ocean_ruin_cold")?;
+        let starts =
+            generator.restore_saved_structure_starts(native_persistence::world::ChunkPos {
+                x: source.x,
+                z: source.z,
+            })?;
+        let RestoredStructureStart::Present {
+            pieces, original, ..
+        } = &starts[&id]
+        else {
+            anyhow::bail!("saved ocean ruin is missing")
+        };
+        assert_eq!(pieces.len(), 3);
+        let original = original.clone();
+        let packed = (u64::from(source.x as u32) | (u64::from(source.z as u32) << 32)) as i64;
+        let data = Tag::Compound(vec![(
+            "minecraft:ocean_ruin_cold".into(),
+            Tag::LongArray(vec![packed]),
+        )]);
+        let make_references = |target| -> Result<_> {
+            let report = restore_saved_structure_references(target, Some(&data), |candidate| {
+                Ok(candidate == &id)
+            })?;
+            ensure!(
+                report.discarded.is_empty(),
+                "test references were discarded"
+            );
+            Ok(report.references)
+        };
+        let outside = ChunkPos { x: 22, z: 20 };
+        let plan = generator.prepare_captured_structure_plan(
+            &BTreeMap::new(),
+            None,
+            &make_references(outside)?,
+            native_persistence::world::ChunkPos {
+                x: outside.x,
+                z: outside.z,
+            },
+        )?;
+        assert!(plan.order.is_empty());
+        assert!(plan.starts.is_empty() && plan.mineshafts.is_empty());
+        let error = generator
+            .prepare_captured_structure_plan(
+                &BTreeMap::new(),
+                None,
+                &make_references(source)?,
+                native_persistence::world::ChunkPos {
+                    x: source.x,
+                    z: source.z,
+                },
+            )
+            .err()
+            .context("touching ocean ruin was not rejected")?;
+        assert!(format!("{error:#}").contains("saved structure decoration type is not supported"));
+        let again =
+            generator.restore_saved_structure_starts(native_persistence::world::ChunkPos {
+                x: source.x,
+                z: source.z,
+            })?;
+        assert!(
+            matches!(&again[&id], RestoredStructureStart::Present { original: actual, .. } if actual == &original)
+        );
+        Ok(())
+    }
+
     #[test]
     fn saved_mineshaft_filter_uses_inclusive_chunk_bounds() -> Result<()> {
         use native_core::beardifier::BoundingBox;
@@ -11131,7 +11329,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
-    fn saved_mineshaft_filter_matches_java_structure_placement() -> Result<()> {
+    fn saved_structure_filters_match_java_structure_placement() -> Result<()> {
         use native_core::beardifier::BoundingBox;
         use native_resources::mineshaft::{
             MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant,
@@ -11192,52 +11390,65 @@ mod tests {
             "Java oracle compilation failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        let output = Command::new(java.join("java.exe"))
-            .arg("-classpath")
-            .arg(&classpath)
-            .arg("SavedMineshaftNoopOracle")
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "Java oracle failed: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = std::str::from_utf8(&output.stdout)?;
-        let mut results = BTreeMap::new();
-        for line in output.lines() {
-            let Some((_, row)) = line.split_once("P ") else {
-                continue;
-            };
-            let mut fields = row.split_whitespace();
-            let index: usize = fields.next().context("case index missing")?.parse()?;
-            let calls: usize = fields.next().context("call count missing")?.parse()?;
-            let unchanged: bool = fields.next().context("random state missing")?.parse()?;
-            ensure!(fields.next().is_none(), "extra oracle fields");
+        for structure in [
+            "minecraft:mineshaft",
+            "minecraft:ocean_ruin_cold",
+            "minecraft:ocean_ruin_warm",
+        ] {
+            let output = Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&classpath)
+                .arg("SavedMineshaftNoopOracle")
+                .arg(structure)
+                .output()?;
             ensure!(
-                results.insert(index, (calls, unchanged)).is_none(),
-                "duplicate case"
+                output.status.success(),
+                "Java oracle failed for {structure}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
-        }
-        assert_eq!(results.len(), cases.len());
-        for (index, (min, max)) in cases.into_iter().enumerate() {
-            let piece = RestoredStructurePiece::Mineshaft(SavedMineshaftPiece {
-                piece: MineshaftGraphPiece {
-                    bounds: BoundingBox::new(min, max).map_err(anyhow::Error::msg)?,
-                    direction: None,
-                    depth: 0,
-                    kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
-                },
-                variant: MineshaftVariant::Normal,
-                placed_spider: false,
-            });
-            let may_touch = mineshaft_may_touch_chunk(ChunkPos { x: -1, z: 2 }, &[piece])?;
-            let (calls, unchanged) = results[&index];
-            assert_eq!(
-                (calls, unchanged),
-                [(0, true), (1, false), (0, true), (1, false), (0, true)][index]
-            );
-            assert!(may_touch || (calls == 0 && unchanged));
+            let output = std::str::from_utf8(&output.stdout)?;
+            let mut results = BTreeMap::new();
+            for line in output.lines() {
+                let Some((_, row)) = line.split_once("P ") else {
+                    continue;
+                };
+                let mut fields = row.split_whitespace();
+                let index: usize = fields.next().context("case index missing")?.parse()?;
+                let calls: usize = fields.next().context("call count missing")?.parse()?;
+                let unchanged: bool = fields.next().context("random state missing")?.parse()?;
+                ensure!(fields.next().is_none(), "extra oracle fields");
+                ensure!(
+                    results.insert(index, (calls, unchanged)).is_none(),
+                    "duplicate case"
+                );
+            }
+            assert_eq!(results.len(), cases.len());
+            for (index, (min, max)) in cases.into_iter().enumerate() {
+                let target = ChunkPos { x: -1, z: 2 };
+                let may_touch = if structure == "minecraft:mineshaft" {
+                    let piece = RestoredStructurePiece::Mineshaft(SavedMineshaftPiece {
+                        piece: MineshaftGraphPiece {
+                            bounds: BoundingBox::new(min, max).map_err(anyhow::Error::msg)?,
+                            direction: None,
+                            depth: 0,
+                            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+                        },
+                        variant: MineshaftVariant::Normal,
+                        placed_spider: false,
+                    });
+                    mineshaft_may_touch_chunk(target, &[piece])?
+                } else {
+                    ocean_ruin_may_touch_chunk(target, &[saved_ocean_piece(min, max)?])?
+                };
+                let (calls, unchanged) = results[&index];
+                assert_eq!(
+                    (calls, unchanged),
+                    [(0, true), (1, false), (0, true), (1, false), (0, true)][index],
+                    "{structure} case {index}"
+                );
+                assert!(may_touch || (calls == 0 && unchanged));
+            }
         }
         Ok(())
     }

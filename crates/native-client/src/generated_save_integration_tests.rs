@@ -64,7 +64,10 @@ fn private_play_save_world() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn copy_private_world(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+pub(crate) fn copy_private_world(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
     std::fs::create_dir(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;

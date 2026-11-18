@@ -41,8 +41,9 @@ public class SavedMineshaftNoopOracle {
     public static void main(String[] args) {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
-        Structure mine = VanillaRegistries.createWorldLookup().lookupOrThrow(Registries.STRUCTURE)
-                .getOrThrow(ResourceKey.create(Registries.STRUCTURE, Identifier.parse("minecraft:mineshaft")))
+        String structureId = args.length == 0 ? "minecraft:mineshaft" : args[0];
+        Structure structure = VanillaRegistries.createWorldLookup().lookupOrThrow(Registries.STRUCTURE)
+                .getOrThrow(ResourceKey.create(Registries.STRUCTURE, Identifier.parse(structureId)))
                 .value();
         int[][] bounds = {
             {0, 0, 32, 7, 7, 39},
@@ -56,7 +57,7 @@ public class SavedMineshaftNoopOracle {
         for (int index = 0; index < bounds.length; index++) {
             int[] b = bounds[index];
             Probe piece = new Probe(new BoundingBox(b[0], b[1], b[2], b[3], b[4], b[5]));
-            StructureStart start = new StructureStart(mine, new ChunkPos(0, 0), 0,
+            StructureStart start = new StructureStart(structure, new ChunkPos(0, 0), 0,
                     new PiecesContainer(List.of(piece)));
             RandomSource random = RandomSource.create(1234L);
             RandomSource baseline = RandomSource.create(1234L);
